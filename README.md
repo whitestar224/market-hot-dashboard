@@ -1,6 +1,10 @@
 # 星云社 · 跨市场热榜雷达
 
+> Local-first cross-market trading intelligence dashboard for crypto, stocks, RSS, X/KOL tracking, AI insights, and desktop alerts.
+
 星云社是一个面向交易员和信息流研究者的跨市场热榜仪表盘。它把加密货币交易所、链上 DEX、港股、美股、A 股、交易所上新、IPO、新股新币、律动快讯、RSS/公众号、X KOL 动态和 TodoList 聚合到同一套本地优先的工作台里。
+
+如果这个项目对你有帮助，欢迎点一个 Star 支持一下，也欢迎加入 [Discord 社群](https://discord.gg/mKyCwtHW) 交流数据源、交易信息流自动化和产品建议。
 
 > **使用声明**：本项目仅供学习使用，如要商用，请获得本人授权；如需二次商业发行或作为商业服务的一部分使用，也请先获得作者本人授权。
 > **风险提示**：页面数据和 AI 分析仅作信息聚合与研究辅助，不构成任何投资建议。
