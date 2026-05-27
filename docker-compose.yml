@@ -1,0 +1,40 @@
+services:
+  xingyunshe:
+    build:
+      context: .
+      args:
+        PYTHON_IMAGE: public.ecr.aws/docker/library/python:3.12-slim
+    image: xingyunshe-dashboard:latest
+    restart: unless-stopped
+    environment:
+      XINGYUN_ENV: production
+      XINGYUN_HOST: 0.0.0.0
+      XINGYUN_PORT: "8765"
+      PORT: "8765"
+      XINGYUN_LOAD_DOTENV: "0"
+      XINGYUN_LOAD_ENV_EXAMPLE: "0"
+      XINGYUN_ENV_FILE: /run/secrets/xingyun.env
+      XINGYUN_DISABLE_DESKTOP_ALERT: "0"
+      XINGYUN_DESKTOP_ALERT_BRIDGE_URL: "http://host.docker.internal:8766/api/desktop-alert"
+      AICOIN_USER_DATA_DIR: /host-aicoin
+    ports:
+      - "8765:8765"
+    volumes:
+      - xingyunshe_runtime:/app/.runtime-cache
+      - type: bind
+        source: ./.env.production
+        target: /run/secrets/xingyun.env
+        read_only: true
+      - type: bind
+        source: "${AICOIN_HOST_USER_DATA_DIR:-./.runtime-cache/aicoin-host-empty}"
+        target: /host-aicoin
+        read_only: true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/health', timeout=4).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  xingyunshe_runtime:

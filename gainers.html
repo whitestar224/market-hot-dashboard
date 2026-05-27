@@ -1,0 +1,87 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>星云社 · 涨幅榜</title>
+    <link rel="icon" href="./favicon.ico?v=2" sizes="any" />
+    <link rel="icon" type="image/png" sizes="32x32" href="./assets/favicon-32.png?v=2" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./assets/apple-touch-icon.png?v=2" />
+    <link rel="manifest" href="./site.webmanifest" />
+    <script src="./desktop_adapter.js?v=1"></script>
+    <link rel="stylesheet" href="./styles.css?v=53" />
+  </head>
+  <body data-ranking-mode="gainers">
+    <main class="app-shell ranking-shell">
+      <header class="command-deck flash-deck">
+        <div class="topbar">
+          <div class="brand">
+            <span class="brand-mark brand-logo">
+              <img src="./assets/xingyunshe-logo.png?v=2" alt="星云社 logo" />
+            </span>
+            <div>
+              <p class="eyebrow">XINGYUN SOCIETY</p>
+              <h1>星云社</h1>
+              <span class="brand-subtitle">跨市场涨幅榜</span>
+            </div>
+          </div>
+          <nav class="page-nav" aria-label="页面导航">
+            <a class="nav-link" href="./index.html">热门榜</a>
+            <a class="nav-link active" href="./gainers.html">涨幅榜</a>
+            <a class="nav-link" href="./turnover.html">成交额榜</a>
+            <a class="nav-link" href="./newboards.html">新币新股</a>
+            <a class="nav-link" href="./listings.html">上新IPO</a>
+            <a class="nav-link" href="./newsflash.html">律动快讯</a>
+            <a class="nav-link" href="./briefs.html">自动简报</a>
+            <a class="nav-link" href="./rss.html">RSS订阅</a>
+            <a class="nav-link" href="./xwatch.html">X追踪</a>
+            <a class="nav-link" href="./todo.html">TodoList</a>
+           <a class="nav-link nav-discord" href="https://discord.gg/mKyCwtHW" target="_blank" rel="noreferrer noopener" aria-label="打开星云社 Discord 社区">Discord</a>
+          </nav>
+          <div class="status-cluster" aria-label="数据状态">
+            <span class="live-dot"></span>
+            <span id="clock">--:--:--</span>
+            <span id="rankingStatus" class="status-pill">数据就绪</span>
+          </div>
+        </div>
+
+        <section class="flash-hero ranking-hero">
+          <p class="section-label">GAINERS / CRYPTO / HK-US-CN STOCKS</p>
+          <div class="ranking-metrics" aria-label="涨幅榜概览">
+            <span><b id="rankingTotal">--</b><em>上榜</em></span>
+            <span><b id="rankingLeader">--</b><em>领涨</em></span>
+            <span><b id="rankingCrypto">--</b><em>币圈</em></span>
+            <span><b id="rankingStock">--</b><em>股票</em></span>
+          </div>
+        </section>
+      </header>
+
+      <section class="control-dock ranking-controls" aria-label="涨幅榜控制">
+        <label class="search-box">
+          <span>搜索</span>
+          <input id="rankingSearch" type="search" placeholder="BILL / NVDA / 港股 / Binance / AIcoin" />
+        </label>
+        <div class="segmented" id="rankingFilter" role="group" aria-label="市场筛选">
+          <button type="button" data-filter="all" class="active">全部</button>
+          <button type="button" data-filter="crypto">币圈</button>
+          <button type="button" data-filter="stock">股票</button>
+          <button type="button" data-filter="hk">港股</button>
+          <button type="button" data-filter="us">美股</button>
+          <button type="button" data-filter="cn">A股</button>
+        </div>
+        <button id="refreshRanking" class="action-button" type="button">刷新榜单</button>
+      </section>
+
+      <section id="rankingGrid" class="leaderboard-grid ranking-grid" aria-label="涨幅榜列表">
+        <div class="loading-panel">正在读取缓存数据...</div>
+      </section>
+    </main>
+
+    <script src="./auth.js?v=17"></script>
+    <script src="./ai_insights.js?v=4"></script>
+    <script src="./insights.js?v=5"></script>
+    <script src="./rankings.js?v=15"></script>
+    <script src="./notifier.js?v=10"></script>
+    <script src="./todo_reminder.js?v=1"></script>
+  </body>
+</html>

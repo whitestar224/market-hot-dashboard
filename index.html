@@ -1,0 +1,134 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>星云社 · 跨市场热门榜雷达</title>
+    <link rel="icon" href="./favicon.ico?v=2" sizes="any" />
+    <link rel="icon" type="image/png" sizes="32x32" href="./assets/favicon-32.png?v=2" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./assets/apple-touch-icon.png?v=2" />
+    <link rel="manifest" href="./site.webmanifest" />
+    <script src="./desktop_adapter.js?v=1"></script>
+    <link rel="stylesheet" href="./styles.css?v=53" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="command-deck">
+        <div class="topbar">
+          <div class="brand">
+            <span class="brand-mark brand-logo">
+              <img src="./assets/xingyunshe-logo.png?v=2" alt="星云社 logo" />
+            </span>
+            <div>
+              <p class="eyebrow">XINGYUN SOCIETY</p>
+              <h1>星云社</h1>
+              <span class="brand-subtitle">跨市场热门榜雷达</span>
+            </div>
+          </div>
+          <nav class="page-nav" aria-label="页面导航">
+            <a class="nav-link active" href="./index.html">热门榜</a>
+            <a class="nav-link" href="./gainers.html">涨幅榜</a>
+            <a class="nav-link" href="./turnover.html">成交额榜</a>
+            <a class="nav-link" href="./newboards.html">新币新股</a>
+            <a class="nav-link" href="./listings.html">上新IPO</a>
+            <a class="nav-link" href="./newsflash.html">律动快讯</a>
+            <a class="nav-link" href="./briefs.html">自动简报</a>
+            <a class="nav-link" href="./rss.html">RSS订阅</a>
+            <a class="nav-link" href="./xwatch.html">X追踪</a>
+            <a class="nav-link" href="./todo.html">TodoList</a>
+           <a class="nav-link nav-discord" href="https://discord.gg/mKyCwtHW" target="_blank" rel="noreferrer noopener" aria-label="打开星云社 Discord 社区">Discord</a>
+          </nav>
+          <div class="status-cluster" aria-label="数据状态">
+            <span class="live-dot"></span>
+            <span id="clock">--:--:--</span>
+            <span id="dataStatus" class="status-pill">数据就绪</span>
+          </div>
+        </div>
+
+        <section class="hero-grid">
+          <div class="hero-copy">
+            <p class="section-label">CRYPTO / FUTU / 10JQKA / BLOCKBEATS</p>
+            <div class="exchange-affiliate-strip hero-affiliate-strip" aria-label="交易所返佣广告">
+              <div class="affiliate-copy">
+                <span>交易所返佣</span>
+                <strong>永久返手续费 20%</strong>
+                <em>星云社专属邀请链接</em>
+              </div>
+              <div class="affiliate-cards">
+                <a class="affiliate-card affiliate-binance" href="https://www.binance.com/join?ref=WF7KWSF5" target="_blank" rel="noreferrer noopener">
+                  <i class="affiliate-bg" aria-hidden="true"></i>
+                  <span class="affiliate-badge">全球第一交易平台</span>
+                  <span class="affiliate-logo">BN</span>
+                  <span class="affiliate-main">
+                    <b>Binance</b>
+                    <small>全球领先的数字资产交易平台</small>
+                    <em>永久返手续费 20%</em>
+                  </span>
+                  <strong>立即注册</strong>
+                </a>
+                <a class="affiliate-card affiliate-okx" href="https://www.bjwebptyiou.com/join/51629076" target="_blank" rel="noreferrer noopener">
+                  <i class="affiliate-bg" aria-hidden="true"></i>
+                  <span class="affiliate-badge">安全稳定 值得信赖</span>
+                  <span class="affiliate-logo">OK</span>
+                  <span class="affiliate-main">
+                    <b>OKX</b>
+                    <small>技术驱动的数字资产交易平台</small>
+                    <em>永久返手续费 20%</em>
+                  </span>
+                  <strong>立即注册</strong>
+                </a>
+                <a class="affiliate-card affiliate-bitget" href="https://partner.bitgetapps.com/bg/xy8888" target="_blank" rel="noreferrer noopener">
+                  <i class="affiliate-bg" aria-hidden="true"></i>
+                  <span class="affiliate-badge">合约交易 全球领先</span>
+                  <span class="affiliate-logo">BG</span>
+                  <span class="affiliate-main">
+                    <b>Bitget</b>
+                    <small>专业级数字资产衍生品交易平台</small>
+                    <em>永久返手续费 20%</em>
+                  </span>
+                  <strong>立即注册</strong>
+                </a>
+              </div>
+            </div>
+          </div>
+        </section>
+      </header>
+
+      <section class="control-dock" aria-label="榜单控制">
+        <label class="search-box">
+          <span>搜索</span>
+          <input id="searchInput" type="search" placeholder="BTC / 泡泡玛特 / NVDA / 巨力索具" />
+        </label>
+
+        <div class="segmented" id="filterButtons" role="group" aria-label="市场筛选">
+          <button type="button" data-filter="all" class="active">全部</button>
+          <button type="button" data-filter="crypto">币圈</button>
+          <button type="button" data-filter="aicoin">AIcoin</button>
+          <button type="button" data-filter="hk">港股</button>
+          <button type="button" data-filter="us">美股</button>
+          <button type="button" data-filter="cn">A股</button>
+        </div>
+
+        <label class="sort-box">
+          <span>排序</span>
+          <select id="sortSelect">
+            <option value="rank">榜单原序</option>
+            <option value="heat">热度优先</option>
+            <option value="change">涨幅优先</option>
+            <option value="amount">成交/交易优先</option>
+          </select>
+        </label>
+      </section>
+
+      <section id="summaryGrid" class="summary-grid" aria-label="全局概览"></section>
+      <section id="leaderboards" class="leaderboard-grid" aria-label="热门榜列表"></section>
+    </main>
+
+    <script src="./auth.js?v=17"></script>
+    <script src="./ai_insights.js?v=4"></script>
+    <script src="./insights.js?v=5"></script>
+    <script src="./app.js?v=13"></script>
+    <script src="./notifier.js?v=10"></script>
+    <script src="./todo_reminder.js?v=1"></script>
+  </body>
+</html>

@@ -1,0 +1,115 @@
+{
+  "name": "xingyunshe-market-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "星云社跨市场热门榜雷达桌面端",
+  "main": "electron/main.js",
+  "author": "Xingyun Society",
+  "license": "SEE LICENSE IN LICENSE",
+  "scripts": {
+    "desktop:dev": "electron .",
+    "desktop:prepare-config": "powershell -NoProfile -ExecutionPolicy Bypass -File desktop/prepare-desktop-config.ps1",
+    "desktop:backend:win": "powershell -NoProfile -ExecutionPolicy Bypass -File desktop/build-backend-win.ps1",
+    "desktop:backend:mac": "bash desktop/build-backend-macos.sh",
+    "desktop:build:win": "npm run desktop:prepare-config && npm run desktop:backend:win && electron-builder --win nsis portable",
+    "desktop:build:mac": "npm run desktop:prepare-config && npm run desktop:backend:mac && electron-builder --mac dmg zip",
+    "desktop:pack": "npm run desktop:prepare-config && electron-builder --dir"
+  },
+  "devDependencies": {
+    "electron": "^42.2.0",
+    "electron-builder": "^26.8.1"
+  },
+  "build": {
+    "appId": "com.xingyunshe.marketdashboard",
+    "productName": "星云社",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "electron/**/*",
+      "package.json",
+      "assets/icon-512.png",
+      "assets/icon-192.png",
+      "assets/favicon.ico",
+      "assets/xingyunshe-logo-transparent.png"
+    ],
+    "extraResources": [
+      {
+        "from": ".",
+        "to": "dashboard",
+        "filter": [
+          "*.html",
+          "*.js",
+          "*.css",
+          "*.ico",
+          "*.webmanifest",
+          "server.py",
+          "desktop_alert.py",
+          "desktop_alert_bridge.py",
+          "requirements.txt",
+          "assets/**",
+          "docs/**",
+          "tools/publish_automation_briefs.py",
+          ".env.production.example",
+          "!node_modules/**",
+          "!release/**",
+          "!dist-backend/**",
+          "!__pycache__/**",
+          "!.runtime-cache/**",
+          "!.git/**",
+          "!.env",
+          "!.env.local",
+          "!.env.production",
+          "!dashboard-*.png",
+          "!newsflash-preview.png"
+        ]
+      },
+      {
+        "from": "dist-backend",
+        "to": "backend",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "desktop-private/.env.desktop",
+        "to": "dashboard/.env.desktop"
+      },
+      {
+        "from": "desktop-private/runtime-seed",
+        "to": "runtime-seed",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "icon": "assets/icon-512.png"
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "icon": "assets/icon-512.png",
+      "category": "public.app-category.finance",
+      "artifactName": "XingyunShe-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "artifactName": "XingyunShe-Setup-${version}-${arch}.${ext}",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "星云社"
+    },
+    "portable": {
+      "artifactName": "XingyunShe-Portable-${version}-${arch}.${ext}"
+    }
+  }
+}

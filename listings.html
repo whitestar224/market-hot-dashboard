@@ -1,0 +1,97 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>星云社 · 上新 IPO</title>
+    <link rel="icon" href="./favicon.ico?v=2" sizes="any" />
+    <link rel="icon" type="image/png" sizes="32x32" href="./assets/favicon-32.png?v=2" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./assets/apple-touch-icon.png?v=2" />
+    <link rel="manifest" href="./site.webmanifest" />
+    <script src="./desktop_adapter.js?v=1"></script>
+    <link rel="stylesheet" href="./styles.css?v=53" />
+  </head>
+  <body>
+    <main class="app-shell listings-shell">
+      <header class="command-deck flash-deck">
+        <div class="topbar">
+          <div class="brand">
+            <span class="brand-mark brand-logo">
+              <img src="./assets/xingyunshe-logo.png?v=2" alt="星云社 logo" />
+            </span>
+            <div>
+              <p class="eyebrow">XINGYUN SOCIETY</p>
+              <h1>星云社</h1>
+              <span class="brand-subtitle">交易所上新 · IPO 信息</span>
+            </div>
+          </div>
+          <nav class="page-nav" aria-label="页面导航">
+            <a class="nav-link" href="./index.html">热门榜</a>
+            <a class="nav-link" href="./gainers.html">涨幅榜</a>
+            <a class="nav-link" href="./turnover.html">成交额榜</a>
+            <a class="nav-link" href="./newboards.html">新币新股</a>
+            <a class="nav-link active" href="./listings.html">上新IPO</a>
+            <a class="nav-link" href="./newsflash.html">律动快讯</a>
+            <a class="nav-link" href="./briefs.html">自动简报</a>
+            <a class="nav-link" href="./rss.html">RSS订阅</a>
+            <a class="nav-link" href="./xwatch.html">X追踪</a>
+            <a class="nav-link" href="./todo.html">TodoList</a>
+           <a class="nav-link nav-discord" href="https://discord.gg/mKyCwtHW" target="_blank" rel="noreferrer noopener" aria-label="打开星云社 Discord 社区">Discord</a>
+          </nav>
+          <div class="status-cluster" aria-label="数据状态">
+            <span class="live-dot"></span>
+            <span id="clock">--:--:--</span>
+            <span id="listingStatus" class="status-pill">数据就绪</span>
+          </div>
+        </div>
+
+        <section class="flash-hero listings-hero">
+          <p class="section-label">LISTING TIMELINE / IPO CALENDAR / HK-US NEW ISSUES</p>
+          <div class="listing-hero-metrics" aria-label="上新概览">
+            <span>
+              <b id="listingCount">--</b>
+              <em>事件</em>
+            </span>
+            <span>
+              <b id="listingToday">--</b>
+              <em>今日</em>
+            </span>
+            <span>
+              <b id="listingSources">--</b>
+              <em>来源</em>
+            </span>
+          </div>
+        </section>
+      </header>
+
+      <section class="control-dock listing-controls" aria-label="上新 IPO 控制">
+        <label class="search-box">
+          <span>搜索</span>
+          <input id="listingSearch" type="search" placeholder="BILL / Nasdaq / A股 / 港股 / Binance / IPO" />
+        </label>
+        <div class="segmented" id="listingFilter" role="group" aria-label="信息分类">
+          <button type="button" data-filter="all" class="active">全部</button>
+          <button type="button" data-filter="crypto">交易所</button>
+          <button type="button" data-filter="ipo">IPO</button>
+          <button type="button" data-filter="cn">A股</button>
+          <button type="button" data-filter="hk">港股</button>
+          <button type="button" data-filter="us">美股</button>
+        </div>
+        <button id="refreshListings" class="action-button" type="button">刷新上新</button>
+      </section>
+
+      <section id="todayListings" class="today-listings" aria-label="当天上新和 IPO 情况">
+        <div class="loading-panel">暂无今日事件。</div>
+      </section>
+
+      <section id="listingBoard" class="listing-timeline" aria-label="按发布时间排序的上新和 IPO 信息">
+        <div class="loading-panel">暂无缓存数据。</div>
+      </section>
+    </main>
+
+    <script src="./auth.js?v=17"></script>
+    <script src="./listings.js?v=6"></script>
+    <script src="./notifier.js?v=10"></script>
+    <script src="./todo_reminder.js?v=1"></script>
+  </body>
+</html>

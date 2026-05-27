@@ -1,0 +1,16 @@
+.git
+.runtime-cache
+desktop-private
+node_modules
+release
+dist-backend
+__pycache__/
+*.pyc
+.env
+.env.local
+.env.production
+.qa-*
+dashboard-*.png
+newsflash-preview.png
+Thumbs.db
+.DS_Store

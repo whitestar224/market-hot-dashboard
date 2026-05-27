@@ -1,0 +1,207 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>星云社 · RSS订阅</title>
+    <link rel="icon" href="./favicon.ico?v=2" sizes="any" />
+    <link rel="icon" type="image/png" sizes="32x32" href="./assets/favicon-32.png?v=2" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./assets/apple-touch-icon.png?v=2" />
+    <link rel="manifest" href="./site.webmanifest" />
+    <script src="./desktop_adapter.js?v=1"></script>
+    <link rel="stylesheet" href="./styles.css?v=53" />
+  </head>
+  <body>
+    <main class="app-shell rss-shell">
+      <header class="command-deck flash-deck rss-command-deck">
+        <div class="topbar">
+          <div class="brand">
+            <span class="brand-mark brand-logo">
+              <img src="./assets/xingyunshe-logo.png?v=2" alt="星云社 logo" />
+            </span>
+            <div>
+              <p class="eyebrow">XINGYUN SOCIETY</p>
+              <h1>星云社</h1>
+              <span class="brand-subtitle">RSS / 公众号订阅</span>
+            </div>
+          </div>
+          <nav class="page-nav" aria-label="页面导航">
+            <a class="nav-link" href="./index.html">热门榜</a>
+            <a class="nav-link" href="./gainers.html">涨幅榜</a>
+            <a class="nav-link" href="./turnover.html">成交额榜</a>
+            <a class="nav-link" href="./newboards.html">新币新股</a>
+            <a class="nav-link" href="./listings.html">上新IPO</a>
+            <a class="nav-link" href="./newsflash.html">律动快讯</a>
+            <a class="nav-link" href="./briefs.html">自动简报</a>
+            <a class="nav-link active" href="./rss.html">RSS订阅</a>
+            <a class="nav-link" href="./xwatch.html">X追踪</a>
+            <a class="nav-link" href="./todo.html">TodoList</a>
+           <a class="nav-link nav-discord" href="https://discord.gg/mKyCwtHW" target="_blank" rel="noreferrer noopener" aria-label="打开星云社 Discord 社区">Discord</a>
+          </nav>
+          <div class="status-cluster" aria-label="RSS状态">
+            <span class="live-dot"></span>
+            <span id="clock">--:--:--</span>
+            <span id="rssStatus" class="status-pill">本地订阅库</span>
+          </div>
+        </div>
+
+        <section class="flash-hero rss-hero">
+          <p class="section-label">RSS / WEWE RSS / WECHAT OFFICIAL ACCOUNTS</p>
+          <div class="rss-hero-metrics" aria-label="RSS概览">
+            <span>
+              <b id="rssSourceCount">0</b>
+              <em>订阅</em>
+            </span>
+            <span>
+              <b id="rssItemCount">0</b>
+              <em>文章</em>
+            </span>
+            <span>
+              <b id="rssUnreadCount">0</b>
+              <em>未读</em>
+            </span>
+            <span>
+              <b id="rssWechatCount">0</b>
+              <em>公众号</em>
+            </span>
+          </div>
+        </section>
+      </header>
+
+      <section class="rss-workspace" aria-label="RSS订阅工作区">
+        <aside class="rss-sidebar">
+          <button id="rssAddBtn" class="rss-add-button" type="button">
+            <span>+</span>
+            添加订阅
+          </button>
+
+          <button id="rssAllSource" class="rss-source-row active" type="button" data-source-id="all">
+            <span class="rss-source-icon all">ALL</span>
+            <span>
+              <b>全部</b>
+              <em id="rssAllCount">0 条内容</em>
+            </span>
+          </button>
+
+          <div class="rss-sidebar-heading">
+            <span>订阅源</span>
+            <button id="rssImportBtn" type="button">导入OPML</button>
+          </div>
+          <div id="rssSourceList" class="rss-source-list"></div>
+
+          <div class="rss-wechat-auth">
+            <div>
+              <b>公众号授权</b>
+              <em id="rssWechatAuthState">检查中</em>
+            </div>
+            <button id="rssWechatLogin" type="button">扫码授权</button>
+            <div id="rssWechatQrPanel" class="rss-wechat-qr" hidden>
+              <img id="rssWechatQrImage" alt="微信读书授权二维码" />
+              <span id="rssWechatQrHint">用微信扫码确认，授权后自动刷新订阅。</span>
+            </div>
+          </div>
+
+          <div class="rss-auto-box">
+            <label class="rss-auto-toggle">
+              <input id="rssAutoToggle" type="checkbox" />
+              <span>自动更新</span>
+            </label>
+            <label class="rss-auto-select">
+              <span>间隔</span>
+              <select id="rssAutoInterval">
+                <option value="60000">1分钟</option>
+                <option value="180000">3分钟</option>
+                <option value="300000">5分钟</option>
+                <option value="900000">15分钟</option>
+                <option value="1800000">30分钟</option>
+              </select>
+            </label>
+            <em id="rssNextRefresh">下次 --</em>
+          </div>
+
+          <div class="rss-sidebar-actions">
+            <button id="rssRefreshAll" type="button">更新全部</button>
+            <button id="rssExportOpml" type="button">导出OPML</button>
+          </div>
+          <input id="rssOpmlInput" type="file" accept=".opml,.xml,text/xml" hidden />
+        </aside>
+
+        <section class="rss-reader">
+          <header class="rss-reader-toolbar">
+            <div class="rss-reader-title">
+              <p id="rssCurrentScope">全部订阅 /</p>
+              <h2 id="rssReaderTitle">聚合信息流</h2>
+            </div>
+            <label class="rss-search">
+              <span>搜索</span>
+              <input id="rssSearch" type="search" placeholder="搜索标题 / 摘要 / 来源" />
+            </label>
+            <div id="rssViewFilter" class="rss-view-filter" role="group" aria-label="阅读筛选">
+              <button type="button" data-filter="all" class="active">全部</button>
+              <button type="button" data-filter="unread">未读</button>
+              <button type="button" data-filter="wechat">公众号</button>
+            </div>
+          </header>
+
+          <div class="rss-table-head" aria-hidden="true">
+            <span>标题</span>
+            <span>来源</span>
+            <span>发布时间</span>
+          </div>
+          <div id="rssItemList" class="rss-item-list">
+            <div class="loading-panel">添加 RSS 或微信公众号订阅后，这里会按发布时间聚合展示。</div>
+          </div>
+        </section>
+      </section>
+
+      <div id="rssModal" class="rss-modal" hidden>
+        <form id="rssForm" class="rss-dialog">
+          <div class="rss-dialog-head">
+            <div>
+              <p class="section-label">ADD SOURCE</p>
+              <h2>添加订阅源</h2>
+            </div>
+            <button id="rssCloseModal" type="button" aria-label="关闭">×</button>
+          </div>
+
+          <div class="rss-type-tabs" role="group" aria-label="订阅类型">
+            <button type="button" data-rss-type="feed" class="active">RSS / Atom</button>
+            <button type="button" data-rss-type="wechat">微信公众号</button>
+          </div>
+
+          <label>
+            <span>订阅名称</span>
+            <input id="rssTitleInput" type="text" placeholder="可选，留空会读取源标题" />
+          </label>
+
+          <div id="rssFeedFields" class="rss-form-grid">
+            <label>
+              <span>RSS 地址</span>
+              <input id="rssUrlInput" type="url" placeholder="https://example.com/feed.xml" />
+            </label>
+          </div>
+
+          <div id="rssWechatFields" class="rss-form-grid" hidden>
+            <label>
+              <span>公众号名称或文章链接</span>
+              <input id="rssWechatInput" type="text" placeholder="粘贴公众号任意文章链接，或输入公众号名称" />
+            </label>
+          </div>
+
+          <p class="rss-dialog-note">
+            公众号精确订阅需要先完成微信读书授权；不会使用搜索结果冒充公众号最新文章列表。
+          </p>
+          <div class="rss-dialog-actions">
+            <button type="button" id="rssCancelBtn">取消</button>
+            <button type="submit">添加并更新</button>
+          </div>
+        </form>
+      </div>
+    </main>
+
+    <script src="./auth.js?v=17"></script>
+    <script src="./notifier.js?v=10"></script>
+    <script src="./rss.js?v=8"></script>
+    <script src="./todo_reminder.js?v=1"></script>
+  </body>
+</html>

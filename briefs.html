@@ -1,0 +1,88 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>星云社 · 自动化简报</title>
+    <link rel="icon" href="./favicon.ico?v=2" sizes="any" />
+    <link rel="icon" type="image/png" sizes="32x32" href="./assets/favicon-32.png?v=2" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./assets/apple-touch-icon.png?v=2" />
+    <link rel="manifest" href="./site.webmanifest" />
+    <script src="./desktop_adapter.js?v=1"></script>
+    <link rel="stylesheet" href="./styles.css?v=53" />
+  </head>
+  <body>
+    <main class="app-shell briefs-shell">
+      <header class="command-deck flash-deck">
+        <div class="topbar">
+          <div class="brand">
+            <span class="brand-mark brand-logo">
+              <img src="./assets/xingyunshe-logo.png?v=2" alt="星云社 logo" />
+            </span>
+            <div>
+              <p class="eyebrow">XINGYUN SOCIETY</p>
+              <h1>星云社</h1>
+              <span class="brand-subtitle">自动化简报</span>
+            </div>
+          </div>
+          <nav class="page-nav" aria-label="页面导航">
+            <a class="nav-link" href="./index.html">热门榜</a>
+            <a class="nav-link" href="./gainers.html">涨幅榜</a>
+            <a class="nav-link" href="./turnover.html">成交额榜</a>
+            <a class="nav-link" href="./newboards.html">新币新股</a>
+            <a class="nav-link" href="./listings.html">上新IPO</a>
+            <a class="nav-link" href="./newsflash.html">律动快讯</a>
+            <a class="nav-link active" href="./briefs.html">自动简报</a>
+            <a class="nav-link" href="./rss.html">RSS订阅</a>
+            <a class="nav-link" href="./xwatch.html">X追踪</a>
+            <a class="nav-link" href="./todo.html">TodoList</a>
+           <a class="nav-link nav-discord" href="https://discord.gg/mKyCwtHW" target="_blank" rel="noreferrer noopener" aria-label="打开星云社 Discord 社区">Discord</a>
+          </nav>
+          <div class="status-cluster" aria-label="数据状态">
+            <span class="live-dot"></span>
+            <span id="clock">--:--:--</span>
+            <span id="briefStatus" class="status-pill">简报就绪</span>
+          </div>
+        </div>
+
+        <section class="flash-hero brief-hero">
+          <p class="section-label">CODEX AUTOMATIONS / HOURLY</p>
+          <div class="brief-hero-metrics" aria-label="简报概览">
+            <span>
+              <b id="briefCount">--</b>
+              <em>任务</em>
+            </span>
+            <span>
+              <b id="briefLatest">--</b>
+              <em>最新</em>
+            </span>
+            <span>
+              <b id="briefWords">--</b>
+              <em>字数</em>
+            </span>
+          </div>
+        </section>
+      </header>
+
+      <section class="control-dock flash-controls" aria-label="简报控制">
+        <label class="search-box">
+          <span>搜索</span>
+          <input id="briefSearch" type="search" placeholder="NIL / MU / 主升浪 / 风险" />
+        </label>
+        <button id="refreshBriefs" class="action-button" type="button">刷新简报</button>
+        <a class="action-link" href="./index.html">返回热门榜</a>
+      </section>
+
+      <section id="briefOverview" class="brief-overview-grid" aria-label="自动化简报统计"></section>
+
+      <section id="briefList" class="brief-workspace" aria-label="自动化任务简报">
+        <div class="loading-panel">暂无简报。</div>
+      </section>
+    </main>
+
+    <script src="./auth.js?v=17"></script>
+    <script src="./briefs.js?v=3"></script>
+    <script src="./notifier.js?v=10"></script>
+    <script src="./todo_reminder.js?v=1"></script>
+  </body>
+</html>

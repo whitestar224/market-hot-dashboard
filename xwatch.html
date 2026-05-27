@@ -1,0 +1,124 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>星云社 · X KOL追踪</title>
+    <link rel="icon" href="./favicon.ico?v=2" sizes="any" />
+    <link rel="icon" type="image/png" sizes="32x32" href="./assets/favicon-32.png?v=2" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./assets/apple-touch-icon.png?v=2" />
+    <link rel="manifest" href="./site.webmanifest" />
+    <script src="./desktop_adapter.js?v=1"></script>
+    <link rel="stylesheet" href="./styles.css?v=53" />
+  </head>
+  <body>
+    <main class="app-shell xwatch-shell">
+      <header class="command-deck flash-deck xwatch-deck">
+        <div class="topbar">
+          <div class="brand">
+            <span class="brand-mark brand-logo">
+              <img src="./assets/xingyunshe-logo.png?v=2" alt="星云社 logo" />
+            </span>
+            <div>
+              <p class="eyebrow">XINGYUN SOCIETY</p>
+              <h1>星云社</h1>
+              <span class="brand-subtitle">X KOL动态追踪</span>
+            </div>
+          </div>
+          <nav class="page-nav" aria-label="页面导航">
+            <a class="nav-link" href="./index.html">热门榜</a>
+            <a class="nav-link" href="./gainers.html">涨幅榜</a>
+            <a class="nav-link" href="./turnover.html">成交额榜</a>
+            <a class="nav-link" href="./newboards.html">新币新股</a>
+            <a class="nav-link" href="./listings.html">上新IPO</a>
+            <a class="nav-link" href="./newsflash.html">律动快讯</a>
+            <a class="nav-link" href="./briefs.html">自动简报</a>
+            <a class="nav-link" href="./rss.html">RSS订阅</a>
+            <a class="nav-link active" href="./xwatch.html">X追踪</a>
+            <a class="nav-link" href="./todo.html">TodoList</a>
+           <a class="nav-link nav-discord" href="https://discord.gg/mKyCwtHW" target="_blank" rel="noreferrer noopener" aria-label="打开星云社 Discord 社区">Discord</a>
+          </nav>
+          <div class="status-cluster" aria-label="X追踪状态">
+            <span class="live-dot"></span>
+            <span id="clock">--:--:--</span>
+            <span id="xwatchStatus" class="status-pill">本地追踪</span>
+          </div>
+        </div>
+
+        <section class="flash-hero rss-hero xwatch-hero">
+          <p class="section-label">X KOL / TIMELINE / WINDOWS ALERTS</p>
+          <div class="rss-hero-metrics xwatch-hero-metrics" aria-label="X追踪概览">
+            <span>
+              <b id="xwatchSourceCount">0</b>
+              <em>KOL</em>
+            </span>
+            <span>
+              <b id="xwatchPostCount">0</b>
+              <em>动态</em>
+            </span>
+            <span>
+              <b id="xwatchFreshCount">0</b>
+              <em>24h</em>
+            </span>
+            <span>
+              <b id="xwatchProvider">--</b>
+              <em>数据源</em>
+            </span>
+          </div>
+        </section>
+      </header>
+
+      <section class="xwatch-workspace" aria-label="X KOL追踪工作区">
+        <aside class="xwatch-sidebar">
+          <form id="xwatchForm" class="xwatch-form">
+            <label>
+              <span>KOL</span>
+              <input id="xwatchHandle" type="text" placeholder="@elonmusk / x.com/user" autocomplete="off" />
+            </label>
+            <label>
+              <span>显示名</span>
+              <input id="xwatchName" type="text" placeholder="可选" autocomplete="off" />
+            </label>
+            <label>
+              <span>关注词</span>
+              <input id="xwatchKeywords" type="text" placeholder="只标记，不过滤" autocomplete="off" />
+            </label>
+            <div class="xwatch-form-actions">
+              <button id="xwatchSubmit" type="submit">添加追踪</button>
+              <button id="xwatchCancelEdit" class="xwatch-cancel-edit" type="button" hidden>取消</button>
+            </div>
+          </form>
+
+          <div class="xwatch-source-head">
+            <span>追踪列表</span>
+            <button id="xwatchSave" type="button">保存</button>
+          </div>
+          <div id="xwatchSourceList" class="xwatch-source-list"></div>
+        </aside>
+
+        <section class="xwatch-reader">
+          <div class="xwatch-toolbar">
+            <label class="search-box xwatch-search">
+              <span>搜索</span>
+              <input id="xwatchSearch" type="search" placeholder="搜索内容 / KOL / 关键词" />
+            </label>
+            <select id="xwatchSourceFilter" aria-label="KOL筛选">
+              <option value="all">全部KOL</option>
+            </select>
+            <button id="xwatchRefresh" type="button">刷新动态</button>
+          </div>
+          <div id="xwatchTimeline" class="xwatch-timeline">
+            <div class="loading-panel">
+              <b>正在读取X动态</b>
+              <span>先显示本地缓存，后台再更新。</span>
+            </div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="./auth.js?v=17"></script>
+    <script src="./xwatch.js?v=8"></script>
+    <script src="./todo_reminder.js?v=2"></script>
+  </body>
+</html>

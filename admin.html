@@ -1,0 +1,196 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>星云社 · 后台管理</title>
+    <link rel="icon" href="./assets/xingyunshe-logo-icon.png?v=2" />
+    <link rel="stylesheet" href="./styles.css?v=53" />
+  </head>
+  <body class="admin-console-body">
+    <div class="ry-admin">
+      <aside class="ry-sidebar" aria-label="后台菜单">
+        <a class="ry-logo" href="./admin.html" aria-label="星云社后台首页">
+          <img src="./assets/xingyunshe-logo.png?v=2" alt="星云社" />
+          <strong>星云社后台</strong>
+        </a>
+        <nav class="ry-menu">
+          <a class="ry-menu-item" href="./index.html">
+            <span>⌂</span>
+            <b>返回前台</b>
+          </a>
+          <a class="ry-menu-item active" href="./admin.html">
+            <span>●</span>
+            <b>首页</b>
+          </a>
+          <div class="ry-menu-group">
+            <button type="button" class="expanded">
+              <span>⚙</span>
+              <b>系统管理</b>
+              <em>⌄</em>
+            </button>
+            <a class="active" href="#userTable">用户管理</a>
+          </div>
+          <div class="ry-menu-group">
+            <button type="button" class="expanded">
+              <span>▣</span>
+              <b>系统监控</b>
+              <em>⌄</em>
+            </button>
+            <a href="#onlineUsers">在线用户</a>
+            <a href="#cachePanel">缓存监控</a>
+            <a href="#sourcePanel">数据源状态</a>
+            <a href="#wechatPanel">公众号授权</a>
+          </div>
+        </nav>
+      </aside>
+
+      <section class="ry-main">
+        <header class="ry-topbar">
+          <div class="ry-top-left">
+            <button type="button" class="ry-icon-button" aria-label="折叠菜单">☰</button>
+            <span class="ry-breadcrumb">首页 / 系统管理 / 用户管理</span>
+          </div>
+          <div class="ry-top-actions">
+            <button type="button" class="ry-icon-button" aria-label="搜索">⌕</button>
+            <button type="button" class="ry-icon-button" aria-label="全屏">⛶</button>
+            <button type="button" class="ry-icon-button" aria-label="帮助">?</button>
+            <span class="ry-badge">3</span>
+            <span class="ry-user-avatar" id="adminAvatar">A</span>
+            <button type="button" id="adminLogout" class="ry-text-button">退出</button>
+          </div>
+        </header>
+
+        <div class="ry-tabbar" aria-label="标签页">
+          <a href="./admin.html">首页</a>
+          <button type="button" class="active">用户管理 ×</button>
+        </div>
+
+        <main class="ry-content">
+          <section class="ry-overview" id="onlineUsers" aria-label="后台概览">
+            <article>
+              <span>用户总数</span>
+              <strong id="metricUsers">--</strong>
+            </article>
+            <article>
+              <span>在线会话</span>
+              <strong id="metricSessions">--</strong>
+            </article>
+            <article>
+              <span>缓存文件</span>
+              <strong id="metricCache">--</strong>
+            </article>
+            <article id="wechatPanel">
+              <span>公众号授权</span>
+              <strong id="metricWechat">--</strong>
+            </article>
+          </section>
+
+          <section class="ry-card ry-query-card" aria-label="查询条件">
+            <form id="adminSearchForm" class="ry-query-form">
+              <label>
+                <span>用户信息</span>
+                <input id="userSearch" type="search" placeholder="用户名 / 昵称 / 邮箱 / 登录方式" />
+              </label>
+              <label>
+                <span>角色</span>
+                <select id="roleFilter">
+                  <option value="">全部</option>
+                  <option value="admin">管理员</option>
+                  <option value="user">普通用户</option>
+                </select>
+              </label>
+              <div class="ry-query-actions">
+                <button type="submit" class="ry-primary">搜索</button>
+                <button type="button" id="resetSearch" class="ry-default">重置</button>
+              </div>
+            </form>
+          </section>
+
+          <section class="ry-card" id="userTable">
+            <div class="ry-table-toolbar">
+              <div>
+                <button type="button" id="toggleCreateUser" class="ry-success">新增</button>
+                <button type="button" id="reloadUsers" class="ry-default">刷新用户</button>
+              </div>
+              <div>
+                <button type="button" id="refreshCache" class="ry-primary">后台刷新缓存</button>
+                <button type="button" id="clearCache" class="ry-danger">清理接口缓存</button>
+              </div>
+            </div>
+
+            <form id="adminCreateUser" class="ry-create-form" hidden>
+              <label>
+                <span>用户名</span>
+                <input name="username" type="text" autocomplete="off" placeholder="2-32 位" required />
+              </label>
+              <label>
+                <span>密码</span>
+                <input name="password" type="password" autocomplete="new-password" placeholder="至少 8 位" required />
+              </label>
+              <label>
+                <span>角色</span>
+                <select name="role">
+                  <option value="user">普通用户</option>
+                  <option value="admin">管理员</option>
+                </select>
+              </label>
+              <button type="submit" class="ry-primary">保存新增</button>
+            </form>
+
+            <div class="ry-message" id="adminMessage">后台已连接数据库，用户数据、TodoList 和 X追踪均按账号隔离。</div>
+
+            <div class="ry-table-wrap">
+              <table class="ry-table">
+                <thead>
+                  <tr>
+                    <th>序号</th>
+                    <th>用户信息</th>
+                    <th>角色</th>
+                    <th>登录绑定</th>
+                    <th>交易所UID</th>
+                    <th>Todo任务</th>
+                    <th>X追踪源</th>
+                    <th>在线会话</th>
+                    <th>更新时间</th>
+                    <th>创建时间</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="adminUsers"></tbody>
+              </table>
+            </div>
+
+            <footer class="ry-pagination">
+              <span id="adminUserCount">共 0 条</span>
+              <select aria-label="每页条数">
+                <option>10条/页</option>
+                <option>20条/页</option>
+              </select>
+              <button type="button" class="active">1</button>
+            </footer>
+          </section>
+
+          <section class="ry-monitor-grid">
+            <article class="ry-card" id="cachePanel">
+              <header class="ry-card-head">
+                <h2>缓存监控</h2>
+                <span id="adminStatusText">读取后台</span>
+              </header>
+              <div id="adminRuntime" class="ry-runtime-grid"></div>
+            </article>
+            <article class="ry-card" id="sourcePanel">
+              <header class="ry-card-head">
+                <h2>数据源状态</h2>
+              </header>
+              <div id="adminSources" class="ry-source-list"></div>
+            </article>
+          </section>
+        </main>
+      </section>
+    </div>
+
+    <script src="./auth.js?v=17"></script>
+    <script src="./admin.js?v=5"></script>
+  </body>
+</html>

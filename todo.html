@@ -1,0 +1,149 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>星云社 · TodoList</title>
+    <link rel="icon" href="./favicon.ico?v=2" sizes="any" />
+    <link rel="icon" type="image/png" sizes="32x32" href="./assets/favicon-32.png?v=2" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./assets/apple-touch-icon.png?v=2" />
+    <link rel="manifest" href="./site.webmanifest" />
+    <script src="./desktop_adapter.js?v=1"></script>
+    <link rel="stylesheet" href="./styles.css?v=53" />
+  </head>
+  <body>
+    <main class="app-shell todo-page-shell">
+      <header class="command-deck flash-deck todo-command-deck">
+        <div class="topbar">
+          <div class="brand">
+            <span class="brand-mark brand-logo">
+              <img src="./assets/xingyunshe-logo.png?v=2" alt="星云社 logo" />
+            </span>
+            <div>
+              <p class="eyebrow">XINGYUN SOCIETY</p>
+              <h1>星云社</h1>
+              <span class="brand-subtitle">交易 TodoList</span>
+            </div>
+          </div>
+          <nav class="page-nav" aria-label="页面导航">
+            <a class="nav-link" href="./index.html">热门榜</a>
+            <a class="nav-link" href="./gainers.html">涨幅榜</a>
+            <a class="nav-link" href="./turnover.html">成交额榜</a>
+            <a class="nav-link" href="./newboards.html">新币新股</a>
+            <a class="nav-link" href="./listings.html">上新IPO</a>
+            <a class="nav-link" href="./newsflash.html">律动快讯</a>
+            <a class="nav-link" href="./briefs.html">自动简报</a>
+            <a class="nav-link" href="./rss.html">RSS订阅</a>
+            <a class="nav-link" href="./xwatch.html">X追踪</a>
+            <a class="nav-link active" href="./todo.html">TodoList</a>
+           <a class="nav-link nav-discord" href="https://discord.gg/mKyCwtHW" target="_blank" rel="noreferrer noopener" aria-label="打开星云社 Discord 社区">Discord</a>
+          </nav>
+          <div class="status-cluster" aria-label="本地状态">
+            <span class="live-dot"></span>
+            <span id="clock">--:--:--</span>
+            <span id="todoStatus" class="status-pill">本地任务库</span>
+          </div>
+        </div>
+
+        <section class="flash-hero todo-page-hero">
+          <p class="section-label">TASKS / PROJECTS / EXECUTION</p>
+          <div class="todo-inline-metrics" aria-label="任务概览">
+            <span><b id="todoCount">--</b> 任务总数</span>
+            <span><b id="todoOpen">--</b> 待完成</span>
+            <span><b id="todoToday">--</b> 今日截止</span>
+            <span><b id="todoProjects">--</b> 项目</span>
+          </div>
+        </section>
+      </header>
+
+      <section class="todo-page-workspace" aria-label="TodoList 工作区">
+        <aside class="todo-sidebar-panel">
+          <button id="quickAddBtn" class="todo-side-add" type="button">
+            <span>+</span>
+            添加任务
+          </button>
+
+          <label class="todo-page-search">
+            <span>搜索</span>
+            <input id="todoSearch" type="search" placeholder="搜索任务 / 备注 / 标签" />
+          </label>
+
+          <div id="todoFilters" class="todo-page-filters" role="group" aria-label="任务筛选">
+            <button type="button" data-filter="all" class="active">收件箱</button>
+            <button type="button" data-filter="today">今天</button>
+            <button type="button" data-filter="upcoming">预览</button>
+            <button type="button" data-filter="completed">已完成</button>
+          </div>
+
+          <div class="todo-project-head">
+            <h3>我的项目</h3>
+            <button id="newProjectBtn" type="button">新建</button>
+          </div>
+          <div id="todoProjectList" class="todo-project-list"></div>
+        </aside>
+
+        <section class="todo-board-panel">
+          <div class="todo-task-column">
+            <header class="todo-board-head">
+              <div>
+                <p id="todoCurrentProjectTag">我的项目 /</p>
+                <h2 id="todoCurrentProject">龙头逻辑list</h2>
+              </div>
+              <div class="todo-board-actions">
+                <span>共享</span>
+                <span>布局</span>
+                <button id="clearDoneBtn" class="action-link" type="button">清理已完成</button>
+              </div>
+            </header>
+
+            <div id="todoTaskList" class="todo-task-list">
+              <div class="loading-panel">暂无任务。</div>
+            </div>
+          </div>
+
+          <aside class="todo-editor-panel" aria-label="新增任务">
+            <div class="todo-editor-title">
+              <b>添加任务</b>
+              <span>快速记录交易计划、观察点和复盘项</span>
+            </div>
+            <form id="todoTaskForm" class="todo-editor">
+              <label class="todo-title-input">
+                <span>任务内容</span>
+                <input id="todoTaskTitle" name="title" type="text" placeholder="例如：跟踪 AI 新股上市后的承接" required />
+              </label>
+              <label>
+                <span>截止时间</span>
+                <input id="todoTaskDue" name="due" type="datetime-local" />
+              </label>
+              <label>
+                <span>项目</span>
+                <select id="todoTaskProject" name="project"></select>
+              </label>
+              <label>
+                <span>优先级</span>
+                <select id="todoTaskPriority" name="priority">
+                  <option value="high">高优先</option>
+                  <option value="normal" selected>常规</option>
+                  <option value="low">低优先</option>
+                </select>
+              </label>
+              <label class="todo-note">
+                <span>备注</span>
+                <textarea id="todoTaskNote" name="note" rows="5" placeholder="交易计划、触发条件、风控提醒"></textarea>
+              </label>
+              <div class="todo-editor-actions">
+                <button id="todoTaskSubmit" class="action-button todo-submit" type="submit">保存任务</button>
+                <button id="cancelEditBtn" class="todo-cancel-edit" type="button" hidden>取消编辑</button>
+              </div>
+            </form>
+          </aside>
+        </section>
+      </section>
+    </main>
+
+    <script src="./auth.js?v=17"></script>
+    <script src="./todo.js?v=7"></script>
+    <script src="./notifier.js?v=10"></script>
+    <script src="./todo_reminder.js?v=1"></script>
+  </body>
+</html>

@@ -1,0 +1,75 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>星云社 · 登录</title>
+    <link rel="icon" href="./favicon.ico?v=2" sizes="any" />
+    <link rel="icon" type="image/png" sizes="32x32" href="./assets/favicon-32.png?v=2" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./assets/apple-touch-icon.png?v=2" />
+    <link rel="manifest" href="./site.webmanifest" />
+    <script src="./desktop_adapter.js?v=1"></script>
+    <link rel="stylesheet" href="./styles.css?v=54" />
+  </head>
+  <body class="auth-body">
+    <main class="auth-shell">
+      <section class="auth-panel">
+        <div class="auth-brand">
+          <span class="brand-mark brand-logo">
+            <img src="./assets/xingyunshe-logo.png?v=2" alt="星云社 logo" />
+          </span>
+          <div>
+            <p class="eyebrow">XINGYUN SOCIETY</p>
+            <h1>星云社</h1>
+            <span id="authModeText">私有功能登录</span>
+          </div>
+        </div>
+
+        <div class="auth-tabs" role="tablist" aria-label="登录方式">
+          <button class="active" type="button" data-auth-tab="password">账号密码</button>
+          <button type="button" data-auth-tab="email">邮箱验证码</button>
+        </div>
+
+        <form id="authForm" class="auth-form auth-section active" data-auth-section="password">
+          <label>
+            <span>用户名</span>
+            <input id="authUsername" name="username" type="text" autocomplete="username" placeholder="例如：xingyun" required />
+          </label>
+          <label>
+            <span>密码</span>
+            <input id="authPassword" name="password" type="password" autocomplete="current-password" placeholder="至少 8 位" required />
+          </label>
+          <button id="authSubmit" type="submit">登录</button>
+          <button id="authToggle" class="auth-secondary-button" type="button">注册新账号</button>
+        </form>
+
+        <form id="emailForm" class="auth-form auth-section" data-auth-section="email">
+          <label>
+            <span>邮箱</span>
+            <input id="authEmail" name="email" type="email" autocomplete="email" placeholder="例如：name@example.com" />
+          </label>
+          <label>
+            <span>验证码</span>
+            <span class="auth-code-row">
+              <input id="authCode" name="code" type="text" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="6 位验证码" />
+              <button id="sendEmailCode" class="auth-secondary-button" type="button">发送</button>
+            </span>
+          </label>
+          <button id="emailSubmit" type="submit">邮箱登录 / 注册</button>
+        </form>
+
+        <div class="auth-provider-divider" aria-hidden="true"><span>或继续使用</span></div>
+        <div class="auth-provider-grid">
+          <a id="googleLogin" class="auth-provider-card google-provider" href="#">
+            <span class="provider-logo provider-google" aria-hidden="true">G</span>
+            <span>Google</span>
+          </a>
+        </div>
+
+        <p id="authMessage" class="auth-message" aria-live="polite"></p>
+      </section>
+    </main>
+
+    <script src="./login.js?v=10"></script>
+  </body>
+</html>
