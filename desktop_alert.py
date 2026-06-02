@@ -110,6 +110,21 @@ def payload_image_path(payload: dict) -> tuple[Path | None, Path | None]:
             return path, None
 
     image_url = str(payload.get("imageUrl") or "").strip()
+    if image_url.lower().startswith("data:image/"):
+        try:
+            header, encoded = image_url.split(",", 1)
+            suffix = ".png"
+            if "jpeg" in header.lower() or "jpg" in header.lower():
+                suffix = ".jpg"
+            elif "gif" in header.lower():
+                suffix = ".gif"
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            with tmp:
+                tmp.write(base64.b64decode(encoded))
+            path = Path(tmp.name)
+            return path, path
+        except Exception:
+            return None, None
     if not image_url.lower().startswith(("http://", "https://")):
         return None, None
     try:
@@ -134,6 +149,17 @@ def payload_image_path(payload: dict) -> tuple[Path | None, Path | None]:
 
 def load_tk_image(image_path: Path, max_size: int):
     try:
+        from PIL import Image, ImageTk
+
+        image = Image.open(image_path)
+        image.thumbnail((max_size, max_size))
+        if image.mode not in {"RGB", "RGBA"}:
+            image = image.convert("RGBA")
+        return ImageTk.PhotoImage(image)
+    except Exception:
+        pass
+
+    try:
         import tkinter as tk
 
         image = tk.PhotoImage(file=str(image_path))
@@ -146,15 +172,7 @@ def load_tk_image(image_path: Path, max_size: int):
         )
         return image.subsample(factor, factor)
     except Exception:
-        pass
-
-    try:
-        from PIL import Image, ImageTk
-
-        image = Image.open(image_path)
-        image.thumbnail((max_size, max_size))
-        return ImageTk.PhotoImage(image)
-    except Exception as exc:
+        exc = sys.exc_info()[1]
         print(f"alert image unavailable: {exc}", file=sys.stderr)
         return None
 
@@ -301,7 +319,11 @@ def show_popup(payload: dict, slot: int) -> int:
         cursor="arrow",
         takefocus=0,
     )
-    text.pack(fill="both", expand=True)
+    if image_path:
+        text.configure(height=6)
+        text.pack(fill="x", expand=False)
+    else:
+        text.pack(fill="both", expand=True)
     text.tag_configure("kind", foreground="#5a6870", font=("Microsoft YaHei UI", 9, "bold"), spacing3=6)
     text.tag_configure(
         "title",
@@ -323,7 +345,8 @@ def show_popup(payload: dict, slot: int) -> int:
             alert_image = load_tk_image(image_path, max_image_size)
             if alert_image:
                 image_wrap = tk.Frame(content, bg="#f8fcff")
-                image_wrap.pack(fill="x", padx=22, pady=(10, 4))
+                image_wrap.pack(fill="both", expand=True, padx=22, pady=(6, 4))
+                image_wrap.pack_propagate(False)
                 tk.Label(
                     image_wrap,
                     image=alert_image,

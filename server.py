@@ -28,6 +28,7 @@ from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
 from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
@@ -99,6 +100,7 @@ OKX_FUTURES_CACHE_PATH = PERSIST_CACHE_DIR / "okx_futures_hot.json"
 OKX_DEX_SOURCE_CACHE_PATH = PERSIST_CACHE_DIR / "okx_dex_source.json"
 THS_SOURCE_CACHE_PATH = PERSIST_CACHE_DIR / "ths_hot_source.json"
 WECHAT_ACCOUNT_CACHE_PATH = PERSIST_CACHE_DIR / "wechat_accounts.json"
+WECHAT_SOURCE_ALIAS_CACHE_PATH = PERSIST_CACHE_DIR / "wechat_source_aliases.json"
 X_KOL_SOURCES_PATH = PERSIST_CACHE_DIR / "x_kol_sources.json"
 CN_STOCK_GAINERS_CACHE_PATH = PERSIST_CACHE_DIR / "cn_stock_gainers_source.json"
 DEEPSEEK_INSIGHTS_CACHE_PATH = PERSIST_CACHE_DIR / "deepseek_rank_insights.json"
@@ -110,7 +112,9 @@ AUTOMATION_BRIEFS_DEFAULT_REMOTE_URL = (
     "https://raw.githubusercontent.com/whitestar224/market-hot-dashboard/main/docs/automation-briefs.json"
 )
 RSS_FETCH_MAX_BYTES = 2_500_000
+RSS_MAX_STORED_ITEMS = 1800
 RSS_RETENTION_MS = 14 * 24 * 60 * 60 * 1000
+MAX_JSON_BODY_BYTES = int(os.getenv("XINGYUN_MAX_JSON_BODY_BYTES", "8000000") or "8000000")
 WECHAT_ACCOUNT_COOLDOWN_SECONDS = 30 * 60
 WECHAT_AUTH_ALERT_COOLDOWN_SECONDS = 15 * 60
 WECHAT_AUTH_ALERT_LOCK = threading.Lock()
@@ -148,6 +152,8 @@ SECURITY_RATE_LOCK = threading.Lock()
 SECURITY_RATE_BUCKETS: dict[str, list[float]] = {}
 USER_SCOPE_TODO = "todo"
 USER_SCOPE_X_KOL_SOURCES = "x_kol_sources"
+USER_SCOPE_RSS_SOURCES = "rss_sources"
+USER_SCOPE_RSS_ITEMS = "rss_items"
 STOCK_LOGO_OVERRIDES = {
     "hk:00100": ["minimax.io"],
     "hk:01236": ["ldrobot.com"],
@@ -2454,6 +2460,672 @@ def normalize_feed_url(value: Any) -> str:
     return url
 
 
+def is_generic_wechat_title(value: Any) -> bool:
+    text = clean_feed_text(value, 120).lower()
+    return text in {"", "微信公众号", "微信公众账号", "订阅号", "wechat", "wechat official account"}
+
+
+def is_wechat_platform_mp_id(value: Any, platform: Any = "") -> bool:
+    text = clean_feed_text(value, 120)
+    platform_text = clean_feed_text(platform, 80).lower()
+    return bool(text.upper().startswith("MP_WXS_") or (platform_text == "wewe-platform" and re.fullmatch(r"[A-Fa-f0-9]{16,64}", text)))
+
+
+def rss_source_identity(source: dict[str, Any]) -> str:
+    source_type = clean_feed_text(source.get("type"), 20)
+    if source_type == "wechat":
+        return clean_feed_text(
+            (source.get("mpId") if is_wechat_platform_mp_id(source.get("mpId"), source.get("platform")) else "")
+            or source.get("seedUrl")
+            or source.get("query")
+            or source.get("feedUrl")
+            or source.get("title"),
+            600,
+        )
+    return clean_feed_text(source.get("feedUrl") or source.get("url") or source.get("title"), 600)
+
+
+def normalize_rss_source(source: Any) -> dict[str, Any]:
+    if not isinstance(source, dict):
+        return {}
+    source_type = clean_feed_text(source.get("type") or "feed", 20).lower()
+    if source_type in {"rss", "atom"}:
+        source_type = "feed"
+    if source_type not in {"feed", "wechat"}:
+        source_type = "feed"
+
+    title = clean_feed_text(source.get("title"), 120)
+    feed_url = clean_feed_text(source.get("feedUrl") or source.get("url"), 900)
+    seed_url = clean_feed_text(source.get("seedUrl"), 900)
+    query = clean_feed_text(source.get("query"), 160)
+    mp_id = clean_feed_text(source.get("mpId"), 120)
+    site_url = clean_feed_text(source.get("siteUrl"), 900)
+    cover = clean_feed_text(source.get("cover"), 900)
+    platform = clean_feed_text(source.get("platform"), 80)
+    etag = clean_feed_text(source.get("etag"), 300)
+    last_modified = clean_feed_text(source.get("lastModified"), 300)
+
+    if source_type == "wechat":
+        if is_generic_wechat_title(title) and query and not is_generic_wechat_title(query):
+            title = query
+        if not query and title and not is_generic_wechat_title(title):
+            query = title
+        if mp_id and not is_wechat_platform_mp_id(mp_id, platform):
+            mp_id = ""
+        if not mp_id and is_generic_wechat_title(title) and is_generic_wechat_title(query):
+            return {}
+
+    if source_type == "feed":
+        try:
+            feed_url = normalize_feed_url(feed_url)
+        except Exception:
+            return {}
+    else:
+        if not (mp_id or seed_url or query or title):
+            return {}
+        if not feed_url:
+            feed_url = f"wechat-mp://{mp_id or stable_feed_id('wechat', seed_url, query, title)}"
+        if not mp_id:
+            mp_id = ""
+
+    source_id = clean_feed_text(source.get("id"), 120) or f"{source_type}-{stable_feed_id(source_type, feed_url, seed_url, query, title)}"
+    created_at = int(safe_float(source.get("createdAt")) or int(time.time() * 1000))
+    last_fetched_at = int(safe_float(source.get("lastFetchedAt")) or 0)
+    last_new_count = int(safe_float(source.get("lastNewCount")) or 0)
+    last_skipped = int(safe_float(source.get("lastSkippedExisting")) or 0)
+    return {
+        "id": source_id,
+        "type": source_type,
+        "title": title,
+        "feedUrl": feed_url,
+        "siteUrl": site_url,
+        "description": clean_feed_text(source.get("description"), 240),
+        "cover": cover,
+        "seedUrl": seed_url,
+        "query": query,
+        "mpId": mp_id,
+        "platform": platform,
+        "etag": etag,
+        "lastModified": last_modified,
+        "lastFetchedAt": last_fetched_at,
+        "lastNewCount": last_new_count,
+        "lastSkippedExisting": last_skipped,
+        "createdAt": created_at,
+    }
+
+
+def normalize_rss_sources_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_sources = payload.get("sources") if isinstance(payload, dict) else []
+    if not isinstance(raw_sources, list):
+        raw_sources = []
+    sources: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_source in raw_sources[:300]:
+        source = normalize_rss_source(raw_source)
+        if not source:
+            continue
+        identity = rss_source_identity(source) or source["id"]
+        if identity in seen:
+            continue
+        seen.add(identity)
+        sources.append(source)
+    return {"sources": sources, "updatedAt": int(time.time() * 1000)}
+
+
+def normalize_rss_item(item: Any) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return {}
+    source_id = clean_feed_text(item.get("sourceId"), 120)
+    source_type = clean_feed_text(item.get("sourceType") or "feed", 20).lower()
+    if source_type not in {"feed", "wechat"}:
+        source_type = "feed"
+    title = clean_feed_text(item.get("title"), 220)
+    url = clean_feed_text(item.get("url"), 1000)
+    item_id = clean_feed_text(item.get("id"), 220)
+    if not source_id or not (title or url or item_id):
+        return {}
+    published_at = int(safe_float(item.get("publishedAt")) or 0)
+    fetched_at = int(safe_float(item.get("fetchedAt")) or int(time.time() * 1000))
+    key = clean_feed_text(item.get("key"), 260) or stable_feed_id("rss-item", source_id, item_id, url, title)
+    return {
+        "key": key,
+        "id": item_id or key,
+        "title": title or url or item_id,
+        "url": url,
+        "publishedAt": published_at,
+        "author": clean_feed_text(item.get("author"), 120),
+        "summary": clean_feed_text(item.get("summary"), 520),
+        "image": clean_feed_text(item.get("image"), 1000),
+        "sourceId": source_id,
+        "sourceType": source_type,
+        "sourceTitle": clean_feed_text(item.get("sourceTitle"), 160),
+        "fetchedAt": fetched_at,
+    }
+
+
+def normalize_rss_items_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_items = payload.get("items") if isinstance(payload, dict) else []
+    if not isinstance(raw_items, list):
+        raw_items = []
+    cutoff = int(time.time() * 1000) - RSS_RETENTION_MS
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_item in raw_items:
+        item = normalize_rss_item(raw_item)
+        if not item:
+            continue
+        published_at = int(safe_float(item.get("publishedAt")) or 0)
+        if published_at and published_at < cutoff:
+            continue
+        dedupe_key = clean_feed_text(item.get("url") or item.get("id") or item.get("title"), 1000)
+        combined_key = f"{item['sourceId']}|{dedupe_key}"
+        if combined_key in seen:
+            continue
+        seen.add(combined_key)
+        rows.append(item)
+    rows.sort(key=lambda value: int(safe_float(value.get("publishedAt")) or safe_float(value.get("fetchedAt")) or 0), reverse=True)
+    return {"items": rows[:RSS_MAX_STORED_ITEMS], "updatedAt": int(time.time() * 1000)}
+
+
+def recover_rss_sources_from_alert_history() -> list[dict[str, Any]]:
+    history_path = PERSIST_CACHE_DIR / "desktop_alert_seen.json"
+    try:
+        data = json.loads(history_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    seen = data.get("seen") if isinstance(data, dict) else {}
+    if not isinstance(seen, dict):
+        return []
+    ignored_sources = {
+        "blockbeats",
+        "okx",
+        "okx public instruments",
+        "binance",
+        "bitget",
+        "aicoin",
+        "futu",
+        "futunn",
+        "ths",
+    }
+    latest_by_source: dict[str, tuple[float, str, str]] = {}
+    for raw_key, raw_time in seen.items():
+        key = str(raw_key or "")
+        if not key.startswith("alert-title-url:"):
+            continue
+        rest = key.removeprefix("alert-title-url:")
+        if "|" not in rest:
+            continue
+        source = clean_feed_text(rest.split("|", 1)[0], 120)
+        source_key = source.lower()
+        match = re.search(r"https?://mp\.weixin\.qq\.com/s/[^\s|]+", rest)
+        url = clean_feed_text(match.group(0) if match else "", 900)
+        if not source or source_key in ignored_sources or is_generic_wechat_title(source) or re.fullmatch(r"[\W_?]+", source):
+            continue
+        if not url:
+            continue
+        timestamp = safe_float(raw_time)
+        previous = latest_by_source.get(source_key)
+        if previous and previous[0] >= timestamp:
+            continue
+        latest_by_source[source_key] = (timestamp, url, source)
+
+    sources: list[dict[str, Any]] = []
+    for _, (_, seed_url, source_title) in sorted(latest_by_source.items(), key=lambda item: item[1][0], reverse=True):
+        title = clean_feed_text(source_title, 120)
+        recovered = normalize_rss_source(
+            {
+                "type": "wechat",
+                "title": title,
+                "seedUrl": seed_url,
+                "query": title,
+                "createdAt": int(time.time() * 1000),
+            }
+        )
+        if recovered:
+            sources.append(recovered)
+        if len(sources) >= 120:
+            break
+    return sources
+
+
+def wechat_seed_candidates_from_alert_history(source_title: str, limit: int = 12) -> list[str]:
+    title_key = clean_feed_text(source_title, 120).lower()
+    if not title_key:
+        return []
+    history_path = PERSIST_CACHE_DIR / "desktop_alert_seen.json"
+    try:
+        data = json.loads(history_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    seen = data.get("seen") if isinstance(data, dict) else {}
+    if not isinstance(seen, dict):
+        return []
+    candidates: list[tuple[float, str]] = []
+    for raw_key, raw_time in seen.items():
+        key = str(raw_key or "")
+        if not key.startswith("alert-title-url:"):
+            continue
+        rest = key.removeprefix("alert-title-url:")
+        parts = rest.split("|")
+        if len(parts) < 3:
+            continue
+        source = clean_feed_text(parts[0], 120).lower()
+        if source != title_key:
+            continue
+        match = re.search(r"https?://mp\.weixin\.qq\.com/[^\s|]+", rest)
+        if not match:
+            continue
+        url = clean_feed_text(match.group(0), 900)
+        if url:
+            candidates.append((safe_float(raw_time), url))
+    urls: list[str] = []
+    for _, url in sorted(candidates, key=lambda item: item[0], reverse=True):
+        if url not in urls:
+            urls.append(url)
+        if len(urls) >= limit:
+            break
+    return urls
+
+
+def wechat_history_items_for_source(source_title: str, cutoff_ms: int = 0, limit: int = 80) -> list[dict[str, Any]]:
+    title_key = clean_feed_text(source_title, 120).lower()
+    if not title_key:
+        return []
+    history_path = PERSIST_CACHE_DIR / "desktop_alert_seen.json"
+    try:
+        data = json.loads(history_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    seen = data.get("seen") if isinstance(data, dict) else {}
+    if not isinstance(seen, dict):
+        return []
+    summaries: dict[tuple[str, str], str] = {}
+    rows: list[tuple[float, dict[str, Any]]] = []
+    for raw_key, raw_time in seen.items():
+        key = str(raw_key or "")
+        if key.startswith("alert-body:"):
+            parts = key.removeprefix("alert-body:").split("|", 2)
+            if len(parts) >= 3 and clean_feed_text(parts[0], 120).lower() == title_key:
+                summaries[(parts[0], parts[1])] = clean_feed_text(parts[2], 420)
+            continue
+        if not key.startswith("alert-title-url:"):
+            continue
+        rest = key.removeprefix("alert-title-url:")
+        parts = rest.split("|", 2)
+        if len(parts) < 3:
+            continue
+        source = clean_feed_text(parts[0], 120)
+        if source.lower() != title_key:
+            continue
+        article_title = clean_feed_text(parts[1], 180)
+        match = re.search(r"https?://mp\.weixin\.qq\.com/[^\s|]+", parts[2])
+        if not article_title or not match:
+            continue
+        timestamp_ms = int(safe_float(raw_time) * 1000)
+        if cutoff_ms and timestamp_ms and timestamp_ms < cutoff_ms:
+            continue
+        url = clean_feed_text(match.group(0), 900)
+        rows.append(
+            (
+                timestamp_ms,
+                {
+                    "id": stable_feed_id("wechat-history", source, article_title, url),
+                    "title": article_title,
+                    "url": url,
+                    "publishedAt": timestamp_ms,
+                    "author": source,
+                    "summary": summaries.get((source, article_title), ""),
+                    "image": "",
+                },
+            )
+        )
+    items: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for _, item in sorted(rows, key=lambda row: row[0], reverse=True):
+        key = clean_feed_text(item.get("url") or item.get("title"), 900)
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        items.append(item)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def rss_sources_payload(user: dict[str, Any] | None) -> dict[str, Any]:
+    owner = user
+    exists = user_payload_exists(owner, USER_SCOPE_RSS_SOURCES)
+    payload = normalize_rss_sources_payload(load_user_payload(owner, USER_SCOPE_RSS_SOURCES))
+    if not payload["sources"]:
+        shared_owner = admin_user()
+        if shared_owner and (not owner or int(safe_float(shared_owner.get("id"))) != int(safe_float(owner.get("id")))):
+            shared_payload = normalize_rss_sources_payload(load_user_payload(shared_owner, USER_SCOPE_RSS_SOURCES))
+            if shared_payload["sources"]:
+                owner = shared_owner
+                exists = True
+                payload = shared_payload
+    if owner and is_admin(owner) and not payload["sources"]:
+        recovered_sources = recover_rss_sources_from_alert_history()
+        if recovered_sources:
+            payload = normalize_rss_sources_payload({"sources": recovered_sources})
+            save_user_payload(owner, USER_SCOPE_RSS_SOURCES, payload)
+            exists = True
+    return {
+        "ok": True,
+        "authenticated": bool(user),
+        "shared": bool(owner and user and int(safe_float(owner.get("id"))) != int(safe_float(user.get("id")))),
+        "exists": exists,
+        "sources": payload["sources"],
+        "updatedAt": payload.get("updatedAt") or 0,
+    }
+
+
+def save_rss_sources_payload(payload: dict[str, Any], user: dict[str, Any] | None) -> dict[str, Any]:
+    normalized = normalize_rss_sources_payload(payload)
+    owner = user or admin_user()
+    if owner:
+        save_user_payload(owner, USER_SCOPE_RSS_SOURCES, normalized)
+    return {
+        "ok": True,
+        "authenticated": bool(user),
+        "saved": bool(owner),
+        "sources": normalized["sources"],
+        "updatedAt": normalized["updatedAt"],
+    }
+
+
+def synthesize_rss_items_from_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for source in sources:
+        if source.get("type") != "wechat":
+            continue
+        title = clean_feed_text(source.get("title") or source.get("query"), 160)
+        if not title:
+            continue
+        for item in wechat_history_items_for_source(title, limit=80):
+            merged = {
+                **item,
+                "sourceId": source.get("id"),
+                "sourceType": "wechat",
+                "sourceTitle": title,
+                "fetchedAt": int(time.time() * 1000),
+            }
+            merged["key"] = stable_feed_id("rss-item", merged["sourceId"], merged.get("id"), merged.get("url"), merged.get("title"))
+            rows.append(merged)
+    return normalize_rss_items_payload({"items": rows})["items"]
+
+
+def rss_items_payload(user: dict[str, Any] | None) -> dict[str, Any]:
+    owner = user
+    exists = user_payload_exists(owner, USER_SCOPE_RSS_ITEMS)
+    payload = normalize_rss_items_payload(load_user_payload(owner, USER_SCOPE_RSS_ITEMS))
+    if not payload["items"]:
+        shared_owner = admin_user()
+        if shared_owner and (not owner or int(safe_float(shared_owner.get("id"))) != int(safe_float(owner.get("id")))):
+            shared_payload = normalize_rss_items_payload(load_user_payload(shared_owner, USER_SCOPE_RSS_ITEMS))
+            if shared_payload["items"]:
+                owner = shared_owner
+                exists = True
+                payload = shared_payload
+    if not owner:
+        owner = admin_user()
+    if owner and not payload["items"]:
+        sources_payload = rss_sources_payload(owner)
+        recovered_items = synthesize_rss_items_from_sources(sources_payload.get("sources") or [])
+        if recovered_items:
+            payload = normalize_rss_items_payload({"items": recovered_items})
+            save_user_payload(owner, USER_SCOPE_RSS_ITEMS, payload)
+            exists = True
+    return {
+        "ok": True,
+        "authenticated": bool(user),
+        "shared": bool(owner and user and int(safe_float(owner.get("id"))) != int(safe_float(user.get("id")))),
+        "exists": exists,
+        "items": payload["items"],
+        "updatedAt": payload.get("updatedAt") or 0,
+    }
+
+
+def save_rss_items_payload(payload: dict[str, Any], user: dict[str, Any] | None) -> dict[str, Any]:
+    normalized = normalize_rss_items_payload(payload)
+    owner = user or admin_user()
+    if owner:
+        save_user_payload(owner, USER_SCOPE_RSS_ITEMS, normalized)
+    return {
+        "ok": True,
+        "authenticated": bool(user),
+        "saved": bool(owner),
+        "items": normalized["items"],
+        "updatedAt": normalized["updatedAt"],
+    }
+
+
+def rss_source_items_for_checkpoint(source_id: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in items
+        if clean_feed_text(item.get("sourceId"), 120) == source_id
+    ]
+
+
+def rss_source_checkpoint(source_id: str, items: list[dict[str, Any]]) -> dict[str, Any]:
+    source_items = sorted(
+        rss_source_items_for_checkpoint(source_id, items),
+        key=lambda item: int(safe_float(item.get("publishedAt")) or safe_float(item.get("fetchedAt")) or 0),
+        reverse=True,
+    )
+    known_ids: list[str] = []
+    seen: set[str] = set()
+    since = 0
+    for item in source_items:
+        since = max(since, int(safe_float(item.get("publishedAt")) or 0))
+        for value in (item.get("id"), item.get("url"), item.get("title")):
+            key = clean_feed_text(value, 260)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            known_ids.append(key)
+            if len(known_ids) >= 500:
+                break
+        if len(known_ids) >= 500:
+            break
+    return {
+        "knownIds": known_ids,
+        "since": since,
+        "backfill": not bool(source_items),
+        "fullSync": not bool(source_items),
+    }
+
+
+def rss_source_from_fetch_result(source: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    feed = payload.get("feed") if isinstance(payload.get("feed"), dict) else {}
+    updated = {**source}
+    feed_title = clean_feed_text(feed.get("title"), 160)
+    if source.get("type") == "wechat":
+        if feed_title and not is_generic_wechat_title(feed_title):
+            updated["title"] = feed_title
+            updated["query"] = updated.get("query") or feed_title
+    elif feed_title:
+        updated["title"] = feed_title
+    for target, field, limit in (
+        ("siteUrl", "siteUrl", 900),
+        ("description", "description", 240),
+        ("cover", "cover", 900),
+        ("feedUrl", "feedUrl", 900),
+    ):
+        value = clean_feed_text(feed.get(field), limit)
+        if value:
+            updated[target] = value
+    feed_id = clean_feed_text(feed.get("id"), 120)
+    platform = clean_feed_text(feed.get("platform") or updated.get("platform"), 80)
+    if platform:
+        updated["platform"] = platform
+    if updated.get("type") == "wechat":
+        if is_wechat_platform_mp_id(feed_id, platform):
+            updated["mpId"] = feed_id
+            updated["platform"] = "wewe-platform"
+            updated["feedUrl"] = f"wechat-mp://{feed_id}"
+        elif not is_wechat_platform_mp_id(updated.get("mpId"), updated.get("platform")):
+            updated["mpId"] = ""
+    elif feed_id:
+        updated["mpId"] = feed_id
+    if payload.get("etag"):
+        updated["etag"] = clean_feed_text(payload.get("etag"), 300)
+    if payload.get("lastModified"):
+        updated["lastModified"] = clean_feed_text(payload.get("lastModified"), 300)
+    updated["lastFetchedAt"] = int(safe_float(payload.get("fetchedAt")) or int(time.time() * 1000))
+    updated["lastNewCount"] = len(payload.get("items") or [])
+    updated["lastSkippedExisting"] = int(safe_float(payload.get("skippedExisting")) or 0)
+    if payload.get("warning") and not payload.get("items"):
+        updated["lastMessage"] = clean_feed_text(payload.get("warning"), 240)
+    elif payload.get("notice") and not payload.get("items"):
+        updated["lastMessage"] = clean_feed_text(payload.get("notice"), 240)
+    else:
+        updated["lastMessage"] = ""
+    return normalize_rss_source(updated)
+
+
+def rss_merge_fetched_items(
+    current_items: list[dict[str, Any]],
+    fetched_items: list[dict[str, Any]],
+    source: dict[str, Any],
+    fetched_at: int,
+) -> list[dict[str, Any]]:
+    rows = [*current_items]
+    source_id = clean_feed_text(source.get("id"), 120)
+    source_type = clean_feed_text(source.get("type") or "feed", 20)
+    source_title = clean_feed_text(source.get("title"), 160)
+    for item in fetched_items:
+        if not isinstance(item, dict):
+            continue
+        merged = {
+            **item,
+            "sourceId": source_id,
+            "sourceType": source_type,
+            "sourceTitle": source_title or clean_feed_text(item.get("sourceTitle"), 160),
+            "fetchedAt": fetched_at or int(time.time() * 1000),
+        }
+        merged["key"] = stable_feed_id("rss-item", source_id, merged.get("id"), merged.get("url"), merged.get("title"))
+        rows.append(merged)
+    return normalize_rss_items_payload({"items": rows})["items"]
+
+
+def rss_refresh_one_source(source: dict[str, Any], current_items: list[dict[str, Any]], force_full_sync: bool = False) -> dict[str, Any]:
+    source_id = clean_feed_text(source.get("id"), 120)
+    checkpoint = rss_source_checkpoint(source_id, current_items)
+    checkpoint["backfill"] = bool(force_full_sync or checkpoint["backfill"])
+    checkpoint["fullSync"] = bool(force_full_sync or checkpoint["fullSync"])
+    try:
+        if source.get("type") == "wechat" and not is_legacy_wechat_source(source):
+            payload = wechat_mp_fetch_payload(
+                {
+                    "source": source,
+                    **checkpoint,
+                    "allowHistoryFallback": False,
+                }
+            )
+        else:
+            payload = rss_fetch_payload(
+                {
+                    "url": source.get("feedUrl") or source.get("url"),
+                    "etag": source.get("etag"),
+                    "lastModified": source.get("lastModified"),
+                    **checkpoint,
+                }
+            )
+        updated_source = rss_source_from_fetch_result(source, payload)
+        return {
+            "ok": True,
+            "source": updated_source or source,
+            "items": payload.get("items") or [],
+            "fetchedAt": int(safe_float(payload.get("fetchedAt")) or int(time.time() * 1000)),
+            "warning": clean_feed_text(payload.get("warning") or payload.get("notice"), 240),
+            "platformItems": int(safe_float(payload.get("platformItems")) or 0),
+            "skippedExisting": int(safe_float(payload.get("skippedExisting")) or 0),
+        }
+    except Exception as exc:
+        failed_source = normalize_rss_source({**source, "lastFetchedAt": int(time.time() * 1000), "lastMessage": str(exc)})
+        return {
+            "ok": False,
+            "source": failed_source or source,
+            "items": [],
+            "fetchedAt": int(time.time() * 1000),
+            "warning": clean_feed_text(str(exc), 240),
+            "platformItems": 0,
+            "skippedExisting": 0,
+        }
+
+
+def is_legacy_wechat_source(source: dict[str, Any]) -> bool:
+    return (
+        source.get("type") == "wechat"
+        and bool(re.match(r"^https?://", clean_feed_text(source.get("feedUrl"), 900), re.I))
+        and not source.get("mpId")
+        and not source.get("seedUrl")
+        and not source.get("query")
+    )
+
+
+def rss_refresh_all_payload(payload: dict[str, Any], user: dict[str, Any] | None) -> dict[str, Any]:
+    owner = user or admin_user()
+    sources_payload = rss_sources_payload(owner)
+    sources = sources_payload.get("sources") or []
+    items_payload = rss_items_payload(owner)
+    current_items = items_payload.get("items") or []
+    has_wechat_sources = any((source.get("type") == "wechat") for source in sources if isinstance(source, dict))
+    auth_required = bool(has_wechat_sources and not wechat_platform_account())
+    if not sources:
+        return {
+            "ok": True,
+            "sources": [],
+            "items": current_items,
+            "updatedAt": int(time.time() * 1000),
+            "stats": {"sources": 0, "newItems": 0, "errors": 0},
+        }
+    force_full_sync = bool(payload.get("fullSync"))
+    max_workers = max(1, min(3, int(safe_float(payload.get("workers"), 3)) or 3, len(sources)))
+    results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(rss_refresh_one_source, source, current_items, force_full_sync) for source in sources]
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    source_by_id = {clean_feed_text(source.get("id"), 120): source for source in sources}
+    for result in results:
+        source = result.get("source") if isinstance(result.get("source"), dict) else {}
+        source_id = clean_feed_text(source.get("id"), 120)
+        if source_id:
+            source_by_id[source_id] = source
+        current_items = rss_merge_fetched_items(current_items, result.get("items") or [], source or source_by_id.get(source_id, {}), int(safe_float(result.get("fetchedAt")) or 0))
+
+    normalized_sources = normalize_rss_sources_payload({"sources": list(source_by_id.values())})
+    normalized_items = normalize_rss_items_payload({"items": current_items})
+    if owner:
+        save_user_payload(owner, USER_SCOPE_RSS_SOURCES, normalized_sources)
+        save_user_payload(owner, USER_SCOPE_RSS_ITEMS, normalized_items)
+    return {
+        "ok": True,
+        "sources": normalized_sources["sources"],
+        "items": normalized_items["items"],
+        "updatedAt": int(time.time() * 1000),
+        "stats": {
+            "sources": len(sources),
+            "newItems": sum(len(result.get("items") or []) for result in results),
+            "errors": sum(1 for result in results if not result.get("ok")),
+            "platformItems": sum(int(safe_float(result.get("platformItems")) or 0) for result in results),
+            "authRequired": auth_required,
+        },
+        "warnings": [
+            {
+                "source": clean_feed_text((result.get("source") or {}).get("title"), 160),
+                "message": result.get("warning"),
+            }
+            for result in results
+            if result.get("warning") and not result.get("items")
+        ][:20],
+    }
+
+
 def parse_json_feed(payload: dict[str, Any], feed_url: str) -> dict[str, Any]:
     feed = {
         "title": clean_feed_text(payload.get("title") or payload.get("home_page_url") or feed_url, 120),
@@ -3506,6 +4178,80 @@ def write_wechat_account_cache(payload: dict[str, Any]) -> None:
     write_json_cache(WECHAT_ACCOUNT_CACHE_PATH, payload)
 
 
+def wechat_source_alias_key(*values: Any) -> str:
+    for value in values:
+        text = clean_feed_text(value, 120).lower()
+        text = re.sub(r"\s+", "", text)
+        if text and not is_generic_wechat_title(text):
+            return text
+    return ""
+
+
+def read_wechat_source_alias_cache() -> dict[str, Any]:
+    payload = read_json_cache(WECHAT_SOURCE_ALIAS_CACHE_PATH)
+    aliases = payload.get("aliases")
+    if not isinstance(aliases, dict):
+        payload["aliases"] = {}
+    return payload
+
+
+def write_wechat_source_alias_cache(payload: dict[str, Any]) -> None:
+    payload["updatedAt"] = int(time.time())
+    write_json_cache(WECHAT_SOURCE_ALIAS_CACHE_PATH, payload)
+
+
+def public_wechat_source_alias(source: dict[str, Any]) -> dict[str, Any]:
+    mp_id = clean_feed_text(source.get("mpId") or source.get("id"), 100)
+    if not is_wechat_platform_mp_id(mp_id, "wewe-platform"):
+        return {}
+    return {
+        "type": "wechat",
+        "title": clean_feed_text(source.get("title") or source.get("name"), 120),
+        "mpId": mp_id,
+        "query": clean_feed_text(source.get("query") or source.get("title") or source.get("name"), 120),
+        "seedUrl": clean_feed_text(source.get("seedUrl"), 900),
+        "feedUrl": f"wechat-mp://{mp_id}",
+        "cover": clean_feed_text(source.get("cover"), 900),
+        "intro": clean_feed_text(source.get("intro") or source.get("description"), 240),
+        "platform": "wewe-platform",
+    }
+
+
+def cache_wechat_source_alias(source: dict[str, Any]) -> None:
+    alias = public_wechat_source_alias(source)
+    if not alias:
+        return
+    keys = {
+        wechat_source_alias_key(alias.get("title")),
+        wechat_source_alias_key(alias.get("query")),
+    }
+    keys = {key for key in keys if key}
+    if not keys:
+        return
+    payload = read_wechat_source_alias_cache()
+    aliases = payload.setdefault("aliases", {})
+    for key in keys:
+        aliases[key] = {**aliases.get(key, {}), **alias, "updatedAt": int(time.time())}
+    write_wechat_source_alias_cache(payload)
+
+
+def cached_wechat_source_alias(*values: Any) -> dict[str, Any]:
+    payload = read_wechat_source_alias_cache()
+    aliases = payload.get("aliases") if isinstance(payload, dict) else {}
+    if not isinstance(aliases, dict):
+        return {}
+    for value in values:
+        key = wechat_source_alias_key(value)
+        if not key:
+            continue
+        alias = aliases.get(key)
+        if isinstance(alias, dict):
+            public_alias = public_wechat_source_alias(alias)
+            if public_alias:
+                return public_alias
+    return {}
+
+
 def public_wechat_account(account: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": clean_feed_text(account.get("id"), 80),
@@ -3622,7 +4368,7 @@ def update_wechat_account_state(account: dict[str, Any], error: Exception | None
                 item["status"] = "cooldown"
                 item["cooldownUntil"] = now + WECHAT_ACCOUNT_COOLDOWN_SECONDS
             else:
-                item["status"] = "active"
+                item["status"] = clean_feed_text(item.get("status") or "active", 40)
         changed = True
         break
     if changed:
@@ -3651,7 +4397,36 @@ def wechat_platform_headers(account: dict[str, Any] | None = None) -> dict[str, 
     }
 
 
-def wechat_platform_request(method: str, path: str, account: dict[str, Any] | None = None, **kwargs) -> Any:
+def wechat_platform_candidate_paths(path: str) -> list[str]:
+    clean_path = "/" + str(path or "").lstrip("/")
+    if clean_path.startswith("/api/platform/"):
+        tail = clean_path.removeprefix("/api/platform/")
+        return [clean_path, f"/api/v2/platform/{tail}"]
+    if clean_path.startswith("/api/v2/platform/"):
+        tail = clean_path.removeprefix("/api/v2/platform/")
+        return [f"/api/platform/{tail}", clean_path]
+    return [clean_path]
+
+
+def wechat_platform_route_missing(error: Any) -> bool:
+    text = str(error or "").lower()
+    return "cannot get" in text or "cannot post" in text or "http 404" in text or "not found" in text
+
+
+def wechat_platform_source_error(error: Any) -> bool:
+    text = str(error or "").lower()
+    return "no book found" in text
+
+
+def wechat_platform_request(
+    method: str,
+    path: str,
+    account: dict[str, Any] | None = None,
+    *,
+    mark_ok: bool = True,
+    state_error: bool = True,
+    **kwargs,
+) -> Any:
     accounts = [account] if account else wechat_platform_accounts()
     accounts = [item for item in accounts if item]
     if not accounts:
@@ -3663,33 +4438,39 @@ def wechat_platform_request(method: str, path: str, account: dict[str, Any] | No
 
     last_error: Exception | None = None
     extra_headers = kwargs.pop("headers", {}) or {}
-    url = f"{wechat_platform_url()}{path}"
+    paths = wechat_platform_candidate_paths(path)
     for item in accounts:
-        request_kwargs = {**kwargs}
-        request_kwargs.setdefault("timeout", 18)
-        try:
-            response = requests.request(
-                method,
-                url,
-                headers={**wechat_platform_headers(item), **extra_headers},
-                **request_kwargs,
-            )
-            text = response.text[:500]
-            if response.status_code >= 400:
-                try:
-                    message = response.json().get("message") or text
-                except Exception:
-                    message = text
-                raise RuntimeError(f"WeWe platform HTTP {response.status_code}: {message}")
-            payload = response.json()
-            if isinstance(payload, dict) and payload.get("message") and not payload.get("token"):
-                raise RuntimeError(str(payload.get("message")))
-            update_wechat_account_state(item, None)
-            return payload
-        except Exception as exc:
-            last_error = exc
-            update_wechat_account_state(item, exc)
-            continue
+        account_error: Exception | None = None
+        for candidate_path in paths:
+            request_kwargs = {**kwargs}
+            request_kwargs.setdefault("timeout", 18)
+            url = f"{wechat_platform_url()}{candidate_path}"
+            try:
+                response = requests.request(
+                    method,
+                    url,
+                    headers={**wechat_platform_headers(item), **extra_headers},
+                    **request_kwargs,
+                )
+                text = response.text[:500]
+                if response.status_code >= 400:
+                    try:
+                        message = response.json().get("message") or text
+                    except Exception:
+                        message = text
+                    raise RuntimeError(f"WeWe platform HTTP {response.status_code}: {message}")
+                payload = response.json()
+                if isinstance(payload, dict) and payload.get("message") and not payload.get("token"):
+                    raise RuntimeError(str(payload.get("message")))
+                if mark_ok:
+                    update_wechat_account_state(item, None)
+                return payload
+            except Exception as exc:
+                last_error = exc
+                account_error = exc
+                continue
+        if state_error and account_error and not wechat_platform_route_missing(account_error) and not wechat_platform_source_error(account_error):
+            update_wechat_account_state(item, account_error)
     if wechat_error_requires_auth(last_error):
         try:
             notify_wechat_auth_required(last_error)
@@ -3698,28 +4479,36 @@ def wechat_platform_request(method: str, path: str, account: dict[str, Any] | No
     raise last_error or ValueError("微信公众号平台接口请求失败")
 
 
-def wechat_platform_resolve_article(url: str) -> list[dict[str, Any]]:
+def wechat_platform_resolve_article(url: str, account: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     payload = wechat_platform_request(
         "POST",
-        "/api/v2/platform/wxs2mp",
+        "/api/platform/wxs2mp",
+        account=account,
         json={"url": normalize_wechat_article_url(url)},
+        mark_ok=False,
     )
     return payload if isinstance(payload, list) else []
 
 
-def wechat_platform_articles(mp_id: str, page: int = 1) -> list[dict[str, Any]]:
+def wechat_platform_articles(mp_id: str, page: int = 1, account: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     payload = wechat_platform_request(
         "GET",
-        f"/api/v2/platform/mps/{mp_id}/articles",
+        f"/api/platform/mps/{mp_id}/articles",
+        account=account,
         params={"page": page},
     )
     return payload if isinstance(payload, list) else []
 
 
-def wechat_platform_articles_pages(mp_id: str, page_limit: int = 1, cutoff_ms: int = 0) -> list[dict[str, Any]]:
+def wechat_platform_articles_pages(
+    mp_id: str,
+    page_limit: int = 1,
+    cutoff_ms: int = 0,
+    account: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for page in range(1, max(1, page_limit) + 1):
-        page_items = wechat_platform_articles(mp_id, page)
+        page_items = wechat_platform_articles(mp_id, page, account=account)
         if not page_items:
             break
         items.extend(page_items)
@@ -3742,12 +4531,16 @@ def wechat_login_begin_payload() -> dict[str, Any]:
     uuid = clean_feed_text(payload.get("uuid"), 80)
     if not uuid:
         raise ValueError("微信读书登录二维码创建失败")
+    qr_data_url = wechat_qr_data_url(uuid)
+    qr_image_path = wechat_qr_image_path(uuid, qr_data_url)
     return {
         "ok": True,
         "uuid": uuid,
         "scanUrl": clean_feed_text(payload.get("scanUrl"), 600),
         "qrUrl": f"https://open.weixin.qq.com/connect/qrcode/{uuid}",
-        "qrDataUrl": wechat_qr_data_url(uuid),
+        "qrDataUrl": qr_data_url,
+        "qrImagePath": qr_image_path,
+        "qrImageUrl": wechat_qr_image_public_url(uuid) if qr_image_path else "",
     }
 
 
@@ -3778,48 +4571,171 @@ def wechat_qr_image_path(uuid: str, data_url: str = "") -> str:
     if not match:
         return ""
     content_type = match.group(1).lower()
-    suffix = ".png"
-    if "jpeg" in content_type or "jpg" in content_type:
-        suffix = ".jpg"
-    elif "gif" in content_type:
-        suffix = ".gif"
-    path = PERSIST_CACHE_DIR / f"wechat-auth-qr-{uuid}{suffix}"
+    raw = base64.b64decode(match.group(2))
+    path = PERSIST_CACHE_DIR / f"wechat-auth-qr-{uuid}.png"
     try:
-        path.write_bytes(base64.b64decode(match.group(2)))
+        try:
+            from PIL import Image
+
+            image = Image.open(BytesIO(raw))
+            image.save(path, format="PNG")
+        except Exception:
+            suffix = ".png"
+            if "jpeg" in content_type or "jpg" in content_type:
+                suffix = ".jpg"
+            elif "gif" in content_type:
+                suffix = ".gif"
+            path = PERSIST_CACHE_DIR / f"wechat-auth-qr-{uuid}{suffix}"
+            path.write_bytes(raw)
         return str(path)
     except Exception:
         return ""
+
+
+def wechat_qr_image_file(uuid: str) -> Path | None:
+    uuid = re.sub(r"[^A-Za-z0-9_-]+", "", str(uuid or ""))[:80]
+    if not uuid:
+        return None
+    for suffix in (".png", ".jpg", ".jpeg", ".gif"):
+        path = PERSIST_CACHE_DIR / f"wechat-auth-qr-{uuid}{suffix}"
+        if path.exists() and path.is_file():
+            return path
+    return None
+
+
+def runtime_public_base_url() -> str:
+    configured = env_value("XINGYUN_PUBLIC_BASE_URL").rstrip("/")
+    if configured:
+        return configured
+    host = env_value("XINGYUN_HOST", "127.0.0.1") or "127.0.0.1"
+    if host in {"0.0.0.0", "::"}:
+        host = "127.0.0.1"
+    port = env_value("PORT") or env_value("XINGYUN_PORT") or "8765"
+    return f"http://{host}:{port}"
+
+
+def wechat_qr_image_public_url(uuid: str) -> str:
+    uuid = re.sub(r"[^A-Za-z0-9_-]+", "", str(uuid or ""))[:80]
+    if not uuid:
+        return ""
+    return f"{runtime_public_base_url()}/api/wechat-qr-image?uuid={quote(uuid, safe='')}"
+
+
+def jwt_payload(token: Any) -> dict[str, Any]:
+    parts = str(token or "").split(".")
+    if len(parts) < 2:
+        return {}
+    try:
+        body = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = base64.urlsafe_b64decode(body.encode("ascii"))
+        data = json.loads(payload.decode("utf-8", errors="ignore"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def iter_nested_dicts(value: Any, limit: int = 80) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    queue: list[Any] = [value]
+    while queue and len(found) < limit:
+        current = queue.pop(0)
+        if isinstance(current, dict):
+            found.append(current)
+            queue.extend(current.values())
+        elif isinstance(current, list):
+            queue.extend(current[:limit])
+    return found
+
+
+def wechat_login_account_from_result(result: Any) -> dict[str, Any]:
+    containers = iter_nested_dicts(result)
+    token_keys = ("token", "accessToken", "access_token", "jwt", "jwtToken", "Authorization", "authorization")
+    id_keys = ("vid", "id", "userVid", "user_id", "userId", "xid", "unionid", "openid")
+    name_keys = ("username", "name", "nickName", "nickname", "displayName")
+    tokens: list[str] = []
+    account_ids: list[str] = []
+    names: list[str] = []
+
+    for item in containers:
+        for key in token_keys:
+            value = item.get(key)
+            if value:
+                text = str(value).replace("Bearer ", "").strip()
+                if text and text not in tokens:
+                    tokens.append(text)
+        for key in id_keys:
+            value = clean_feed_text(item.get(key), 120)
+            if value and value not in account_ids:
+                account_ids.append(value)
+        for key in name_keys:
+            value = clean_feed_text(item.get(key), 120)
+            if value and value not in names:
+                names.append(value)
+
+    for token in list(tokens):
+        claims = jwt_payload(token)
+        for key in ("vid", "id", "userVid", "user_id", "userId", "xid"):
+            value = clean_feed_text(claims.get(key), 120)
+            if value and value not in account_ids:
+                account_ids.append(value)
+        for key in ("name", "username", "nickname"):
+            value = clean_feed_text(claims.get(key), 120)
+            if value and value not in names:
+                names.append(value)
+
+    if tokens and account_ids:
+        return {
+            "id": account_ids[0],
+            "token": tokens[0],
+            "name": names[0] if names else f"WeRead {account_ids[0]}",
+        }
+    return {}
+
+
+def wechat_existing_authorized_payload() -> dict[str, Any] | None:
+    account = wechat_platform_account()
+    if not account:
+        return None
+    return {"ok": True, "status": "authorized", "account": public_wechat_account(account), "fromCache": True}
 
 
 def wechat_login_poll_payload(payload: dict[str, Any]) -> dict[str, Any]:
     uuid = clean_feed_text(payload.get("uuid"), 80)
     if not uuid:
         raise ValueError("缺少微信读书登录 uuid")
-    response = requests.get(
-        f"{wechat_platform_url()}/api/v2/login/platform/{uuid}",
-        headers={**HEADERS, "Accept": "application/json"},
-        timeout=35,
-    )
-    response.raise_for_status()
-    result = response.json()
-    if result.get("token") and (result.get("vid") or result.get("id")):
-        account = upsert_wechat_account(
-            {
-                "id": result.get("vid") or result.get("id"),
-                "token": result.get("token"),
-                "name": result.get("username") or result.get("name"),
-            }
+    try:
+        response = requests.get(
+            f"{wechat_platform_url()}/api/v2/login/platform/{uuid}",
+            headers={**HEADERS, "Accept": "application/json"},
+            timeout=35,
         )
+        response.raise_for_status()
+        result = response.json()
+    except Exception as exc:
+        cached = wechat_existing_authorized_payload()
+        if cached:
+            return {**cached, "message": "已检测到本机已有可用授权"}
+        raise exc
+
+    login_account = wechat_login_account_from_result(result)
+    if login_account:
+        account = upsert_wechat_account(login_account)
         return {"ok": True, "status": "authorized", "account": public_wechat_account(account)}
+    cached = wechat_existing_authorized_payload()
+    if cached:
+        return {**cached, "message": "已检测到本机已有可用授权"}
+    message = clean_feed_text(result.get("message") if isinstance(result, dict) else "", 160) or "waiting"
     return {
         "ok": True,
-        "status": clean_feed_text(result.get("message") or "waiting", 80),
-        "message": clean_feed_text(result.get("message") or "waiting", 160),
+        "status": clean_feed_text(message, 80),
+        "message": message,
     }
 
 
 def wechat_error_requires_auth(error: Any) -> bool:
     text = str(error or "").lower()
+    if "wereaderror400" in text and "no book found" not in text:
+        return True
     return any(marker in text for marker in ("401", "invalid", "unauthorized", "token", "登录", "授权", "wereaderror401"))
 
 
@@ -3835,22 +4751,12 @@ def wechat_validate_account(account: dict[str, Any], *, force: bool = False) -> 
         return {**public_wechat_account(account), "valid": status != "invalid", "checked": False}
 
     try:
-        response = requests.post(
-            f"{wechat_platform_url()}/api/v2/platform/wxs2mp",
-            headers=wechat_platform_headers(account),
-            json={"url": normalize_wechat_article_url(wechat_auth_probe_url())},
-            timeout=12,
-        )
-        text = response.text[:500]
-        if response.status_code >= 400:
-            try:
-                message = response.json().get("message") or text
-            except Exception:
-                message = text
-            raise RuntimeError(f"WeWe platform HTTP {response.status_code}: {message}")
-        payload = response.json()
-        if isinstance(payload, dict) and payload.get("message") and not payload.get("token"):
-            raise RuntimeError(str(payload.get("message")))
+        payload = wechat_platform_resolve_article(wechat_auth_probe_url(), account=account)
+        probe_mp_id = ""
+        if isinstance(payload, list) and payload:
+            probe_mp_id = clean_feed_text(payload[0].get("id") if isinstance(payload[0], dict) else "", 80)
+        if probe_mp_id:
+            wechat_platform_articles(probe_mp_id, 1, account=account)
         update_wechat_account_state(account, None)
         refreshed = public_wechat_account({**account, "status": "active", "lastOkAt": now, "lastCheckAt": now, "lastError": "", "cooldownUntil": 0})
         return {**refreshed, "valid": True, "checked": True}
@@ -3875,7 +4781,7 @@ def wechat_validate_account(account: dict[str, Any], *, force: bool = False) -> 
 
 def wechat_auth_poll_worker(uuid: str) -> None:
     try:
-        for _ in range(90):
+        for _ in range(300):
             time.sleep(2)
             try:
                 payload = wechat_login_poll_payload({"uuid": uuid})
@@ -3883,6 +4789,10 @@ def wechat_auth_poll_worker(uuid: str) -> None:
                 continue
             if payload.get("status") == "authorized":
                 account = payload.get("account") if isinstance(payload.get("account"), dict) else {}
+                try:
+                    rss_refresh_all_payload({"fullSync": False, "workers": 2}, admin_user())
+                except Exception as exc:
+                    print(f"WeChat auth refresh failed: {exc}", file=sys.stderr)
                 launch_desktop_alert(
                     {
                         "key": f"wechat-auth-ok:{account.get('id') or uuid}",
@@ -3927,7 +4837,11 @@ def notify_wechat_auth_required(reason: Any = "", *, force: bool = False, slot_l
         raise
     uuid = clean_feed_text(login_payload.get("uuid"), 80)
     qr_url = clean_feed_text(login_payload.get("qrUrl"), 600)
-    qr_image_path = wechat_qr_image_path(uuid, clean_feed_text(login_payload.get("qrDataUrl"), 1_000_000))
+    qr_image_path = clean_feed_text(login_payload.get("qrImagePath"), 600) or wechat_qr_image_path(
+        uuid,
+        clean_feed_text(login_payload.get("qrDataUrl"), 1_000_000),
+    )
+    qr_image_url = clean_feed_text(login_payload.get("qrImageUrl"), 600) or wechat_qr_image_public_url(uuid) or qr_url
     start_wechat_auth_poll(uuid)
     message = clean_feed_text(reason, 120) or "授权已失效或缺少可用账号"
     slot_label = clean_feed_text(slot_label, 24)
@@ -3944,7 +4858,7 @@ def notify_wechat_auth_required(reason: Any = "", *, force: bool = False, slot_l
             "title": title,
             "body": f"{message}。请用微信扫码，成功后会自动恢复订阅更新。",
             "url": "http://127.0.0.1:8765/rss.html",
-            "imageUrl": qr_url,
+            "imageUrl": qr_image_url,
             "imagePath": qr_image_path,
             "priority": "扫码授权",
         }
@@ -4071,7 +4985,7 @@ def fetch_sogou_wechat_articles(query: str, limit: int = 20) -> list[dict[str, A
 
 
 def resolve_wechat_mp_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    raw = clean_feed_text(payload.get("input") or payload.get("url") or payload.get("query"), 600)
+    raw = clean_feed_text(payload.get("input") or payload.get("url") or payload.get("query") or payload.get("raw"), 600)
     title_override = clean_feed_text(payload.get("title"), 120)
     if not raw:
         raise ValueError("请填写公众号名称，或粘贴公众号任意一篇文章链接")
@@ -4082,6 +4996,7 @@ def resolve_wechat_mp_payload(payload: dict[str, Any]) -> dict[str, Any]:
             matches = wechat_platform_resolve_article(raw) if wechat_platform_account() else []
             if matches:
                 source = source_from_wechat_mp_info(matches[0], raw)
+                cache_wechat_source_alias(source)
             else:
                 parsed = parse_wechat_article(raw)
                 source = {
@@ -4123,14 +5038,28 @@ def wechat_mp_fetch_payload(payload: dict[str, Any]) -> dict[str, Any]:
     seed_url = clean_feed_text(source.get("seedUrl"), 600)
     query = clean_feed_text(source.get("query") or source.get("title"), 120)
     title = clean_feed_text(source.get("title") or query or "微信公众号", 120)
+    platform = source.get("platform") or ""
+    if is_generic_wechat_title(title) and query and not is_generic_wechat_title(query):
+        title = query
+    if mp_id and not is_wechat_platform_mp_id(mp_id, platform):
+        mp_id = ""
+    if not mp_id:
+        cached_source = cached_wechat_source_alias(title, query)
+        if cached_source:
+            mp_id = cached_source.get("mpId") or ""
+            title = cached_source.get("title") or title
+            query = cached_source.get("query") or query
+            seed_url = seed_url or cached_source.get("seedUrl") or ""
+            source = {**source, **cached_source}
+            platform = "wewe-platform"
 
     items: list[dict[str, Any]] = []
-    platform = source.get("platform") or ""
     warning = ""
     notice = ""
     platform_items_count = 0
     has_wechat_account = bool(wechat_platform_account())
     cutoff_ms = int(time.time() * 1000) - RSS_RETENTION_MS
+    allow_history_fallback = payload.get("allowHistoryFallback") is not False
     if not has_wechat_account:
         try:
             notify_wechat_auth_required("当前没有可用的微信公众号授权账号")
@@ -4138,17 +5067,29 @@ def wechat_mp_fetch_payload(payload: dict[str, Any]) -> dict[str, Any]:
             pass
 
     if seed_url and has_wechat_account and platform != "wewe-platform":
-        try:
-            matches = wechat_platform_resolve_article(seed_url)
-            if matches:
-                platform_source = source_from_wechat_mp_info(matches[0], seed_url)
-                mp_id = platform_source.get("mpId") or mp_id
-                title = platform_source.get("title") or title
-                query = platform_source.get("query") or query
-                source = {**source, **platform_source}
-                platform = "wewe-platform"
-        except Exception as exc:
-            warning = f"公众号账号接口解析失败：{exc}"
+        resolve_errors: list[str] = []
+        candidate_urls = [seed_url]
+        for candidate in wechat_seed_candidates_from_alert_history(title):
+            if candidate not in candidate_urls:
+                candidate_urls.append(candidate)
+        for candidate_url in candidate_urls[:12]:
+            try:
+                matches = wechat_platform_resolve_article(candidate_url)
+                if matches:
+                    platform_source = source_from_wechat_mp_info(matches[0], candidate_url)
+                    cache_wechat_source_alias(platform_source)
+                    mp_id = platform_source.get("mpId") or mp_id
+                    title = platform_source.get("title") or title
+                    query = platform_source.get("query") or query
+                    seed_url = candidate_url
+                    source = {**source, **platform_source}
+                    platform = "wewe-platform"
+                    warning = ""
+                    break
+            except Exception as exc:
+                resolve_errors.append(str(exc))
+        if platform != "wewe-platform" and resolve_errors:
+            warning = f"公众号账号接口解析失败：{resolve_errors[-1]}"
 
     if mp_id and has_wechat_account and not platform.startswith("sogou"):
         try:
@@ -4183,19 +5124,33 @@ def wechat_mp_fetch_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if seed_url:
         try:
             parsed = parse_wechat_article(seed_url)
-            title = parsed["feed"]["title"] or title
+            parsed_title = clean_feed_text(parsed["feed"].get("title"), 120)
+            if parsed_title and not is_generic_wechat_title(parsed_title):
+                title = parsed_title
             items.extend(parsed["items"])
             if not query:
-                query = parsed["feed"].get("query") or parsed["feed"]["title"]
+                parsed_query = clean_feed_text(parsed["feed"].get("query") or parsed_title, 120)
+                if parsed_query and not is_generic_wechat_title(parsed_query):
+                    query = parsed_query
         except Exception:
             pass
 
-    if not platform_items_count and not warning:
-        notice = (
-            "公众号接口本轮没有返回列表，已保留本地历史内容"
-            if has_wechat_account
-            else "未完成微信读书授权，只显示当前文章；扫码授权后才能精确拉取公众号最新列表"
-        )
+    used_history_items = False
+    if allow_history_fallback and not items:
+        history_items = wechat_history_items_for_source(title or query, cutoff_ms=cutoff_ms)
+        if history_items:
+            items.extend(history_items)
+            used_history_items = True
+            warning = ""
+            notice = "已使用本地历史内容；重新粘贴该公众号任意一篇原文链接后可恢复实时更新。"
+
+    if not platform_items_count and not warning and not used_history_items:
+        if has_wechat_account and not mp_id:
+            notice = "该公众号源缺少真实公众号 ID，历史文章链接无法解析；请重新粘贴该公众号任意文章链接修复订阅"
+        elif has_wechat_account:
+            notice = "公众号接口本轮没有返回列表，已保留本地历史内容"
+        else:
+            notice = "微信公众号授权已失效或不可用，扫码授权后才能精确拉取公众号最新列表"
 
     deduped: dict[str, dict[str, Any]] = {}
     for item in items:
@@ -8899,6 +9854,10 @@ def alert_dedupe_title(value: Any) -> str:
 
 def alert_dedupe_keys(item: dict[str, Any]) -> list[str]:
     primary = alert_text(item.get("key"), 260)
+    kind = alert_text(item.get("kind"), 40)
+    source_label = alert_text(item.get("source") or item.get("sourceLabel"), 80)
+    if "公众号授权" in kind or "公众号授权" in source_label or primary.startswith(("wechat-auth-required:", "wechat-auth-qr:")):
+        return [primary] if primary else []
     title = alert_dedupe_title(item.get("title"))
     source = item.get("source") or item.get("sourceLabel")
     url = item.get("url")
@@ -8908,13 +9867,56 @@ def alert_dedupe_keys(item: dict[str, Any]) -> list[str]:
             key
             for key in [
                 primary,
+                js_stable_key("alert-global-title-url", title, url),
+                js_stable_key("alert-global-title", title),
                 js_stable_key("alert-title-url", source, title, url),
                 js_stable_key("alert-title", source, title),
                 js_stable_key("alert-body", source, title, body),
             ]
-            if key and key != "alert-title-url:" and key != "alert-title:" and key != "alert-body:"
+            if key
+            and key
+            not in {
+                "alert-global-title-url:",
+                "alert-global-title:",
+                "alert-title-url:",
+                "alert-title:",
+                "alert-body:",
+            }
         )
     )
+
+
+def expand_legacy_desktop_alert_seen_keys(seen: dict[str, float]) -> dict[str, float]:
+    expanded = dict(seen)
+    for raw_key, seen_at in seen.items():
+        key = str(raw_key or "")
+        timestamp = safe_float(seen_at)
+        if key.startswith("alert-title-url:"):
+            rest = key.removeprefix("alert-title-url:")
+            if "|" not in rest:
+                continue
+            remainder = rest.split("|", 1)[1]
+            match = re.search(r"https?://[^\s|]+", remainder)
+            if match:
+                title = remainder[: match.start()].rstrip("| ")
+                url = match.group(0)
+            else:
+                parts = remainder.rsplit("|", 1)
+                title = parts[0]
+                url = parts[1] if len(parts) > 1 else ""
+            deduped_title = alert_dedupe_title(title)
+            if deduped_title:
+                expanded.setdefault(js_stable_key("alert-global-title", deduped_title), timestamp)
+            if deduped_title and url:
+                expanded.setdefault(js_stable_key("alert-global-title-url", deduped_title, url), timestamp)
+        elif key.startswith("alert-title:"):
+            rest = key.removeprefix("alert-title:")
+            if "|" not in rest:
+                continue
+            deduped_title = alert_dedupe_title(rest.split("|", 1)[1])
+            if deduped_title:
+                expanded.setdefault(js_stable_key("alert-global-title", deduped_title), timestamp)
+    return expanded
 
 
 def site_amount_from_text(value: Any) -> float:
@@ -9147,7 +10149,8 @@ def launch_desktop_alert(payload: dict[str, Any]) -> dict[str, Any]:
         if not DESKTOP_ALERT_SEEN_LOADED:
             cached_seen = read_json_cache(DESKTOP_ALERT_STATE_PATH).get("seen")
             if isinstance(cached_seen, dict):
-                DESKTOP_ALERT_SEEN.update({str(key): safe_float(value) for key, value in cached_seen.items()})
+                loaded_seen = {str(key): safe_float(value) for key, value in cached_seen.items()}
+                DESKTOP_ALERT_SEEN.update(expand_legacy_desktop_alert_seen_keys(loaded_seen))
             DESKTOP_ALERT_SEEN_LOADED = True
         stale = [item_key for item_key, seen_at in DESKTOP_ALERT_SEEN.items() if now - seen_at > DESKTOP_ALERT_TTL]
         for item_key in stale:
@@ -10289,10 +11292,20 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_binary(self, body: bytes, content_type: str, status: int = 200, cache_control: str = "no-store"):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", cache_control)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0 or length > 1_500_000:
+        if length <= 0:
             return {}
+        if length > MAX_JSON_BODY_BYTES:
+            raise ValueError(f"JSON 请求体过大：{length} bytes，当前上限 {MAX_JSON_BODY_BYTES} bytes")
         data = json.loads(self.rfile.read(length).decode("utf-8"))
         return data if isinstance(data, dict) else {}
 
@@ -10930,11 +11943,37 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"ok": False, "projects": [], "tasks": [], "error": str(exc)}, status=502)
             return
+        if parsed.path == "/api/rss-sources":
+            try:
+                self.send_json(rss_sources_payload(self.current_user()))
+            except Exception as exc:
+                self.send_json({"ok": False, "sources": [], "error": str(exc)}, status=502)
+            return
+        if parsed.path == "/api/rss-items":
+            try:
+                self.send_json(rss_items_payload(self.current_user()))
+            except Exception as exc:
+                self.send_json({"ok": False, "items": [], "error": str(exc)}, status=502)
+            return
         if parsed.path == "/api/wechat-account-status":
             try:
                 self.send_json(wechat_account_status_payload(force_validate=force_refresh))
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=502)
+            return
+        if parsed.path == "/api/wechat-qr-image":
+            uuid = clean_feed_text((query.get("uuid") or [""])[0], 100)
+            image_file = wechat_qr_image_file(uuid)
+            if not image_file:
+                self.send_json({"ok": False, "error": "qr image not found"}, status=404)
+                return
+            suffix = image_file.suffix.lower()
+            content_type = "image/png"
+            if suffix in {".jpg", ".jpeg"}:
+                content_type = "image/jpeg"
+            elif suffix == ".gif":
+                content_type = "image/gif"
+            self.send_binary(image_file.read_bytes(), content_type, cache_control="no-store")
             return
         if parsed.path == "/api/site-alert-monitor-status":
             self.send_json(
@@ -11098,6 +12137,24 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json(result)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=502)
+            return
+        if route == "/api/rss-sources" or route.endswith("/api/rss-sources"):
+            try:
+                self.send_json(save_rss_sources_payload(self.read_json(), self.current_user()))
+            except Exception as exc:
+                self.send_json({"ok": False, "sources": [], "error": str(exc)}, status=502)
+            return
+        if route == "/api/rss-items" or route.endswith("/api/rss-items"):
+            try:
+                self.send_json(save_rss_items_payload(self.read_json(), self.current_user()))
+            except Exception as exc:
+                self.send_json({"ok": False, "items": [], "error": str(exc)}, status=502)
+            return
+        if route == "/api/rss-refresh-all" or route.endswith("/api/rss-refresh-all"):
+            try:
+                self.send_json(rss_refresh_all_payload(self.read_json(), self.current_user()))
+            except Exception as exc:
+                self.send_json({"ok": False, "sources": [], "items": [], "error": str(exc)}, status=502)
             return
         if route == "/api/rss-fetch" or route.endswith("/api/rss-fetch"):
             try:

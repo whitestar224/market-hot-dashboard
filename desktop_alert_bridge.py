@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-MAX_BODY_BYTES = 64 * 1024
+MAX_BODY_BYTES = 1_200_000
 
 
 def spawn_alert(payload: dict) -> None:

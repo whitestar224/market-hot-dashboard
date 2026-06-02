@@ -11,6 +11,10 @@ const RSS_AUTH_ALERT_LAST_KEY = "xingyunshe:rss:wechat-auth-alert:last";
 const RSS_AUTH_ALERT_COOLDOWN_MS = 15 * 60 * 1000;
 let wechatLoginPending = false;
 let renderQueued = false;
+let rssSourceSaveTimer = null;
+let rssSourceHydrated = false;
+let rssItemSaveTimer = null;
+let rssItemsHydrated = false;
 
 const rssState = {
   sources: [],
@@ -160,7 +164,8 @@ function notifyWechatQrDesktop(payload, reason = "公众号授权需要更新") 
       title: "微信公众号授权需要更新",
       body: `${reason}。请用微信扫码，授权后会自动恢复订阅更新。`,
       url: `${location.origin}/rss.html`,
-      imageUrl: payload.qrUrl || "",
+      imageUrl: payload.qrImageUrl || payload.qrUrl || "",
+      imagePath: payload.qrImagePath || payload.imagePath || "",
       priority: "扫码授权"
     })
   }).catch(() => {});
@@ -176,7 +181,7 @@ async function loadWechatAuthStatus(force = false) {
     const hasWechatSources = rssState.sources.some((source) => source.type === "wechat");
     if (payload.needsAuth || (!payload.authorized && hasWechatSources)) {
       setWechatAuthState(payload.invalidCount ? "授权已失效" : "授权需更新", false);
-      beginWechatLogin({ silent: true, reason: "公众号授权已失效或不可用" });
+      beginWechatLogin({ silent: true, desktop: false, reason: "公众号授权已失效或不可用" });
     } else {
       setWechatAuthState(count ? `已授权 ${count} 个账号` : "未授权", count > 0);
     }
@@ -185,8 +190,26 @@ async function loadWechatAuthStatus(force = false) {
   }
 }
 
+async function syncWechatAuthorizedFromCache() {
+  try {
+    const response = await fetch("/api/wechat-account-status", { cache: "no-store" });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok || !payload.authorized) return false;
+    const name = payload.accounts?.find((item) => item?.valid)?.name || "微信读书账号";
+    setWechatAuthState(`已授权 ${name}`, true);
+    if (nodes.wechatQrPanel) nodes.wechatQrPanel.hidden = true;
+    if (nodes.wechatQrHint) nodes.wechatQrHint.textContent = "授权已恢复";
+    setStatus("公众号授权已恢复", "success");
+    wechatLoginPending = false;
+    refreshAll({ manual: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function pollWechatLogin(uuid, attempt = 0) {
-  if (!uuid || attempt > 90) {
+  if (!uuid || attempt > 300) {
     if (nodes.wechatQrHint) nodes.wechatQrHint.textContent = "二维码已超时，请重新发起扫码授权。";
     setWechatAuthState("二维码已过期", false);
     wechatLoginPending = false;
@@ -208,8 +231,14 @@ async function pollWechatLogin(uuid, attempt = 0) {
       refreshAll({ manual: true });
       return;
     }
+    if (attempt > 0 && attempt % 3 === 0 && await syncWechatAuthorizedFromCache()) {
+      return;
+    }
     if (nodes.wechatQrHint) nodes.wechatQrHint.textContent = payload.message || "等待扫码确认";
   } catch (error) {
+    if (attempt > 0 && attempt % 3 === 0 && await syncWechatAuthorizedFromCache()) {
+      return;
+    }
     if (nodes.wechatQrHint) nodes.wechatQrHint.textContent = error.message || String(error);
   }
   setTimeout(() => pollWechatLogin(uuid, attempt + 1), 2000);
@@ -232,7 +261,9 @@ async function beginWechatLogin(options = {}) {
     if (nodes.wechatQrPanel) nodes.wechatQrPanel.hidden = false;
     if (nodes.wechatQrHint) nodes.wechatQrHint.textContent = "用微信扫码确认，授权后自动刷新订阅。";
     setWechatAuthState("等待扫码", false);
-    notifyWechatQrDesktop(payload, options.reason || "公众号授权已失效或不可用");
+    if (options.desktop !== false) {
+      notifyWechatQrDesktop(payload, options.reason || "公众号授权已失效或不可用");
+    }
     pollWechatLogin(payload.uuid);
   } catch (error) {
     wechatLoginPending = false;
@@ -252,11 +283,219 @@ function normalizeUrl(value) {
   return url;
 }
 
+function normalizedWechatTitleKey(source) {
+  const candidates = [source?.query, source?.title];
+  for (const value of candidates) {
+    if (!sourceTitleQuality(value)) continue;
+    return String(value).trim().toLowerCase().replace(/\s+/g, "");
+  }
+  return "";
+}
+
 function sourceIdentity(source) {
   if (source.type === "wechat") {
-    return source.mpId || source.seedUrl || source.query || source.feedUrl || source.title;
+    const titleKey = normalizedWechatTitleKey(source);
+    const mpId = String(source.mpId || "");
+    return titleKey
+      || (isWechatPlatformMpId(mpId, source.platform) ? mpId : "")
+      || source.seedUrl
+      || source.feedUrl
+      || source.title;
   }
   return source.feedUrl;
+}
+
+function sourceMergeKey(source) {
+  return `${source?.type || "feed"}:${sourceIdentity(source) || source?.id || ""}`;
+}
+
+function sourceTitleQuality(value) {
+  const text = String(value || "").trim();
+  if (!text || ["微信公众号", "微信公众账号", "订阅号", "wechat"].includes(text.toLowerCase())) return 0;
+  return text.length;
+}
+
+function normalizeClientSource(source) {
+  const next = { ...(source || {}) };
+  if (next.type === "wechat") {
+    if (!sourceTitleQuality(next.title) && sourceTitleQuality(next.query)) next.title = next.query;
+    if (!next.query && sourceTitleQuality(next.title)) next.query = next.title;
+    if (next.mpId && !isWechatPlatformMpId(next.mpId, next.platform)) next.mpId = "";
+    if (!isWechatPlatformMpId(next.mpId, next.platform) && !sourceTitleQuality(next.title) && !sourceTitleQuality(next.query)) return null;
+  }
+  return next;
+}
+
+function sourceFieldQuality(source, field) {
+  const value = String(source?.[field] || "").trim();
+  if (!value) return 0;
+  if (field === "mpId" && !isWechatPlatformMpId(value, source?.platform)) return 0;
+  return value.length;
+}
+
+function isWechatPlatformMpId(value, platform = "") {
+  const text = String(value || "").trim();
+  return text.toUpperCase().startsWith("MP_WXS_") || (String(platform || "").toLowerCase() === "wewe-platform" && /^[A-Fa-f0-9]{16,64}$/.test(text));
+}
+
+function sourceNeedsWechatRepair(source) {
+  if (!source || source.type !== "wechat" || isWechatPlatformMpId(source.mpId, source.platform)) return false;
+  const message = String(source.lastMessage || source.error || "");
+  if (/缺少真实公众号 ID|文章链接|公众号 ID/.test(message)) return true;
+  const items = sourceItems(source.id);
+  const hasSeedArticle = /^https?:\/\/mp\.weixin\.qq\.com\/s\//i.test(source.seedUrl || source.siteUrl || "");
+  return !items.length && !hasSeedArticle;
+}
+
+function mergeSourceRecord(existing, incoming) {
+  const existingTime = Math.max(Number(existing.lastFetchedAt) || 0, Number(existing.createdAt) || 0);
+  const incomingTime = Math.max(Number(incoming.lastFetchedAt) || 0, Number(incoming.createdAt) || 0);
+  const base = incomingTime >= existingTime ? { ...existing, ...incoming } : { ...incoming, ...existing };
+  if (existing.id && incoming.id && existing.id !== incoming.id) {
+    const existingCount = sourceItems(existing.id).length;
+    const incomingCount = sourceItems(incoming.id).length;
+    if (existingCount >= incomingCount) base.id = existing.id;
+  }
+  if (sourceTitleQuality(existing.title) > sourceTitleQuality(incoming.title)) base.title = existing.title;
+  if (sourceTitleQuality(incoming.title) > sourceTitleQuality(existing.title)) base.title = incoming.title;
+  for (const field of ["query", "seedUrl", "siteUrl", "cover", "platform", "etag", "lastModified"]) {
+    if (!String(base[field] || "").trim()) base[field] = existing[field] || incoming[field] || "";
+  }
+  if (sourceFieldQuality(existing, "mpId") > sourceFieldQuality(incoming, "mpId")) base.mpId = existing.mpId;
+  if (sourceFieldQuality(incoming, "mpId") > sourceFieldQuality(existing, "mpId")) base.mpId = incoming.mpId;
+  if (base.mpId && !isWechatPlatformMpId(base.mpId, base.platform)) base.mpId = "";
+  return base;
+}
+
+function mergeSources(...groups) {
+  const merged = new Map();
+  for (const sources of groups) {
+    for (const rawSource of Array.isArray(sources) ? sources : []) {
+      const source = normalizeClientSource(rawSource);
+      if (!source) continue;
+      const key = sourceMergeKey(source);
+      if (!key || key.endsWith(":")) continue;
+      const existing = merged.get(key);
+      if (!existing) {
+        merged.set(key, source);
+        continue;
+      }
+      merged.set(key, mergeSourceRecord(existing, source));
+    }
+  }
+  return [...merged.values()];
+}
+
+function sourcesFingerprint(sources) {
+  return JSON.stringify((sources || []).map((source) => ({
+    id: source.id,
+    type: source.type,
+    title: source.title,
+    feedUrl: source.feedUrl,
+    seedUrl: source.seedUrl,
+    query: source.query,
+    mpId: source.mpId,
+    lastFetchedAt: source.lastFetchedAt,
+    lastNewCount: source.lastNewCount,
+    lastSkippedExisting: source.lastSkippedExisting
+  })));
+}
+
+async function persistSourcesToServerNow() {
+  try {
+    await fetch("/api/rss-sources", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sources: rssState.sources })
+    });
+  } catch {
+    // Local cache remains the immediate fallback; the next save/load will retry the DB sync.
+  }
+}
+
+function schedulePersistSourcesToServer() {
+  clearTimeout(rssSourceSaveTimer);
+  rssSourceSaveTimer = setTimeout(persistSourcesToServerNow, 350);
+}
+
+async function persistItemsToServerNow() {
+  try {
+    const response = await fetch("/api/rss-items", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ items: [...rssState.items.values()] })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.error || "RSS items sync failed");
+    }
+  } catch (error) {
+    console.warn("RSS items DB sync failed", error);
+    // Browser cache remains the immediate fallback; the next item save will retry the DB sync.
+  }
+}
+
+function schedulePersistItemsToServer() {
+  clearTimeout(rssItemSaveTimer);
+  rssItemSaveTimer = setTimeout(persistItemsToServerNow, 500);
+}
+
+async function hydrateSourcesFromServer() {
+  const localSources = readJson(RSS_SOURCES_KEY, []);
+  const before = sourcesFingerprint(rssState.sources);
+  try {
+    const response = await fetch("/api/rss-sources", { cache: "no-store" });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) throw new Error(payload.error || "rss sources sync failed");
+    const remoteSources = Array.isArray(payload.sources) ? payload.sources : [];
+    const merged = mergeSources(localSources, remoteSources);
+    const remoteFingerprint = sourcesFingerprint(remoteSources);
+    const mergedFingerprint = sourcesFingerprint(merged);
+    if (mergedFingerprint !== before) {
+      rssState.sources = merged;
+      if (rssState.activeSourceId !== "all" && !rssState.sources.some((source) => source.id === rssState.activeSourceId)) {
+        rssState.activeSourceId = "all";
+      }
+      saveJson(RSS_SOURCES_KEY, rssState.sources);
+      requestRenderItems();
+    }
+    rssSourceHydrated = true;
+    if (mergedFingerprint !== remoteFingerprint) {
+      await persistSourcesToServerNow();
+    }
+  } catch {
+    rssSourceHydrated = true;
+  }
+}
+
+async function hydrateItemsFromServer() {
+  try {
+    const response = await fetch("/api/rss-items", { cache: "no-store" });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) throw new Error(payload.error || "rss items sync failed");
+    const remoteItems = Array.isArray(payload.items) ? payload.items : [];
+    const localItemCount = rssState.items.size;
+    let changed = false;
+    for (const rawItem of remoteItems) {
+      const sourceId = String(rawItem.sourceId || "").trim();
+      if (!sourceId) continue;
+      const key = rawItem.key || itemKey(sourceId, rawItem);
+      if (!key || rssState.items.has(key)) continue;
+      rssState.items.set(key, { ...rawItem, key, sourceId });
+      changed = true;
+    }
+    rssItemsHydrated = true;
+    if (changed) {
+      persistItems();
+      requestRenderItems();
+    } else if (localItemCount > remoteItems.length) {
+      await persistItemsToServerNow();
+    } else if (rssState.items.size) {
+      schedulePersistItemsToServer();
+    }
+  } catch {
+    rssItemsHydrated = true;
+  }
 }
 
 function isLegacyWechatFeed(source) {
@@ -343,6 +582,7 @@ function filteredItems() {
 
 function persistSources() {
   saveJson(RSS_SOURCES_KEY, rssState.sources);
+  if (rssSourceHydrated) schedulePersistSourcesToServer();
 }
 
 function persistItems() {
@@ -366,6 +606,7 @@ function persistItems() {
   }
   rssState.items = new Map(items.map((item) => [item.key, item]));
   saveJson(RSS_ITEMS_KEY, items);
+  if (rssItemsHydrated) schedulePersistItemsToServer();
 }
 
 function pruneStoredItems() {
@@ -468,7 +709,7 @@ function persistAutoSettings() {
 }
 
 function loadState() {
-  rssState.sources = readJson(RSS_SOURCES_KEY, []);
+  rssState.sources = mergeSources(readJson(RSS_SOURCES_KEY, []));
   const items = readJson(RSS_ITEMS_KEY, []);
   rssState.items = new Map(items.map((item) => [item.key, item]));
   rssState.read = new Set(readJson(RSS_READ_KEY, []));
@@ -549,7 +790,8 @@ function renderSources() {
     const unread = sourceItems(source.id).filter((item) => !rssState.read.has(item.key)).length;
     const isLoading = rssState.loading.has(source.id);
     const isActive = rssState.activeSourceId === source.id;
-    const status = source.error ? "异常" : isLoading ? "同步" : `${unread} 未读`;
+    const needsRepair = sourceNeedsWechatRepair(source);
+    const status = source.error ? "异常" : isLoading ? "同步" : needsRepair ? "需文章链接修复" : `${unread} 未读`;
     return `
       <div class="rss-source-shell ${isActive ? "active" : ""}">
         <button class="rss-source-row" type="button" data-source-id="${escapeHtml(source.id)}">
@@ -667,7 +909,7 @@ async function fetchSource(source, options = {}) {
     });
     const payload = await response.json();
     if (!response.ok || !payload.ok) throw new Error(payload.error || "订阅源更新失败");
-    if (source.type === "wechat" && payload.feed?.title) {
+    if (source.type === "wechat" && sourceTitleQuality(payload.feed?.title)) {
       source.title = payload.feed.title;
     } else {
       source.title = source.title || payload.feed?.title || "未命名订阅";
@@ -676,8 +918,14 @@ async function fetchSource(source, options = {}) {
     source.description = payload.feed?.description || source.description || "";
     source.cover = payload.feed?.cover || source.cover || "";
     source.feedUrl = source.feedUrl || payload.feed?.feedUrl || "";
-    source.mpId = payload.feed?.id || source.mpId || "";
-    source.platform = payload.feed?.platform || source.platform || "";
+    const feedId = payload.feed?.id || "";
+    const feedPlatform = payload.feed?.platform || source.platform || "";
+    source.platform = feedPlatform;
+    if (source.type === "wechat") {
+      source.mpId = isWechatPlatformMpId(feedId, feedPlatform) ? feedId : (isWechatPlatformMpId(source.mpId, source.platform) ? source.mpId : "");
+    } else {
+      source.mpId = feedId || source.mpId || "";
+    }
     source.etag = payload.etag || source.etag || "";
     source.lastModified = payload.lastModified || source.lastModified || "";
     source.lastFetchedAt = payload.fetchedAt || Date.now();
@@ -710,7 +958,10 @@ async function fetchSource(source, options = {}) {
       : newCount
       ? `已更新 ${source.title}，新增 ${newCount} 条${skipNote}`
       : `${source.title} 暂无新内容${skipNote}`;
-    sourceStatus(payload.warning || payload.notice || okMessage, payload.warning ? "error" : "success");
+    const hasItems = (payload.items || []).length > 0;
+    const statusText = hasItems ? (payload.notice || okMessage) : (payload.warning || payload.notice || okMessage);
+    const statusMode = hasItems ? "success" : (payload.warning ? "error" : "success");
+    sourceStatus(statusText, statusMode);
   } catch (error) {
     source.error = error.message || String(error);
     if (source.type === "wechat" && isWechatAuthError(source.error)) {
@@ -728,6 +979,44 @@ async function fetchSource(source, options = {}) {
   }
 }
 
+function applyServerRefreshPayload(payload, options = {}) {
+  const remoteSources = Array.isArray(payload.sources) ? payload.sources : [];
+  const remoteItems = Array.isArray(payload.items) ? payload.items : [];
+  if (remoteSources.length) {
+    rssState.sources = mergeSources(rssState.sources, remoteSources);
+  }
+  const beforeKeys = new Set(rssState.items.keys());
+  const nextItems = new Map();
+  const newItemsBySource = new Map();
+  for (const rawItem of remoteItems) {
+    const sourceId = String(rawItem.sourceId || "").trim();
+    if (!sourceId) continue;
+    const key = rawItem.key || itemKey(sourceId, rawItem);
+    const item = { ...rawItem, key, sourceId };
+    nextItems.set(key, item);
+    if (!beforeKeys.has(key)) {
+      if (!newItemsBySource.has(sourceId)) newItemsBySource.set(sourceId, []);
+      newItemsBySource.get(sourceId).push(item);
+    }
+  }
+  if (nextItems.size) {
+    rssState.items = nextItems;
+  }
+  if (rssState.activeSourceId !== "all" && !rssState.sources.some((source) => source.id === rssState.activeSourceId)) {
+    rssState.activeSourceId = "all";
+  }
+  persistSources();
+  persistItems();
+  requestRenderItems();
+  if (!options.skipAlerts) {
+    for (const [sourceId, items] of newItemsBySource.entries()) {
+      const source = rssState.sources.find((item) => item.id === sourceId);
+      if (source) sendRssAlerts(source, items);
+    }
+  }
+  return [...newItemsBySource.values()].reduce((sum, items) => sum + items.length, 0);
+}
+
 async function refreshAll(options = {}) {
   if (!rssState.sources.length) {
     setStatus("先添加订阅源", "normal");
@@ -738,6 +1027,30 @@ async function refreshAll(options = {}) {
   rssState.refreshingAll = true;
   setStatus(options.auto ? "自动同步已启用" : "同步已触发");
   try {
+    try {
+      const response = await fetch("/api/rss-refresh-all", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fullSync: options.fullSync === true })
+      });
+      const payload = await response.json();
+      if (!response.ok || !payload.ok) throw new Error(payload.error || "server rss refresh failed");
+      const added = applyServerRefreshPayload(payload, { skipAlerts: false });
+      rssState.auto.lastRunAt = Date.now();
+      rssState.auto.nextAt = Date.now() + rssState.auto.intervalMs;
+      persistAutoSettings();
+      if (payload.stats?.authRequired) {
+        setStatus("微信公众号授权已失效，扫码授权后再更新", "error");
+        loadWechatAuthStatus(true);
+        return;
+      }
+      const errors = Number(payload.stats?.errors || 0);
+      const suffix = errors ? ` · ${errors} sources need repair` : "";
+      setStatus(`${options.auto ? "自动" : "手动"}更新完成 · 新增 ${added} 条${suffix}`, errors ? "normal" : "success");
+      return;
+    } catch (serverError) {
+      // Fall back to the browser updater if the local refresh endpoint is temporarily unavailable.
+    }
     const queue = [...rssState.sources];
     const workers = Array.from({ length: Math.min(3, queue.length) }, async () => {
       while (queue.length) {
@@ -945,20 +1258,19 @@ function bindEvents() {
   nodes.opmlInput?.addEventListener("change", () => importOpml(nodes.opmlInput.files?.[0]));
 }
 
-function init() {
+async function init() {
   tickClock();
   setInterval(tickClock, 1000);
   loadState();
   bindEvents();
   renderItems();
+  await hydrateSourcesFromServer();
+  await hydrateItemsFromServer();
   loadWechatAuthStatus(true);
   setInterval(() => loadWechatAuthStatus(false), 60_000);
   updateAutoUi();
   setInterval(updateAutoUi, 1000);
   scheduleAutoRefresh(false);
-  if (rssState.sources.length) {
-    setStatus(rssState.auto.enabled ? "订阅已恢复" : "自动更新已关闭", "success");
-  }
 }
 
 init();
