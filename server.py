@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import gzip
 import hashlib
@@ -72,12 +73,14 @@ SITE_ALERT_STATE: dict[str, Any] = {"seen": {}, "ready": []}
 SITE_ALERT_STATE_LOADED = False
 SITE_ALERT_SEEN_LIMIT = 10000
 DEEPSEEK_INSIGHTS_LOCK = threading.Lock()
+AICOIN_CDP_RELAUNCH_LOCK = threading.Lock()
 SITE_ALERT_FUTURE_TOLERANCE_MS = 10 * 60 * 1000
 SITE_ALERT_MONITOR_ACTIVE = False
 SITE_ALERT_MONITOR_STARTED_AT = 0
 RANK_MONITOR_LOCK = threading.Lock()
 RANK_MONITOR_INTERVAL = 30
 RANK_MONITOR_COOLDOWN_SECONDS = 20 * 60
+DISCORD_NEWSFLASH_BRIDGE_PROCESS: subprocess.Popen | None = None
 RANK_MONITOR_MAX_EVENTS_PER_RUN = 1
 RANK_MONITOR_HOT_WATCH_RANK = 10
 RANK_MONITOR_STOCK_HOT_WATCH_RANK = 10
@@ -379,6 +382,11 @@ def cached(key: str, fn):
     value = fn()
     CACHE[key] = (now, value)
     return value
+
+
+def clear_market_source_memory_cache() -> None:
+    for key in ("binance", "okx", "okx-dex", "bitget", "aicoin", "futu-hk", "futu-us", "ths"):
+        CACHE.pop(key, None)
 
 
 def write_json_cache(path: Path, payload: dict[str, Any]) -> None:
@@ -2273,6 +2281,40 @@ def cached_source_copy(source: dict[str, Any], suffix: str) -> dict[str, Any]:
     return copied
 
 
+def source_cache_updated_at_ms(source: dict[str, Any]) -> int:
+    if not isinstance(source, dict):
+        return 0
+    meta = source.get("_cache") if isinstance(source.get("_cache"), dict) else {}
+    values = [source.get("updatedAt"), source.get("cachedAt"), meta.get("updatedAt")]
+    timestamps: list[int] = []
+    for value in values:
+        try:
+            number = float(value or 0)
+        except (TypeError, ValueError):
+            number = 0
+        if number > 0:
+            timestamps.append(int(number if number > 10_000_000_000 else number * 1000))
+    return max(timestamps) if timestamps else 0
+
+
+def source_cache_is_fresh(source: dict[str, Any], source_id: str) -> bool:
+    if source_id != "aicoin":
+        return True
+    ttl_seconds = int(safe_float(env_value("AICOIN_SOURCE_CACHE_TTL_SECONDS", "1800"), 1800))
+    if ttl_seconds <= 0:
+        return True
+    updated_at = source_cache_updated_at_ms(source)
+    if not updated_at:
+        return False
+    return int(time.time() * 1000) - updated_at <= ttl_seconds * 1000
+
+
+def source_fallback_allowed(source_id: str, cache_path: Path) -> bool:
+    if source_id != "aicoin":
+        return True
+    return source_cache_is_fresh(read_json_cache(cache_path), source_id)
+
+
 def cached_source_fallback(source_id: str, source_cache_path: Path, *, api_key: str = "market-hot") -> dict[str, Any]:
     cached_source = cached_source_copy(read_json_cache(source_cache_path), "本地缓存")
     if cached_source:
@@ -2315,13 +2357,13 @@ def cached_or_fallback_source(
                     return fallback
             write_json_cache(cache_path, source)
             return source
-        fallback = cached_source_fallback(key, cache_path, api_key=api_key)
+        fallback = cached_source_fallback(key, cache_path, api_key=api_key) if source_fallback_allowed(key, cache_path) else {}
         if fallback:
             fallback["sourceName"] = f"{fallback.get('sourceName') or key} · 实时返回为空"
             return fallback
         return source if isinstance(source, dict) else {}
     except Exception as exc:
-        fallback = cached_source_fallback(key, cache_path, api_key=api_key)
+        fallback = cached_source_fallback(key, cache_path, api_key=api_key) if source_fallback_allowed(key, cache_path) else {}
         if fallback:
             fallback["sourceName"] = f"{fallback.get('sourceName') or key} · 实时失败：{alert_text(exc, 60)}"
             return fallback
@@ -2365,6 +2407,8 @@ def with_cache_meta(key: str, payload: dict[str, Any], *, stale: bool = False) -
 
 
 def refresh_api_cache_now(key: str, fetcher) -> dict[str, Any]:
+    if key == "market-hot":
+        clear_market_source_memory_cache()
     payload = fetcher()
     if not isinstance(payload, dict):
         payload = {}
@@ -2403,7 +2447,9 @@ def cached_api_payload(key: str, fetcher, ttl_seconds: int = 60, *, force_refres
     if cached_payload:
         age = now - payload_cache_time(cached_payload)
         stale = age > ttl_seconds
-        if force_refresh or stale:
+        if force_refresh:
+            return with_cache_meta(key, refresh_api_cache_now(key, fetcher), stale=False)
+        if stale:
             trigger_api_refresh(key, fetcher)
         return with_cache_meta(key, cached_payload, stale=stale)
     return refresh_api_cache_now(key, fetcher)
@@ -7027,6 +7073,67 @@ def aicoin_app_data_dir() -> Path:
     return Path.home() / "AppData" / "Roaming" / "AiCoin"
 
 
+def aicoin_cdp_ready(host: str, port: str) -> bool:
+    try:
+        response = requests.get(f"http://{host}:{port}/json/version", timeout=2)
+        return response.ok and "webSocketDebuggerUrl" in response.text
+    except Exception:
+        return False
+
+
+def aicoin_exe_path() -> Path:
+    configured = env_value("AICOIN_EXE_PATH")
+    if configured:
+        return Path(configured)
+    return Path("D:/AICOIN/AiCoin.exe")
+
+
+def ensure_aicoin_cdp_ready(host: str, port: str) -> None:
+    if host not in {"127.0.0.1", "localhost"} or aicoin_cdp_ready(host, port):
+        return
+    if (env_value("AICOIN_AUTO_RELAUNCH_CDP", "1") or "").lower() not in {"1", "true", "yes"}:
+        return
+
+    exe_path = aicoin_exe_path()
+    if not exe_path.exists():
+        return
+
+    with AICOIN_CDP_RELAUNCH_LOCK:
+        if aicoin_cdp_ready(host, port):
+            return
+        try:
+            subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "Get-Process | Where-Object { $_.ProcessName -eq 'AiCoin' } | Stop-Process -Force",
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+            )
+        except Exception:
+            pass
+        try:
+            subprocess.Popen(
+                [str(exe_path), f"--remote-debugging-port={port}"],
+                cwd=str(exe_path.parent),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            return
+
+        deadline = time.time() + 18
+        while time.time() < deadline:
+            if aicoin_cdp_ready(host, port):
+                return
+            time.sleep(1)
+
+
 def aicoin_cookie_values() -> dict[str, str]:
     db_path = aicoin_app_data_dir() / "Network" / "Cookies"
     if not db_path.exists():
@@ -7288,6 +7395,7 @@ def aicoin_client_hot_payload() -> dict[str, Any]:
 
     host = env_value("AICOIN_CDP_HOST", "127.0.0.1") or "127.0.0.1"
     port = env_value("AICOIN_CDP_PORT", "9222")
+    ensure_aicoin_cdp_ready(host, port)
     target_hint = env_value("AICOIN_CDP_TARGET_HINT", "#/main/exchange")
     targets = requests.get(f"http://{host}:{port}/json/list", timeout=3).json()
     pages = [item for item in targets if item.get("type") == "page" and item.get("webSocketDebuggerUrl")]
@@ -11817,7 +11925,10 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
-        force_refresh = (query.get("refresh") or ["0"])[0].lower() in {"1", "true", "yes"}
+        force_refresh = (
+            (query.get("refresh") or query.get("force") or ["0"])[0].lower()
+            in {"1", "true", "yes"}
+        )
         if parsed.path == "/robots.txt":
             self.send_text(robots_txt(self), "text/plain", cache_control="public, max-age=3600")
             return
@@ -12242,6 +12353,91 @@ def warm_api_response_cache() -> None:
         trigger_api_refresh(key, fetcher)
 
 
+def bool_env(name: str, default: bool = False) -> bool:
+    value = env_value(name)
+    if value is None or str(value).strip() == "":
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def discord_newsflash_project_root() -> Path:
+    return Path(env_value("XINGYUN_DISCORD_NEWSFLASH_ROOT") or (ROOT.parent / "discord-alpha-observer")).resolve()
+
+
+def discord_newsflash_webhook_is_configured(project_root: Path) -> bool:
+    env_path = project_root / ".env"
+    if not env_path.exists():
+        return False
+    try:
+        for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if not re.match(r"^\s*NEWSFLASH_WEBHOOK_URL\s*=", line):
+                continue
+            return bool(line.split("=", 1)[1].strip())
+    except Exception:
+        return False
+    return False
+
+
+def start_discord_newsflash_bridge(host: str, port: int) -> None:
+    global DISCORD_NEWSFLASH_BRIDGE_PROCESS
+    if not bool_env("XINGYUN_DISCORD_NEWSFLASH_ENABLED", True):
+        print("Discord newsflash bridge: disabled by XINGYUN_DISCORD_NEWSFLASH_ENABLED")
+        return
+    if DISCORD_NEWSFLASH_BRIDGE_PROCESS and DISCORD_NEWSFLASH_BRIDGE_PROCESS.poll() is None:
+        return
+
+    bridge_root = discord_newsflash_project_root()
+    runner = bridge_root / "run_newsflash_to_discord_service.ps1"
+    if not runner.exists():
+        print(f"Discord newsflash bridge: runner not found: {runner}")
+        return
+    if not discord_newsflash_webhook_is_configured(bridge_root):
+        print(f"Discord newsflash bridge: NEWSFLASH_WEBHOOK_URL is not configured in {bridge_root / '.env'}")
+        return
+
+    env = os.environ.copy()
+    env.setdefault("NEWSFLASH_ENABLED", "true")
+    env["NEWSFLASH_API_URL"] = f"http://{host}:{port}/api/newsflash"
+
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        DISCORD_NEWSFLASH_BRIDGE_PROCESS = subprocess.Popen(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(runner),
+            ],
+            cwd=str(bridge_root),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            creationflags=creationflags,
+            close_fds=True,
+        )
+        print(f"Discord newsflash bridge: started pid={DISCORD_NEWSFLASH_BRIDGE_PROCESS.pid}")
+    except Exception as exc:
+        print(f"Discord newsflash bridge: failed to start: {exc}", file=sys.stderr)
+
+
+def stop_discord_newsflash_bridge() -> None:
+    global DISCORD_NEWSFLASH_BRIDGE_PROCESS
+    process = DISCORD_NEWSFLASH_BRIDGE_PROCESS
+    if not process or process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=5)
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+
 def main():
     parser = argparse.ArgumentParser()
     default_host = env_value("XINGYUN_HOST", "127.0.0.1") or "127.0.0.1"
@@ -12266,7 +12462,12 @@ def main():
     warm_api_response_cache()
     start_site_alert_monitor()
     start_wechat_auth_monitor()
-    server.serve_forever()
+    atexit.register(stop_discord_newsflash_bridge)
+    threading.Timer(1.0, start_discord_newsflash_bridge, args=(args.host, args.port)).start()
+    try:
+        server.serve_forever()
+    finally:
+        stop_discord_newsflash_bridge()
 
 
 if __name__ == "__main__":
