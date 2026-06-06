@@ -107,6 +107,7 @@ WECHAT_SOURCE_ALIAS_CACHE_PATH = PERSIST_CACHE_DIR / "wechat_source_aliases.json
 X_KOL_SOURCES_PATH = PERSIST_CACHE_DIR / "x_kol_sources.json"
 CN_STOCK_GAINERS_CACHE_PATH = PERSIST_CACHE_DIR / "cn_stock_gainers_source.json"
 DEEPSEEK_INSIGHTS_CACHE_PATH = PERSIST_CACHE_DIR / "deepseek_rank_insights.json"
+AICOIN_PAYLOAD_TOKEN_PATH = PERSIST_CACHE_DIR / "aicoin_payload_token.txt"
 AUTOMATION_BRIEF_IDS = ("automation", "automation-2")
 AUTOMATION_BRIEF_PLACEHOLDER = "暂时没有找到这条自动化任务最近生成的简报正文。"
 AUTOMATION_BRIEFS_REMOTE_CACHE_PATH = PERSIST_CACHE_DIR / "automation_briefs_remote.json"
@@ -7073,6 +7074,18 @@ def aicoin_app_data_dir() -> Path:
     return Path.home() / "AppData" / "Roaming" / "AiCoin"
 
 
+AICOIN_DEFAULT_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAh9Ls/JGedqcIGK8CTWTL
+eb2EKgrLBJ8UeSfAxdtBhz1Vj4taxw+C9HKk+R7lOQy1zZ5aQU/gKvh6PlxsyusF
+phw1WpYZniYpLcLikxbi27qV1pFZAZQ/aKempNzsKZuI0QorMudH3gI2ejcMq80j
+/lpnIOHRyHTR5sRuksaQH8j3aEQgijdVXmX+HNbTtZCU9v/H9WRNzlOrrXMB2baz
+gDh6shXy9vp4o2/OHYefhtSy0xLCf92bRCNfbPil0w505KcM1XGmkRHIHqWTvWZH
+N/I1TUNII7cvdjyk8OtDWX4qMzFoArFNeN6Ob11Ee6f0i2lmLkyi17yP4t6RB+4s
+/wIDAQAB
+-----END PUBLIC KEY-----"""
+AICOIN_DEFAULT_PUBLIC_KEY_VERSION = "1744770600"
+
+
 def aicoin_cdp_ready(host: str, port: str) -> bool:
     try:
         response = requests.get(f"http://{host}:{port}/json/version", timeout=2)
@@ -7091,7 +7104,7 @@ def aicoin_exe_path() -> Path:
 def ensure_aicoin_cdp_ready(host: str, port: str) -> None:
     if host not in {"127.0.0.1", "localhost"} or aicoin_cdp_ready(host, port):
         return
-    if (env_value("AICOIN_AUTO_RELAUNCH_CDP", "1") or "").lower() not in {"1", "true", "yes"}:
+    if (env_value("AICOIN_AUTO_RELAUNCH_CDP", "0") or "").lower() not in {"1", "true", "yes"}:
         return
 
     exe_path = aicoin_exe_path()
@@ -7161,11 +7174,31 @@ def aicoin_cookie_values() -> dict[str, str]:
     return values
 
 
+def aicoin_cached_payload_token() -> str:
+    try:
+        token = AICOIN_PAYLOAD_TOKEN_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return token if 20 <= len(token) <= 1000 else ""
+
+
+def save_aicoin_payload_token(token: Any) -> None:
+    value = str(token or "").strip()
+    if not (20 <= len(value) <= 1000):
+        return
+    try:
+        AICOIN_PAYLOAD_TOKEN_PATH.write_text(value, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def aicoin_token_candidates() -> list[str]:
     candidates: list[str] = []
-    for name in ("AICOIN_TOKEN", "AICOIN_AUTH_TOKEN", "AICOIN_WEB_TOKEN"):
+    for name in ("AICOIN_PAYLOAD_TOKEN", "AICOIN_TOKEN", "AICOIN_AUTH_TOKEN", "AICOIN_WEB_TOKEN"):
         if value := env_value(name):
             candidates.append(value)
+    if cached_token := aicoin_cached_payload_token():
+        candidates.append(cached_token)
 
     data_dir = aicoin_app_data_dir()
     token_patterns = [
@@ -7207,8 +7240,13 @@ def aicoin_encrypted_headers() -> dict[str, str]:
         **HEADERS,
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Origin": "https://www.aicoin.com",
-        "Referer": "https://www.aicoin.com/",
+        "User-Agent": env_value(
+            "AICOIN_USER_AGENT",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) aicoin/2.16.4 Chrome/108.0.5359.215 "
+            "Electron/22.3.27 Safari/537.36 AiCoin/2.16.4",
+        ),
+        "Referer": "",
         "compress": "1",
     }
 
@@ -7222,17 +7260,10 @@ def aicoin_encrypt_body(body: dict[str, Any]) -> tuple[dict[str, str], bytes, by
     except Exception as exc:
         raise RuntimeError("missing cryptography package for AICoin encrypted API") from exc
 
-    conn = requests.post(
-        "https://vip-pcapi.aicoin.com/api/conn/load",
-        json={"v": ""},
-        headers=aicoin_encrypted_headers(),
-        timeout=12,
-    ).json()
-    conn_data = conn.get("data") or {}
-    public_key = conn_data.get("info")
-    version = conn_data.get("v")
-    if not public_key or not version:
-        raise RuntimeError("AICoin conn/load did not return encryption metadata")
+    public_key = env_value("AICOIN_PUBLIC_KEY", AICOIN_DEFAULT_PUBLIC_KEY)
+    version = env_value("AICOIN_PUBLIC_KEY_VERSION", AICOIN_DEFAULT_PUBLIC_KEY_VERSION)
+    if "\\n" in public_key:
+        public_key = public_key.replace("\\n", "\n")
 
     key_seed = os.urandom(16)
     iv_seed = os.urandom(8)
@@ -7334,9 +7365,9 @@ def aicoin_rest_hot_payload() -> dict[str, Any]:
         "currency": env_value("AICOIN_CURRENCY", "usd").lower(),
         "keyWord": "",
         "customGroupIds": [],
-        "lan": env_value("AICOIN_LANGUAGE", "zh"),
+        "lan": env_value("AICOIN_LANGUAGE", "cn"),
         "pc_client": env_value("AICOIN_PC_CLIENT", "Windows x64"),
-        "pc_client_version": env_value("AICOIN_PC_CLIENT_VERSION", "2.16.3"),
+        "pc_client_version": env_value("AICOIN_PC_CLIENT_VERSION", "2.16.4"),
     }
     tokens = aicoin_token_candidates()
     if not tokens:
@@ -7429,6 +7460,15 @@ def aicoin_client_hot_payload() -> dict[str, Any]:
       return JSON.stringify({{ ok: false, message: "AiCoin axios module not found" }});
     }}
     self.__aicoinAxios = axios;
+    let payloadToken = "";
+    try {{
+      const currentAccount = localStorage.getItem("account") || "";
+      const accounts = JSON.parse(localStorage.getItem("aicoin_accounts_list") || "[]");
+      const matched = Array.isArray(accounts)
+        ? (accounts.find(x => x && (x.email === currentAccount || x.account === currentAccount)) || accounts.find(x => x && x.token))
+        : null;
+      payloadToken = matched && matched.token ? String(matched.token) : "";
+    }} catch (tokenError) {{}}
     const body = {json.dumps(body, ensure_ascii=False)};
     const res = await axios.post("{endpoint}", body);
     const root = res && res.data ? res.data : res;
@@ -7439,6 +7479,7 @@ def aicoin_client_hot_payload() -> dict[str, Any]:
       endpoint: "POST https://vip-pcapi.aicoin.com/api/{endpoint}",
       body,
       count: data && (data.count || data.total || data.totalCount) || list.length || 0,
+      payloadToken,
       list: Array.isArray(list) ? list.slice(0, {size}).map(x => ({{
         coinShow: x.coinShow,
         coinName: x.coinName,
@@ -7494,6 +7535,7 @@ def aicoin_client_hot_payload() -> dict[str, Any]:
     payload = json.loads(value or "{}")
     if not payload.get("ok"):
         raise RuntimeError(payload.get("message") or "AiCoin 客户端没有返回可用热门榜。")
+    save_aicoin_payload_token(payload.get("payloadToken"))
     return payload
 
 
