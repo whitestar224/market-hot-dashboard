@@ -19,6 +19,7 @@
 5. **多周期只做共振。** Cross-frame alignment upgrades grade and priority after the current-frame boundary is independently valid. It cannot fabricate a consolidation or previous high.
 6. **硬否决优先。** Mother-box interior, unrecovered selloff, high-level distribution, rising wedge/channel, rushed stair-step, opened beyond trigger, launch distance above 7%, and duplicate recross without reset remain earlier than score.
 7. **双层召回继续保留。** A true boundary cross that misses only soft quality gates remains in `retainedCandidates`; it never paints B, triggers popup/voice, or bypasses a permanent denial.
+8. **二次突破是提示层。** 当第一次外沿突破没有明显量能、只完成试盘，随后价格回到边界附近但没有破坏母结构，再次从线下突破且量能/速度改善时，生成独立的 `secondaryBreakoutHints`。盘面用红色 B 标记其重要性；它不进入正式 `signals`，不计入买点数，也不触发弹窗、语音或自动执行。
 
 ## Tasks
 
@@ -60,6 +61,7 @@
 - Modify: `tests/dragon_wave_page.test.js`
 
 - Show the hierarchy tier and missing prerequisite in explanations/ledger where applicable.
+- Render secondary-breakout hints as red B markers below the candle; keep filtered red crosses above candles so the two meanings remain visually distinct.
 - Bump cache and API strategy versions together.
 
 ### Task 5: Verify and restart
