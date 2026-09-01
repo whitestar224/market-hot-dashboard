@@ -503,7 +503,9 @@ def onebot_enabled() -> bool:
 
 
 def onebot_recovery_enabled() -> bool:
-    return os.name == "nt" and str(os.getenv("QQ_ONEBOT_RECOVERY_ENABLED", "1")).strip().lower() in {
+    # Recovery launches a managed NapCat QQ session. Keep it opt-in so a temporary
+    # OneBot outage can never take over or terminate the user's interactive QQ.
+    return os.name == "nt" and str(os.getenv("QQ_ONEBOT_RECOVERY_ENABLED", "0")).strip().lower() in {
         "1", "true", "yes", "on"
     }
 

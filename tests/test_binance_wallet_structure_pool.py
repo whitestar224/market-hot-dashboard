@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -54,6 +55,30 @@ class BinanceWalletStructurePoolTests(unittest.TestCase):
         self.assertEqual(rows[0]["lastSeenAt"], first_at + 6 * 60 * 60 * 1000)
         self.assertEqual(rows[0]["expiresAt"] - rows[0]["lastSeenAt"], 30 * 24 * 60 * 60 * 1000)
 
+    def test_persisted_history_hydrates_before_live_source_sync(self):
+        observed_at = 1_800_000_000_000
+        saved_row = {
+            **self.wallet_row("FABLE", "0xfable", 6),
+            "firstSeenAt": observed_at,
+            "lastSeenAt": observed_at,
+            "expiresAt": observed_at + 30 * 24 * 60 * 60 * 1000,
+            "walletHotRank": 6,
+            "walletHeat": 50,
+            "wallet4hVolumeUsd": 12_000_000,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "wallet-4h.json"
+            path.write_text(
+                json.dumps({"updatedAt": observed_at, "items": [saved_row]}),
+                encoding="utf-8",
+            )
+            with patch.object(server, "BINANCE_WALLET_4H_STRUCTURE_PATH", path), patch.object(
+                server, "BINANCE_WALLET_4H_STRUCTURE_ACTIVE", False
+            ):
+                rows = server.binance_wallet_4h_structure_rows(now_ms=observed_at + 60_000)
+
+        self.assertEqual([row["symbol"] for row in rows], ["FABLE"])
+
     def test_wallet_history_joins_existing_structure_pool_with_contract_identity(self):
         wallet_row = {
             **self.wallet_row("我的女友景甜", "0xff7777", 2),
@@ -68,7 +93,7 @@ class BinanceWalletStructurePoolTests(unittest.TestCase):
             patch.object(server.time, "time", return_value=now_ms / 1000),
             patch.object(server, "price_watch_aicoin_source", return_value={"status": "ok", "rows": []}),
             patch.object(server, "price_watch_active_rows", return_value=[]),
-            patch.object(server, "filter_price_monitor_rows_by_activity", return_value=[]),
+            patch.object(server, "filter_price_monitor_rows_by_activity", side_effect=lambda rows: rows),
             patch.object(server, "reconcile_price_structure_exclusions", return_value=set()),
             patch.object(server, "strategy_active_adaptive_contexts", return_value=[]),
             patch.object(server, "price_structure_priority_context", return_value={}),

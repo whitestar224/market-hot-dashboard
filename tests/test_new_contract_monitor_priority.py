@@ -100,7 +100,9 @@ class NewContractMonitorPriorityTests(unittest.TestCase):
             self.assertFalse(public["ONEW"]["priorHighEnabled"])
             self.assertFalse(public["BNEW"]["priorHighEnabled"])
             self.assertFalse(public["MANUAL"]["priorHighEnabled"])
-            with patch.object(server, "price_watch_aicoin_source", return_value={"status": "ok", "rows": []}):
+            with patch.object(
+                server, "price_watch_aicoin_source", return_value={"status": "ok", "rows": []}
+            ), patch.object(server, "binance_wallet_4h_structure_rows", return_value=[]):
                 structure_rows = server.price_structure_watch_rows()
         self.assertEqual(structure_rows, [])
 

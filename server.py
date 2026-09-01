@@ -472,11 +472,15 @@ PRICE_STRUCTURE_ONCHAIN_POOL_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 PRICE_STRUCTURE_ONCHAIN_POOL_CACHE_LOCK = threading.Lock()
 PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE: dict[str, tuple[float, list[tuple[int, float, float, float, float, float]]]] = {}
 PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE_LOCK = threading.Lock()
+PRICE_STRUCTURE_ONCHAIN_CANDLE_INFLIGHT: dict[str, threading.Event] = {}
+PRICE_STRUCTURE_ONCHAIN_CANDLE_ERROR_CACHE: dict[str, tuple[float, str]] = {}
 BINANCE_WALLET_4H_STRUCTURE_LOCK = threading.Lock()
 BINANCE_WALLET_4H_STRUCTURE_LAST_SYNC_AT = 0.0
 BINANCE_WALLET_4H_STRUCTURE_ACTIVE = False
 PRICE_STRUCTURE_ONCHAIN_POOL_CACHE_TTL_SECONDS = 10 * 60
 PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE_TTL_SECONDS = 20
+PRICE_STRUCTURE_ONCHAIN_CANDLE_STALE_TTL_SECONDS = 10 * 60
+PRICE_STRUCTURE_ONCHAIN_CANDLE_ERROR_TTL_SECONDS = 10
 PRICE_STRUCTURE_MOMENTUM_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 PRICE_STRUCTURE_MOMENTUM_CACHE_LOCK = threading.Lock()
 PRICE_STRUCTURE_MOMENTUM_CACHE_TTL_SECONDS = 10
@@ -7698,8 +7702,6 @@ def sync_binance_wallet_4h_structure_history(*, force_refresh: bool = False) -> 
 
 
 def binance_wallet_4h_structure_rows(*, now_ms: int | None = None) -> list[dict[str, Any]]:
-    if not BINANCE_WALLET_4H_STRUCTURE_ACTIVE:
-        return []
     current_ms = int(now_ms or time.time() * 1000)
     cutoff = current_ms - BINANCE_WALLET_4H_STRUCTURE_RETENTION_SECONDS * 1000
     with BINANCE_WALLET_4H_STRUCTURE_LOCK:
@@ -7709,6 +7711,12 @@ def binance_wallet_4h_structure_rows(*, now_ms: int | None = None) -> list[dict[
         for item in (payload.get("items") if isinstance(payload.get("items"), list) else [])
         if isinstance(item, dict) and int(safe_float(item.get("lastSeenAt"), 0)) >= cutoff
     ]
+    # The live-source flag is process-local, while the 30-day membership pool
+    # is intentionally persistent. Hydrate valid saved rows immediately after
+    # a restart so structure monitoring does not depend on somebody opening the
+    # Binance Wallet ranking page first.
+    if not BINANCE_WALLET_4H_STRUCTURE_ACTIVE and not rows:
+        return []
     rows.sort(key=lambda item: (
         int(safe_float(item.get("lastSeenAt"), 0)),
         -int(safe_float(item.get("walletHotRank"), 999)),
@@ -16380,6 +16388,8 @@ BINANCE_WALLET_KLINE_CHAINS = {
     "bnb": ("56", "bsc"),
     "8453": ("8453", "base"),
     "base": ("8453", "base"),
+    "4663": ("4663", "robinhood"),
+    "robinhood": ("4663", "robinhood"),
     "ct_501": ("CT_501", "solana"),
     "solana": ("CT_501", "solana"),
     "sol": ("CT_501", "solana"),
@@ -16503,6 +16513,118 @@ def price_structure_candles_from_binance_wallet(
     raise RuntimeError("; ".join(errors[-2:]) or "no Binance Wallet onchain candles")
 
 
+OKX_DEX_KLINE_CHAINS = {
+    "ethereum": "1",
+    "eth": "1",
+    "1": "1",
+    "bsc": "56",
+    "bnb": "56",
+    "56": "56",
+    "base": "8453",
+    "8453": "8453",
+    "arbitrum": "42161",
+    "42161": "42161",
+    "optimism": "10",
+    "10": "10",
+    "polygon": "137",
+    "polygon_pos": "137",
+    "137": "137",
+    "avalanche": "43114",
+    "avax": "43114",
+    "43114": "43114",
+    "solana": "501",
+    "sol": "501",
+    "ct_501": "501",
+    "501": "501",
+    "robinhood": "4663",
+    "4663": "4663",
+}
+OKX_DEX_KLINE_BARS = {
+    "1m": "1m",
+    "5m": "5m",
+    "15m": "15m",
+    "1h": "1H",
+    "4h": "4H",
+    "1d": "1D",
+}
+
+
+def price_structure_candles_from_okx_dex(
+    contract_address: Any,
+    chain: Any,
+    interval: str,
+    *,
+    limit: int = 299,
+    min_rows: int = 2,
+    timeout: float = 8,
+) -> tuple[list[tuple[int, float, float, float, float, float]], str]:
+    """Fetch signed contract-first OHLCV from OKX OnchainOS Market API."""
+    contract = clean_feed_text(contract_address, 180)
+    chain_index = OKX_DEX_KLINE_CHAINS.get(str(chain or "").strip().lower(), "")
+    bar = OKX_DEX_KLINE_BARS.get(clean_feed_text(interval, 12).lower(), "")
+    api_key = str(os.getenv("OKX_DEX_API_KEY") or "").strip()
+    api_secret = str(os.getenv("OKX_DEX_SECRET_KEY") or "").strip()
+    passphrase = str(os.getenv("OKX_DEX_PASSPHRASE") or "").strip()
+    if not contract or not chain_index or not bar:
+        raise RuntimeError("unsupported OKX DEX onchain kline identity")
+    if not api_key or not api_secret or not passphrase:
+        raise RuntimeError("OKX DEX market credentials unavailable")
+
+    path = "/api/v6/dex/market/candles"
+    params = {
+        "chainIndex": chain_index,
+        "tokenContractAddress": contract.lower() if contract.lower().startswith("0x") else contract,
+        "bar": bar,
+        "limit": str(max(1, min(299, int(limit or 299)))),
+    }
+    query = urlencode(params)
+    request_path = f"{path}?{query}"
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    signature = base64.b64encode(
+        hmac.new(
+            api_secret.encode("utf-8"),
+            f"{timestamp}GET{request_path}".encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+    ).decode("ascii")
+    response = requests.get(
+        f"https://web3.okx.com{request_path}",
+        headers={
+            **HEADERS,
+            "Accept": "application/json",
+            "OK-ACCESS-KEY": api_key,
+            "OK-ACCESS-SIGN": signature,
+            "OK-ACCESS-TIMESTAMP": timestamp,
+            "OK-ACCESS-PASSPHRASE": passphrase,
+        },
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or str(payload.get("code") or "") != "0":
+        raise RuntimeError(clean_feed_text((payload or {}).get("msg") if isinstance(payload, dict) else "", 180) or "no OKX DEX candles")
+    rows = payload.get("data") if isinstance(payload.get("data"), list) else []
+    candles = [
+        (
+            int(safe_float(row[0], 0)),
+            safe_float(row[1]),
+            safe_float(row[2]),
+            safe_float(row[3]),
+            safe_float(row[4]),
+            safe_float(row[6] if len(row) > 6 else row[5]),
+        )
+        for row in rows
+        if isinstance(row, list)
+        and len(row) >= 6
+        and int(safe_float(row[0], 0)) > 0
+        and all(safe_float(row[index], 0) > 0 for index in (1, 2, 3, 4))
+    ]
+    candles.sort(key=lambda item: item[0])
+    if len(candles) < max(1, min_rows):
+        raise RuntimeError("insufficient OKX DEX structure candles")
+    return candles[-max(1, min(299, int(limit or 299))):], "OKX DEX K线"
+
+
 def price_structure_geckoterminal_network(value: Any) -> str:
     return {
         "1": "eth",
@@ -16515,6 +16637,8 @@ def price_structure_geckoterminal_network(value: Any) -> str:
         "bnb": "bsc",
         "solana": "solana",
         "base": "base",
+        "4663": "robinhood",
+        "robinhood": "robinhood",
         "arbitrum": "arbitrum",
         "optimism": "optimism",
         "polygon": "polygon_pos",
@@ -16569,31 +16693,70 @@ def price_structure_onchain_pool(
     except Exception:
         pass
 
-    # DexScreener is also queried when the ecosystem store already knows a pool:
-    # the store supplies identity, while the live response supplies liquidity and
-    # aggregate 24h turnover needed by the shared USD 10m activity gate.
+    # Resolve by contract and chain before falling back to a symbol search. This
+    # avoids same-ticker collisions and uses DexScreener's documented token-pairs
+    # endpoint whenever the chain identity is known.
     try:
-        response = requests.get(
-            (
-                f"https://api.dexscreener.com/latest/dex/tokens/{quote(contract_filter, safe='')}"
-                if contract_filter
-                else "https://api.dexscreener.com/latest/dex/search"
-            ),
-            params={} if contract_filter else {"q": symbol_key},
-            headers={**HEADERS, "Accept": "application/json"},
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        pairs = payload.get("pairs") if isinstance(payload, dict) and isinstance(payload.get("pairs"), list) else []
+        pairs: list[dict[str, Any]] = []
+        if contract_filter and requested_network:
+            try:
+                response = requests.get(
+                    (
+                        "https://api.dexscreener.com/token-pairs/v1/"
+                        f"{quote(requested_network, safe='')}/{quote(contract_filter, safe='')}"
+                    ),
+                    headers={**HEADERS, "Accept": "application/json"},
+                    timeout=timeout,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                pairs = payload if isinstance(payload, list) else []
+            except Exception:
+                pairs = []
+        if not pairs:
+            try:
+                response = requests.get(
+                    (
+                        f"https://api.dexscreener.com/latest/dex/tokens/{quote(contract_filter, safe='')}"
+                        if contract_filter
+                        else "https://api.dexscreener.com/latest/dex/search"
+                    ),
+                    params={} if contract_filter else {"q": symbol_key},
+                    headers={**HEADERS, "Accept": "application/json"},
+                    timeout=timeout,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                pairs = payload.get("pairs") if isinstance(payload, dict) and isinstance(payload.get("pairs"), list) else []
+            except Exception:
+                pairs = []
         for pair in pairs:
             if not isinstance(pair, dict):
                 continue
             base = pair.get("baseToken") if isinstance(pair.get("baseToken"), dict) else {}
+            quote_token = pair.get("quoteToken") if isinstance(pair.get("quoteToken"), dict) else {}
             base_contract = str(base.get("address") or "").strip().casefold()
+            quote_contract = str(quote_token.get("address") or "").strip().casefold()
+            matched_token = base
+            token_side = "base"
+            if contract_filter:
+                if base_contract == contract_identity:
+                    matched_token = base
+                elif quote_contract == contract_identity:
+                    matched_token = quote_token
+                    token_side = "quote"
+                else:
+                    continue
+            elif price_structure_monitor_symbol(base.get("symbol")) == symbol_key:
+                matched_token = base
+            elif price_structure_monitor_symbol(quote_token.get("symbol")) == symbol_key:
+                matched_token = quote_token
+                token_side = "quote"
+            else:
+                continue
             if (
-                (contract_filter and base_contract != contract_identity)
-                or (not contract_filter and price_structure_monitor_symbol(base.get("symbol")) != symbol_key)
+                contract_filter
+                and str(matched_token.get("address") or "").strip().casefold() != contract_identity
             ):
                 continue
             network = price_structure_geckoterminal_network(pair.get("chainId"))
@@ -16605,7 +16768,8 @@ def price_structure_onchain_pool(
             candidates.append({
                 "network": network,
                 "poolAddress": pool_address,
-                "contractAddress": str(base.get("address") or "").strip(),
+                "contractAddress": str(matched_token.get("address") or "").strip(),
+                "tokenSide": token_side,
                 "liquidityUsd": safe_float((pair.get("liquidity") or {}).get("usd"), 0),
                 "volume24hUsd": safe_float((pair.get("volume") or {}).get("h24"), 0),
                 "source": "DexScreener 链上主池",
@@ -16647,7 +16811,11 @@ def price_structure_onchain_pool(
             "poolCount": len(selected_group.get("pools") or []),
         }
     with PRICE_STRUCTURE_ONCHAIN_POOL_CACHE_LOCK:
-        PRICE_STRUCTURE_ONCHAIN_POOL_CACHE[cache_key] = (time.time(), dict(selected))
+        if selected:
+            PRICE_STRUCTURE_ONCHAIN_POOL_CACHE[cache_key] = (time.time(), dict(selected))
+        else:
+            # A transient resolver outage must not turn into a ten-minute blank card.
+            PRICE_STRUCTURE_ONCHAIN_POOL_CACHE.pop(cache_key, None)
     return dict(selected)
 
 
@@ -16677,42 +16845,80 @@ def price_structure_geckoterminal_base_candles(
 ) -> list[tuple[int, float, float, float, float, float]]:
     network = str(pool.get("network") or "").strip()
     pool_address = str(pool.get("poolAddress") or "").strip()
-    cache_key = f"{network}:{pool_address.lower()}:{timeframe}"
+    token_side = "quote" if str(pool.get("tokenSide") or "").lower() == "quote" else "base"
+    cache_key = f"{network}:{pool_address.lower()}:{token_side}:{timeframe}"
     now = time.time()
     with PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE_LOCK:
         cached = PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE.get(cache_key)
-    if cached and now - cached[0] < PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE_TTL_SECONDS:
-        return list(cached[1])
+        if cached and now - cached[0] < PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE_TTL_SECONDS:
+            return list(cached[1])
+        cached_error = PRICE_STRUCTURE_ONCHAIN_CANDLE_ERROR_CACHE.get(cache_key)
+        if cached_error and now - cached_error[0] < PRICE_STRUCTURE_ONCHAIN_CANDLE_ERROR_TTL_SECONDS:
+            raise RuntimeError(cached_error[1])
+        inflight = PRICE_STRUCTURE_ONCHAIN_CANDLE_INFLIGHT.get(cache_key)
+        owner = inflight is None
+        if owner:
+            inflight = threading.Event()
+            PRICE_STRUCTURE_ONCHAIN_CANDLE_INFLIGHT[cache_key] = inflight
 
-    # Never hold the global candle-cache lock while waiting on the network.
-    # One slow pool used to serialize every other symbol behind it and leave
-    # the whole structure page showing stale provider errors for minutes.
-    response = requests.get(
-        f"https://api.geckoterminal.com/api/v2/networks/{network}/pools/{pool_address}/ohlcv/{timeframe}",
-        params={"aggregate": 1, "limit": 300, "currency": "usd", "token": "base"},
-        headers={**HEADERS, "Accept": "application/json"},
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    attributes = ((payload.get("data") or {}).get("attributes") or {}) if isinstance(payload, dict) else {}
-    rows = attributes.get("ohlcv_list") if isinstance(attributes.get("ohlcv_list"), list) else []
-    candles = [
-        (
-            int(safe_float(row[0], 0) * 1000),
-            safe_float(row[1]),
-            safe_float(row[2]),
-            safe_float(row[3]),
-            safe_float(row[4]),
-            safe_float(row[5]),
+    if not owner:
+        if not inflight.wait(max(1.0, timeout + 2)):
+            raise RuntimeError("GeckoTerminal candle request still in progress")
+        with PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE_LOCK:
+            cached = PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE.get(cache_key)
+            cached_error = PRICE_STRUCTURE_ONCHAIN_CANDLE_ERROR_CACHE.get(cache_key)
+        if cached and time.time() - cached[0] < PRICE_STRUCTURE_ONCHAIN_CANDLE_STALE_TTL_SECONDS:
+            return list(cached[1])
+        raise RuntimeError(cached_error[1] if cached_error else "GeckoTerminal candle request failed")
+
+    # One request per pool/timeframe serves every concurrent structure interval.
+    # This preserves parallelism between different assets without hitting the
+    # public API four times for the same minute/hour base series.
+    try:
+        response = requests.get(
+            f"https://api.geckoterminal.com/api/v2/networks/{network}/pools/{pool_address}/ohlcv/{timeframe}",
+            params={
+                "aggregate": 1,
+                "limit": 300,
+                "currency": "usd",
+                "token": token_side,
+            },
+            headers={**HEADERS, "Accept": "application/json"},
+            timeout=timeout,
         )
-        for row in rows
-        if isinstance(row, list) and len(row) >= 6
-    ]
-    candles.sort(key=lambda item: item[0])
-    with PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE_LOCK:
-        PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE[cache_key] = (time.time(), candles)
-    return list(candles)
+        response.raise_for_status()
+        payload = response.json()
+        attributes = ((payload.get("data") or {}).get("attributes") or {}) if isinstance(payload, dict) else {}
+        rows = attributes.get("ohlcv_list") if isinstance(attributes.get("ohlcv_list"), list) else []
+        candles = [
+            (
+                int(safe_float(row[0], 0) * 1000),
+                safe_float(row[1]),
+                safe_float(row[2]),
+                safe_float(row[3]),
+                safe_float(row[4]),
+                safe_float(row[5]),
+            )
+            for row in rows
+            if isinstance(row, list) and len(row) >= 6
+        ]
+        candles.sort(key=lambda item: item[0])
+        with PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE_LOCK:
+            PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE[cache_key] = (time.time(), candles)
+            PRICE_STRUCTURE_ONCHAIN_CANDLE_ERROR_CACHE.pop(cache_key, None)
+        return list(candles)
+    except Exception as exc:
+        error = safe_error_text(str(exc)) or "GeckoTerminal candle request failed"
+        with PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE_LOCK:
+            PRICE_STRUCTURE_ONCHAIN_CANDLE_ERROR_CACHE[cache_key] = (time.time(), error)
+        if cached and time.time() - cached[0] < PRICE_STRUCTURE_ONCHAIN_CANDLE_STALE_TTL_SECONDS:
+            return list(cached[1])
+        raise
+    finally:
+        with PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE_LOCK:
+            event = PRICE_STRUCTURE_ONCHAIN_CANDLE_INFLIGHT.pop(cache_key, None)
+            if event:
+                event.set()
 
 
 def price_structure_candles_from_geckoterminal(
@@ -17142,7 +17348,9 @@ def price_structure_watch_rows() -> list[dict[str, Any]]:
     )
     now_ms = int(time.time() * 1000)
     priority_cutoff = now_ms - PRICE_WATCH_RETENTION_SECONDS * 1000
-    wallet_rows = binance_wallet_4h_structure_rows(now_ms=now_ms)
+    wallet_rows = filter_price_monitor_rows_by_activity(
+        binance_wallet_4h_structure_rows(now_ms=now_ms)
+    )
     wallet_by_symbol = {
         price_structure_monitor_symbol(row.get("symbol") or row.get("name")): row
         for row in wallet_rows
@@ -17999,6 +18207,16 @@ def fetch_price_structure_item(
             True,
         ),
         (
+            "OKX DEX K线",
+            lambda value, min_rows: price_structure_candles_from_okx_dex(
+                row.get("contractAddress"), row.get("chain"), value,
+                limit=min(299, PRICE_STRUCTURE_CANDLE_LIMIT), min_rows=min_rows,
+                timeout=request_timeout,
+            ),
+            0,
+            True,
+        ),
+        (
             "链上 K线",
             lambda value, min_rows: price_structure_candles_from_geckoterminal(
                 symbol, value, limit=PRICE_STRUCTURE_CANDLE_LIMIT, min_rows=min_rows,
@@ -18054,11 +18272,21 @@ def fetch_price_structure_item(
                 fetched_by_key: dict[str, list[tuple[int, float, float, float, float, float]]] = {}
                 for future in as_completed(timeframe_futures):
                     key = timeframe_futures[future]
-                    candles, _ = future.result()
-                    fetched_by_key[key] = candles
+                    try:
+                        candles, _ = future.result()
+                        fetched_by_key[key] = candles
+                    except Exception as timeframe_exc:
+                        if not (allow_short_history or provider_allows_short_history):
+                            raise
+                        errors.append(
+                            f"{provider_name} {key}: {safe_error_text(str(timeframe_exc))[:120]}"
+                        )
+            if not fetched_by_key:
+                raise RuntimeError(f"{provider_name} did not return any timeframe")
             timeframes = {
                 key: fetched_by_key[key]
                 for key, _label, *_provider_values in requested_timeframes
+                if key in fetched_by_key
             }
             for price_key in ("1m", "1h", "4h", "1d"):
                 if timeframes.get(price_key):
@@ -19249,9 +19477,15 @@ def price_monitor_market_activity_state(
     }
 
 
-def price_structure_onchain_activity_state(symbol_value: Any, *, timeout: float = 5) -> dict[str, Any]:
-    """Resolve aggregate DEX turnover for personal-X assets absent from CEX activity maps."""
-    symbol = clean_price_watch_symbol(symbol_value)
+def price_structure_onchain_activity_state(
+    symbol_value: Any,
+    *,
+    contract_address: Any = "",
+    chain: Any = "",
+    timeout: float = 5,
+) -> dict[str, Any]:
+    """Resolve aggregate DEX turnover by contract before falling back to a ticker."""
+    symbol = price_structure_monitor_symbol(symbol_value)
     if not symbol:
         return {
             "active": True,
@@ -19261,7 +19495,12 @@ def price_structure_onchain_activity_state(symbol_value: Any, *, timeout: float 
             "source": "",
             "thresholdUsd": NEW_COIN_LOW_MIN_TURNOVER_24H_USD,
         }
-    pool = price_structure_onchain_pool(symbol, timeout=timeout)
+    pool = price_structure_onchain_pool(
+        symbol,
+        contract_address=contract_address,
+        chain=chain,
+        timeout=timeout,
+    )
     if not pool:
         return {
             "active": True,
@@ -19294,27 +19533,39 @@ def filter_price_monitor_rows_by_activity(rows: list[dict[str, Any]]) -> list[di
     now_ms = int(time.time() * 1000)
     personal_x_cutoff = now_ms - PERSONAL_X_MONITOR_RETENTION_SECONDS * 1000
     states = {
-        clean_price_watch_symbol(row.get("symbol")): price_monitor_market_activity_state(row.get("symbol"), activity)
+        price_structure_monitor_symbol(row.get("symbol")): price_monitor_market_activity_state(row.get("symbol"), activity)
         for row in rows
-        if clean_price_watch_symbol(row.get("symbol"))
+        if price_structure_monitor_symbol(row.get("symbol"))
     }
     onchain_rows = [
         row
         for row in rows
-        if int(safe_float(row.get("personal_x_mentioned_at"), 0)) >= personal_x_cutoff
+        if (
+            clean_feed_text(row.get("contractAddress"), 180)
+            or int(safe_float(row.get("personal_x_mentioned_at"), 0)) >= personal_x_cutoff
+        )
         and (
-            states.get(clean_price_watch_symbol(row.get("symbol")), {}).get("status") == "unavailable"
-            or not states.get(clean_price_watch_symbol(row.get("symbol")), {}).get("active", True)
+            states.get(price_structure_monitor_symbol(row.get("symbol")), {}).get("status") == "unavailable"
+            or not states.get(price_structure_monitor_symbol(row.get("symbol")), {}).get("active", True)
+            or clean_feed_text(row.get("contractAddress"), 180)
         )
     ]
     if onchain_rows:
         with ThreadPoolExecutor(max_workers=min(4, len(onchain_rows))) as executor:
             futures = {
-                executor.submit(price_structure_onchain_activity_state, row.get("symbol")): clean_price_watch_symbol(row.get("symbol"))
+                executor.submit(
+                    price_structure_onchain_activity_state,
+                    row.get("symbol"),
+                    contract_address=row.get("contractAddress"),
+                    chain=row.get("chain"),
+                ): (
+                    price_structure_monitor_symbol(row.get("symbol")),
+                    bool(clean_feed_text(row.get("contractAddress"), 180)),
+                )
                 for row in onchain_rows
             }
             for future in as_completed(futures):
-                symbol = futures[future]
+                symbol, contract_bound = futures[future]
                 try:
                     onchain_state = future.result()
                 except Exception:
@@ -19323,7 +19574,8 @@ def filter_price_monitor_rows_by_activity(rows: list[dict[str, Any]]) -> list[di
                 if onchain_state.get("status") == "unavailable":
                     continue
                 if (
-                    onchain_state.get("active")
+                    contract_bound
+                    or onchain_state.get("active")
                     or current_state.get("status") == "unavailable"
                     or safe_float(onchain_state.get("turnover24hUsd"), 0)
                     > safe_float(current_state.get("turnover24hUsd"), 0)
@@ -19333,7 +19585,7 @@ def filter_price_monitor_rows_by_activity(rows: list[dict[str, Any]]) -> list[di
     excluded = 0
     unavailable = 0
     for row in rows:
-        state = states.get(clean_price_watch_symbol(row.get("symbol"))) or price_monitor_market_activity_state(
+        state = states.get(price_structure_monitor_symbol(row.get("symbol"))) or price_monitor_market_activity_state(
             row.get("symbol"), activity
         )
         if state["status"] == "unavailable":

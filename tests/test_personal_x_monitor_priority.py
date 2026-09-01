@@ -190,7 +190,7 @@ class PersonalXMonitorPriorityTests(unittest.TestCase):
 
         self.assertEqual(structure_rows[0]["symbol"], "PONS")
         self.assertEqual(structure_rows[0]["marketActivity"]["source"], "DexScreener 链上聚合")
-        fallback.assert_called_once_with("PONS")
+        fallback.assert_called_once_with("PONS", contract_address=None, chain=None)
 
     def test_onchain_pool_aggregates_same_contract_volume_across_pools(self):
         response = Mock()

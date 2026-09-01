@@ -1,5 +1,6 @@
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
 import server
@@ -577,7 +578,8 @@ class PriceStructureRecognitionTests(unittest.TestCase):
     def test_fast_provider_fallback_reaches_gate_and_htx_before_giving_up(self):
         providers = [
             ("Binance Futures",), ("OKX Swap",), ("Bitget Futures",), ("KuCoin Spot",), ("Gate Futures",),
-            ("HTX Futures",), ("Aster Futures",), ("Hyperliquid",), ("Trade.xyz",), ("链上 K线",),
+            ("HTX Futures",), ("Aster Futures",), ("Hyperliquid",), ("Trade.xyz",),
+            ("Binance Wallet K线",), ("OKX DEX K线",), ("链上 K线",),
         ]
         preferred = "OKX Swap"
         ordered = sorted(providers, key=lambda provider: 0 if provider[0] == preferred else 1)
@@ -592,6 +594,7 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         self.assertIn("KuCoin Spot", first_names)
         self.assertIn("Hyperliquid", second_names)
         self.assertIn("Trade.xyz", second_names)
+        self.assertIn("OKX DEX K线", second_names)
         self.assertIn("链上 K线", second_names)
         self.assertEqual(server.PRICE_STRUCTURE_FAST_PROVIDER_LIMIT, 6)
 
@@ -669,6 +672,7 @@ class PriceStructureRecognitionTests(unittest.TestCase):
                     "price_structure_candles_from_bitget", "price_structure_candles_from_gate",
                     "price_structure_candles_from_kucoin", "price_structure_candles_from_htx", "price_structure_candles_from_aster",
                     "price_structure_candles_from_hyperliquid", "price_structure_candles_from_binance_wallet",
+                    "price_structure_candles_from_okx_dex",
                     "price_structure_candles_from_geckoterminal",
                 )
             ]
@@ -722,6 +726,143 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         self.assertEqual(request.call_args.kwargs["params"]["chainId"], "CT_501")
         self.assertEqual(request.call_args.kwargs["params"]["interval"], "1h")
 
+    def test_robinhood_chain_identity_is_supported_by_wallet_and_gecko(self):
+        self.assertEqual(server.BINANCE_WALLET_KLINE_CHAINS["4663"], ("4663", "robinhood"))
+        self.assertEqual(server.price_structure_geckoterminal_network("4663"), "robinhood")
+
+    def test_dexscreener_resolves_robinhood_contract_before_symbol_search(self):
+        contract = "0x9fe1a89c2b5a702dd2f5eb9f783a08e3d6cec737"
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = [{
+            "chainId": "robinhood",
+            "pairAddress": "0xpool",
+            "baseToken": {"address": "0xother", "symbol": "USD"},
+            "quoteToken": {"address": contract, "symbol": "FABLE"},
+            "liquidity": {"usd": 72_000},
+            "volume": {"h24": 20_300_000},
+        }]
+        with server.PRICE_STRUCTURE_ONCHAIN_POOL_CACHE_LOCK:
+            server.PRICE_STRUCTURE_ONCHAIN_POOL_CACHE.clear()
+        try:
+            with (
+                patch.object(server.CHAIN_ECOSYSTEM_MONITOR.store, "list_chains", return_value=[]),
+                patch.object(server.requests, "get", return_value=response) as request,
+            ):
+                pool = server.price_structure_onchain_pool(
+                    "FABLE", contract_address=contract, chain="4663"
+                )
+        finally:
+            with server.PRICE_STRUCTURE_ONCHAIN_POOL_CACHE_LOCK:
+                server.PRICE_STRUCTURE_ONCHAIN_POOL_CACHE.clear()
+
+        self.assertIn("/token-pairs/v1/robinhood/", request.call_args.args[0])
+        self.assertEqual(pool["network"], "robinhood")
+        self.assertEqual(pool["contractAddress"], contract)
+        self.assertEqual(pool["tokenSide"], "quote")
+        self.assertEqual(pool["volume24hUsd"], 20_300_000)
+
+    def test_dexscreener_contract_fallback_survives_primary_endpoint_timeout(self):
+        contract = "0xeb9e768c42d6f5b08d34980c6f721494372a7777"
+        fallback = Mock()
+        fallback.raise_for_status.return_value = None
+        fallback.json.return_value = {"pairs": [{
+            "chainId": "bsc",
+            "pairAddress": "0xpool",
+            "baseToken": {"address": contract, "symbol": "CAILI"},
+            "quoteToken": {"address": "0xusd", "symbol": "USDT"},
+            "liquidity": {"usd": 76_000},
+            "volume": {"h24": 3_700_000},
+        }]}
+        with server.PRICE_STRUCTURE_ONCHAIN_POOL_CACHE_LOCK:
+            server.PRICE_STRUCTURE_ONCHAIN_POOL_CACHE.clear()
+        try:
+            with (
+                patch.object(server.CHAIN_ECOSYSTEM_MONITOR.store, "list_chains", return_value=[]),
+                patch.object(
+                    server.requests,
+                    "get",
+                    side_effect=[server.requests.Timeout("primary timeout"), fallback],
+                ) as request,
+            ):
+                pool = server.price_structure_onchain_pool(
+                    "CAILI", contract_address=contract, chain="56"
+                )
+        finally:
+            with server.PRICE_STRUCTURE_ONCHAIN_POOL_CACHE_LOCK:
+                server.PRICE_STRUCTURE_ONCHAIN_POOL_CACHE.clear()
+
+        self.assertEqual(request.call_count, 2)
+        self.assertIn("/latest/dex/tokens/", request.call_args_list[1].args[0])
+        self.assertEqual(pool["volume24hUsd"], 3_700_000)
+
+    def test_okx_dex_contract_kline_is_signed_and_sorted(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "code": "0",
+            "data": [
+                ["1800000060000", "1.1", "1.3", "1.0", "1.2", "10", "12", "1"],
+                ["1800000000000", "1.0", "1.2", "0.9", "1.1", "9", "10", "1"],
+            ],
+        }
+        env = {
+            "OKX_DEX_API_KEY": "key",
+            "OKX_DEX_SECRET_KEY": "secret",
+            "OKX_DEX_PASSPHRASE": "passphrase",
+        }
+        with patch.dict(server.os.environ, env, clear=False), patch.object(
+            server.requests, "get", return_value=response
+        ) as request:
+            rows, provider = server.price_structure_candles_from_okx_dex(
+                "0xABCDEF", "4663", "1h", limit=2, min_rows=2
+            )
+
+        url = request.call_args.args[0]
+        headers = request.call_args.kwargs["headers"]
+        self.assertEqual(provider, "OKX DEX K线")
+        self.assertIn("chainIndex=4663", url)
+        self.assertIn("tokenContractAddress=0xabcdef", url)
+        self.assertIn("bar=1H", url)
+        self.assertTrue(headers["OK-ACCESS-SIGN"])
+        self.assertEqual(rows[0][0], 1_800_000_000_000)
+        self.assertEqual(rows[-1][5], 12.0)
+
+    def test_geckoterminal_coalesces_concurrent_base_candle_requests(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "data": {"attributes": {"ohlcv_list": [
+                [1_800_000_000, 1.0, 1.2, 0.9, 1.1, 100.0],
+                [1_800_000_060, 1.1, 1.3, 1.0, 1.2, 120.0],
+            ]}}
+        }
+        pool = {"network": "robinhood", "poolAddress": "0xpool", "tokenSide": "base"}
+        with server.PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE_LOCK:
+            server.PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE.clear()
+            server.PRICE_STRUCTURE_ONCHAIN_CANDLE_ERROR_CACHE.clear()
+            server.PRICE_STRUCTURE_ONCHAIN_CANDLE_INFLIGHT.clear()
+
+        def delayed_response(*_args, **_kwargs):
+            time.sleep(0.05)
+            return response
+
+        try:
+            with patch.object(server.requests, "get", side_effect=delayed_response) as request:
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    results = list(executor.map(
+                        lambda _index: server.price_structure_geckoterminal_base_candles(pool, "minute"),
+                        range(4),
+                    ))
+        finally:
+            with server.PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE_LOCK:
+                server.PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE.clear()
+                server.PRICE_STRUCTURE_ONCHAIN_CANDLE_ERROR_CACHE.clear()
+                server.PRICE_STRUCTURE_ONCHAIN_CANDLE_INFLIGHT.clear()
+
+        self.assertEqual(request.call_count, 1)
+        self.assertTrue(all(len(rows) == 2 for rows in results))
+
     def test_contract_asset_prefers_binance_wallet_kline_before_exchange_symbol_probes(self):
         market_rows = candles([0.1 + index * 0.001 for index in range(80)])
         strategy_payload = {
@@ -752,6 +893,37 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         self.assertEqual(wallet_kline.call_count, len(server.PRICE_STRUCTURE_TIMEFRAMES))
         binance_futures.assert_not_called()
 
+    def test_recent_contract_asset_keeps_partial_timeframes_when_daily_history_is_not_ready(self):
+        market_rows = candles([0.1, 0.11, 0.12])
+
+        def wallet_kline(_contract, _chain, interval, **_kwargs):
+            if interval == "1d":
+                raise RuntimeError("only one daily candle")
+            return market_rows, "Binance Wallet K线"
+
+        strategy_payload = {
+            "ok": True,
+            "strategyVersion": "shared-engine-live",
+            "frames": [],
+            "signals": [],
+            "alertHints": [],
+        }
+        with (
+            patch.object(server, "price_structure_allows_short_history", return_value=True),
+            patch.object(server, "price_structure_candles_from_binance_wallet", side_effect=wallet_kline),
+            patch.object(server, "run_dragon_wave_monitor_strategy", return_value=strategy_payload) as strategy,
+        ):
+            item = server.fetch_price_structure_item({
+                "symbol": "FABLE",
+                "chain": "4663",
+                "contractAddress": "0x9fe1a89c2b5a702dd2f5eb9f783a08e3d6cec737",
+            })
+
+        self.assertEqual(item["provider"], "Binance Wallet K线")
+        observed = strategy.call_args.args[0]
+        self.assertEqual(set(observed), {"1m", "5m", "15m", "1h", "4h"})
+        self.assertNotIn("1d", observed)
+
     def test_structure_cache_identity_does_not_change_with_display_order(self):
         rows = [
             {"symbol": "CHIP", "structure1mOverride": 1, "structureIntervalOverrides": {}},
@@ -777,6 +949,58 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         self.assertEqual(filtered[1]["marketActivity"]["status"], "unavailable")
         self.assertEqual(server.PRICE_MONITOR_ACTIVITY_SUMMARY["excluded"], 1)
         self.assertEqual(server.PRICE_MONITOR_ACTIVITY_SUMMARY["thresholdUsd"], 10_000_000)
+
+    def test_contract_turnover_replaces_same_ticker_cex_activity(self):
+        rows = [{
+            "symbol": "FGL",
+            "chain": "4663",
+            "contractAddress": "0xf5e42fcad8342a80c0ca400be26f54a455f41316",
+        }]
+        cex_activity = {"FGL": {"turnover24hUsd": 20_000_000, "source": "Binance"}}
+        onchain_state = {
+            "active": False,
+            "status": "inactive",
+            "reason": "onchain-turnover-below-threshold",
+            "turnover24hUsd": 4_300_000,
+            "source": "DexScreener 链上聚合",
+            "thresholdUsd": 10_000_000,
+        }
+        with patch.object(
+            server, "fetch_new_coin_low_market_activity", return_value=cex_activity
+        ), patch.object(
+            server, "price_structure_onchain_activity_state", return_value=onchain_state
+        ) as onchain:
+            filtered = server.filter_price_monitor_rows_by_activity(rows)
+
+        self.assertEqual(filtered, [])
+        self.assertEqual(onchain.call_args.kwargs["contract_address"], rows[0]["contractAddress"])
+        self.assertEqual(onchain.call_args.kwargs["chain"], "4663")
+
+    def test_unicode_contract_symbols_keep_independent_onchain_activity(self):
+        rows = [
+            {"symbol": "彩礼币", "chain": "56", "contractAddress": "0xcaili"},
+            {"symbol": "金猫", "chain": "56", "contractAddress": "0jmao"},
+        ]
+
+        def state_for(symbol, **_kwargs):
+            active = symbol == "金猫"
+            return {
+                "active": active,
+                "status": "active" if active else "inactive",
+                "reason": "test",
+                "turnover24hUsd": 12_000_000 if active else 3_000_000,
+                "source": "DexScreener 链上聚合",
+                "thresholdUsd": 10_000_000,
+            }
+
+        with patch.object(
+            server, "fetch_new_coin_low_market_activity", return_value={}
+        ), patch.object(
+            server, "price_structure_onchain_activity_state", side_effect=state_for
+        ):
+            filtered = server.filter_price_monitor_rows_by_activity(rows)
+
+        self.assertEqual([row["symbol"] for row in filtered], ["金猫"])
 
     def test_broadcast_qualification_rejects_formal_and_prearm_exits(self):
         rejected = {"eligible": False, "reason": "deep-legacy-no-new-wave", "allowedIntervals": []}

@@ -29,7 +29,7 @@
 
 ## 功能概览
 
-- **热门榜**：Binance、OKX、Bitget、AIcoin、OKX DEX、港股、美股、A 股同花顺热榜。
+- **热门榜**：Binance、OKX、Bitget、AIcoin、OKX DEX、币安钱包、港股、美股、A 股同花顺热榜；各榜保持独立卡片和原有布局。
 - **涨幅榜**：按交易所和市场拆分展示，不做混合榜；支持榜首异动提醒。
 - **成交额榜**：按交易所和市场独立展示资金最集中的标的。
 - **新币新股**：交易所新币、新合约、IPO、港美 A 新股集中展示，高热标的红色标注。
@@ -39,6 +39,8 @@
 - **RSS / 公众号**：支持 RSS、Atom、JSON Feed，以及参考 WeWe RSS 逻辑的微信公众号订阅。
 - **X KOL 追踪**：追踪指定 KOL 动态，正文和引用分开展示，支持桌面提醒。
 - **公链生态监控**：按 L0-L3 市场树跟踪新链生态、市场 Top5、潜在发币项目和高价值变化提醒，内置 Robinhood Chain 样例。
+- **多周期结构监控**：持续跟踪 AIcoin、个人 X 和币安钱包 4 小时榜入池标的；链上币按链 ID 与合约地址解析，低于 1000 万美元 24 小时成交额的标的统一剔除。
+- **News Trade**：按发布时间展示事件与链上标的，包含安全检查、手续费/滑点预估、钱包授权和人工确认后的买入准备流程。
 - **TodoList**：项目分组、任务增删改查、今日提醒，按用户隔离数据。
 - **账号系统**：账号密码、邮箱验证码、Google OAuth，支持用户资料和交易所 UID 绑定。
 - **桌面弹窗**：市场异动、快讯、RSS、X 动态、Todo 提醒、公众号授权失效均可弹窗。
@@ -140,6 +142,8 @@ docker compose down
 
 “监控 → 多周期结构”和起爆台共用仓库中的当前策略实现，不维护第二套监控专用规则。服务端通过 `tools/dragon_wave_monitor_bridge.js` 调用 `dragon-wave-engine.js`、`dragon-wave-cases.js`、`dragon-wave-data.js`、`dragon-wave-feedback.js` 和 `dragon-wave-vision.js`，因此后续策略优化会自动同步到结构监控。
 
+链上标的使用“链 ID + 合约地址”作为第一身份，行情按 Binance Wallet K 线、可选的 OKX OnchainOS DEX K 线、GeckoTerminal OHLCV 轮换；DexScreener 用于解析主池并聚合同一合约的流动性与 24 小时成交额。Robinhood Chain 的 `4663`、BSC、Ethereum、Base、Solana 等常用链均有显式映射。极新代币尚未形成日线时会保留已经可用的分钟、小时和 4 小时数据，不再因为单个周期历史不足让整张卡片失败。
+
 默认扫描 1 分钟、5 分钟、15 分钟、1 小时、4 小时和日线；1 小时、4 小时识别出的三角、降楔等有效结构突破按 B 点处理。主升浪或主升浪预期、人工反馈、多周期共振以及已确认案例的回归保护，也都由同一策略引擎统一判定。
 
 Docker 镜像已内置 Node.js；直接本地运行时请确保 `node --version` 可用，也可以通过 `DRAGON_WAVE_NODE_BINARY` 指定 Node.js 可执行文件。结构监控接口为 `/api/price-structures`，起爆台页面为 `/dragon-wave.html`。
@@ -157,6 +161,7 @@ Docker 镜像已内置 Node.js；直接本地运行时请确保 `node --version`
 - `X_BEARER_TOKEN`：X KOL 官方 API。
 - `WECHAT_*`：微信公众号订阅授权。
 - `OKX_*` / `BITGET_*` / `AICOIN_*`：交易所和客户端数据源配置。
+- `OKX_DEX_API_KEY` / `OKX_DEX_SECRET_KEY` / `OKX_DEX_PASSPHRASE`：可选的 OKX OnchainOS 行情密钥，用于增加链上合约 K 线备用源；未配置时自动跳过。
 - `CHAIN_ECOSYSTEM_REFRESH_SECONDS`：公链生态后台扫描间隔，默认 300 秒；数据源连续失败时会自动退避。
 - `XINGYUN_DISABLE_CHAIN_ECOSYSTEM_MONITOR`：设为 `1` 可暂停公链生态后台扫描。
 - `GITHUB_TOKEN`：可选，仅用于提高手动添加项目仓库的 GitHub 公共接口额度。
@@ -257,3 +262,5 @@ Copyright (c) 2026 星云社。
 QQ 群监控默认通过本机 NapCat / OneBot 11 接口工作，不需要 QQ 窗口保持可见。系统使用 WebSocket 接收实时群消息，并定时调用 `get_group_msg_history` 回补服务重启或短暂断线期间的消息；群名、发送人过滤、币种提取、去重、结构监控入池和微信转发仍由原有业务链路处理。
 
 安全约束：HTTP 与 WebSocket 必须只监听 `127.0.0.1`，两个接口使用相同 Token，禁止将端口暴露到局域网或公网。运行配置位于 `.env`：`QQ_ONEBOT_HTTP_URL`、`QQ_ONEBOT_WS_URL`、`QQ_ONEBOT_TOKEN`。确认 OneBot 连通后保持 `QQ_UI_FALLBACK_ENABLED=0`，避免重新依赖窗口或 OCR。
+
+`QQ_ONEBOT_RECOVERY_ENABLED` 默认必须保持为 `0`。这样 OneBot 断线只会显示通道不可用，不会结束、隐藏启动或抢占用户手动登录的 QQ。只有使用独立 QQ 账号的无人值守环境才应显式设为 `1`；即使开启，恢复脚本也只管理 NapCat 自己的进程树，检测到普通 QQ 正在运行时会跳过后台拉起。

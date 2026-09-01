@@ -1,6 +1,8 @@
 import json
+import os
+from pathlib import Path
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from qq_onebot_bridge import (
     QQOneBotBridge,
@@ -8,6 +10,7 @@ from qq_onebot_bridge import (
     QQOneBotSupervisor,
     flatten_onebot_message,
     normalize_group_event,
+    onebot_recovery_enabled,
 )
 
 
@@ -35,6 +38,23 @@ class FakeSession:
 
 
 class QQOneBotBridgeTests(unittest.TestCase):
+    def test_local_recovery_is_opt_in(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("QQ_ONEBOT_RECOVERY_ENABLED", None)
+            self.assertFalse(onebot_recovery_enabled())
+
+        with patch.dict(os.environ, {"QQ_ONEBOT_RECOVERY_ENABLED": "1"}, clear=False):
+            self.assertEqual(onebot_recovery_enabled(), os.name == "nt")
+
+    def test_recovery_script_protects_interactive_qq(self):
+        script = (Path(__file__).resolve().parents[1] / "tools" / "recover_napcat_bridge.ps1").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("status = 'manual_qq_active'", script)
+        self.assertIn("$command -notmatch $accountPattern", script)
+        self.assertNotIn("$path.StartsWith($qqDirectory", script)
+
     def test_supervisor_recovers_only_after_sustained_health_failures(self):
         bridge = Mock()
         bridge.health.side_effect = [

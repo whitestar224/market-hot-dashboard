@@ -25,7 +25,6 @@ function Test-OneBotPorts {
 
 $runtimePath = (Resolve-Path -LiteralPath $RuntimeDir).Path.TrimEnd('\')
 $qqExecutable = (Resolve-Path -LiteralPath $QqPath).Path
-$qqDirectory = Split-Path -Parent $qqExecutable
 $launcher = Join-Path $runtimePath 'launcher.bat'
 $napcatExecutable = Join-Path $runtimePath 'NapCatWinBootMain.exe'
 
@@ -43,24 +42,37 @@ if (Test-OneBotPorts) {
     exit 0
 }
 
-$managed = @(
-    Get-Process -ErrorAction SilentlyContinue |
-        Where-Object {
-            if ($_.HasExited) { return $false }
-            try {
-                $path = $_.Path
-            } catch {
-                return $false
-            }
-            if (-not $path) { return $false }
-            return $path.Equals($napcatExecutable, [System.StringComparison]::OrdinalIgnoreCase) -or
-                $path.StartsWith($qqDirectory + '\', [System.StringComparison]::OrdinalIgnoreCase)
-        }
+$processSnapshot = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+$accountPattern = '(?i)(?:^|\s)-q\s+' + [regex]::Escape($Account) + '(?:\s|$)'
+$managedRoots = @(
+    $processSnapshot | Where-Object {
+        $path = [string]$_.ExecutablePath
+        $command = [string]$_.CommandLine
+        ($path -and $path.Equals($napcatExecutable, [System.StringComparison]::OrdinalIgnoreCase)) -or
+        ($path -and $path.Equals($qqExecutable, [System.StringComparison]::OrdinalIgnoreCase) -and $command -match $accountPattern)
+    }
 )
 
-# Stop only binaries resolved inside the configured QQ directory or the exact NapCat runtime.
-# Children are stopped before their parents to avoid the half-exited QQ state blocking a new login.
-$ordered = @($managed | Sort-Object @{ Expression = { if ($_.Path -ieq $napcatExecutable) { 2 } elseif ($_.Path -ieq $qqExecutable) { 1 } else { 0 } } })
+# Only the exact NapCat process tree and QQ instances carrying NapCat's `-q <account>`
+# marker are managed. A normal QQ process from the same install directory is never touched.
+$managedIds = [System.Collections.Generic.HashSet[int]]::new()
+$queue = [System.Collections.Generic.Queue[int]]::new()
+foreach ($root in $managedRoots) {
+    if ($managedIds.Add([int]$root.ProcessId)) { $queue.Enqueue([int]$root.ProcessId) }
+}
+while ($queue.Count -gt 0) {
+    $parentId = $queue.Dequeue()
+    foreach ($child in $processSnapshot | Where-Object { [int]$_.ParentProcessId -eq $parentId }) {
+        if ($managedIds.Add([int]$child.ProcessId)) { $queue.Enqueue([int]$child.ProcessId) }
+    }
+}
+
+$managed = @(
+    Get-Process -Id @($managedIds) -ErrorAction SilentlyContinue |
+        Where-Object { -not $_.HasExited }
+)
+$napcatRootIds = @($managedRoots | Where-Object { ([string]$_.ExecutablePath) -ieq $napcatExecutable } | ForEach-Object { [int]$_.ProcessId })
+$ordered = @($managed | Sort-Object @{ Expression = { if ($napcatRootIds -contains $_.Id) { 1 } else { 0 } } })
 foreach ($process in $ordered) {
     Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
 }
@@ -72,10 +84,7 @@ do {
             Where-Object {
                 if ($_.HasExited) { return $false }
                 try { $path = $_.Path } catch { return $false }
-                return $path -and (
-                    $path.Equals($napcatExecutable, [System.StringComparison]::OrdinalIgnoreCase) -or
-                    $path.StartsWith($qqDirectory + '\', [System.StringComparison]::OrdinalIgnoreCase)
-                )
+                return $managedIds.Contains([int]$_.Id)
             }
     )
     if (-not $remaining) { break }
@@ -84,6 +93,27 @@ do {
 
 if ($remaining) {
     throw "QQ residual processes could not be terminated: $($remaining.Id -join ',')"
+}
+
+$manualQq = @(
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $path = [string]$_.ExecutablePath
+            $command = [string]$_.CommandLine
+            $path -and
+                $path.Equals($qqExecutable, [System.StringComparison]::OrdinalIgnoreCase) -and
+                $command -notmatch $accountPattern
+        }
+)
+if ($manualQq) {
+    @{
+        ok = $true
+        status = 'manual_qq_active'
+        changed = ($managed.Count -gt 0)
+        stopped = $managed.Count
+        skippedLaunch = $true
+    } | ConvertTo-Json -Compress
+    exit 0
 }
 
 Start-Process -FilePath 'cmd.exe' `
