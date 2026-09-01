@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>星云社 · 策略看盘</title>
+    <link rel="icon" href="./favicon.ico?v=2" sizes="any" />
+    <link rel="icon" type="image/png" sizes="32x32" href="./assets/favicon-32.png?v=2" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./assets/apple-touch-icon.png?v=2" />
+    <link rel="manifest" href="./site.webmanifest" />
+    <script src="./desktop_adapter.js?v=1"></script>
+    <link rel="stylesheet" href="./styles.css?v=77" />
+  </head>
+  <body>
+    <main class="app-shell strategy-shell">
+      <header class="command-deck strategy-deck">
+        <div class="topbar">
+          <div class="brand">
+            <span class="brand-mark brand-logo"><img src="./assets/xingyunshe-logo.png?v=2" alt="星云社 logo" /></span>
+            <div>
+              <p class="eyebrow">XINGYUN SOCIETY</p>
+              <h1>星云社</h1>
+              <span class="brand-subtitle">量化策略看盘</span>
+            </div>
+          </div>
+          <nav class="page-nav" aria-label="页面导航">
+            <a class="nav-link" href="./index.html">热门榜</a>
+            <a class="nav-link" href="./gainers.html">涨幅榜</a>
+            <a class="nav-link" href="./turnover.html">成交额榜</a>
+            <a class="nav-link" href="./newboards.html">新币新股</a>
+            <a class="nav-link" href="./listings.html">上新IPO</a>
+            <a class="nav-link" href="./newsflash.html">律动快讯</a>
+            <a class="nav-link" href="./briefs.html">自动简报</a>
+            <a class="nav-link" href="./rss.html">RSS订阅</a>
+            <a class="nav-link" href="./xwatch.html">X追踪</a>
+            <a class="nav-link" href="./price-watch.html">监控</a>
+            <a class="nav-link active" href="./strategy.html">策略看盘</a>
+            <a class="nav-link" href="./todo.html">TodoList</a>
+            <a class="nav-link nav-discord" href="https://discord.gg/mKyCwtHW" target="_blank" rel="noreferrer noopener">Discord</a>
+          </nav>
+        </div>
+        <section class="strategy-overview" aria-label="策略状态">
+          <p class="section-label">DRAGON WAVE / MULTI-TIMEFRAME / RISK EXECUTION</p>
+          <div class="strategy-metrics">
+            <span><b id="strategyWatching">0</b><em>监控</em></span>
+            <span><b id="strategyStructured">0</b><em>已成结构</em></span>
+            <span><b id="strategyAwaiting">0</b><em>待确认</em></span>
+            <span class="is-ready"><b id="strategyReady">0</b><em>可执行</em></span>
+            <span><b id="strategyPositions">0</b><em>持仓</em></span>
+          </div>
+        </section>
+      </header>
+
+      <section class="strategy-account-strip" aria-label="账户风控参数">
+        <label><span>账户权益</span><input id="accountEquity" type="number" min="1" step="100" value="10000" /></label>
+        <label><span>今日已实现亏损</span><input id="dailyLoss" type="number" min="0" step="10" value="0" /></label>
+        <label><span>执行模式</span><select id="tradeMode"><option value="paper">模拟确认</option><option value="live">真实交易</option></select></label>
+        <button id="exchangeApiSettings" class="action-button strategy-api-trigger" type="button">交易 API</button>
+        <button id="strategyRefresh" class="action-button" type="button">刷新信号</button>
+        <span id="strategyStatus" class="strategy-status">读取监控信号</span>
+      </section>
+
+      <section class="strategy-workspace">
+        <div class="strategy-signal-panel">
+          <header class="strategy-panel-head">
+            <div><p class="section-label">SIGNAL PIPELINE</p><h2>龙头起爆策略信号</h2></div>
+            <div class="strategy-filter" role="tablist" aria-label="信号筛选">
+              <button class="is-active" type="button" data-signal-filter="all">全部</button>
+              <button type="button" data-signal-filter="ready">可执行</button>
+              <button type="button" data-signal-filter="confirm">预判</button>
+            </div>
+          </header>
+          <div class="strategy-table-head" aria-hidden="true"><span>标的</span><span>阶段</span><span>价格 / 突破位</span><span>策略 / 行情源</span><span>操作</span></div>
+          <div id="strategySignals" class="strategy-signals" aria-live="polite"><div class="loading-panel"><b>正在读取策略信号</b></div></div>
+        </div>
+
+        <aside class="strategy-risk-console" aria-label="风险与仓位计算">
+          <header><p class="section-label">RISK ENGINE</p><h2 id="riskSymbol">选择信号</h2><span id="riskTier">--</span></header>
+          <div class="risk-inputs">
+            <label><span>总资金量</span><div><input id="totalCapital" type="number" min="1" step="100" value="10000" /><em>USDT</em></div></label>
+            <label><span>总风险敞口</span><div><input id="riskExposurePct" type="number" min="0.01" max="100" step="0.05" value="0.5" /><em>%</em></div></label>
+            <label class="risk-margin-field"><span><b>保证金</b><em id="marginAvailable">可用 -- USDT</em></span><div><input id="orderMargin" type="number" min="0" step="10" placeholder="输入保证金" /><em>USDT</em></div></label>
+            <div class="risk-margin-slider">
+              <input id="marginRatio" type="range" min="0" max="100" step="25" value="0" aria-label="保证金占可用资金比例" />
+              <div class="risk-margin-marks"><button type="button" data-margin-ratio="0">0</button><button type="button" data-margin-ratio="25">25%</button><button type="button" data-margin-ratio="50">50%</button><button type="button" data-margin-ratio="75">75%</button><button type="button" data-margin-ratio="100">100%</button></div>
+            </div>
+            <label><span>杠杆</span><div><input id="leverage" type="number" min="1" max="3" step="0.5" value="3" /><em>x</em></div></label>
+            <label><span>策略突破位</span><div><input id="breakoutPrice" type="number" readonly /><em>USDT</em></div></label>
+            <label><span>止损价</span><div><input id="stopLossPrice" type="number" readonly /><em>K低点 / ≥3%</em></div></label>
+            <label class="risk-exchange"><span>执行交易所</span><select id="strategyExchange"><option value="binance">Binance</option><option value="okx">OKX</option><option value="bitget">Bitget</option></select></label>
+          </div>
+          <button id="calculatePosition" class="action-button strategy-calculate" type="button" disabled>计算下单数量</button>
+          <div id="riskPreview" class="risk-preview is-empty"><span>选择信号后计算</span></div>
+          <button id="stageOrder" class="action-button strategy-stage" type="button" disabled>人工确认下单</button>
+        </aside>
+      </section>
+
+      <section class="strategy-position-panel">
+        <header class="strategy-panel-head">
+          <div><p class="section-label">POSITION CONTROL</p><h2>仓位监控</h2></div>
+          <span id="positionModeLabel">模拟仓</span>
+        </header>
+        <div class="position-table-head" aria-hidden="true"><span>仓位</span><span>入场 / 标记</span><span>下单数量</span><span>保证金 / 杠杆</span><span>浮动盈亏</span><span>止损</span><span>操作</span></div>
+        <div id="strategyPositionsList" class="strategy-positions" aria-live="polite"><div class="strategy-empty"><b>暂无持仓</b></div></div>
+      </section>
+    </main>
+
+    <dialog id="orderConfirmDialog" class="strategy-dialog">
+      <form method="dialog">
+        <header><div><p class="section-label">MANUAL CONFIRMATION</p><h2>确认建仓</h2></div><button value="cancel" aria-label="关闭">×</button></header>
+        <div id="orderConfirmSummary" class="confirm-summary"></div>
+        <label class="confirm-input"><span>输入“确认下单”</span><input id="orderAcknowledgement" type="text" autocomplete="off" /></label>
+        <footer><button class="action-button" value="cancel">取消</button><button id="confirmOrderButton" class="action-button is-primary" type="button">确认下单</button></footer>
+      </form>
+    </dialog>
+
+    <dialog id="breakEvenDialog" class="strategy-dialog strategy-break-even-dialog">
+      <form method="dialog">
+        <header><div><p class="section-label">STOP CONTROL</p><h2>设置保本止损</h2></div><button value="cancel" aria-label="关闭">×</button></header>
+        <div id="breakEvenSummary" class="confirm-summary"></div>
+        <label class="confirm-input"><span>输入“确认保本”</span><input id="breakEvenAcknowledgement" type="text" autocomplete="off" /></label>
+        <footer><button class="action-button" value="cancel">取消</button><button id="confirmBreakEvenButton" class="action-button is-primary" type="button">移动止损</button></footer>
+      </form>
+    </dialog>
+
+    <dialog id="exchangeApiDialog" class="strategy-dialog strategy-api-dialog">
+      <form method="dialog">
+        <header><div><p class="section-label">EXCHANGE CONNECTION</p><h2>交易 API</h2></div><button value="cancel" aria-label="关闭">×</button></header>
+        <div id="exchangeApiTabs" class="strategy-api-tabs" role="tablist" aria-label="交易所">
+          <button class="is-active" type="button" data-exchange-tab="binance">Binance</button>
+          <button type="button" data-exchange-tab="okx">OKX</button>
+          <button type="button" data-exchange-tab="bitget">Bitget</button>
+        </div>
+        <section class="strategy-api-form" aria-live="polite">
+          <div class="strategy-api-state"><span id="exchangeApiStateDot"></span><strong id="exchangeApiState">未配置</strong><em id="exchangeApiHint"></em></div>
+          <label><span>API Key</span><input id="exchangeApiKey" type="password" autocomplete="off" spellcheck="false" placeholder="输入 API Key" /></label>
+          <label><span>API Secret</span><input id="exchangeApiSecret" type="password" autocomplete="new-password" spellcheck="false" placeholder="输入 API Secret" /></label>
+          <label id="exchangeApiPassphraseField" hidden><span>API 密码</span><input id="exchangeApiPassphrase" type="password" autocomplete="new-password" spellcheck="false" placeholder="输入创建 OKX API 时设置的密码" /></label>
+          <p id="exchangeApiMessage" class="strategy-api-message"></p>
+        </section>
+        <footer><button id="removeExchangeApi" class="action-button strategy-api-remove" type="button">删除配置</button><button class="action-button" value="cancel">取消</button><button id="saveExchangeApi" class="action-button is-primary" type="button">加密保存</button></footer>
+      </form>
+    </dialog>
+
+    <script src="./auth.js?v=17"></script>
+    <script src="./strategy.js?v=10"></script>
+    <script src="./todo_reminder.js?v=2"></script>
+  </body>
+</html>

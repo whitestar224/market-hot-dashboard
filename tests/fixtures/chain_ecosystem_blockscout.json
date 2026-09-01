@@ -1,0 +1,13 @@
+{
+  "items": [
+    {
+      "address_hash": "0x0000000000000000000000000000000000000044",
+      "name": "Explorer Token",
+      "symbol": "EXP",
+      "type": "ERC-20",
+      "holders_count": "100",
+      "exchange_rate": "1.00"
+    }
+  ],
+  "next_page_params": null
+}

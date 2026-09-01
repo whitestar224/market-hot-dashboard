@@ -26,6 +26,7 @@ $allowPrefixes = @(
   "MARKET_",
   "NO_PROXY",
   "OKX_",
+  "PRICE_WATCH_",
   "QQ_",
   "REQUESTS_",
   "SMTP_",

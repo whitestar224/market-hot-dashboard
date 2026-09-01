@@ -13,7 +13,13 @@
     activeSource: "all",
     saving: false,
     editingId: "",
-    user: null
+    user: null,
+    translations: {},
+    translationTexts: {},
+    translationLoading: new Set(),
+    feedLoading: false,
+    stream: null,
+    streamReady: false
   };
 
   const $ = (id) => document.getElementById(id);
@@ -116,6 +122,58 @@
     return String(number);
   }
 
+  function looksEnglish(value) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    if (text.length < 12) return false;
+    const latin = (text.match(/[A-Za-z]/g) || []).length;
+    const cjk = (text.match(/[\u3400-\u9fff]/g) || []).length;
+    const words = (text.match(/[A-Za-z]{2,}/g) || []).length;
+    return latin >= 18 && words >= 5 && latin >= Math.max(18, cjk * 4);
+  }
+
+  function translationKey(item, scope) {
+    return `${item.id || item.url || item.publishedAt || "x"}:${scope}`;
+  }
+
+  function translationControls(item, scope, text) {
+    if (!looksEnglish(text)) return "";
+    const key = translationKey(item, scope);
+    state.translationTexts[key] = String(text || "");
+    const entry = state.translations[key] || {};
+    const loading = state.translationLoading.has(key);
+    const label = loading ? "翻译中" : entry.text ? "已翻译" : "翻译";
+    return `
+      <div class="xwatch-translate">
+        <button type="button" data-action="translate" data-translation-key="${escapeHtml(key)}" ${loading ? "disabled" : ""}>${label}</button>
+        ${entry.error ? `<span class="xwatch-translate-error">${escapeHtml(entry.error)}</span>` : ""}
+      </div>
+      ${entry.text ? `<div class="xwatch-translation"><b>译文</b><span>${escapeHtml(entry.text)}</span></div>` : ""}
+    `;
+  }
+
+  async function translateXText(key) {
+    const text = state.translationTexts[key];
+    if (!text || state.translationLoading.has(key)) return;
+    state.translationLoading.add(key);
+    state.translations[key] = { ...(state.translations[key] || {}), error: "" };
+    renderTimeline();
+    try {
+      const payload = await apiJson("/api/x-kol-translate", {
+        method: "POST",
+        body: JSON.stringify({ text })
+      });
+      if (!payload.ok) throw new Error(payload.error || "翻译失败");
+      state.translations[key] = payload.translation
+        ? { text: payload.translation, cached: Boolean(payload.cached) }
+        : { error: "这条内容不需要翻译" };
+    } catch (error) {
+      state.translations[key] = { error: error.message || "翻译失败" };
+    } finally {
+      state.translationLoading.delete(key);
+      renderTimeline();
+    }
+  }
+
   function status(text, mode = "ok") {
     if (!nodes.status) return;
     nodes.status.textContent = text;
@@ -169,11 +227,35 @@
   }
 
   function loadCachedFeed() {
-    // Feed 缓存改走服务端 API 缓存，浏览器不再保存 X追踪内容。
+    try {
+      const raw = sessionStorage.getItem(userKey(CACHE_KEY));
+      if (!raw) return false;
+      const cached = JSON.parse(raw);
+      if (!cached || Date.now() - Number(cached.savedAt || 0) > 15 * 60 * 1000) return false;
+      applyFeedPayload(cached.payload || {}, { cached: true });
+      return state.items.length > 0;
+    } catch {
+      return false;
+    }
   }
 
   function saveCachedFeed(payload) {
-    void payload;
+    if (!payload || payload.pending || !Array.isArray(payload.items)) return;
+    try {
+      sessionStorage.setItem(userKey(CACHE_KEY), JSON.stringify({
+        savedAt: Date.now(),
+        payload: {
+          ok: true,
+          items: payload.items.slice(0, 240),
+          sources: Array.isArray(payload.sources) ? payload.sources : [],
+          provider: payload.provider || "--",
+          hasToken: Boolean(payload.hasToken),
+          updatedAt: payload.updatedAt || Date.now()
+        }
+      }));
+    } catch {
+      // 会话缓存只负责加速首屏，空间不足时直接跳过。
+    }
   }
 
   function mergeSources(serverSources, { includeLocal = false } = {}) {
@@ -233,23 +315,74 @@
   }
 
   async function loadFeed({ refresh = false } = {}) {
-    if (!refresh) loadCachedFeed();
-    status(refresh ? "后台更新中" : "读取动态中", "loading");
+    if (state.feedLoading) return;
+    state.feedLoading = true;
+    if (!refresh && !state.items.length) loadCachedFeed();
+    if (!state.items.length) status(refresh ? "后台更新中" : "读取动态中", "loading");
     try {
       const payload = await apiJson(`/api/x-kol-feed${refresh ? "?refresh=1" : ""}`);
-      state.items = Array.isArray(payload.items) ? payload.items : [];
-      state.sourceStates = Array.isArray(payload.sources) ? payload.sources : [];
-      mergeLiveSourceState(state.sourceStates);
-      state.provider = payload.provider || "--";
-      state.hasToken = Boolean(payload.hasToken);
-      saveCachedFeed(payload);
-      const limited = state.sourceStates.some((source) => source.limited);
-      status(payload._cache?.stale ? "缓存数据" : limited ? "RSS受限" : "追踪中", limited ? "warn" : "ok");
-      render();
+      applyFeedPayload(payload);
     } catch (error) {
       status(error.message || "动态读取失败", "error");
       render();
+    } finally {
+      state.feedLoading = false;
     }
+  }
+
+  function applyFeedPayload(payload, { cached = false } = {}) {
+    if (!payload || payload.pending) {
+      if (!state.items.length) status("实时连接已建立，正在等待上游数据", "loading");
+      return;
+    }
+    const incomingItems = Array.isArray(payload.items) ? payload.items : [];
+    if (incomingItems.length || !state.items.length) state.items = incomingItems;
+    state.sourceStates = Array.isArray(payload.sources) ? payload.sources : [];
+    mergeLiveSourceState(state.sourceStates);
+    state.provider = payload.provider || "--";
+    state.hasToken = Boolean(payload.hasToken);
+    if (!cached) saveCachedFeed(payload);
+    const limited = state.sourceStates.some((source) => source.limited);
+    const upstreamMode = payload.upstreamMode || "";
+    const realtimeLabel = upstreamMode === "official-stream"
+      ? "X 实时流"
+      : upstreamMode === "official-api"
+        ? "实时连接 · X API"
+        : upstreamMode === "rss-resilient"
+          ? "实时连接 · RSS自动换源"
+        : payload.realtime
+          ? "实时连接 · RSS回退"
+          : limited
+            ? "RSS受限"
+            : "追踪中";
+    const recovering = state.sourceStates.some((source) => source.status === "recovering");
+    status(cached ? "缓存内容 · 正在同步" : realtimeLabel, cached || upstreamMode.includes("rss") || limited || recovering ? "warn" : "ok");
+    render();
+  }
+
+  function connectRealtimeFeed() {
+    if (!state.user || typeof EventSource === "undefined") return;
+    state.stream?.close();
+    const stream = new EventSource("/api/x-kol-stream");
+    state.stream = stream;
+    stream.addEventListener("open", () => {
+      state.streamReady = true;
+      status("实时连接", "ok");
+    });
+    stream.addEventListener("feed", (event) => {
+      try {
+        applyFeedPayload(JSON.parse(event.data));
+      } catch {
+        status("实时数据解析失败", "error");
+      }
+    });
+    stream.addEventListener("status", () => {
+      if (!state.items.length) status("实时连接已建立，正在等待上游数据", "loading");
+    });
+    stream.addEventListener("error", () => {
+      state.streamReady = false;
+      status("实时连接重连中", "warn");
+    });
   }
 
   function sourceState(id) {
@@ -299,7 +432,7 @@
     }
     nodes.sourceList.innerHTML = state.sources.map((source) => {
       const live = sourceState(source.id);
-      const statusClass = live.status === "error" ? "error" : source.enabled ? "ok" : "muted";
+      const statusClass = live.status === "error" ? "error" : live.status === "recovering" ? "recovering" : source.enabled ? "ok" : "muted";
       const displayName = source.displayName || live.displayName || source.handle;
       const avatar = live.avatar || source.avatar || fallbackAvatar(source.handle);
       const initials = (displayName || source.handle || "X").slice(0, 2).toUpperCase();
@@ -381,7 +514,8 @@
       const typeLabel = item.entryType && item.entryType !== "tweet" ? item.entryType : "";
       const quote = item.quote && item.quote.text ? item.quote : null;
       const quoteHtml = quote ? `
-        <a class="xwatch-quote-card" href="${escapeHtml(quote.url || item.url || "#")}" target="_blank" rel="noreferrer noopener">
+        <div class="xwatch-quote-card">
+        <a class="xwatch-quote-link" href="${escapeHtml(quote.url || item.url || "#")}" target="_blank" rel="noreferrer noopener">
           <div class="xwatch-quote-head">
             <b>${escapeHtml(quote.authorName || (quote.handle ? `@${quote.handle}` : "引用动态"))}</b>
             ${quote.handle ? `<em>@${escapeHtml(quote.handle)}</em>` : ""}
@@ -389,6 +523,8 @@
           </div>
           <p>${escapeHtml(quote.text)}</p>
         </a>
+        ${translationControls(item, "quote", quote.text)}
+        </div>
       ` : "";
       const matchingSource = state.sources.find((source) => source.id === item.sourceId);
       const avatar = item.avatar || matchingSource?.avatar || fallbackAvatar(item.handle);
@@ -407,6 +543,7 @@
               <time>${escapeHtml(timeLabel(item.publishedAt))}</time>
             </header>
             <p>${escapeHtml(item.text || item.title || "")}</p>
+            ${translationControls(item, "main", item.text || item.title || "")}
             ${quoteHtml}
             <footer>
               <div class="xwatch-post-metrics">${keywordHtml}${typeLabel ? `<span>${escapeHtml(typeLabel)}</span>` : ""}${metricHtml || "<span>动态</span>"}</div>
@@ -501,6 +638,14 @@
     await loadFeed({ refresh: true });
   });
 
+  nodes.timeline.addEventListener("click", (event) => {
+    const button = event.target.closest('[data-action="translate"]');
+    if (!button) return;
+    event.preventDefault();
+    event.stopPropagation();
+    translateXText(button.dataset.translationKey);
+  });
+
   nodes.sourceList.addEventListener("click", async (event) => {
     const row = event.target.closest(".xwatch-source-row");
     if (!row) return;
@@ -565,9 +710,13 @@
     setInterval(updateClock, 1000);
 
     mergeSources([]);
-    loadCachedFeed();
-    await loadSources();
-    await loadFeed();
+    const hasCachedFeed = loadCachedFeed();
+    render();
+    connectRealtimeFeed();
+    void loadSources().catch((error) => status(error.message || "追踪列表读取失败", "error"));
+    window.setTimeout(() => {
+      if (!state.streamReady || !hasCachedFeed) void loadFeed();
+    }, hasCachedFeed ? 1200 : 350);
   }
 
   boot().catch((error) => {
@@ -577,6 +726,12 @@
 
   setInterval(() => {
     if (!state.user || document.hidden) return;
-    loadFeed();
-  }, 60_000);
+    if (!state.streamReady) loadFeed();
+  }, 5_000);
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && state.user && (!state.stream || state.stream.readyState === EventSource.CLOSED)) {
+      connectRealtimeFeed();
+    }
+  });
 })();

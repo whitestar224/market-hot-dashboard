@@ -1,0 +1,32 @@
+{
+  "data": [
+    {
+      "id": "robinhood_0x00000000000000000000000000000000000000a1",
+      "type": "pool",
+      "attributes": {
+        "address": "0x00000000000000000000000000000000000000a1",
+        "name": "SMP / WETH",
+        "base_token_price_usd": "1.25",
+        "reserve_in_usd": "250000",
+        "volume_usd": {"h24": "520000"},
+        "transactions": {"h24": {"buys": 120, "sells": 80}},
+        "pool_created_at": "2026-07-02T00:00:00Z"
+      },
+      "relationships": {
+        "base_token": {"data": {"id": "robinhood_0x0000000000000000000000000000000000000011"}},
+        "dex": {"data": {"id": "uniswap"}}
+      }
+    },
+    {
+      "id": "robinhood_invalid-pool",
+      "type": "pool",
+      "attributes": {
+        "address": "invalid-pool",
+        "name": "INVALID / WETH",
+        "reserve_in_usd": "0",
+        "volume_usd": {}
+      },
+      "relationships": {}
+    }
+  ]
+}

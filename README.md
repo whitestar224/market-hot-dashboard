@@ -38,6 +38,7 @@
 - **自动简报**：读取自动化任务生成的交易简报，并支持 GitHub Raw JSON 兜底。
 - **RSS / 公众号**：支持 RSS、Atom、JSON Feed，以及参考 WeWe RSS 逻辑的微信公众号订阅。
 - **X KOL 追踪**：追踪指定 KOL 动态，正文和引用分开展示，支持桌面提醒。
+- **公链生态监控**：按 L0-L3 市场树跟踪新链生态、市场 Top5、潜在发币项目和高价值变化提醒，内置 Robinhood Chain 样例。
 - **TodoList**：项目分组、任务增删改查、今日提醒，按用户隔离数据。
 - **账号系统**：账号密码、邮箱验证码、Google OAuth，支持用户资料和交易所 UID 绑定。
 - **桌面弹窗**：市场异动、快讯、RSS、X 动态、Todo 提醒、公众号授权失效均可弹窗。
@@ -67,7 +68,7 @@
 
 ## 本地运行
 
-需要 Python 3.11+。
+需要 Python 3.11+ 和 Node.js 18+。Node.js 用于运行与起爆台完全一致的结构策略引擎；缺少 Node.js 时，结构监控不会使用降级版或旧版规则。
 
 ```powershell
 pip install -r requirements.txt
@@ -135,6 +136,14 @@ docker compose down
 
 完整上线说明见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
 
+## 结构监控与起爆台策略
+
+“监控 → 多周期结构”和起爆台共用仓库中的当前策略实现，不维护第二套监控专用规则。服务端通过 `tools/dragon_wave_monitor_bridge.js` 调用 `dragon-wave-engine.js`、`dragon-wave-cases.js`、`dragon-wave-data.js`、`dragon-wave-feedback.js` 和 `dragon-wave-vision.js`，因此后续策略优化会自动同步到结构监控。
+
+默认扫描 1 分钟、5 分钟、15 分钟、1 小时、4 小时和日线；1 小时、4 小时识别出的三角、降楔等有效结构突破按 B 点处理。主升浪或主升浪预期、人工反馈、多周期共振以及已确认案例的回归保护，也都由同一策略引擎统一判定。
+
+Docker 镜像已内置 Node.js；直接本地运行时请确保 `node --version` 可用，也可以通过 `DRAGON_WAVE_NODE_BINARY` 指定 Node.js 可执行文件。结构监控接口为 `/api/price-structures`，起爆台页面为 `/dragon-wave.html`。
+
 ## 配置说明
 
 敏感配置只放在本地 `.env` 或 `.env.production`，不要提交到 GitHub。
@@ -148,6 +157,41 @@ docker compose down
 - `X_BEARER_TOKEN`：X KOL 官方 API。
 - `WECHAT_*`：微信公众号订阅授权。
 - `OKX_*` / `BITGET_*` / `AICOIN_*`：交易所和客户端数据源配置。
+- `CHAIN_ECOSYSTEM_REFRESH_SECONDS`：公链生态后台扫描间隔，默认 300 秒；数据源连续失败时会自动退避。
+- `XINGYUN_DISABLE_CHAIN_ECOSYSTEM_MONITOR`：设为 `1` 可暂停公链生态后台扫描。
+- `GITHUB_TOKEN`：可选，仅用于提高手动添加项目仓库的 GitHub 公共接口额度。
+
+## 公链生态监控
+
+在“监控 → 公链生态”中可查看三阶段公链列表、L0-L3 细分市场、每个市场 Top5、潜在发币池及证据来源。自动扫描使用 GeckoTerminal、DEX Screener、DefiLlama、Blockscout 和 GitHub 的公开接口；也可以手动添加公链、项目或证据，系统会把二者合并后重新评估。
+
+桌面端只推送四类高价值变化：公链阶段升级、新细分市场、Top1 连续两轮确认变更，以及流动性/成交量/交易笔数显著放大。代币形成有效交易只更新市场状态和排名，不弹窗、不播报。首次成功扫描仅建立基线，不补发历史提醒；某个数据源失败时保留上一份完整快照，也不会据此触发阶段或龙头变化。
+
+## 钉钉热门币监控机器人
+
+钉钉推送是独立进程：它复用价格监控接口已经计算好的 AICoin 热门币、最近 7 日前高和预警轮次，但拥有单独的 Webhook、加签密钥和发送状态。Discord 是否配置或发送成功不会影响钉钉。
+
+1. 在目标钉钉群中添加“自定义机器人”，安全设置选择“加签”，保存 Webhook 和 `SEC...` 开头的密钥。创建流程见[钉钉开放平台文档](https://open.dingtalk.com/document/orgapp/custom-robot-access)。
+2. 把下面配置加入本地 `.env`：
+
+```dotenv
+DINGTALK_PRICE_WATCH_WEBHOOK_URL=https://oapi.dingtalk.com/robot/send?access_token=你的令牌
+DINGTALK_PRICE_WATCH_SECRET=SEC你的加签密钥
+```
+
+3. 保持主行情监控服务运行，先发送连接测试：
+
+```powershell
+.\start-dingtalk-price-watch.ps1 -TestMessage
+```
+
+4. 测试成功后启动持续监控：
+
+```powershell
+.\start-dingtalk-price-watch.ps1
+```
+
+只检查一轮可使用 `-Once`。首次启动默认记录当前预警轮次但不补发旧消息；如需推送当前仍在前高附近的信号，可首次使用 `-SendExisting`。独立发送状态保存在 `.runtime-cache/dingtalk-price-watch-state.json`，钉钉发送失败时不会推进状态，下一轮会自动重试。
 
 ## 隐私与公开仓库说明
 
@@ -208,3 +252,8 @@ Copyright (c) 2026 星云社。
 本项目仅供学习、研究和个人使用。未经作者本人授权，不得用于商业用途、商业分发、SaaS 服务、付费产品、企业内部商业化部署或任何以盈利为目的的再发布。
 
 如需商用授权，请通过 Discord 或 GitHub 联系作者。
+# QQ 后台群消息通道
+
+QQ 群监控默认通过本机 NapCat / OneBot 11 接口工作，不需要 QQ 窗口保持可见。系统使用 WebSocket 接收实时群消息，并定时调用 `get_group_msg_history` 回补服务重启或短暂断线期间的消息；群名、发送人过滤、币种提取、去重、结构监控入池和微信转发仍由原有业务链路处理。
+
+安全约束：HTTP 与 WebSocket 必须只监听 `127.0.0.1`，两个接口使用相同 Token，禁止将端口暴露到局域网或公网。运行配置位于 `.env`：`QQ_ONEBOT_HTTP_URL`、`QQ_ONEBOT_WS_URL`、`QQ_ONEBOT_TOKEN`。确认 OneBot 连通后保持 `QQ_UI_FALLBACK_ENABLED=0`，避免重新依赖窗口或 OCR。

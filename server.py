@@ -12,6 +12,7 @@ import math
 import os
 import re
 import secrets
+import shutil
 import smtplib
 import sqlite3
 import subprocess
@@ -24,7 +25,7 @@ import urllib.request
 import urllib3
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
 from http.cookies import SimpleCookie
@@ -37,6 +38,23 @@ from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from chain_ecosystem_monitor import (
+    ChainEcosystemMonitor,
+    ChainEcosystemStore,
+    safe_monitor_error,
+)
+from qq_onebot_bridge import start_qq_onebot_bridge, stop_qq_onebot_bridge
+from wechat_group_monitor import (
+    WechatDeliveryUncertainError,
+    candidate_rule_score,
+    collect_visible_group_messages,
+    extract_candidate_symbols,
+    message_fingerprint,
+    normalize_chat_platform,
+    normalize_group_name,
+    send_text_to_wechat,
+)
 
 
 ROOT = Path(os.getenv("XINGYUN_APP_ROOT") or Path(__file__).resolve().parent).resolve()
@@ -55,6 +73,35 @@ THS_HEADERS = {
 }
 CACHE: dict[str, tuple[float, Any]] = {}
 CACHE_TTL = 15
+EVENT_MONITOR_DEX_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+EVENT_MONITOR_DEX_CACHE_LOCK = threading.Lock()
+EVENT_MONITOR_DEX_CACHE_TTL_SECONDS = 120
+NEWS_TRADE_DISCOVERY_CACHE: dict[str, tuple[float, Any]] = {}
+NEWS_TRADE_DISCOVERY_CACHE_LOCK = threading.Lock()
+NEWS_TRADE_DISCOVERY_CACHE_TTL_SECONDS = max(
+    60,
+    int(float(os.getenv("NEWS_TRADE_DISCOVERY_CACHE_SECONDS", "300") or "300")),
+)
+NEWS_TRADE_SECURITY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+NEWS_TRADE_SECURITY_CACHE_LOCK = threading.Lock()
+NEWS_TRADE_SECURITY_INFLIGHT: set[str] = set()
+NEWS_TRADE_SECURITY_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="news-trade-security")
+NEWS_TRADE_SECURITY_CACHE_TTL_SECONDS = max(
+    120,
+    int(float(os.getenv("NEWS_TRADE_SECURITY_CACHE_SECONDS", "900") or "900")),
+)
+NEWS_TRADE_SECURITY_NEGATIVE_TTL_SECONDS = max(
+    30,
+    int(float(os.getenv("NEWS_TRADE_SECURITY_NEGATIVE_CACHE_SECONDS", "180") or "180")),
+)
+NEWS_TRADE_SEARCH_LOCK = threading.Lock()
+NEWS_TRADE_SEARCH_PREVIEWS: dict[str, dict[str, Any]] = {}
+NEWS_TRADE_SEARCH_PREVIEW_TTL_SECONDS = 15 * 60
+NEWS_TRADE_TOPIC_POOL_LOCK = threading.Lock()
+NEWS_TRADE_ALERT_STATE_LOCK = threading.Lock()
+NEWS_TRADE_DESKTOP_INTAKE_LOCK = threading.Lock()
+ASTER_ANNOUNCEMENT_LOCK = threading.Lock()
+ASTER_X_LISTING_LOCK = threading.Lock()
 API_REFRESH_LOCK = threading.Lock()
 API_REFRESHING: set[str] = set()
 DESKTOP_ALERT_LOCK = threading.Lock()
@@ -66,13 +113,144 @@ DESKTOP_ALERT_SEEN_LIMIT = 20000
 DESKTOP_ALERT_QUEUE = deque()
 DESKTOP_ALERT_QUEUE_ACTIVE = False
 DESKTOP_ALERT_MIN_INTERVAL_SECONDS = 75
+DESKTOP_ALERT_URGENT_INTERVAL_SECONDS = 4
+DESKTOP_ALERT_CRITICAL_PRIORITY = 900
+DESKTOP_ALERT_CRITICAL_INTERVAL_SECONDS = max(
+    4.0,
+    float(os.getenv("DESKTOP_ALERT_CRITICAL_INTERVAL_SECONDS", "6.5") or "6.5"),
+)
+DESKTOP_ALERT_CRITICAL_MAX_QUEUE_AGE_SECONDS = max(
+    DESKTOP_ALERT_CRITICAL_INTERVAL_SECONDS,
+    float(os.getenv("DESKTOP_ALERT_CRITICAL_MAX_QUEUE_AGE_SECONDS", "45") or "45"),
+)
+DESKTOP_ALERT_TRADING_SIGNAL_PRIORITY = 1000
+DESKTOP_ALERT_TRADING_PREARM_PRIORITY = 999
 DESKTOP_ALERT_QUEUE_LIMIT = 80
 DESKTOP_ALERT_LAST_LAUNCHED_AT = 0.0
+DESKTOP_ALERT_LAST_LAUNCHED_PRIORITY = 0
+DESKTOP_ALERT_ACTIVE_PROCESS: Any = None
+DESKTOP_ALERT_QUEUE_WAKE = threading.Event()
+DESKTOP_ALERT_MILITARY_PATTERN = re.compile(
+    r"(?:军事|军方|军队|美军|俄军|乌军|以军|伊军|英军|法军|日军|韩军|朝鲜军|解放军|"
+    r"海军|空军|陆军|火箭军|驻军|部队|士兵|军舰|战舰|航母|驱逐舰|护卫舰|潜艇|"
+    r"战机|轰炸机|舰队|军事基地|战区|战争|战事|开战|武装冲突|军事冲突|交火|停火|空袭|炮击|"
+    r"导弹|无人机袭击|军演|核武|核打击|入侵|撤军|增兵|伤亡|阵亡|战俘|国防部|"
+    r"五角大楼|领空|领海|边境冲突|封锁海峡|封锁领空|封锁领海|"
+    r"\bmilitary\b|\bwar(?:fare)?\b|\barmed conflict\b|\bairstrikes?\b|"
+    r"\bmissiles?\b|\bdrone attacks?\b|\bceasefires?\b|\btroops?\b|"
+    r"\binvasion\b|\bwithdrawal of forces\b|\bdefen[cs]e ministry\b|"
+    r"\bpentagon\b|\bnuclear weapons?\b)",
+    re.I,
+)
+DESKTOP_ALERT_POLITICAL_PATTERN = re.compile(
+    r"(?:地缘政治|政治局势|政局|政治危机|国际局势|选举|大选|竞选|政党|弹劾|政变|"
+    r"政府停摆|政府倒台|内阁倒台|外交危机|外交关系|外交争端|示威|抗议活动|"
+    r"贸易战|关税战|关税争端|国际制裁|经济制裁|"
+    r"\bgeopolitic(?:al|s)?\b|\bpolitical (?:crisis|tensions?|party|parties)\b|"
+    r"\belections?\b|\belection campaign\b|\bimpeachment\b|\bcoup\b|"
+    r"\bgovernment shutdown\b|\bcabinet collapse\b|\bdiplomatic (?:crisis|tensions?|relations?)\b|"
+    r"\bprotests?\b)",
+    re.I,
+)
+DESKTOP_ALERT_POLITICAL_ACTOR_PATTERN = re.compile(
+    r"(?:(?:总统|首相|总理|国家元首|政府|内阁).{0,16}(?:会晤|会见|通话|访问|辞职|任命|"
+    r"支持率|倒台|停摆|组阁)|(?:会晤|会见|通话|访问|辞职|任命|组阁).{0,16}"
+    r"(?:总统|首相|总理|国家元首|政府|内阁)|"
+    r"\b(?:president|prime minister|head of state|cabinet)\b.{0,40}"
+    r"\b(?:meets?|meeting|talks?|visits?|resigns?|appoints?|approval rating|coalition)\b)",
+    re.I,
+)
+DESKTOP_ALERT_POLITICAL_FIGURE_PATTERN = re.compile(
+    r"(?:(?:特朗普|川普|普京|泽连斯基|内塔尼亚胡|哈梅内伊|拜登|马克龙|金正恩).{0,24}"
+    r"(?:会晤|会见|通话|访问|竞选|大选|制裁|关税|外交|峰会|会谈|停火|战争|军事)|"
+    r"(?:会晤|会见|通话|访问|竞选|大选|制裁|关税|外交|峰会|会谈|停火|战争|军事).{0,24}"
+    r"(?:特朗普|川普|普京|泽连斯基|内塔尼亚胡|哈梅内伊|拜登|马克龙|金正恩)|"
+    r"\b(?:trump|putin|zelensky|netanyahu|khamenei|biden|macron|kim jong un)\b.{0,60}"
+    r"\b(?:meeting|talks?|visit|election|campaign|sanctions?|tariffs?|diplomatic|summit|ceasefire|war|military)\b)",
+    re.I,
+)
+DESKTOP_ALERT_GEOPOLITICAL_ACTOR_PATTERN = re.compile(
+    r"(?:(?:俄乌|乌克兰|俄罗斯|以色列|伊朗|加沙|巴勒斯坦|黎巴嫩|叙利亚|朝鲜|台海|"
+    r"红海|北约).{0,20}(?:局势|冲突|袭击|制裁|会谈|停火|战争|军事)|"
+    r"(?:局势|冲突|袭击|制裁|会谈|停火|战争|军事).{0,20}"
+    r"(?:俄乌|乌克兰|俄罗斯|以色列|伊朗|加沙|巴勒斯坦|黎巴嫩|叙利亚|朝鲜|台海|"
+    r"红海|北约)|"
+    r"\b(?:russia|ukraine|israel|iran|gaza|palestine|lebanon|syria|north korea|"
+    r"taiwan strait|red sea|nato)\b.{0,60}"
+    r"\b(?:conflict|attack|sanctions?|talks?|ceasefire|war|military|tensions?)\b)",
+    re.I,
+)
+DESKTOP_ALERT_WHALE_PNL_PATTERN = re.compile(
+    r"(?:(?:巨鲸|鲸鱼|大户|聪明钱|某地址|某账户).{0,80}"
+    r"(?:赚(?:取|得)?|获利|盈利|浮盈|亏损|浮亏|止盈|止损|爆仓|清算|实现亏损|累计亏损)|"
+    r"(?:赚(?:取|得)?|获利|盈利|浮盈|亏损|浮亏|止盈|止损|爆仓|清算|实现亏损|累计亏损).{0,80}"
+    r"(?:巨鲸|鲸鱼|大户|聪明钱|某地址|某账户)|"
+    r"\b(?:whale|large holder|smart money|wallet|address)\b.{0,120}"
+    r"\b(?:profit|loss|pnl|stop[- ]?loss|take[- ]?profit|liquidat(?:ed|ion))\b|"
+    r"\b(?:profit|loss|pnl|stop[- ]?loss|take[- ]?profit|liquidat(?:ed|ion))\b.{0,120}"
+    r"\b(?:whale|large holder|smart money|wallet|address)\b)",
+    re.I,
+)
+WECHAT_GROUP_MONITOR_LOCK = threading.Lock()
+WECHAT_GROUP_MONITOR_STARTED = False
+WECHAT_GROUP_ANALYSIS_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="wechat-opportunity")
+WECHAT_GROUP_OPPORTUNITY_DEDUP_SECONDS = 48 * 60 * 60
+DEFAULT_QQ_GROUP_NAME = "地表最强bsc eth"
+DEFAULT_QQ_SENDER_FILTER = "鲸鱼🐳PP"
+DEFAULT_QQ_WECHAT_FORWARD_TARGET = "文件传输助手"
+CHAT_FORWARD_RETRY_SECONDS = (15, 60, 5 * 60, 15 * 60, 60 * 60)
+CHAT_FORWARD_LOCK = threading.Lock()
 SITE_ALERT_LOCK = threading.Lock()
 SITE_ALERT_STATE: dict[str, Any] = {"seen": {}, "ready": []}
 SITE_ALERT_STATE_LOADED = False
 SITE_ALERT_SEEN_LIMIT = 10000
 DEEPSEEK_INSIGHTS_LOCK = threading.Lock()
+X_KOL_TRANSLATION_LOCK = threading.Lock()
+X_KOL_REALTIME_CONDITION = threading.Condition()
+X_KOL_REALTIME_SNAPSHOTS: dict[int, dict[str, Any]] = {}
+X_KOL_REALTIME_DISK_HYDRATED: set[int] = set()
+X_KOL_REALTIME_WORKERS: set[int] = set()
+X_KOL_REALTIME_WAKE_EVENTS: dict[int, threading.Event] = {}
+X_KOL_REALTIME_RSS_INTERVAL_SECONDS = max(2.0, float(os.getenv("X_KOL_REALTIME_RSS_INTERVAL_SECONDS", "3") or "3"))
+X_KOL_REALTIME_API_INTERVAL_SECONDS = max(5.0, float(os.getenv("X_KOL_REALTIME_API_INTERVAL_SECONDS", "15") or "15"))
+X_KOL_RSS_TIMEOUT_SECONDS = max(2.0, float(os.getenv("X_KOL_RSS_TIMEOUT_SECONDS", "4") or "4"))
+X_KOL_RSS_MIRROR_WORKERS = max(1, min(8, int(os.getenv("X_KOL_RSS_MIRROR_WORKERS", "4") or "4")))
+X_KOL_RSS_SOURCE_WORKERS = max(1, min(6, int(os.getenv("X_KOL_RSS_SOURCE_WORKERS", "4") or "4")))
+X_KOL_RSS_MIRROR_ATTEMPTS = max(1, min(4, int(os.getenv("X_KOL_RSS_MIRROR_ATTEMPTS", "2") or "2")))
+X_KOL_RSS_CIRCUIT_BASE_SECONDS = max(5.0, float(os.getenv("X_KOL_RSS_CIRCUIT_BASE_SECONDS", "15") or "15"))
+X_KOL_RSS_CIRCUIT_MAX_SECONDS = max(
+    X_KOL_RSS_CIRCUIT_BASE_SECONDS,
+    float(os.getenv("X_KOL_RSS_CIRCUIT_MAX_SECONDS", "300") or "300"),
+)
+X_KOL_RSS_PREFERENCE_LOCK = threading.Lock()
+X_KOL_RSS_PREFERRED_TEMPLATES: dict[str, str] = {}
+X_KOL_RSS_MIRROR_HEALTH_LOCK = threading.Lock()
+X_KOL_RSS_MIRROR_HEALTH: dict[str, dict[str, Any]] = {}
+X_KOL_OFFICIAL_STREAM_LOCK = threading.Lock()
+X_KOL_OFFICIAL_STREAM_USERS: dict[int, dict[str, Any]] = {}
+X_KOL_OFFICIAL_STREAM_STARTED = False
+X_KOL_OFFICIAL_STREAM_RESPONSE: Any = None
+X_KOL_OFFICIAL_STREAM_WAKE = threading.Event()
+X_KOL_PRIORITY_RSS_INTERVAL_SECONDS = max(
+    0.75,
+    float(os.getenv("X_KOL_PRIORITY_RSS_INTERVAL_SECONDS", "1") or "1"),
+)
+X_KOL_PRIORITY_API_INTERVAL_SECONDS = max(
+    5.0,
+    float(os.getenv("X_KOL_PRIORITY_API_INTERVAL_SECONDS", "15") or "15"),
+)
+X_KOL_PRIORITY_RSS_TIMEOUT_SECONDS = max(
+    1.0,
+    float(os.getenv("X_KOL_PRIORITY_RSS_TIMEOUT_SECONDS", "2") or "2"),
+)
+X_KOL_PRIORITY_RSS_MIRRORS = max(
+    1,
+    min(4, int(os.getenv("X_KOL_PRIORITY_RSS_MIRRORS", "3") or "3")),
+)
+X_KOL_PRIORITY_LOCK = threading.Lock()
+X_KOL_PRIORITY_STARTED = False
+X_KOL_PRIORITY_WAKE = threading.Event()
+LOCAL_TRANSLATION_PROCESS: subprocess.Popen | None = None
 AICOIN_CDP_RELAUNCH_LOCK = threading.Lock()
 SITE_ALERT_FUTURE_TOLERANCE_MS = 10 * 60 * 1000
 SITE_ALERT_MONITOR_ACTIVE = False
@@ -87,6 +265,248 @@ RANK_MONITOR_STOCK_HOT_WATCH_RANK = 10
 RANK_MONITOR_TURNOVER_WATCH_LIMIT = 20
 RANK_MONITOR_SKIP_UPDATE_SOURCES = {"okx-dex", "okx-dex-gainers"}
 RANK_MONITOR_STATE_VERSION = 3
+MARKET_PRIORITY_WINDOWS = {"1h": 60 * 60, "6h": 6 * 60 * 60, "24h": 24 * 60 * 60}
+MARKET_PRIORITY_HISTORY_SECONDS = 25 * 60 * 60
+MARKET_PRIORITY_SNAPSHOT_INTERVAL_SECONDS = 5 * 60
+PRICE_WATCH_WINDOW_SECONDS = 7 * 24 * 60 * 60
+PRICE_WATCH_RETENTION_SECONDS = 30 * 24 * 60 * 60
+BINANCE_WALLET_4H_STRUCTURE_RETENTION_SECONDS = PRICE_WATCH_RETENTION_SECONDS
+BINANCE_WALLET_4H_STRUCTURE_SYNC_SECONDS = 5 * 60
+PERSONAL_X_MONITOR_RETENTION_SECONDS = PRICE_WATCH_RETENTION_SECONDS
+PERSONAL_X_MONITOR_INGEST_MAX_AGE_SECONDS = 8 * 60 * 60
+PERSONAL_X_MONITOR_BACKFILL_DEFAULT_DAYS = 3
+NEW_CONTRACT_MONITOR_RETENTION_SECONDS = PRICE_WATCH_RETENTION_SECONDS
+PRICE_WATCH_THRESHOLD_PCT = 3.0
+PRICE_WATCH_RESET_PCT = 3.25
+PRICE_WATCH_REENTRY_COOLDOWN_SECONDS = 15 * 60
+PRICE_WATCH_NEW_HIGH_DELTA_PCT = 0.5
+PRICE_WATCH_STRUCTURE_BARS = 96
+PRICE_WATCH_RETEST_MIN_BARS = 12
+PRICE_WATCH_RETEST_DEPTH_PCT = 4.0
+PRICE_WATCH_RETEST_HOLD_BARS = 8
+PRICE_WATCH_CONSOLIDATION_BARS = 12
+PRICE_WATCH_CONSOLIDATION_RANGE_PCT = 2.2
+PRICE_WATCH_CONSOLIDATION_NET_PCT = 1.5
+PRICE_WATCH_OVERSOLD_DRAWDOWN_PCT = 50.0
+PRICE_WATCH_OVERSOLD_THRESHOLD_PCT = 3.0
+PRICE_WATCH_OVERSOLD_REARM_PCT = 6.0
+PRICE_WATCH_OVERSOLD_MIN_BARS_SINCE_LOW = 3
+PRICE_WATCH_OVERSOLD_MIN_STAGE_GAIN_PCT = 5.0
+PRICE_WATCH_OVERSOLD_RETEST_DEPTH_PCT = 4.0
+PRICE_WATCH_OVERSOLD_NEW_LOW_DELTA_PCT = 5.0
+PRICE_WATCH_FIB_DAILY_LIMIT = 240
+PRICE_WATCH_FIB_RECENT_HIGH_DAYS = 14
+PRICE_WATCH_FIB_MAX_IMPULSE_DAYS = 210
+PRICE_WATCH_FIB_MIN_IMPULSE_DAYS = 3
+PRICE_WATCH_FIB_MIN_IMPULSE_GAIN_PCT = 100.0
+PRICE_WATCH_FIB_MIN_TREND_EFFICIENCY = 0.35
+PRICE_WATCH_FIB_MIN_POSITIVE_DAY_RATIO = 0.50
+PRICE_WATCH_FIB_EXPLOSIVE_GAIN_PCT = 300.0
+PRICE_WATCH_FIB_EXPLOSIVE_MIN_EFFICIENCY = 0.18
+PRICE_WATCH_FIB_MIN_EARLY_LIFT_PCT = 6.0
+PRICE_WATCH_FIB_BASE_LOOKBACK_DAYS = 30
+PRICE_WATCH_FIB_BASE_TOLERANCE_PCT = 4.0
+PRICE_WATCH_FIB_BASE_CLOSE_RANGE_PCT = 35.0
+PRICE_WATCH_FIB_MAX_PATH_DRAWDOWN_PCT = 15.0
+PRICE_WATCH_FIB_SUSTAINED_BASE_DAYS = 7
+PRICE_WATCH_FIB_DEPARTURE_PCT = 8.0
+PRICE_WATCH_FIB_STRONG_DEPARTURE_PCT = 20.0
+PRICE_WATCH_FIB_BREAKOUT_CANDLE_GAIN_PCT = 80.0
+PRICE_WATCH_FIB_PRE_BREAKOUT_MAX_GAIN_PCT = 75.0
+PRICE_WATCH_FIB_ACCEL_WINDOW_DAYS = 5
+PRICE_WATCH_FIB_ACCEL_MIN_WINDOW_DAYS = 3
+PRICE_WATCH_FIB_ACCEL_MIN_BULL_RATIO = 0.75
+PRICE_WATCH_FIB_ACCEL_MIN_RATIO_JUMP = 0.35
+PRICE_WATCH_FIB_ACCEL_MIN_GAIN_PCT = 18.0
+PRICE_WATCH_FIB_ACCEL_MIN_EFFICIENCY = 0.55
+PRICE_WATCH_FIB_ACCEL_NEW_LEG_CORRECTION_PCT = 30.0
+PRICE_WATCH_FIB_CYCLE_RESET_DRAWDOWN_PCT = 50.0
+PRICE_WATCH_FIB_CYCLE_RESET_CLOSE_PCT = 65.0
+PRICE_WATCH_FIB_CYCLE_RECOVERY_PCT = 75.0
+PRICE_WATCH_FIB_THRESHOLD_PCT = 3.0
+PRICE_WATCH_FIB_REARM_PCT = 6.0
+PRICE_WATCH_FIB_REFERENCE_DELTA_PCT = 2.0
+PRICE_WATCH_INTERVAL_SECONDS = max(
+    3.0,
+    float(os.getenv("PRICE_WATCH_INTERVAL_SECONDS", "5") or "5"),
+)
+PRICE_WATCH_LOCK = threading.Lock()
+PRICE_WATCH_MONITOR_ACTIVE = False
+ROTATION_LEADER_MIN_GAIN_PCT = 300.0
+ROTATION_REFRESH_SECONDS = 60
+ROTATION_MAX_LEADERS = 40
+ROTATION_RECENT_HOT_SECONDS = 7 * 24 * 60 * 60
+ROTATION_LOW_POSITION_MIN_DISTANCE_PCT = 15.0
+ROTATION_GAINER_HISTORY_SECONDS = 30 * 24 * 60 * 60
+ROTATION_MAX_CANDIDATES = 8
+PRICE_STRUCTURE_CACHE_TTL_SECONDS = 180
+PRICE_STRUCTURE_STRATEGY_VERSION = "v73"
+PRICE_STRUCTURE_NEW_COIN_MAX_AGE_DAYS = 14
+PRICE_STRUCTURE_DEEP_DRAWDOWN_PCT = 70.0
+PRICE_STRUCTURE_REPRICING_LOOKBACK_BARS = 192
+PRICE_STRUCTURE_REPRICING_PEAK_MAX_AGE_BARS = 144
+PRICE_STRUCTURE_REGIME_RESET_MIN_SCORE = 75
+PRICE_STRUCTURE_EXTREME_HEAT_MIN = 80.0
+PRICE_STRUCTURE_EXTREME_HEAT_MAX_RANK = 3
+PRICE_STRUCTURE_EVENT_CONTEXT_LOCK = threading.Lock()
+PRICE_STRUCTURE_EVENT_CONTEXTS: dict[str, dict[str, Any]] = {}
+PRICE_STRUCTURE_MONITOR_INTERVAL_SECONDS = max(
+    1.0,
+    float(os.getenv("PRICE_STRUCTURE_MONITOR_INTERVAL_SECONDS", "3") or "3"),
+)
+PRICE_STRUCTURE_MONITOR_WORKERS = max(
+    2,
+    min(16, int(os.getenv("PRICE_STRUCTURE_MONITOR_WORKERS", "8") or "8")),
+)
+PRICE_STRUCTURE_PRIORITY_REFRESH_SECONDS = max(
+    3.0,
+    float(os.getenv("PRICE_STRUCTURE_PRIORITY_REFRESH_SECONDS", "10") or "10"),
+)
+PRICE_STRUCTURE_REGULAR_REFRESH_SECONDS = max(
+    PRICE_STRUCTURE_PRIORITY_REFRESH_SECONDS,
+    float(os.getenv("PRICE_STRUCTURE_REGULAR_REFRESH_SECONDS", "45") or "45"),
+)
+PRICE_STRUCTURE_SHORT_HISTORY_MAX_AGE_DAYS = max(
+    30,
+    int(os.getenv("PRICE_STRUCTURE_SHORT_HISTORY_MAX_AGE_DAYS", "45") or "45"),
+)
+PRICE_STRUCTURE_RECENT_LISTING_CACHE_SECONDS = 5 * 60
+PRICE_STRUCTURE_FAST_PROVIDER_LIMIT = max(
+    3,
+    min(10, int(os.getenv("PRICE_STRUCTURE_FAST_PROVIDER_LIMIT", "6") or "6")),
+)
+PRICE_STRUCTURE_PREARM_INTERVAL_SECONDS = max(
+    0.5,
+    float(os.getenv("PRICE_STRUCTURE_PREARM_INTERVAL_SECONDS", "1") or "1"),
+)
+PRICE_STRUCTURE_PREARM_DISTANCE_PCT = max(
+    0.05,
+    float(os.getenv("PRICE_STRUCTURE_PREARM_DISTANCE_PCT", "0.8") or "0.8"),
+)
+PRICE_STRUCTURE_PREARM_MAX_OVERSHOOT_PCT = max(
+    0.05,
+    float(os.getenv("PRICE_STRUCTURE_PREARM_MAX_OVERSHOOT_PCT", "0.35") or "0.35"),
+)
+PRICE_STRUCTURE_PREARM_FORECAST_MINUTES = max(
+    1.0,
+    float(os.getenv("PRICE_STRUCTURE_PREARM_FORECAST_MINUTES", "10") or "10"),
+)
+PRICE_STRUCTURE_PREARM_MAX_FORECAST_DISTANCE_PCT = max(
+    PRICE_STRUCTURE_PREARM_DISTANCE_PCT,
+    float(os.getenv("PRICE_STRUCTURE_PREARM_MAX_FORECAST_DISTANCE_PCT", "4") or "4"),
+)
+PRICE_STRUCTURE_PREARM_MIN_SPEED_PCT_PER_MINUTE = max(
+    0.001,
+    float(os.getenv("PRICE_STRUCTURE_PREARM_MIN_SPEED_PCT_PER_MINUTE", "0.02") or "0.02"),
+)
+PRICE_STRUCTURE_PREARM_MIN_UP_RATIO = min(
+    1.0,
+    max(0.5, float(os.getenv("PRICE_STRUCTURE_PREARM_MIN_UP_RATIO", "0.6") or "0.6")),
+)
+PRICE_STRUCTURE_PREARM_MAX_SNAPSHOT_AGE_SECONDS = max(
+    30.0,
+    float(os.getenv("PRICE_STRUCTURE_PREARM_MAX_SNAPSHOT_AGE_SECONDS", "180") or "180"),
+)
+PRICE_STRUCTURE_SIGNAL_CLOSE_GRACE_MS = max(
+    15_000,
+    int(float(os.getenv("PRICE_STRUCTURE_SIGNAL_CLOSE_GRACE_SECONDS", "120") or "120") * 1000),
+)
+PRICE_STRUCTURE_OBSERVATION_COOLDOWN_MS = max(
+    60_000,
+    int(float(os.getenv("PRICE_STRUCTURE_OBSERVATION_COOLDOWN_SECONDS", "3600") or "3600") * 1000),
+)
+NEW_COIN_LOW_MAX_AGE_SECONDS = 365 * 24 * 60 * 60
+NEW_COIN_LOW_INVENTORY_CACHE_SECONDS = 60 * 60
+NEW_COIN_LOW_MONITOR_INTERVAL_SECONDS = max(
+    5.0,
+    float(os.getenv("NEW_COIN_LOW_MONITOR_INTERVAL_SECONDS", "10") or "10"),
+)
+NEW_COIN_LOW_MONITOR_WORKERS = max(
+    2,
+    min(16, int(os.getenv("NEW_COIN_LOW_MONITOR_WORKERS", "4") or "4")),
+)
+NEW_COIN_LOW_ACTIVITY_GRACE_DAYS = max(
+    0.0,
+    float(os.getenv("NEW_COIN_LOW_ACTIVITY_GRACE_DAYS", "0") or "0"),
+)
+NEW_COIN_LOW_MIN_TURNOVER_24H_USD = max(
+    0.0,
+    float(os.getenv("NEW_COIN_LOW_MIN_TURNOVER_24H_USD", "10000000") or "10000000"),
+)
+NEW_COIN_LOW_ACTIVITY_CACHE_SECONDS = max(
+    60.0,
+    float(os.getenv("NEW_COIN_LOW_ACTIVITY_CACHE_SECONDS", "600") or "600"),
+)
+NEW_COIN_LOW_INVENTORY_CACHE: tuple[float, list[dict[str, Any]]] | None = None
+NEW_COIN_LOW_ACTIVITY_CACHE: tuple[float, dict[str, dict[str, Any]]] | None = None
+NEW_COIN_LOW_ACTIVITY_LOCK = threading.Lock()
+PRICE_STRUCTURE_RECENT_LISTING_INDEX_CACHE: tuple[float, dict[str, int]] | None = None
+PRICE_STRUCTURE_RECENT_LISTING_INDEX_LOCK = threading.Lock()
+NEW_COIN_LOW_ACTIVITY_SUMMARY: dict[str, Any] = {
+    "excluded": 0,
+    "unavailable": 0,
+    "thresholdUsd": NEW_COIN_LOW_MIN_TURNOVER_24H_USD,
+    "graceDays": NEW_COIN_LOW_ACTIVITY_GRACE_DAYS,
+}
+PRICE_MONITOR_ACTIVITY_SUMMARY: dict[str, Any] = {
+    "excluded": 0,
+    "unavailable": 0,
+    "thresholdUsd": NEW_COIN_LOW_MIN_TURNOVER_24H_USD,
+}
+NEW_COIN_LOW_ITEMS: dict[str, dict[str, Any]] = {}
+NEW_COIN_LOW_LOCK = threading.Lock()
+NEW_COIN_LOW_MONITOR_ACTIVE = False
+PRICE_STRUCTURE_MONITOR_ACTIVE = False
+PRICE_STRUCTURE_PREARM_MONITOR_ACTIVE = False
+PRICE_STRUCTURE_PREARM_STATUS_LOCK = threading.Lock()
+PRICE_STRUCTURE_PREARM_STATUS: dict[str, Any] = {
+    "lastRunAt": 0,
+    "candidates": 0,
+    "quotes": 0,
+    "alerts": 0,
+}
+PRICE_STRUCTURE_PROVIDER_PREFERENCE: dict[str, str] = {}
+PRICE_STRUCTURE_PROVIDER_PROBE_CURSOR: dict[str, int] = {}
+PRICE_STRUCTURE_PROVIDER_PREFERENCE_LOCK = threading.Lock()
+PRICE_STRUCTURE_ONCHAIN_POOL_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+PRICE_STRUCTURE_ONCHAIN_POOL_CACHE_LOCK = threading.Lock()
+PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE: dict[str, tuple[float, list[tuple[int, float, float, float, float, float]]]] = {}
+PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE_LOCK = threading.Lock()
+BINANCE_WALLET_4H_STRUCTURE_LOCK = threading.Lock()
+BINANCE_WALLET_4H_STRUCTURE_LAST_SYNC_AT = 0.0
+BINANCE_WALLET_4H_STRUCTURE_ACTIVE = False
+PRICE_STRUCTURE_ONCHAIN_POOL_CACHE_TTL_SECONDS = 10 * 60
+PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE_TTL_SECONDS = 20
+PRICE_STRUCTURE_MOMENTUM_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+PRICE_STRUCTURE_MOMENTUM_CACHE_LOCK = threading.Lock()
+PRICE_STRUCTURE_MOMENTUM_CACHE_TTL_SECONDS = 10
+PRICE_STRUCTURE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+PRICE_STRUCTURE_CACHE_LOCK = threading.Lock()
+PRICE_STRUCTURE_REFRESH_LOCK = threading.Lock()
+PRICE_STRUCTURE_DISK_CACHE_HYDRATED = False
+STRATEGY_ADAPTIVE_CONTEXT_LOCK = threading.Lock()
+PRICE_STRUCTURE_TIMEFRAMES = (
+    ("1m", "1分钟", "1m", "1m", "1m", "1m", "1min", "1m", "1m", "1m"),
+    ("5m", "5分钟", "5m", "5m", "5m", "5m", "5min", "5m", "5m", "5m"),
+    ("15m", "15分钟", "15m", "15m", "15m", "15m", "15min", "15m", "15m", "15m"),
+    ("1h", "1小时", "1h", "1H", "1H", "1h", "60min", "1h", "1h", "1h"),
+    ("4h", "4小时", "4h", "4H", "4H", "4h", "4hour", "4h", "4h", "4h"),
+    ("1d", "日线", "1d", "1D", "1D", "1d", "1day", "1d", "1d", "1d"),
+)
+PRICE_STRUCTURE_INTERVAL_LABELS = {key: label for key, label, *_rest in PRICE_STRUCTURE_TIMEFRAMES}
+PRICE_STRUCTURE_CANDLE_LIMIT = 300
+DRAGON_WAVE_MONITOR_BRIDGE = ROOT / "tools" / "dragon_wave_monitor_bridge.js"
+STRATEGY_FEE_BUFFER_PCT = 0.12
+STRATEGY_DEFAULT_STOP_PCT = 3.0
+STRATEGY_MIN_STOP_PCT = 0.35
+STRATEGY_POSITION_REFRESH_SECONDS = 20
+STRATEGY_LIVE_TRADING_ENABLED = str(os.getenv("STRATEGY_LIVE_TRADING_ENABLED", "")).strip().lower() in {
+    "1", "true", "yes", "on"
+}
+STRATEGY_MAX_ORDER_NOTIONAL_USDT = float(os.getenv("STRATEGY_MAX_ORDER_NOTIONAL_USDT", "25000") or "25000")
+STRATEGY_EXCHANGE_CACHE: dict[str, tuple[float, Any]] = {}
+STRATEGY_EXCHANGE_CACHE_LOCK = threading.Lock()
+STRATEGY_POSITION_CACHE_SECONDS = 15
 LOGO_CACHE: dict[str, tuple[float, list[str]]] = {}
 LOGO_CACHE_TTL = 24 * 60 * 60
 configured_runtime_dir = os.getenv("XINGYUN_RUNTIME_DIR", "").strip()
@@ -98,16 +518,28 @@ DESKTOP_ALERT_MARKER_DIR = PERSIST_CACHE_DIR / "desktop_alert_markers"
 DESKTOP_ALERT_MARKER_DIR.mkdir(exist_ok=True)
 DESKTOP_ALERT_MARKER_TTL_SECONDS = 10 * 60
 SITE_ALERT_STATE_PATH = PERSIST_CACHE_DIR / "site_alert_seen.json"
+NEWS_TRADE_ALERT_STATE_PATH = PERSIST_CACHE_DIR / "news_trade_alert_state.json"
+NEWS_TRADE_DESKTOP_INTAKE_PATH = PERSIST_CACHE_DIR / "news_trade_desktop_intake.json"
+ASTER_ANNOUNCEMENT_STATE_PATH = PERSIST_CACHE_DIR / "aster_listing_announcements.json"
+ASTER_X_LISTING_CACHE_PATH = PERSIST_CACHE_DIR / "aster_x_listing_announcements.json"
 RANK_MONITOR_STATE_PATH = PERSIST_CACHE_DIR / "rank_monitor_state.json"
+BINANCE_WALLET_4H_STRUCTURE_PATH = PERSIST_CACHE_DIR / "binance_wallet_4h_structure_history.json"
 OKX_FUTURES_CACHE_PATH = PERSIST_CACHE_DIR / "okx_futures_hot.json"
 OKX_DEX_SOURCE_CACHE_PATH = PERSIST_CACHE_DIR / "okx_dex_source.json"
 THS_SOURCE_CACHE_PATH = PERSIST_CACHE_DIR / "ths_hot_source.json"
 WECHAT_ACCOUNT_CACHE_PATH = PERSIST_CACHE_DIR / "wechat_accounts.json"
 WECHAT_SOURCE_ALIAS_CACHE_PATH = PERSIST_CACHE_DIR / "wechat_source_aliases.json"
 X_KOL_SOURCES_PATH = PERSIST_CACHE_DIR / "x_kol_sources.json"
+X_KOL_TRANSLATION_CACHE_PATH = PERSIST_CACHE_DIR / "x_kol_translations.json"
+STRATEGY_ADAPTIVE_CONTEXT_PATH = PERSIST_CACHE_DIR / "strategy_adaptive_context.json"
+PRICE_STRUCTURE_SNAPSHOT_PATH = PERSIST_CACHE_DIR / "price_structure_snapshot.json"
+NEW_COIN_LOW_SNAPSHOT_PATH = PERSIST_CACHE_DIR / "new_coin_low_structure_snapshot.json"
+NEW_COIN_LOW_LISTING_HISTORY_PATH = PERSIST_CACHE_DIR / "new_coin_low_listing_history.json"
+TRANSLATION_CACHE_MAX_ENTRIES = 20000
 CN_STOCK_GAINERS_CACHE_PATH = PERSIST_CACHE_DIR / "cn_stock_gainers_source.json"
 DEEPSEEK_INSIGHTS_CACHE_PATH = PERSIST_CACHE_DIR / "deepseek_rank_insights.json"
 AICOIN_PAYLOAD_TOKEN_PATH = PERSIST_CACHE_DIR / "aicoin_payload_token.txt"
+AVE_TOKEN_CACHE_PATH = PERSIST_CACHE_DIR / "ave_token.json"
 AUTOMATION_BRIEF_IDS = ("automation", "automation-2")
 AUTOMATION_BRIEF_PLACEHOLDER = "暂时没有找到这条自动化任务最近生成的简报正文。"
 AUTOMATION_BRIEFS_REMOTE_CACHE_PATH = PERSIST_CACHE_DIR / "automation_briefs_remote.json"
@@ -133,6 +565,8 @@ WECHAT_PLATFORM_BACKFILL_PAGE_LIMIT = 24
 X_KOL_RETENTION_MS = 14 * 24 * 60 * 60 * 1000
 X_KOL_FETCH_LIMIT = 80
 AUTH_DB_PATH = PERSIST_CACHE_DIR / "xingyunshe_auth.db"
+CHAIN_ECOSYSTEM_DB_PATH = PERSIST_CACHE_DIR / "chain_ecosystem.db"
+CHAIN_ECOSYSTEM_MONITOR = ChainEcosystemMonitor(ChainEcosystemStore(CHAIN_ECOSYSTEM_DB_PATH))
 AUTH_SESSION_COOKIE = "xys_session"
 AUTH_SESSION_DAYS = 7
 AUTH_PASSWORD_ITERATIONS = 240_000
@@ -157,6 +591,7 @@ SECURITY_RATE_BUCKETS: dict[str, list[float]] = {}
 USER_SCOPE_TODO = "todo"
 USER_SCOPE_X_KOL_SOURCES = "x_kol_sources"
 USER_SCOPE_RSS_SOURCES = "rss_sources"
+USER_SCOPE_DRAGON_WAVE_FEEDBACK = "dragon_wave_feedback_v1"
 USER_SCOPE_RSS_ITEMS = "rss_items"
 STOCK_LOGO_OVERRIDES = {
     "hk:00100": ["minimax.io"],
@@ -369,6 +804,12 @@ def warm_runtime_cache() -> None:
         ("binance-new", fetch_binance_new_coins),
         ("okx-new", fetch_okx_new_coins),
         ("bitget-new", fetch_bitget_new_coins),
+        ("gate-new", fetch_gate_new_coins),
+        ("htx-new", fetch_htx_new_coins),
+        ("trade-xyz-new", fetch_trade_xyz_new_coins),
+        ("hyperliquid-new", fetch_hyperliquid_new_coins),
+        ("aster-new", fetch_aster_new_coins),
+        ("binance-alpha-new", fetch_binance_alpha_new_coins),
     ):
         try:
             cached(key, fetcher)
@@ -386,7 +827,12 @@ def cached(key: str, fn):
 
 
 def clear_market_source_memory_cache() -> None:
-    for key in ("binance", "okx", "okx-dex", "bitget", "aicoin", "futu-hk", "futu-us", "ths"):
+    for key in (
+        "binance", "okx", "okx-dex", "ave", "bitget", "aicoin", "futu-hk", "futu-us", "ths",
+        "binance-wallet-hot-5m", "binance-wallet-hot-1h", "binance-wallet-hot-4h", "binance-wallet-hot-24h",
+        "binance-new", "okx-new", "bitget-new", "gate-new", "htx-new",
+        "trade-xyz-new", "hyperliquid-new", "aster-new", "binance-alpha-new",
+    ):
         CACHE.pop(key, None)
 
 
@@ -638,6 +1084,22 @@ def init_auth_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS translation_cache (
+                cache_key TEXT PRIMARY KEY,
+                source_hash TEXT NOT NULL,
+                source_lang TEXT NOT NULL DEFAULT 'en',
+                target_lang TEXT NOT NULL DEFAULT 'zh',
+                translation TEXT NOT NULL,
+                engine TEXT NOT NULL,
+                hits INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                last_accessed_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS security_audit_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 actor_user_id INTEGER,
@@ -652,6 +1114,355 @@ def init_auth_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_watch_assets (
+                symbol TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                icon TEXT NOT NULL DEFAULT '',
+                pair_hint TEXT NOT NULL DEFAULT '',
+                manual_pinned INTEGER NOT NULL DEFAULT 0,
+                aicoin_first_seen_at INTEGER NOT NULL DEFAULT 0,
+                aicoin_last_seen_at INTEGER NOT NULL DEFAULT 0,
+                personal_x_mentioned_at INTEGER NOT NULL DEFAULT 0,
+                personal_x_source_name TEXT NOT NULL DEFAULT '',
+                personal_x_source_text TEXT NOT NULL DEFAULT '',
+                new_contract_listed_at INTEGER NOT NULL DEFAULT 0,
+                new_contract_source TEXT NOT NULL DEFAULT '',
+                new_contract_pair TEXT NOT NULL DEFAULT '',
+                structure_1m_override INTEGER NOT NULL DEFAULT -1,
+                structure_interval_overrides_json TEXT NOT NULL DEFAULT '{}',
+                prior_high_excluded_at INTEGER NOT NULL DEFAULT 0,
+                prior_high_absent_at INTEGER NOT NULL DEFAULT 0,
+                opportunity_active INTEGER NOT NULL DEFAULT 0,
+                opportunity_first_seen_at INTEGER NOT NULL DEFAULT 0,
+                opportunity_last_seen_at INTEGER NOT NULL DEFAULT 0,
+                opportunity_source TEXT NOT NULL DEFAULT '',
+                opportunity_sources_json TEXT NOT NULL DEFAULT '[]',
+                opportunity_manual_removed_at INTEGER NOT NULL DEFAULT 0,
+                last_quote_success_at INTEGER NOT NULL DEFAULT 0,
+                quote_failure_streak INTEGER NOT NULL DEFAULT 0,
+                dead_at INTEGER NOT NULL DEFAULT 0,
+                dead_reason TEXT NOT NULL DEFAULT '',
+                dismissed_until INTEGER NOT NULL DEFAULT 0,
+                current_price REAL,
+                week_high REAL,
+                distance_pct REAL,
+                provider TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                setup_type TEXT NOT NULL DEFAULT '',
+                structure_low REAL,
+                structure_high REAL,
+                structure_json TEXT NOT NULL DEFAULT '',
+                oversold_status TEXT NOT NULL DEFAULT 'normal',
+                oversold_drawdown_pct REAL,
+                oversold_range_low REAL,
+                oversold_range_high REAL,
+                oversold_distance_pct REAL,
+                oversold_json TEXT NOT NULL DEFAULT '',
+                fib_status TEXT NOT NULL DEFAULT 'normal',
+                fib_json TEXT NOT NULL DEFAULT '',
+                last_checked_at INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        price_watch_asset_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(price_watch_assets)").fetchall()
+        }
+        for column, ddl in {
+            "setup_type": "setup_type TEXT NOT NULL DEFAULT ''",
+            "structure_low": "structure_low REAL",
+            "structure_high": "structure_high REAL",
+            "structure_json": "structure_json TEXT NOT NULL DEFAULT ''",
+            "oversold_status": "oversold_status TEXT NOT NULL DEFAULT 'normal'",
+            "oversold_drawdown_pct": "oversold_drawdown_pct REAL",
+            "oversold_range_low": "oversold_range_low REAL",
+            "oversold_range_high": "oversold_range_high REAL",
+            "oversold_distance_pct": "oversold_distance_pct REAL",
+            "oversold_json": "oversold_json TEXT NOT NULL DEFAULT ''",
+            "fib_status": "fib_status TEXT NOT NULL DEFAULT 'normal'",
+            "fib_json": "fib_json TEXT NOT NULL DEFAULT ''",
+            "opportunity_active": "opportunity_active INTEGER NOT NULL DEFAULT 0",
+            "opportunity_first_seen_at": "opportunity_first_seen_at INTEGER NOT NULL DEFAULT 0",
+            "opportunity_last_seen_at": "opportunity_last_seen_at INTEGER NOT NULL DEFAULT 0",
+            "opportunity_source": "opportunity_source TEXT NOT NULL DEFAULT ''",
+            "opportunity_sources_json": "opportunity_sources_json TEXT NOT NULL DEFAULT '[]'",
+            "opportunity_manual_removed_at": "opportunity_manual_removed_at INTEGER NOT NULL DEFAULT 0",
+            "last_quote_success_at": "last_quote_success_at INTEGER NOT NULL DEFAULT 0",
+            "quote_failure_streak": "quote_failure_streak INTEGER NOT NULL DEFAULT 0",
+            "dead_at": "dead_at INTEGER NOT NULL DEFAULT 0",
+            "dead_reason": "dead_reason TEXT NOT NULL DEFAULT ''",
+            "prior_high_excluded_at": "prior_high_excluded_at INTEGER NOT NULL DEFAULT 0",
+            "prior_high_absent_at": "prior_high_absent_at INTEGER NOT NULL DEFAULT 0",
+            "personal_x_mentioned_at": "personal_x_mentioned_at INTEGER NOT NULL DEFAULT 0",
+            "personal_x_source_name": "personal_x_source_name TEXT NOT NULL DEFAULT ''",
+            "personal_x_source_text": "personal_x_source_text TEXT NOT NULL DEFAULT ''",
+            "new_contract_listed_at": "new_contract_listed_at INTEGER NOT NULL DEFAULT 0",
+            "new_contract_source": "new_contract_source TEXT NOT NULL DEFAULT ''",
+            "new_contract_pair": "new_contract_pair TEXT NOT NULL DEFAULT ''",
+            "structure_1m_override": "structure_1m_override INTEGER NOT NULL DEFAULT -1",
+            "structure_interval_overrides_json": "structure_interval_overrides_json TEXT NOT NULL DEFAULT '{}'",
+        }.items():
+            if column not in price_watch_asset_columns:
+                conn.execute(f"ALTER TABLE price_watch_assets ADD COLUMN {ddl}")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_price_watch_opportunity_active "
+            "ON price_watch_assets(opportunity_active, opportunity_manual_removed_at, dead_at)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_watch_alert_state (
+                symbol TEXT PRIMARY KEY,
+                reference_high REAL NOT NULL DEFAULT 0,
+                in_zone INTEGER NOT NULL DEFAULT 0,
+                last_alert_at INTEGER NOT NULL DEFAULT 0,
+                left_zone_at INTEGER NOT NULL DEFAULT 0,
+                episode INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_watch_first_confirmations (
+                symbol TEXT PRIMARY KEY,
+                episode INTEGER NOT NULL,
+                confirmed_at INTEGER NOT NULL,
+                current_price REAL,
+                reference_high REAL,
+                distance_pct REAL,
+                provider TEXT NOT NULL DEFAULT '',
+                setup_type TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_watch_oversold_alert_state (
+                symbol TEXT PRIMARY KEY,
+                reference_low REAL NOT NULL DEFAULT 0,
+                reference_high REAL NOT NULL DEFAULT 0,
+                in_zone INTEGER NOT NULL DEFAULT 0,
+                armed INTEGER NOT NULL DEFAULT 1,
+                last_alert_at INTEGER NOT NULL DEFAULT 0,
+                left_zone_at INTEGER NOT NULL DEFAULT 0,
+                episode INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_watch_fib_alert_state (
+                symbol TEXT NOT NULL,
+                level TEXT NOT NULL,
+                reference_low REAL NOT NULL DEFAULT 0,
+                reference_high REAL NOT NULL DEFAULT 0,
+                target_price REAL NOT NULL DEFAULT 0,
+                last_price REAL NOT NULL DEFAULT 0,
+                in_zone INTEGER NOT NULL DEFAULT 0,
+                armed INTEGER NOT NULL DEFAULT 1,
+                last_alert_at INTEGER NOT NULL DEFAULT 0,
+                episode INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (symbol, level)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_structure_exclusions (
+                symbol TEXT PRIMARY KEY,
+                excluded_at INTEGER NOT NULL,
+                absent_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_structure_observation_alert_state (
+                symbol TEXT PRIMARY KEY,
+                last_alert_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS strategy_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                signal_episode INTEGER NOT NULL,
+                exchange TEXT NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'paper',
+                side TEXT NOT NULL DEFAULT 'long',
+                order_type TEXT NOT NULL DEFAULT 'market',
+                status TEXT NOT NULL DEFAULT 'staged',
+                account_equity REAL NOT NULL,
+                current_gross_exposure REAL NOT NULL DEFAULT 0,
+                daily_loss REAL NOT NULL DEFAULT 0,
+                risk_pct REAL NOT NULL,
+                daily_loss_limit_pct REAL NOT NULL,
+                exposure_cap_pct REAL NOT NULL,
+                leverage REAL NOT NULL,
+                entry_price REAL NOT NULL,
+                mark_price REAL,
+                stop_loss_price REAL NOT NULL,
+                stop_distance_pct REAL NOT NULL,
+                risk_budget REAL NOT NULL,
+                notional REAL NOT NULL,
+                margin_required REAL NOT NULL,
+                quantity REAL NOT NULL,
+                unrealized_pnl REAL NOT NULL DEFAULT 0,
+                exchange_order_id TEXT NOT NULL DEFAULT '',
+                response_json TEXT NOT NULL DEFAULT '',
+                error TEXT NOT NULL DEFAULT '',
+                break_even_at INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                confirmed_at INTEGER NOT NULL DEFAULT 0,
+                submitted_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(user_id, symbol, signal_episode),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_exchange_credentials (
+                user_id INTEGER NOT NULL,
+                exchange TEXT NOT NULL,
+                api_key TEXT NOT NULL DEFAULT '',
+                api_secret TEXT NOT NULL DEFAULT '',
+                passphrase TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(user_id, exchange),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS wechat_group_monitors (
+                user_id INTEGER NOT NULL,
+                group_name TEXT NOT NULL,
+                platform TEXT NOT NULL DEFAULT 'wechat',
+                sender_filter TEXT NOT NULL DEFAULT '',
+                forward_to_wechat INTEGER NOT NULL DEFAULT 0,
+                forward_target TEXT NOT NULL DEFAULT '',
+                last_forward_at INTEGER NOT NULL DEFAULT 0,
+                last_forward_error TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 0,
+                baseline_ready INTEGER NOT NULL DEFAULT 0,
+                last_status TEXT NOT NULL DEFAULT 'stopped',
+                last_error TEXT NOT NULL DEFAULT '',
+                last_seen_at INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(user_id, group_name),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS wechat_group_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                group_name TEXT NOT NULL,
+                platform TEXT NOT NULL DEFAULT 'wechat',
+                sender_filter TEXT NOT NULL DEFAULT '',
+                message_hash TEXT NOT NULL,
+                sender TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL,
+                captured_at INTEGER NOT NULL,
+                candidate_score INTEGER NOT NULL DEFAULT 0,
+                is_opportunity INTEGER NOT NULL DEFAULT 0,
+                opportunity_score INTEGER NOT NULL DEFAULT 0,
+                category TEXT NOT NULL DEFAULT '',
+                symbols_json TEXT NOT NULL DEFAULT '[]',
+                thesis TEXT NOT NULL DEFAULT '',
+                catalysts_json TEXT NOT NULL DEFAULT '[]',
+                risks_json TEXT NOT NULL DEFAULT '[]',
+                action_hint TEXT NOT NULL DEFAULT '',
+                urgency TEXT NOT NULL DEFAULT '',
+                analysis_source TEXT NOT NULL DEFAULT '',
+                analyzed_at INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                UNIQUE(user_id, message_hash),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS wechat_group_seen (
+                user_id INTEGER NOT NULL,
+                group_name TEXT NOT NULL,
+                message_hash TEXT NOT NULL,
+                seen_at INTEGER NOT NULL,
+                PRIMARY KEY(user_id, group_name, message_hash),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_message_forwards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                message_hash TEXT NOT NULL,
+                source_platform TEXT NOT NULL DEFAULT 'qq',
+                source_name TEXT NOT NULL DEFAULT '',
+                sender TEXT NOT NULL DEFAULT '',
+                target TEXT NOT NULL DEFAULT '文件传输助手',
+                content TEXT NOT NULL,
+                symbols_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                sent_at INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(user_id, message_hash, target),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        wechat_group_monitor_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(wechat_group_monitors)").fetchall()
+        }
+        for column_name, column_sql in {
+            "platform": "platform TEXT NOT NULL DEFAULT 'wechat'",
+            "sender_filter": "sender_filter TEXT NOT NULL DEFAULT ''",
+            "forward_to_wechat": "forward_to_wechat INTEGER NOT NULL DEFAULT 0",
+            "forward_target": "forward_target TEXT NOT NULL DEFAULT ''",
+            "last_forward_at": "last_forward_at INTEGER NOT NULL DEFAULT 0",
+            "last_forward_error": "last_forward_error TEXT NOT NULL DEFAULT ''",
+        }.items():
+            if column_name not in wechat_group_monitor_columns:
+                conn.execute(f"ALTER TABLE wechat_group_monitors ADD COLUMN {column_sql}")
+        wechat_group_message_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(wechat_group_messages)").fetchall()
+        }
+        for column_name, column_sql in {
+            "platform": "platform TEXT NOT NULL DEFAULT 'wechat'",
+            "sender_filter": "sender_filter TEXT NOT NULL DEFAULT ''",
+        }.items():
+            if column_name not in wechat_group_message_columns:
+                conn.execute(f"ALTER TABLE wechat_group_messages ADD COLUMN {column_sql}")
+        price_watch_state_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(price_watch_alert_state)").fetchall()
+        }
+        if "left_zone_at" not in price_watch_state_columns:
+            conn.execute("ALTER TABLE price_watch_alert_state ADD COLUMN left_zone_at INTEGER NOT NULL DEFAULT 0")
+        if "episode" not in price_watch_state_columns:
+            conn.execute("ALTER TABLE price_watch_alert_state ADD COLUMN episode INTEGER NOT NULL DEFAULT 0")
         conn.execute("DROP INDEX IF EXISTS idx_users_email")
         conn.execute("DROP INDEX IF EXISTS idx_users_phone")
         conn.execute("DROP INDEX IF EXISTS idx_users_google_sub")
@@ -660,12 +1471,25 @@ def init_auth_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(token_hash)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_user_payloads_scope ON user_payloads(scope)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_translation_cache_accessed ON translation_cache(last_accessed_at)")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_hash ON users(email_hash) WHERE email_hash IS NOT NULL AND email_hash != ''")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_hash ON users(phone_hash) WHERE phone_hash IS NOT NULL AND phone_hash != ''")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub_hash ON users(google_sub_hash) WHERE google_sub_hash IS NOT NULL AND google_sub_hash != ''")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_security_audit_created_at ON security_audit_logs(created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_security_audit_action ON security_audit_logs(action)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_security_audit_actor ON security_audit_logs(actor_user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_price_watch_aicoin_seen ON price_watch_assets(aicoin_first_seen_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_price_watch_checked ON price_watch_assets(last_checked_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_price_watch_first_confirmed_at ON price_watch_first_confirmations(confirmed_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_price_watch_oversold_updated ON price_watch_oversold_alert_state(updated_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_price_watch_fib_updated ON price_watch_fib_alert_state(updated_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_strategy_orders_user_status ON strategy_orders(user_id, status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_strategy_orders_symbol_episode ON strategy_orders(symbol, signal_episode)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_exchange_credentials_user ON user_exchange_credentials(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_wechat_group_monitors_enabled ON wechat_group_monitors(enabled)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_wechat_group_messages_user_time ON wechat_group_messages(user_id, captured_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_wechat_group_seen_time ON wechat_group_seen(seen_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_message_forwards_pending ON chat_message_forwards(status, next_attempt_at)")
 
 
 def user_count() -> int:
@@ -1174,6 +1998,35 @@ def row_dict(row: sqlite3.Row | dict[str, Any] | None) -> dict[str, Any]:
     if isinstance(row, dict):
         return row
     return {key: row[key] for key in row.keys()}
+
+
+def parse_json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if value in (None, ""):
+        return []
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def bool_value(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    text_value = str(value).strip().lower()
+    if text_value in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if text_value in {"0", "false", "no", "off", "disabled", ""}:
+        return False
+    return default
 
 
 def unique_username(conn: sqlite3.Connection, preferred: str, fallback_prefix: str = "user") -> str:
@@ -3425,12 +4278,59 @@ def x_kol_avatar_url(handle: str, value: Any = "") -> str:
 
 
 def x_kol_token() -> str:
-    return os.getenv("X_BEARER_TOKEN") or os.getenv("TWITTER_BEARER_TOKEN") or ""
+    return (
+        os.getenv("X_BEARER_TOKEN")
+        or os.getenv("TWITTER_BEARER_TOKEN")
+        or os.getenv("X_API_BEARER_TOKEN")
+        or ""
+    )
+
+
+def x_kol_official_api_enabled() -> bool:
+    """Enable the paid live stream by default when a bearer token is configured."""
+    return bool(x_kol_token()) and env_flag("X_KOL_OFFICIAL_API_ENABLED", default=True)
+
+
+def x_kol_official_rest_poll_enabled() -> bool:
+    """Recent/history REST reads are opt-in separately from the live stream."""
+    return x_kol_official_api_enabled() and env_flag(
+        "X_KOL_OFFICIAL_REST_POLL_ENABLED",
+        default=False,
+    )
+
+
+def x_kol_startup_history_recovery_enabled() -> bool:
+    """Allow one official recent-history read at startup to repair offline gaps."""
+    return x_kol_official_api_enabled() and env_flag(
+        "X_KOL_STARTUP_HISTORY_RECOVERY_ENABLED",
+        default=True,
+    )
+
+
+def x_kol_official_stream_enabled() -> bool:
+    return x_kol_official_api_enabled() and env_flag("X_KOL_FILTERED_STREAM_ENABLED", default=True)
+
+
+def x_kol_stream_all_tracked_accounts_enabled() -> bool:
+    return env_flag("X_KOL_STREAM_ALL_TRACKED_ACCOUNTS", default=False)
+
+
+def x_kol_allow_shared_stream_rules() -> bool:
+    return env_flag("X_KOL_ALLOW_SHARED_STREAM_RULES", default=False)
 
 
 def x_kol_fetch_limit() -> int:
     value = int(safe_float(os.getenv("X_KOL_FETCH_LIMIT"), X_KOL_FETCH_LIMIT) or X_KOL_FETCH_LIMIT)
     return max(10, min(value, 240))
+
+
+def personal_x_monitor_backfill_seconds() -> int:
+    """How far startup/history polling may repair missed personal-X monitor entries."""
+    days = safe_float(
+        os.getenv("PERSONAL_X_MONITOR_BACKFILL_DAYS"),
+        PERSONAL_X_MONITOR_BACKFILL_DEFAULT_DAYS,
+    )
+    return int(max(1.0, min(days, 7.0)) * 24 * 60 * 60)
 
 
 def x_kol_page_limit() -> int:
@@ -3457,10 +4357,61 @@ def x_rss_templates() -> list[str]:
         return values
     return [
         "https://rsshub.app/twitter/user/{handle}",
-        "https://nitter.net/{handle}/rss",
+        "https://xcancel.com/{handle}/rss",
+        "https://lightbrd.com/{handle}/rss",
+        "https://nitter.space/{handle}/rss",
         "https://nitter.poast.org/{handle}/rss",
-        "https://nitter.privacydev.net/{handle}/rss",
     ]
+
+
+def x_kol_rss_template_candidates(
+    handle: str,
+    templates: list[str],
+    *,
+    limit: int,
+) -> list[str]:
+    now = time.time()
+    with X_KOL_RSS_PREFERENCE_LOCK:
+        preferred = X_KOL_RSS_PREFERRED_TEMPLATES.get(handle.lower(), "")
+    with X_KOL_RSS_MIRROR_HEALTH_LOCK:
+        health = {template: dict(X_KOL_RSS_MIRROR_HEALTH.get(template) or {}) for template in templates}
+    ready = [template for template in templates if safe_float(health[template].get("retryAt"), 0) <= now]
+    ready.sort(key=lambda template: (
+        0 if template == preferred else 1,
+        int(safe_float(health[template].get("failures"), 0)),
+        -safe_float(health[template].get("lastOkAt"), 0),
+        templates.index(template),
+    ))
+    return ready[: max(1, limit)]
+
+
+def x_kol_record_rss_mirror_result(result: dict[str, Any]) -> None:
+    template = str(result.get("template") or "")
+    if not template:
+        return
+    now = time.time()
+    with X_KOL_RSS_MIRROR_HEALTH_LOCK:
+        previous = dict(X_KOL_RSS_MIRROR_HEALTH.get(template) or {})
+        if result.get("ok"):
+            X_KOL_RSS_MIRROR_HEALTH[template] = {
+                "failures": 0,
+                "retryAt": 0,
+                "lastOkAt": now,
+                "latencySeconds": round(safe_float(result.get("elapsed"), 0), 3),
+            }
+            return
+        failures = min(8, int(safe_float(previous.get("failures"), 0)) + 1)
+        cooldown = min(
+            X_KOL_RSS_CIRCUIT_MAX_SECONDS,
+            X_KOL_RSS_CIRCUIT_BASE_SECONDS * (2 ** (failures - 1)),
+        )
+        X_KOL_RSS_MIRROR_HEALTH[template] = {
+            **previous,
+            "failures": failures,
+            "retryAt": now + cooldown,
+            "lastErrorAt": now,
+            "latencySeconds": round(safe_float(result.get("elapsed"), 0), 3),
+        }
 
 
 def normalize_x_keywords(value: Any) -> list[str]:
@@ -3537,6 +4488,448 @@ def load_x_kol_sources(user: dict[str, Any] | None = None) -> list[dict[str, Any
     return sources[:80]
 
 
+def x_kol_priority_handles() -> tuple[str, ...]:
+    raw = os.getenv("X_KOL_PRIORITY_HANDLES", "whitestar224")
+    handles: list[str] = []
+    seen: set[str] = set()
+    for value in str(raw or "").split(","):
+        handle = normalize_x_handle(value).lower()
+        if handle and handle not in seen:
+            seen.add(handle)
+            handles.append(handle)
+    return tuple(handles or ["whitestar224"])
+
+
+def x_kol_priority_rss_interval_seconds() -> float:
+    return max(0.75, safe_float(os.getenv("X_KOL_PRIORITY_RSS_INTERVAL_SECONDS"), 1.0))
+
+
+def x_kol_priority_api_interval_seconds() -> float:
+    return max(5.0, safe_float(os.getenv("X_KOL_PRIORITY_API_INTERVAL_SECONDS"), 15.0))
+
+
+def x_kol_priority_rss_timeout_seconds() -> float:
+    # Public mirrors are only a recovery path. The currently reliable mirror often
+    # needs 4-5 seconds, so a two-second cutoff made this account appear offline.
+    return max(1.0, safe_float(os.getenv("X_KOL_PRIORITY_RSS_TIMEOUT_SECONDS"), 6.0))
+
+
+def x_kol_priority_rss_mirrors() -> int:
+    return max(1, min(4, int(safe_float(os.getenv("X_KOL_PRIORITY_RSS_MIRRORS"), 3))))
+
+
+def x_kol_priority_sources() -> list[dict[str, Any]]:
+    saved = {
+        normalize_x_handle(source.get("handle")).lower(): source
+        for source in load_x_kol_sources(None)
+        if normalize_x_handle(source.get("handle"))
+    }
+    sources: list[dict[str, Any]] = []
+    for handle in x_kol_priority_handles():
+        source = saved.get(handle)
+        if source:
+            sources.append({**source, "enabled": True, "keywords": [], "priority": True})
+            continue
+        fallback = normalize_x_source(
+            {
+                "id": f"x-priority-{handle}",
+                "handle": handle,
+                "displayName": "\u767d\u661f" if handle == "whitestar224" else handle,
+                "enabled": True,
+            }
+        )
+        if fallback:
+            sources.append({**fallback, "priority": True})
+    return sources
+
+
+def personal_x_monitor_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
+    """Expose only the configured owner account from the existing priority realtime feed."""
+    source_payload = payload if isinstance(payload, dict) else {}
+    handle = x_kol_priority_handles()[0].lower()
+    sources = [
+        dict(row)
+        for row in source_payload.get("sources") or []
+        if isinstance(row, dict) and normalize_x_handle(row.get("handle")).lower() == handle
+    ]
+    account = sources[0] if sources else next(
+        (
+            dict(row)
+            for row in x_kol_priority_sources()
+            if normalize_x_handle(row.get("handle")).lower() == handle
+        ),
+        {"id": f"x:{handle}", "handle": handle, "displayName": handle},
+    )
+    source_ids = {str(row.get("id") or "") for row in sources} | {str(account.get("id") or "")}
+    items = [
+        dict(row)
+        for row in source_payload.get("items") or []
+        if isinstance(row, dict)
+        and (
+            normalize_x_handle(row.get("handle")).lower() == handle
+            or str(row.get("sourceId") or "") in source_ids
+        )
+    ][:120]
+    last_published_at = max((int(safe_float(row.get("publishedAt")) or 0) for row in items), default=0)
+    transport = str(source_payload.get("upstreamMode") or source_payload.get("provider") or "")
+    tactical_signals = strategy_tactical_signal_rows()
+    public_account = {
+        "id": account.get("id") or f"x:{handle}",
+        "handle": handle,
+        "displayName": account.get("displayName") or account.get("name") or handle,
+        "avatar": account.get("avatar") or x_kol_avatar_url(handle),
+        "status": account.get("status") or ("connecting" if source_payload.get("pending") else "ok"),
+        "provider": account.get("provider") or source_payload.get("provider") or "",
+    }
+    return {
+        "ok": not bool(source_payload.get("error")),
+        "pending": bool(source_payload.get("pending")),
+        "realtime": bool(source_payload.get("realtime")),
+        "transport": source_payload.get("transport") or ("sse" if source_payload.get("realtime") else "snapshot"),
+        "upstreamMode": transport,
+        "historyRestored": bool(source_payload.get("historyRestored")),
+        "cached": bool(source_payload.get("cached")),
+        "stale": bool(source_payload.get("stale")),
+        "account": public_account,
+        "sources": sources or [public_account],
+        "items": items,
+        "tacticalSignals": tactical_signals,
+        "tacticalSignalTypes": [
+            {"key": "watch", "label": "重点看"},
+            {"key": "main-wave-expected", "label": "有主升浪预期"},
+        ],
+        "summary": {
+            "posts": len(items),
+            "lastPublishedAt": last_published_at,
+            "transport": transport,
+            "connected": bool(source_payload.get("realtime") and not source_payload.get("pending")),
+            "historyRestored": bool(source_payload.get("historyRestored")),
+            "tacticalSignals": len(tactical_signals),
+        },
+        "message": source_payload.get("message") or "",
+        "error": source_payload.get("error") or "",
+        "updatedAt": int(safe_float(source_payload.get("updatedAt")) or time.time() * 1000),
+    }
+
+
+def feedback_json_value(value: Any, depth: int = 0) -> Any:
+    if depth > 6:
+        return None
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return value if math.isfinite(number) else 0
+    if isinstance(value, str):
+        return value[:1200]
+    if isinstance(value, list):
+        return [feedback_json_value(item, depth + 1) for item in value[:32]]
+    if isinstance(value, dict):
+        return {
+            str(key)[:80]: feedback_json_value(item, depth + 1)
+            for key, item in list(value.items())[:64]
+        }
+    return str(value)[:1200]
+
+
+def normalize_dragon_wave_feedback(value: Any) -> dict[str, Any]:
+    payload = value if isinstance(value, dict) else {}
+    raw_records = payload.get("records") if isinstance(payload.get("records"), dict) else {}
+    ordered = sorted(
+        raw_records.items(),
+        key=lambda item: int(safe_float((item[1] or {}).get("updatedAt"), 0)) if isinstance(item[1], dict) else 0,
+        reverse=True,
+    )[:1200]
+    records: dict[str, dict[str, Any]] = {}
+    for raw_key, raw_record in ordered:
+        if not isinstance(raw_record, dict):
+            continue
+        key = str(raw_key or raw_record.get("key") or "")[:240]
+        decision = str(raw_record.get("decision") or "")
+        if not key or decision not in {"confirmed", "pending", "denied", "cleared"}:
+            continue
+        signal = feedback_json_value(raw_record.get("signal") if isinstance(raw_record.get("signal"), dict) else {})
+        signal = signal if isinstance(signal, dict) else {}
+        certainty_grade = "" if decision == "cleared" else str(raw_record.get("certaintyGrade") or signal.get("manualCertaintyGrade") or "").upper().strip()
+        if certainty_grade not in {"A+", "A", "B"}:
+            certainty_grade = ""
+        if certainty_grade:
+            signal["manualCertaintyGrade"] = certainty_grade
+        else:
+            signal.pop("manualCertaintyGrade", None)
+        allowed_structure_tags = {
+            "horizontalLaunch", "trendlineBreakout", "triangle", "box",
+            "fallingWedge", "pivot", "previousHighBreakout", "consolidationBreakout", "ema90Pullback",
+            "volumeBreakout", "nearPreviousHighConsolidation", "newCoinNotFalling",
+        }
+        raw_structure_tags = raw_record.get("structureTags")
+        if not isinstance(raw_structure_tags, list):
+            raw_structure_tags = signal.get("manualStructureTags") if isinstance(signal.get("manualStructureTags"), list) else []
+        structure_tags = [] if decision == "cleared" else list(dict.fromkeys(str(item) for item in raw_structure_tags if str(item) in allowed_structure_tags))
+        if structure_tags:
+            signal["manualStructureTags"] = structure_tags
+        else:
+            signal.pop("manualStructureTags", None)
+        raw_predicted_tags = raw_record.get("predictedStructureTags")
+        if not isinstance(raw_predicted_tags, list):
+            raw_predicted_tags = signal.get("predictedStructureTags") if isinstance(signal.get("predictedStructureTags"), list) else None
+        predicted_tags = None if raw_predicted_tags is None else ([] if decision == "cleared" else list(dict.fromkeys(str(item) for item in raw_predicted_tags if str(item) in allowed_structure_tags)))
+        structure_review = None
+        if predicted_tags is not None and decision != "cleared":
+            matched = sorted(tag for tag in predicted_tags if tag in structure_tags)
+            added = sorted(tag for tag in structure_tags if tag not in predicted_tags)
+            removed = sorted(tag for tag in predicted_tags if tag not in structure_tags)
+            union_size = len(set(predicted_tags + structure_tags))
+            structure_review = {
+                "predicted": sorted(predicted_tags), "reviewed": sorted(structure_tags), "matched": matched,
+                "addedByUser": added, "removedByUser": removed,
+                "agreement": round(len(matched) / union_size, 3) if union_size else 1,
+                "exact": not added and not removed,
+            }
+            signal["predictedStructureTags"] = predicted_tags
+            signal["structureReview"] = structure_review
+        else:
+            signal.pop("predictedStructureTags", None)
+            signal.pop("structureReview", None)
+        records[key] = {
+            "key": key,
+            "decision": decision,
+            "optimizationLabel": 1 if decision == "confirmed" else -1 if decision == "denied" else 0,
+            "optimizationRole": "positive" if decision == "confirmed" else "negative" if decision == "denied" else "unlabeled" if decision == "pending" else "deleted",
+            "datasetVersion": 10,
+            "createdAt": max(0, int(safe_float(raw_record.get("createdAt"), 0))),
+            "updatedAt": max(0, int(safe_float(raw_record.get("updatedAt"), 0))),
+            "pair": str(raw_record.get("pair") or "")[:32],
+            "interval": str(raw_record.get("interval") or "")[:8],
+            "venue": str(raw_record.get("venue") or "")[:80],
+            "certaintyGrade": certainty_grade,
+            "structureTags": structure_tags,
+            **({"predictedStructureTags": predicted_tags, "structureReview": structure_review} if predicted_tags is not None else {}),
+            "signal": signal,
+        }
+    updated_at = max([int(item.get("updatedAt") or 0) for item in records.values()] or [0])
+    return {"version": 1, "updatedAt": updated_at, "records": records}
+
+
+def dragon_wave_feedback_feature_tokens(signal: Any) -> list[str]:
+    signal = signal if isinstance(signal, dict) else {}
+    foundations = sorted({str(item) for item in signal.get("foundationTypes", [])}) if isinstance(signal.get("foundationTypes"), list) else []
+    auxiliaries = sorted({str(item) for item in signal.get("auxiliaryTypes", [])}) if isinstance(signal.get("auxiliaryTypes"), list) else []
+    confluence = sorted({str(item) for item in signal.get("confluence", [])}) if isinstance(signal.get("confluence"), list) else []
+    interval = str(signal.get("interval") or "").strip()
+    structure_shape = str(signal.get("structureShape") or "none").strip() or "none"
+    tokens = [f"foundation:{item}" for item in foundations]
+    tokens.extend(f"auxiliary:{item}" for item in auxiliaries)
+    if signal.get("patternKey"):
+        tokens.append(f"pattern:{signal['patternKey']}")
+    if confluence:
+        tokens.append(f"combo:{'+'.join(confluence)}")
+    if interval:
+        tokens.append(f"interval:{interval}")
+        if foundations and "manualReview" not in foundations:
+            tokens.append(f"interval-foundation:{interval}|{'+'.join(foundations)}")
+            tokens.append(f"interval-auxiliary:{interval}|{'+'.join(auxiliaries) or 'none'}")
+            tokens.append(f"interval-shape:{interval}|{structure_shape}")
+            tokens.append(f"interval-setup:{interval}|{'+'.join(foundations)}>{'+'.join(auxiliaries) or 'none'}|{structure_shape}")
+    context_tokens = sorted({str(item) for item in signal.get("contextTokens", [])}) if isinstance(signal.get("contextTokens"), list) else []
+    tokens.extend(f"context:{item}" for item in context_tokens)
+    allowed_structure_tags = {
+        "horizontalLaunch", "trendlineBreakout", "triangle", "box",
+        "fallingWedge", "pivot", "previousHighBreakout", "consolidationBreakout", "ema90Pullback",
+        "volumeBreakout", "nearPreviousHighConsolidation", "newCoinNotFalling",
+    }
+    structure_tags = sorted({str(item) for item in signal.get("manualStructureTags", []) if str(item) in allowed_structure_tags}) if isinstance(signal.get("manualStructureTags"), list) else []
+    tokens.extend(f"manual-structure:{item}" for item in structure_tags)
+    predicted_tags = sorted({str(item) for item in signal.get("predictedStructureTags", []) if str(item) in allowed_structure_tags}) if isinstance(signal.get("predictedStructureTags"), list) else []
+    tokens.extend(f"strategy-structure:{item}" for item in predicted_tags)
+    review = signal.get("structureReview") if isinstance(signal.get("structureReview"), dict) else None
+    if review:
+        for field, prefix in (("matched", "review-match"), ("addedByUser", "review-added"), ("removedByUser", "review-removed")):
+            values = sorted({str(item) for item in review.get(field, []) if str(item) in allowed_structure_tags}) if isinstance(review.get(field), list) else []
+            tokens.extend(f"{prefix}:{item}" for item in values)
+        agreement = safe_float(review.get("agreement"), 0)
+        tokens.append(f"review-agreement:{'exact' if review.get('exact') else 'partial' if agreement >= 0.5 else 'low'}")
+    def metric_band(name: str, field: str, boundaries: tuple[float, ...], labels: tuple[str, ...]) -> None:
+        raw_value = signal.get(field)
+        if raw_value is None or isinstance(raw_value, bool):
+            return
+        number = safe_float(raw_value, float("nan"))
+        if not math.isfinite(number):
+            return
+        index = next((cursor for cursor, boundary in enumerate(boundaries) if number < boundary), len(labels) - 1)
+        tokens.append(f"quality:{name}:{labels[index]}")
+    metric_band("base-bars", "consolidationBars", (20, 40, 80), ("short", "forming", "mature", "long"))
+    metric_band("outer-edge", "outerEdgeScore", (60, 80), ("weak", "clean", "strong"))
+    metric_band("ceiling-touches", "ceilingTouches", (2, 3), ("single", "double", "multiple"))
+    metric_band("rhythm", "rhythmScore", (60, 75), ("weak", "flowing", "elite"))
+    metric_band("certainty", "certaintyScore", (70, 85), ("low", "high", "elite"))
+    metric_band("order-flow", "orderFlowScore", (60, 75), ("quiet", "supportive", "strong"))
+    metric_band("launch-distance", "launchDistancePercent", (2, 7), ("attached", "near", "far"))
+    metric_band("prior-range", "priorRangePercent", (4, 8), ("tight", "controlled", "wide"))
+    metric_band("prior-drift", "priorDriftPercent", (2, 6), ("flat", "controlled", "trending"))
+    metric_band("prior-volume", "priorVolumeRatio", (1, 1.35), ("dry", "normal", "expanding"))
+    metric_band("channel-occupancy", "channelInteriorOccupancy", (0.5, 0.7), ("hollow", "occupied", "full"))
+    metric_band("channel-hollow", "channelHollowRatio", (0.25, 0.42), ("low", "moderate", "high"))
+    metric_band("channel-transitions", "channelSideTransitions", (2, 5), ("single-side", "rotating", "active"))
+    if signal.get("outerEdgeConfirmed") is True:
+        tokens.append("quality:outer-edge-confirmed")
+    if signal.get("aboveEma90") is True:
+        tokens.append("quality:above-ema90")
+    if signal.get("breaksPriorHigh") is True:
+        tokens.append("quality:breaks-prior-high")
+    grade = str(signal.get("manualCertaintyGrade") or "").upper().strip()
+    if grade in {"A+", "A", "B"}:
+        tokens.append(f"manual-grade:{grade}")
+    return list(dict.fromkeys(tokens))
+
+
+def dragon_wave_supervised_prototype_profile(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    def percentile(values: list[float], ratio: float) -> float:
+        ordered = sorted(float(value) for value in values)
+        if not ordered:
+            return 0
+        position = (len(ordered) - 1) * ratio
+        lower = int(position)
+        upper = min(len(ordered) - 1, lower + 1)
+        return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+    def build(selected: list[dict[str, Any]], sample_key: str) -> dict[str, Any]:
+        groups: dict[str, dict[str, Any]] = {}
+        for row in selected:
+            tags = sorted(row.get("structureTags") or [])
+            setup_token = next((token for token in row.get("featureTokens", []) if token.startswith("interval-setup:")), "")
+            setup_signature = setup_token.split("|", 1)[1] if "|" in setup_token else "none>none|none"
+            key = f"{row['interval']}|manual:{'+'.join(tags)}" if tags else f"{row['interval']}|setup:{setup_signature}"
+            group = groups.setdefault(key, {
+                "interval": row["interval"], "structureTags": tags, "setupSignature": setup_signature,
+                "rows": [], "pairs": set(),
+            })
+            group["rows"].append(row)
+            group["pairs"].add(row["pair"])
+        prototypes: list[dict[str, Any]] = []
+        for key, group in groups.items():
+            metric_names = sorted({name for row in group["rows"] for name in row.get("metrics", {}) if name != "manualCertaintyLevel"})
+            metrics = {}
+            for name in metric_names:
+                values = [row["metrics"][name] for row in group["rows"] if name in row.get("metrics", {})]
+                metrics[name] = {"low": percentile(values, 0.25), "median": percentile(values, 0.5), "high": percentile(values, 0.75)}
+            counts: dict[str, int] = {}
+            for row in group["rows"]:
+                for token in row.get("featureTokens", []):
+                    if token.startswith(("quality:", "context:", "manual-structure:", "strategy-structure:", "review-")):
+                        counts[token] = counts.get(token, 0) + 1
+            prototypes.append({
+                "key": key,
+                "interval": group["interval"],
+                "structureTags": group["structureTags"],
+                "setupSignature": group["setupSignature"],
+                "sampleCount": len(group["rows"]),
+                "pairCount": len(group["pairs"]),
+                "metrics": metrics,
+                "sharedReasons": sorted((token for token, count in counts.items() if count / len(group["rows"]) >= 0.6), key=lambda token: (-counts[token], token)),
+            })
+        prototypes.sort(key=lambda item: (-item["sampleCount"], item["key"]))
+        return {sample_key: sum(item["sampleCount"] for item in prototypes), "prototypes": prototypes}
+
+    return {
+        "positiveAPlus": build([row for row in rows if row["decision"] == "confirmed" and row["certaintyGrade"] == "A+"], "totalAPlusSamples"),
+        "negativeDenied": build([row for row in rows if row["decision"] == "denied"], "totalDeniedSamples"),
+        "policy": "causal-feature-combination-only",
+    }
+
+
+def dragon_wave_feedback_optimization(value: Any) -> dict[str, Any]:
+    normalized = normalize_dragon_wave_feedback(value)
+    metric_fields = (
+        "score", "certaintyScore", "rhythmScore", "sentimentScore",
+        "orderFlowScore", "consolidationBars", "relativeVolume", "structuralRiskPercent",
+        "ceilingAge", "ceilingTouches", "outerEdgeScore",
+        "platformTouchGroups", "launchDistancePercent", "compressionRatioAtDecision",
+        "channelInteriorOccupancy", "channelMiddleParticipationRatio", "channelHollowRatio", "channelLongestHollowRun", "channelSideTransitions",
+        "ema90AtDecision", "atrAtDecision", "priorHighAtDecision", "priorLowAtDecision",
+        "priorRangePercent", "priorDriftPercent", "priorVolumeRatio", "selectedPrice",
+    )
+    rows: list[dict[str, Any]] = []
+    for record in sorted(normalized["records"].values(), key=lambda item: (item["updatedAt"], item["key"])):
+        if record["decision"] == "cleared":
+            continue
+        signal = record.get("signal") if isinstance(record.get("signal"), dict) else {}
+        metrics = {}
+        for field in metric_fields:
+            raw_value = signal.get(field)
+            if raw_value is None or isinstance(raw_value, bool):
+                continue
+            number = safe_float(raw_value, float("nan"))
+            if math.isfinite(number):
+                metrics[field] = number
+        certainty_grade = str(record.get("certaintyGrade") or "")
+        if certainty_grade:
+            metrics["manualCertaintyLevel"] = {"A+": 3, "A": 2, "B": 1}[certainty_grade]
+        rows.append({
+            "key": record["key"],
+            "label": record["optimizationLabel"],
+            "role": record["optimizationRole"],
+            "decision": record["decision"],
+            "certaintyGrade": certainty_grade,
+            "structureTags": record.get("structureTags") or [],
+            "predictedStructureTags": record.get("predictedStructureTags") or [],
+            "structureReview": record.get("structureReview"),
+            "pair": record["pair"],
+            "interval": record["interval"],
+            "time": max(0, int(safe_float(signal.get("time"), 0))),
+            "updatedAt": record["updatedAt"],
+            "featureTokens": dragon_wave_feedback_feature_tokens({**signal, "interval": record["interval"] or signal.get("interval")}),
+            "metrics": metrics,
+            "visualSignature": signal.get("visualSignature") if isinstance(signal.get("visualSignature"), dict) else None,
+        })
+    feature_tokens = {token for row in rows for token in row["featureTokens"]}
+    supervised = dragon_wave_supervised_prototype_profile(rows)
+    return {
+        "datasetVersion": 10,
+        "generatedAt": normalized["updatedAt"],
+        "causality": "decision-time-features-only",
+        "excludedOutcomeFields": ["futureReturn", "maxFavorableExcursion", "maxAdverseExcursion", "futureHigh", "futureLow"],
+        "summary": {
+            "total": len(rows),
+            "positiveCount": sum(row["label"] == 1 for row in rows),
+            "negativeCount": sum(row["label"] == -1 for row in rows),
+            "pendingCount": sum(row["label"] == 0 for row in rows),
+            "labeledCount": sum(row["label"] != 0 for row in rows),
+            "featureCount": len(feature_tokens),
+            "aPlusPrototypeCount": len(supervised["positiveAPlus"]["prototypes"]),
+            "aPlusSampleCount": supervised["positiveAPlus"]["totalAPlusSamples"],
+            "deniedPrototypeCount": len(supervised["negativeDenied"]["prototypes"]),
+            "deniedPrototypeSampleCount": supervised["negativeDenied"]["totalDeniedSamples"],
+            "visualLabeledCount": sum(row["label"] != 0 and bool(row["visualSignature"]) for row in rows),
+            "visualAPlusCount": sum(row["decision"] == "confirmed" and row["certaintyGrade"] == "A+" and bool(row["visualSignature"]) for row in rows),
+            "visualDeniedCount": sum(row["decision"] == "denied" and bool(row["visualSignature"]) for row in rows),
+        },
+        "supervisedPrototypeProfile": supervised,
+        "rows": rows,
+    }
+
+
+def merge_dragon_wave_feedback(*documents: Any) -> dict[str, Any]:
+    merged: dict[str, Any] = {"version": 1, "updatedAt": 0, "records": {}}
+    for document in documents:
+        normalized = normalize_dragon_wave_feedback(document)
+        for key, record in normalized["records"].items():
+            existing = merged["records"].get(key)
+            if not existing or int(record.get("updatedAt") or 0) >= int(existing.get("updatedAt") or 0):
+                merged["records"][key] = record
+    return normalize_dragon_wave_feedback(merged)
+
+
+def dragon_wave_feedback_for_user(user: dict[str, Any] | None) -> dict[str, Any]:
+    return normalize_dragon_wave_feedback(load_user_payload(user, USER_SCOPE_DRAGON_WAVE_FEEDBACK))
+
+
+def save_dragon_wave_feedback_for_user(user: dict[str, Any], incoming: Any) -> dict[str, Any]:
+    merged = merge_dragon_wave_feedback(dragon_wave_feedback_for_user(user), incoming)
+    save_user_payload(user, USER_SCOPE_DRAGON_WAVE_FEEDBACK, merged)
+    return merged
+
+
 def x_kol_sources_payload(user: dict[str, Any] | None = None) -> dict[str, Any]:
     sources = load_x_kol_sources(user)
     return {
@@ -3580,6 +4973,7 @@ def save_x_kol_sources_payload(payload: dict[str, Any], user: dict[str, Any] | N
             path.unlink(missing_ok=True)
     except Exception:
         pass
+    wake_x_kol_realtime_worker(user)
     return {
         "ok": True,
         **saved,
@@ -3792,6 +5186,256 @@ def x_kol_item_key(source: dict[str, Any], item_id: Any, text: Any, published_at
     return stable_feed_id("x-kol", source.get("id"), item_id, text, published_at)
 
 
+def x_kol_translation_cache_key(text: str, settings: dict[str, Any] | None = None) -> str:
+    material = json.dumps(
+        {
+            "v": 3,
+            "source": "en",
+            "target": "zh",
+            "text": clean_feed_text(text, 1800),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def translation_cache_get(cache_key: str) -> dict[str, Any] | None:
+    now = int(time.time())
+    with AUTH_DB_LOCK, auth_db() as conn:
+        row = conn.execute(
+            "SELECT translation, engine, updated_at FROM translation_cache WHERE cache_key = ?",
+            (cache_key,),
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            "UPDATE translation_cache SET hits = hits + 1, last_accessed_at = ? WHERE cache_key = ?",
+            (now, cache_key),
+        )
+    return {
+        "translation": clean_feed_text(row["translation"], 1800),
+        "engine": clean_feed_text(row["engine"], 40),
+        "updatedAt": int(row["updated_at"] or now) * 1000,
+    }
+
+
+def translation_cache_put(cache_key: str, text: str, translation: str, engine: str) -> int:
+    now = int(time.time())
+    source_hash = hashlib.sha256(clean_feed_text(text, 1800).encode("utf-8")).hexdigest()
+    with AUTH_DB_LOCK, auth_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO translation_cache (
+                cache_key, source_hash, source_lang, target_lang, translation, engine,
+                hits, created_at, updated_at, last_accessed_at
+            ) VALUES (?, ?, 'en', 'zh', ?, ?, 1, ?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                translation = excluded.translation,
+                engine = excluded.engine,
+                hits = translation_cache.hits + 1,
+                updated_at = excluded.updated_at,
+                last_accessed_at = excluded.last_accessed_at
+            """,
+            (cache_key, source_hash, translation, engine, now, now, now),
+        )
+        row = conn.execute("SELECT COUNT(*) AS count FROM translation_cache").fetchone()
+        overflow = max(0, int(row["count"] if row else 0) - TRANSLATION_CACHE_MAX_ENTRIES)
+        if overflow:
+            conn.execute(
+                """
+                DELETE FROM translation_cache
+                WHERE cache_key IN (
+                    SELECT cache_key FROM translation_cache
+                    ORDER BY last_accessed_at ASC
+                    LIMIT ?
+                )
+                """,
+                (overflow,),
+            )
+    return now * 1000
+
+
+def local_translation_service_ready(timeout: float = 1.5) -> bool:
+    base_url = env_value("LIBRETRANSLATE_URL") or "http://127.0.0.1:5000"
+    try:
+        response = requests.get(f"{base_url.rstrip('/')}/languages", timeout=max(0.5, timeout))
+        return response.ok
+    except Exception:
+        return False
+
+
+def ensure_local_translation_service(wait_seconds: int = 0) -> bool:
+    global LOCAL_TRANSLATION_PROCESS
+    if not env_flag("LIBRETRANSLATE_ENABLED", default=True):
+        return False
+    if local_translation_service_ready():
+        return True
+
+    base_url = env_value("LIBRETRANSLATE_URL") or "http://127.0.0.1:5000"
+    parsed = urlparse(base_url)
+    if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        return False
+    if not env_flag("LIBRETRANSLATE_AUTOSTART", default=True):
+        return False
+
+    executable_value = env_value("LIBRETRANSLATE_EXECUTABLE")
+    if executable_value:
+        executable = Path(executable_value).expanduser()
+    else:
+        executable_name = "libretranslate.exe" if os.name == "nt" else "libretranslate"
+        executable = PERSIST_CACHE_DIR / "libretranslate-venv" / ("Scripts" if os.name == "nt" else "bin") / executable_name
+    if not executable.exists():
+        return False
+
+    with X_KOL_TRANSLATION_LOCK:
+        if LOCAL_TRANSLATION_PROCESS is None or LOCAL_TRANSLATION_PROCESS.poll() is not None:
+            port = int(parsed.port or 5000)
+            args = [
+                str(executable),
+                "--host", parsed.hostname or "127.0.0.1",
+                "--port", str(port),
+                "--load-only", "en,zh",
+                "--disable-web-ui",
+                "--disable-files-translation",
+                "--translation-cache", "all",
+                "--threads", "2",
+            ]
+            stdout_path = PERSIST_CACHE_DIR / "libretranslate.log"
+            stderr_path = PERSIST_CACHE_DIR / "libretranslate.err.log"
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            with stdout_path.open("ab") as stdout_file, stderr_path.open("ab") as stderr_file:
+                LOCAL_TRANSLATION_PROCESS = subprocess.Popen(
+                    args,
+                    cwd=str(ROOT),
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    creationflags=creationflags,
+                )
+
+    deadline = time.time() + max(0, wait_seconds)
+    while time.time() < deadline:
+        if local_translation_service_ready(timeout=2):
+            return True
+        process = LOCAL_TRANSLATION_PROCESS
+        if process is not None and process.poll() is not None:
+            break
+        time.sleep(1)
+    return local_translation_service_ready()
+
+
+def libretranslate_translate(text: str) -> str:
+    ensure_local_translation_service(wait_seconds=45)
+    base_url = env_value("LIBRETRANSLATE_URL") or "http://127.0.0.1:5000"
+    endpoint = f"{base_url.rstrip('/')}/translate"
+    body: dict[str, Any] = {
+        "q": text,
+        "source": "en",
+        "target": "zh",
+        "format": "text",
+    }
+    if api_key := env_value("LIBRETRANSLATE_API_KEY"):
+        body["api_key"] = api_key
+    timeout = max(5, min(120, int(safe_float(env_value("LIBRETRANSLATE_TIMEOUT", "45"), 45))))
+    response = requests.post(
+        endpoint,
+        headers={**HEADERS, "Accept": "application/json", "Content-Type": "application/json"},
+        json=body,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("LibreTranslate 返回了无效响应") from exc
+    translation = clean_feed_text(payload.get("translatedText"), 1800)
+    if not translation:
+        raise RuntimeError(clean_feed_text(payload.get("error"), 240) or "LibreTranslate 返回空译文")
+    return translation
+
+
+def x_kol_text_looks_english(text: Any) -> bool:
+    value = clean_feed_text(text, 1800)
+    if len(value) < 12:
+        return False
+    latin = len(re.findall(r"[A-Za-z]", value))
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", value))
+    return latin >= 18 and latin >= max(12, cjk * 4)
+
+
+def x_kol_translate_payload(payload: dict[str, Any], settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    text = clean_feed_text(
+        payload.get("text")
+        or payload.get("translationText")
+        or payload.get("sourceText")
+        or payload.get("body")
+        or payload.get("content"),
+        1800,
+    )
+    if not text:
+        return {"ok": False, "error": "empty text"}
+    if not x_kol_text_looks_english(text) and not payload.get("force"):
+        return {"ok": True, "skipped": True, "translation": ""}
+
+    cache_key = x_kol_translation_cache_key(text)
+    cached = translation_cache_get(cache_key)
+    if cached and cached.get("translation"):
+        return {"ok": True, "cached": True, **cached}
+
+    resolved_settings = settings or system_llm_settings()
+    errors: list[str] = []
+    if env_flag("LIBRETRANSLATE_ENABLED", default=True):
+        try:
+            translation = libretranslate_translate(text)
+            updated_at = translation_cache_put(cache_key, text, translation, "libretranslate")
+            return {
+                "ok": True,
+                "cached": False,
+                "engine": "libretranslate",
+                "translation": translation,
+                "updatedAt": updated_at,
+            }
+        except Exception as exc:
+            errors.append(f"本地翻译不可用：{clean_feed_text(exc, 260)}")
+
+    if not env_flag("TRANSLATION_LLM_FALLBACK", default=False):
+        return {"ok": False, "error": "；".join(errors) or "本地翻译服务未启用"}
+    if not deepseek_enabled(resolved_settings):
+        errors.append("未配置大模型 API Key")
+        return {"ok": False, "error": "；".join(errors)}
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是交易信息流翻译助手。把英文 X/Twitter 动态翻译成自然、简洁的中文。"
+                "保留代币符号、股票代码、@账号、URL、数字、百分比和专有名词；不要解释，不要扩写，不要输出 Markdown。"
+                "只返回 JSON：{\"translation\":\"中文译文\"}。"
+            ),
+        },
+        {"role": "user", "content": json.dumps({"text": text}, ensure_ascii=False)},
+    ]
+    try:
+        response = deepseek_chat(messages, resolved_settings)
+    except Exception as exc:
+        errors.append(f"大模型回退失败：{clean_feed_text(exc, 260)}")
+        return {"ok": False, "error": "；".join(errors)}
+    content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+    parsed = deepseek_extract_json(content)
+    translation = clean_feed_text(parsed.get("translation") or parsed.get("text") or content, 1800)
+    if not translation:
+        return {"ok": False, "error": "empty translation"}
+
+    updated_at = translation_cache_put(cache_key, text, translation, "llm")
+    return {
+        "ok": True,
+        "cached": False,
+        "engine": "llm",
+        "translation": translation,
+        "updatedAt": updated_at,
+    }
+
+
 def x_kol_fetch_api_source(source: dict[str, Any], token: str) -> dict[str, Any]:
     handle = source["handle"]
     fetch_limit = x_kol_fetch_limit()
@@ -3939,108 +5583,233 @@ def x_kol_fetch_api_source(source: dict[str, Any], token: str) -> dict[str, Any]
             "fetchLimit": fetch_limit,
             "includeReplies": x_kol_include_replies(),
             "includeRetweets": x_kol_include_retweets(),
+            "lastOkAt": int(time.time() * 1000),
+            "lastCheckAt": int(time.time() * 1000),
         },
         "items": rows[:fetch_limit],
     }
 
 
-def x_kol_fetch_rss_source(source: dict[str, Any]) -> dict[str, Any]:
+def x_kol_fetch_rss_template(
+    source: dict[str, Any],
+    template: str,
+    *,
+    timeout_seconds: float = X_KOL_RSS_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    handle = source["handle"]
+    url = (
+        template.replace("{handle}", quote(handle, safe=""))
+        if "{handle}" in template
+        else f"{template.rstrip('/')}/{quote(handle, safe='')}"
+    )
+    started_at = time.monotonic()
+    try:
+        response = requests.get(
+            url,
+            headers={
+                **HEADERS,
+                "Accept": "application/rss+xml, application/atom+xml, text/xml, */*",
+            },
+            timeout=(min(2.5, timeout_seconds), timeout_seconds),
+        )
+        response.raise_for_status()
+        parsed = parse_xml_feed(response.content[: RSS_FETCH_MAX_BYTES + 1], url)
+        rows = []
+        for item in parsed.get("items") or []:
+            text = clean_feed_text(item.get("summary") or item.get("title"), 1200)
+            if not text or not x_kol_item_matches(source, text):
+                continue
+            main_text, quote_card = x_kol_split_rss_item(source, item, text)
+            published_at = int(safe_float(item.get("publishedAt")) or 0)
+            rows.append(
+                {
+                    "id": x_kol_item_key(source, item.get("id") or item.get("url"), text, published_at),
+                    "tweetId": item.get("id") or "",
+                    "text": main_text,
+                    "fullText": text,
+                    "quote": quote_card,
+                    "title": clean_feed_text(main_text, 120),
+                    "url": x_kol_normalize_url(item.get("url"), handle) or f"https://x.com/{handle}",
+                    "publishedAt": published_at,
+                    "sourceId": source["id"],
+                    "sourceName": source.get("displayName") or parsed.get("feed", {}).get("title") or handle,
+                    "handle": handle,
+                    "avatar": source.get("avatar") or "",
+                    "metrics": {},
+                    "matchedKeywords": x_kol_keyword_hits(source, text),
+                    "entryType": "rss",
+                    "provider": "rss",
+                }
+            )
+        return {
+            "ok": bool(rows),
+            "template": template,
+            "url": url,
+            "rows": rows,
+            "elapsed": time.monotonic() - started_at,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "template": template,
+            "url": url,
+            "rows": [],
+            "elapsed": time.monotonic() - started_at,
+            "error": str(exc),
+        }
+
+
+def x_kol_rss_result_payload(
+    source: dict[str, Any],
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
     handle = source["handle"]
     fetch_limit = x_kol_fetch_limit()
-    errors = []
-    rows = []
-    feed_urls = []
-    for template in x_rss_templates():
-        url = template.replace("{handle}", quote(handle, safe="")) if "{handle}" in template else f"{template.rstrip('/')}/{quote(handle, safe='')}"
-        try:
-            response = requests.get(
-                url,
-                headers={
-                    **HEADERS,
-                    "Accept": "application/rss+xml, application/atom+xml, text/xml, */*",
-                },
-                timeout=18,
-            )
-            response.raise_for_status()
-            parsed = parse_xml_feed(response.content[: RSS_FETCH_MAX_BYTES + 1], url)
-            for item in parsed.get("items") or []:
-                text = clean_feed_text(item.get("summary") or item.get("title"), 1200)
-                if not text or not x_kol_item_matches(source, text):
-                    continue
-                main_text, quote_card = x_kol_split_rss_item(source, item, text)
-                published_at = int(safe_float(item.get("publishedAt")) or 0)
-                rows.append(
-                    {
-                        "id": x_kol_item_key(source, item.get("id") or item.get("url"), text, published_at),
-                        "tweetId": item.get("id") or "",
-                        "text": main_text,
-                        "fullText": text,
-                        "quote": quote_card,
-                        "title": clean_feed_text(main_text, 120),
-                        "url": x_kol_normalize_url(item.get("url"), handle) or f"https://x.com/{handle}",
-                        "publishedAt": published_at,
-                        "sourceId": source["id"],
-                        "sourceName": source.get("displayName") or parsed.get("feed", {}).get("title") or handle,
-                        "handle": handle,
-                        "avatar": source.get("avatar") or "",
-                        "metrics": {},
-                        "matchedKeywords": x_kol_keyword_hits(source, text),
-                        "entryType": "rss",
-                        "provider": "rss",
-                    }
-                )
-            feed_urls.append(url)
-        except Exception as exc:
-            errors.append(str(exc))
-            continue
+    successful = [result for result in results if result.get("ok")]
+    rows = [row for result in successful for row in result.get("rows") or []]
     if rows:
-        deduped = {}
-        for row in rows:
-            deduped[row["id"]] = row
-        sorted_rows = sorted(deduped.values(), key=lambda row: int(safe_float(row.get("publishedAt"))), reverse=True)
+        deduped = {row["id"]: row for row in rows}
+        sorted_rows = sorted(
+            deduped.values(),
+            key=lambda row: int(safe_float(row.get("publishedAt"))),
+            reverse=True,
+        )
+        successful.sort(
+            key=lambda result: (
+                max((int(safe_float(row.get("publishedAt"))) for row in result.get("rows") or []), default=0),
+                -safe_float(result.get("elapsed")),
+            ),
+            reverse=True,
+        )
+        selected = successful[0]
+        with X_KOL_RSS_PREFERENCE_LOCK:
+            X_KOL_RSS_PREFERRED_TEMPLATES[handle.lower()] = str(selected.get("template") or "")
         return {
             "source": {
                 **source,
                 "status": "ok",
                 "provider": "rss",
-                "feedUrl": feed_urls[0] if feed_urls else "",
-                "feedUrls": feed_urls,
+                "feedUrl": selected.get("url") or "",
+                "feedUrls": [result.get("url") for result in successful if result.get("url")],
                 "itemsReturned": min(len(sorted_rows), fetch_limit),
                 "fetchLimit": fetch_limit,
                 "limited": True,
+                "lastOkAt": int(time.time() * 1000),
+                "lastCheckAt": int(time.time() * 1000),
             },
             "items": sorted_rows[:fetch_limit],
         }
+    upstream_error = clean_feed_text(
+        next((result.get("error") for result in results if result.get("error")), "No RSS mirror is currently ready"),
+        240,
+    )
     return {
         "source": {
             **source,
             "status": "error",
             "provider": "rss",
-            "error": clean_feed_text(errors[-1] if errors else "未配置可用 RSS 代理", 160),
+            "error": "上游暂时波动，正在自动换源",
+            "upstreamError": upstream_error,
+            "lastCheckAt": int(time.time() * 1000),
         },
         "items": [],
     }
+
+
+def x_kol_fetch_rss_source(source: dict[str, Any]) -> dict[str, Any]:
+    handle = source["handle"]
+    templates = x_kol_rss_template_candidates(
+        handle,
+        x_rss_templates(),
+        limit=X_KOL_RSS_MIRROR_ATTEMPTS,
+    )
+
+    results: list[dict[str, Any]] = []
+    if templates:
+        with ThreadPoolExecutor(max_workers=min(X_KOL_RSS_MIRROR_WORKERS, len(templates))) as executor:
+            futures = [executor.submit(x_kol_fetch_rss_template, source, template) for template in templates]
+            for future in as_completed(futures):
+                result = future.result()
+                x_kol_record_rss_mirror_result(result)
+                results.append(result)
+    return x_kol_rss_result_payload(source, results)
+
+
+def x_kol_fetch_priority_rss_source(source: dict[str, Any]) -> dict[str, Any]:
+    handle = source["handle"]
+    templates = x_kol_rss_template_candidates(
+        handle,
+        x_rss_templates(),
+        limit=x_kol_priority_rss_mirrors(),
+    )
+    if not templates:
+        return x_kol_rss_result_payload(source, [])
+
+    results: list[dict[str, Any]] = []
+    executor = ThreadPoolExecutor(max_workers=len(templates))
+    futures = [
+        executor.submit(
+            x_kol_fetch_rss_template,
+            source,
+            template,
+            timeout_seconds=x_kol_priority_rss_timeout_seconds(),
+        )
+        for template in templates
+    ]
+    try:
+        for future in as_completed(futures):
+            result = future.result()
+            x_kol_record_rss_mirror_result(result)
+            results.append(result)
+            if result.get("ok"):
+                return x_kol_rss_result_payload(source, [result])
+    finally:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+    return x_kol_rss_result_payload(source, results)
 
 
 def x_kol_feed_payload(user: dict[str, Any] | None = None) -> dict[str, Any]:
     sources = load_x_kol_sources(user)
     enabled_sources = [source for source in sources if source.get("enabled") is not False]
     token = x_kol_token()
+    paid_api_enabled = x_kol_official_api_enabled()
+    paid_rest_poll_enabled = x_kol_official_rest_poll_enabled()
     items: list[dict[str, Any]] = []
     source_states: list[dict[str, Any]] = []
-    for source in enabled_sources:
+
+    def fetch_source(source: dict[str, Any]) -> dict[str, Any]:
         try:
-            result = x_kol_fetch_api_source(source, token) if token else x_kol_fetch_rss_source(source)
+            return (
+                x_kol_fetch_api_source(source, token)
+                if paid_rest_poll_enabled
+                else x_kol_fetch_rss_source(source)
+            )
         except Exception as exc:
-            result = {
+            return {
                 "source": {
                     **source,
                     "status": "error",
-                    "provider": "x-api" if token else "rss",
-                    "error": clean_feed_text(exc, 160),
+                    "provider": "x-api" if paid_rest_poll_enabled else "rss",
+                    "error": "上游暂时波动，正在自动重连",
+                    "upstreamError": clean_feed_text(exc, 240),
+                    "lastCheckAt": int(time.time() * 1000),
                 },
                 "items": [],
             }
+
+    results_by_id: dict[str, dict[str, Any]] = {}
+    if enabled_sources:
+        with ThreadPoolExecutor(max_workers=min(X_KOL_RSS_SOURCE_WORKERS, len(enabled_sources))) as executor:
+            futures = {executor.submit(fetch_source, source): source for source in enabled_sources}
+            for future in as_completed(futures):
+                source = futures[future]
+                results_by_id[str(source.get("id") or source.get("handle") or "")] = future.result()
+
+    for source in enabled_sources:
+        source_id = str(source.get("id") or source.get("handle") or "")
+        result = results_by_id.get(source_id) or fetch_source(source)
         source_states.append(result["source"])
         items.extend(result["items"])
 
@@ -4058,8 +5827,10 @@ def x_kol_feed_payload(user: dict[str, Any] | None = None) -> dict[str, Any]:
         "items": sorted_items,
         "sourceCount": len(sources),
         "enabledCount": len(enabled_sources),
-        "provider": "x-api" if token else "rss",
+        "provider": "x-api" if paid_rest_poll_enabled else "rss",
         "hasToken": bool(token),
+        "paidApiEnabled": paid_api_enabled,
+        "paidRestPollingEnabled": paid_rest_poll_enabled,
         "updatedAt": int(time.time() * 1000),
     }
 
@@ -4870,6 +6641,13 @@ def start_wechat_auth_poll(uuid: str) -> None:
 
 def notify_wechat_auth_required(reason: Any = "", *, force: bool = False, slot_label: str = "") -> dict[str, Any]:
     global WECHAT_AUTH_ALERT_LAST_AT
+    if env_flag("XINGYUN_DISABLE_WECHAT_AUTH_ALERTS"):
+        return {
+            "ok": True,
+            "skipped": True,
+            "suppressed": True,
+            "reason": "微信公众号授权弹窗已关闭",
+        }
     now = time.time()
     with WECHAT_AUTH_ALERT_LOCK:
         if not force and now - WECHAT_AUTH_ALERT_LAST_AT < WECHAT_AUTH_ALERT_COOLDOWN_SECONDS:
@@ -5658,6 +7436,286 @@ def fetch_binance() -> dict[str, Any]:
     )
 
 
+BINANCE_WALLET_HOT_PERIODS = {
+    "5m": {"api": 20, "label": "5 分钟", "change": "percentChange5m", "volume": "volume5m"},
+    "1h": {"api": 30, "label": "1 小时", "change": "percentChange1h", "volume": "volume1h"},
+    "4h": {"api": 40, "label": "4 小时", "change": "percentChange4h", "volume": "volume4h"},
+    "24h": {"api": 50, "label": "24 小时", "change": "percentChange24h", "volume": "volume24h"},
+}
+BINANCE_WALLET_CHAIN_META = {
+    "1": ("Ethereum", "eth"),
+    "56": ("BSC", "bsc"),
+    "8453": ("Base", "base"),
+    "4663": ("Robinhood", "robinhood"),
+    "CT_501": ("Solana", "sol"),
+}
+
+
+def normalize_binance_wallet_hot_period(value: Any) -> str:
+    period = str(value or "24h").strip().lower()
+    return period if period in BINANCE_WALLET_HOT_PERIODS else "24h"
+
+
+def binance_wallet_icon_url(value: Any) -> str:
+    icon = str(value or "").strip()
+    if not icon:
+        return ""
+    if icon.startswith("//"):
+        return f"https:{icon}"
+    if icon.startswith("/"):
+        return f"https://bin.bnbstatic.com{icon}"
+    return icon
+
+
+def binance_wallet_token_url(chain_id: Any, contract_address: Any) -> str:
+    contract = str(contract_address or "").strip()
+    _, route_chain = BINANCE_WALLET_CHAIN_META.get(str(chain_id or ""), ("", ""))
+    if not contract or not route_chain:
+        return "https://web3.binance.com/en/markets"
+    return f"https://web3.binance.com/en/token/{route_chain}/{quote(contract, safe='')}"
+
+
+def binance_wallet_hot_source_from_payload(payload: dict[str, Any], period: Any = "24h") -> dict[str, Any]:
+    normalized_period = normalize_binance_wallet_hot_period(period)
+    config = BINANCE_WALLET_HOT_PERIODS[normalized_period]
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    tokens = data.get("tokens") if isinstance(data.get("tokens"), list) else []
+    rows: list[dict[str, Any]] = []
+    for raw in tokens:
+        if not isinstance(raw, dict):
+            continue
+        raw_symbol = clean_feed_text(raw.get("symbol") or raw.get("tokenSymbol"), 100)
+        # Wallet rankings contain display symbols written in Chinese and other
+        # Unicode scripts. They are valid on-chain assets even though they are
+        # not valid centralized-exchange ticker codes.
+        symbol = clean_price_watch_symbol(raw_symbol) or raw_symbol
+        if not symbol or is_excluded_crypto_asset(clean_price_watch_symbol(raw_symbol) or raw_symbol):
+            continue
+        chain_id = str(raw.get("chainId") or "").strip()
+        chain_label, _ = BINANCE_WALLET_CHAIN_META.get(chain_id, (chain_id or "链上", ""))
+        contract = clean_feed_text(raw.get("contractAddress"), 128)
+        price = safe_float(raw.get("price"), 0)
+        change = safe_float(raw.get(config["change"]), 0)
+        volume = safe_float(raw.get(config["volume"]), 0)
+        liquidity = safe_float(raw.get("liquidity"), 0)
+        market_cap = safe_float(raw.get("marketCap"), 0)
+        holders = int(safe_float(raw.get("holders"), 0))
+        rank = len(rows) + 1
+        rows.append({
+            "rank": rank,
+            "symbol": symbol,
+            "name": clean_feed_text(raw.get("name") or raw.get("tokenName") or symbol, 100),
+            "icon": binance_wallet_icon_url(raw.get("icon") or raw.get("logo")),
+            "price": price_usd(price) if price > 0 else "--",
+            "change": pct(change),
+            "heat": max(1, round((10 - rank + 1) / 10 * 100)),
+            "amount": volume,
+            "turnover": f"{config['label']}成交 {money_usd(volume)}" if volume > 0 else f"{config['label']}热榜",
+            "metricLabel": money_usd(volume) if volume > 0 else "--",
+            "tags": ["币安钱包热门", chain_label, config["label"]],
+            "note": " · ".join(part for part in (
+                f"流动性 {money_usd(liquidity)}" if liquidity > 0 else "",
+                f"市值 {money_usd(market_cap)}" if market_cap > 0 else "",
+                f"持币 {holders:,}" if holders > 0 else "",
+            ) if part) or "Binance Wallet 链上热门",
+            "chain": chain_id,
+            "chainLabel": chain_label,
+            "contractAddress": contract,
+            "liquidity": liquidity,
+            "marketCap": market_cap,
+            "holders": holders,
+            "url": binance_wallet_token_url(chain_id, contract),
+        })
+        if len(rows) >= 10:
+            break
+    source = source_template(
+        id="binance-wallet-hot",
+        group="crypto",
+        title="币安钱包热门榜",
+        subtitle=f"Binance Wallet 链上热门 · 当前观察 {config['label']}",
+        accent="#f4b740",
+        source_label="BW",
+        source_name="Binance Wallet unified token rank",
+        rows=rows,
+        status="ok" if rows else "unavailable",
+        empty_title="币安钱包热门榜当前为空",
+        empty_message="币安钱包热门接口暂时没有返回可展示标的，后台会继续重试并保留上次成功数据。",
+    )
+    source.update({
+        "period": normalized_period,
+        "periodLabel": config["label"],
+        "periodOptions": [
+            {"value": key, "label": value["label"]}
+            for key, value in BINANCE_WALLET_HOT_PERIODS.items()
+        ],
+    })
+    # A non-default wallet period is loaded through its own endpoint and is not
+    # guaranteed to exist in /api/market-hot's score lookup. Decorate these rows
+    # directly so 5m/1h/4h/24h all have a narrative score of their own.
+    narrative_period = "1h" if normalized_period in {"5m", "1h"} else "6h" if normalized_period == "4h" else "24h"
+    return market_narrative_decorate_source(source, period=narrative_period)
+
+
+def binance_wallet_4h_structure_identity(row: dict[str, Any]) -> str:
+    chain = clean_feed_text(row.get("chain") or row.get("chainId"), 40).lower()
+    contract = clean_feed_text(row.get("contractAddress"), 180).lower()
+    if contract:
+        return js_stable_key("contract", chain, contract)
+    return js_stable_key("symbol", chain, clean_feed_text(row.get("symbol") or row.get("name"), 100).casefold())
+
+
+def record_binance_wallet_4h_structure_source(
+    source: dict[str, Any], *, now_ms: int | None = None
+) -> list[dict[str, Any]]:
+    """Persist every live 4h-wallet ranking appearance for the rolling structure pool."""
+    rows = source.get("rows") if isinstance(source.get("rows"), list) else []
+    if normalize_binance_wallet_hot_period(source.get("period")) != "4h" or not rows:
+        return []
+    observed_at = int(now_ms or time.time() * 1000)
+    cutoff = observed_at - BINANCE_WALLET_4H_STRUCTURE_RETENTION_SECONDS * 1000
+    with BINANCE_WALLET_4H_STRUCTURE_LOCK:
+        payload = read_json_cache(BINANCE_WALLET_4H_STRUCTURE_PATH)
+        stored = payload.get("items") if isinstance(payload.get("items"), list) else []
+        by_identity = {
+            str(item.get("identity") or binance_wallet_4h_structure_identity(item)): dict(item)
+            for item in stored
+            if isinstance(item, dict) and int(safe_float(item.get("lastSeenAt"), 0)) >= cutoff
+        }
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            identity = binance_wallet_4h_structure_identity(raw)
+            if not identity:
+                continue
+            previous = by_identity.get(identity, {})
+            by_identity[identity] = {
+                "identity": identity,
+                "symbol": clean_feed_text(raw.get("symbol") or raw.get("name"), 100),
+                "name": clean_feed_text(raw.get("name") or raw.get("symbol"), 100),
+                "icon": clean_feed_text(raw.get("icon"), 600),
+                "chain": clean_feed_text(raw.get("chain"), 40),
+                "chainLabel": clean_feed_text(raw.get("chainLabel"), 40),
+                "contractAddress": clean_feed_text(raw.get("contractAddress"), 180),
+                "url": clean_feed_text(raw.get("url"), 600),
+                "walletHotRank": int(safe_float(raw.get("rank"), 0)),
+                "walletHeat": safe_float(raw.get("heat"), 0),
+                "wallet4hVolumeUsd": round(max(0.0, safe_float(raw.get("amount"), 0)), 2),
+                "liquidity": round(max(0.0, safe_float(raw.get("liquidity"), 0)), 2),
+                "firstSeenAt": int(safe_float(previous.get("firstSeenAt"), 0)) or observed_at,
+                "lastSeenAt": observed_at,
+                "expiresAt": observed_at + BINANCE_WALLET_4H_STRUCTURE_RETENTION_SECONDS * 1000,
+                "source": "币安钱包4小时热门榜",
+            }
+        items = sorted(
+            by_identity.values(),
+            key=lambda item: (int(safe_float(item.get("lastSeenAt"), 0)), -int(safe_float(item.get("walletHotRank"), 999))),
+            reverse=True,
+        )[:3000]
+        write_json_cache(BINANCE_WALLET_4H_STRUCTURE_PATH, {
+            "updatedAt": observed_at,
+            "retentionDays": BINANCE_WALLET_4H_STRUCTURE_RETENTION_SECONDS // (24 * 60 * 60),
+            "items": items,
+        })
+    return items
+
+
+def fetch_binance_wallet_hot(period: Any = "24h") -> dict[str, Any]:
+    normalized_period = normalize_binance_wallet_hot_period(period)
+    config = BINANCE_WALLET_HOT_PERIODS[normalized_period]
+    body = {
+        "rankType": 10,
+        "period": config["api"],
+        "sortBy": 1,
+        "orderAsc": False,
+        "page": 1,
+        "size": 20,
+    }
+    headers = {
+        **HEADERS,
+        "Accept": "application/json",
+        "Accept-Encoding": "identity",
+        "Content-Type": "application/json",
+        "User-Agent": "binance-web3/2.1 (Xingyun Market Dashboard)",
+        "Referer": "https://web3.binance.com/en/markets",
+    }
+    errors: list[str] = []
+    path = "/bapi/defi/v1/public/wallet-direct/buw/wallet/market/token/pulse/unified/rank/list/ai"
+    for host in ("https://web3.binance.com", "https://www.binance.com"):
+        try:
+            response = requests.post(f"{host}{path}", json=body, headers=headers, timeout=(6, 20))
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict) or payload.get("success") is False:
+                raise RuntimeError(clean_feed_text((payload or {}).get("message") or (payload or {}).get("msg") or "invalid response", 160))
+            source = binance_wallet_hot_source_from_payload(payload, normalized_period)
+            if source_has_rows(source):
+                source["sourceName"] = f"Binance Wallet unified token rank · {urlparse(host).netloc}"
+                if normalized_period == "4h":
+                    record_binance_wallet_4h_structure_source(source)
+                return source
+            errors.append(f"{urlparse(host).netloc}: empty rank")
+        except Exception as exc:
+            errors.append(f"{urlparse(host).netloc}: {safe_error_text(str(exc))}")
+    raise RuntimeError("；".join(errors[-2:]) or "Binance Wallet 热门榜请求失败")
+
+
+def binance_wallet_hot_source(period: Any = "24h", *, force_refresh: bool = False) -> dict[str, Any]:
+    normalized_period = normalize_binance_wallet_hot_period(period)
+    cache_key = f"binance-wallet-hot-{normalized_period}"
+    if force_refresh:
+        CACHE.pop(cache_key, None)
+    source = cached_or_fallback_source(
+        cache_key,
+        lambda: fetch_binance_wallet_hot(normalized_period),
+        api_key="market-hot",
+        fallback_group="crypto",
+        error_title="币安钱包热门榜",
+        error_subtitle=f"Binance Wallet {BINANCE_WALLET_HOT_PERIODS[normalized_period]['label']} 热门数据源请求失败",
+        error_empty_title="币安钱包热门榜暂时不可用",
+    )
+    return {
+        **source,
+        "id": "binance-wallet-hot",
+        "title": "币安钱包热门榜",
+        "sourceLabel": "BW" if source.get("sourceLabel") == "ERR" else source.get("sourceLabel") or "BW",
+        "period": normalized_period,
+        "periodLabel": BINANCE_WALLET_HOT_PERIODS[normalized_period]["label"],
+        "periodOptions": [
+            {"value": key, "label": value["label"]}
+            for key, value in BINANCE_WALLET_HOT_PERIODS.items()
+        ],
+    }
+
+
+def sync_binance_wallet_4h_structure_history(*, force_refresh: bool = False) -> None:
+    global BINANCE_WALLET_4H_STRUCTURE_LAST_SYNC_AT, BINANCE_WALLET_4H_STRUCTURE_ACTIVE
+    now = time.time()
+    if not force_refresh and now - BINANCE_WALLET_4H_STRUCTURE_LAST_SYNC_AT < BINANCE_WALLET_4H_STRUCTURE_SYNC_SECONDS:
+        return
+    BINANCE_WALLET_4H_STRUCTURE_LAST_SYNC_AT = now
+    binance_wallet_hot_source("4h", force_refresh=True)
+    BINANCE_WALLET_4H_STRUCTURE_ACTIVE = True
+
+
+def binance_wallet_4h_structure_rows(*, now_ms: int | None = None) -> list[dict[str, Any]]:
+    if not BINANCE_WALLET_4H_STRUCTURE_ACTIVE:
+        return []
+    current_ms = int(now_ms or time.time() * 1000)
+    cutoff = current_ms - BINANCE_WALLET_4H_STRUCTURE_RETENTION_SECONDS * 1000
+    with BINANCE_WALLET_4H_STRUCTURE_LOCK:
+        payload = read_json_cache(BINANCE_WALLET_4H_STRUCTURE_PATH)
+    rows = [
+        dict(item)
+        for item in (payload.get("items") if isinstance(payload.get("items"), list) else [])
+        if isinstance(item, dict) and int(safe_float(item.get("lastSeenAt"), 0)) >= cutoff
+    ]
+    rows.sort(key=lambda item: (
+        int(safe_float(item.get("lastSeenAt"), 0)),
+        -int(safe_float(item.get("walletHotRank"), 999)),
+    ), reverse=True)
+    return rows
+
+
 def okx_rank_change(value: Any) -> float:
     change = safe_float(value)
     return change * 100 if -1.5 <= change <= 1.5 else change
@@ -6301,6 +8359,35 @@ def okx_dex_chain_from_href(href: str) -> str:
         return ""
 
 
+def chain_display_label(value: Any) -> str:
+    chain = re.sub(r"[^0-9A-Za-z_-]", "", str(value or "").strip()).lower()
+    labels = {
+        "ethereum": "ETH",
+        "eth": "ETH",
+        "bsc": "BSC",
+        "bnb": "BSC",
+        "binance": "BSC",
+        "solana": "SOL",
+        "sol": "SOL",
+        "base": "BASE",
+        "arbitrum": "ARB",
+        "arb": "ARB",
+        "optimism": "OP",
+        "op": "OP",
+        "polygon": "POL",
+        "matic": "POL",
+        "avalanche": "AVAX",
+        "avax": "AVAX",
+        "tron": "TRON",
+        "ton": "TON",
+        "sui": "SUI",
+        "aptos": "APT",
+        "monad": "MONAD",
+        "robinhood": "RBN",
+    }
+    return labels.get(chain, chain.upper()[:10])
+
+
 def fetch_okx_dex_hot_live(max_rows: int = 10) -> dict[str, Any]:
     url = "https://web3.okx.com/zh-hans/token?ct=30&pt=4"
     headers = {
@@ -6366,6 +8453,8 @@ def fetch_okx_dex_hot_live(max_rows: int = 10) -> dict[str, Any]:
                 "name": " · ".join(part for part in [age, address] if part) or name_text,
                 "icon": icon,
                 "icons": [icon] if icon else [],
+                "chain": chain,
+                "chainLabel": chain_display_label(chain),
                 "price": price_text or "--",
                 "change": change or "--",
                 "heat": max(1, round((len(table_rows) - len(rows)) / max(len(table_rows), 1) * 100)),
@@ -6413,6 +8502,444 @@ def fetch_okx_dex_hot(max_rows: int = 10) -> dict[str, Any]:
             return fallback
         raise
 
+
+def ave_api_base() -> str:
+    return env_value("AVE_API_BASE", "https://h5.phaetd4l.com").rstrip("/")
+
+
+def ave_browser_leveldb_dirs() -> list[Path]:
+    configured = env_value("AVE_BROWSER_PROFILE_DIRS")
+    roots: list[Path] = []
+    if configured:
+        roots.extend(Path(item.strip()) for item in re.split(r"[,;]", configured) if item.strip())
+    local_appdata = os.getenv("LOCALAPPDATA")
+    if local_appdata:
+        for browser_root in (
+            Path(local_appdata) / "Google" / "Chrome" / "User Data",
+            Path(local_appdata) / "Microsoft" / "Edge" / "User Data",
+        ):
+            if not browser_root.exists():
+                continue
+            for profile in [browser_root / "Default", *browser_root.glob("Profile *")]:
+                roots.append(profile)
+    result: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        leveldb = root if root.name.lower() == "leveldb" else root / "Local Storage" / "leveldb"
+        key = str(leveldb).lower()
+        if leveldb.exists() and key not in seen:
+            result.append(leveldb)
+            seen.add(key)
+    return result
+
+
+def ave_extract_auth_from_browser_storage() -> dict[str, str]:
+    token_patterns = [
+        rb'ave_token["\x00\x01:=,\s]{0,48}([A-Za-z0-9._~+/=\-]{40,2000})',
+        rb'ave_token=([^;\x00\s]{40,2000})',
+        rb'"ave_token"\s*:\s*"([^"]{40,2000})"',
+    ]
+    udid_patterns = [
+        rb'analogDeviceId["\x00\x01:=,\s]{0,48}([A-Za-z0-9._~:/=\-]{16,200})',
+        rb'"analogDeviceId"\s*:\s*"([^"]{16,200})"',
+        rb'([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})',
+    ]
+    found: dict[str, str] = {}
+    for root in ave_browser_leveldb_dirs():
+        for file_path in root.glob("*"):
+            if file_path.suffix.lower() not in {".ldb", ".log"}:
+                continue
+            try:
+                raw = file_path.read_bytes()
+            except OSError:
+                continue
+            if b"ave" not in raw.lower() and b"analogDeviceId" not in raw:
+                continue
+            if not found.get("token"):
+                for pattern in token_patterns:
+                    match = re.search(pattern, raw)
+                    if match:
+                        token = match.group(1).decode("utf-8", errors="ignore").strip().strip('"')
+                        if 40 <= len(token) <= 2000:
+                            found["token"] = token
+                            break
+            if not found.get("udid"):
+                for pattern in udid_patterns:
+                    match = re.search(pattern, raw)
+                    if match:
+                        udid = match.group(1).decode("utf-8", errors="ignore").strip().strip('"')
+                        if 16 <= len(udid) <= 200:
+                            found["udid"] = udid
+                            break
+            if found.get("token"):
+                if found:
+                    try:
+                        write_json_cache(AVE_TOKEN_CACHE_PATH, {**found, "updatedAt": int(time.time() * 1000), "source": "browser-local-storage"})
+                    except Exception:
+                        pass
+                return found
+    return found
+
+
+def ave_vemachine_path() -> Path:
+    path = PERSIST_CACHE_DIR / "ave_vemachine.js"
+    if path.exists() and path.stat().st_size > 50_000:
+        return path
+    response = requests.get("https://ave.ai/vemachine.js", headers=HEADERS, timeout=20)
+    response.raise_for_status()
+    path.write_text(response.text, encoding="utf-8")
+    return path
+
+
+def ave_generate_auth_with_node() -> dict[str, str]:
+    if not raw_env_flag("AVE_AUTO_GENERATE_TOKEN", True):
+        return {}
+    try:
+        script_path = ave_vemachine_path()
+    except Exception:
+        return {}
+    node_script = r"""
+const fs = require('fs');
+const vm = require('vm');
+const { webcrypto } = require('crypto');
+const scriptPath = process.argv[1];
+const store = {};
+const document = {
+  cookie: '',
+  documentElement: { style: {} },
+  body: { appendChild(){}, removeChild(){} },
+  createElement(){
+    return {
+      style: {}, children: [],
+      appendChild(c){ this.children.push(c); return c; },
+      remove(){}, setAttribute(){}, getAttribute(){ return ''; },
+      getContext(){ return { fillRect(){}, clearRect(){}, getImageData(){ return { data: new Uint8ClampedArray(16) }; }, putImageData(){}, createLinearGradient(){ return { addColorStop(){} }; }, fillText(){}, measureText(){ return { width: 10 }; } }; },
+      toDataURL(){ return 'data:image/png;base64,'; }
+    };
+  },
+  createEvent(){ return { initEvent(){} }; },
+  querySelector(){ return null; },
+  querySelectorAll(){ return []; },
+  getElementsByTagName(){ return []; },
+  addEventListener(){}, removeEventListener(){}
+};
+const localStorage = new Proxy(store, {
+  get(t,p){ if(p === 'getItem') return k => t[k] ?? null; if(p === 'setItem') return (k,v)=>{ t[k] = String(v); }; if(p === 'removeItem') return k => delete t[k]; return t[p]; },
+  set(t,p,v){ t[p] = String(v); return true; }
+});
+const navigator = {
+  appVersion: '5.0 (Windows NT 10.0; Win64; x64)', appName: 'Netscape',
+  vendor: 'Google Inc.', product: 'Gecko', productSub: '20030107',
+  userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  language: 'zh-CN', languages: ['zh-CN','zh','en'], platform: 'Win32',
+  hardwareConcurrency: 8, deviceMemory: 8, maxTouchPoints: 0,
+  cookieEnabled: true, webdriver: false, plugins: [1,2,3], mimeTypes: [1,2],
+  permissions: { query: async()=>({ state:'prompt' }) }
+};
+const sandbox = {
+  console, fetch, crypto: webcrypto, localStorage, document, navigator,
+  window: null, self: null, globalThis: null,
+  screen: { width:1920, height:1080, availWidth:1920, availHeight:1040, colorDepth:24, pixelDepth:24 },
+  location: { href:'https://ave.ai/markets', origin:'https://ave.ai' },
+  module: { exports:{} }, exports: {}, setTimeout, clearTimeout, Promise,
+  TextEncoder, TextDecoder, Uint8Array, Uint8ClampedArray, ArrayBuffer,
+  atob: s => Buffer.from(s,'base64').toString('binary'),
+  btoa: s => Buffer.from(s,'binary').toString('base64')
+};
+sandbox.window = sandbox.self = sandbox.globalThis = sandbox;
+sandbox.exports = sandbox.module.exports;
+vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(scriptPath, 'utf8'), sandbox, { timeout: 10000 });
+(async () => {
+  const api = sandbox.module.exports || sandbox.vemachine;
+  const token = await api.generateToken(true);
+  console.log(JSON.stringify({ token, udid: store.analogDeviceId || '' }));
+})().catch(err => {
+  console.error(err && (err.stack || err.message || err));
+  process.exit(2);
+});
+"""
+    try:
+        completed = subprocess.run(
+            ["node", "-e", node_script, str(script_path)],
+            capture_output=True,
+            text=True,
+            timeout=28,
+            check=False,
+        )
+    except Exception:
+        return {}
+    if completed.returncode != 0:
+        return {}
+    for line in reversed(completed.stdout.splitlines()):
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+        token = str(payload.get("token") or "").strip()
+        udid = str(payload.get("udid") or "").strip()
+        if 40 <= len(token) <= 2000:
+            auth = {"token": token, "udid": udid, "updatedAt": int(time.time() * 1000), "source": "vemachine-node"}
+            try:
+                write_json_cache(AVE_TOKEN_CACHE_PATH, auth)
+            except Exception:
+                pass
+            return auth
+    return {}
+
+
+def ave_auth_values() -> tuple[str, str]:
+    env_token = (env_value("AVE_X_AUTH") or env_value("AVE_TOKEN") or "").strip()
+    env_udid = (env_value("AVE_UDID") or env_value("AVE_ANALOG_DEVICE_ID") or "").strip()
+    cached_auth = read_json_cache(AVE_TOKEN_CACHE_PATH)
+    token = (env_token or str(cached_auth.get("token") or cached_auth.get("xAuth") or "")).strip()
+    udid = (env_udid or str(cached_auth.get("udid") or cached_auth.get("aveUdid") or "")).strip()
+    if not token and raw_env_flag("AVE_READ_BROWSER_STORAGE", True):
+        browser_auth = ave_extract_auth_from_browser_storage()
+        token = str(browser_auth.get("token") or "").strip()
+        udid = udid or str(browser_auth.get("udid") or "").strip()
+    if not token:
+        generated_auth = ave_generate_auth_with_node()
+        token = str(generated_auth.get("token") or "").strip()
+        udid = udid or str(generated_auth.get("udid") or "").strip()
+    return token, udid
+
+
+def ave_web_headers(token: str = "", udid: str = "") -> dict[str, str]:
+    headers = {
+        **HEADERS,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Origin": "https://ave.ai",
+        "Referer": "https://ave.ai/",
+        "Ave-Platform": "web",
+    }
+    if token:
+        headers["X-Auth"] = token
+    if udid:
+        headers["ave-udid"] = udid
+    if user_agent := env_value("AVE_WEB_USER_AGENT"):
+        headers["User-Agent"] = user_agent
+    if extra_headers := env_value("AVE_EXTRA_HEADERS"):
+        for item in re.split(r";\s*", extra_headers):
+            if not item:
+                continue
+            separator = ":" if ":" in item else "="
+            if separator not in item:
+                continue
+            name, value = item.split(separator, 1)
+            if name.strip() and value.strip():
+                headers[name.strip()] = value.strip()
+    return headers
+
+
+def ave_extract_items(payload: Any) -> list[dict[str, Any]]:
+    candidates: list[Any] = [payload]
+    if isinstance(payload, dict):
+        for key in ("data", "result", "items", "records", "list"):
+            if key in payload:
+                candidates.append(payload.get(key))
+        data = payload.get("data")
+        if isinstance(data, dict):
+            for key in ("data", "list", "items", "records"):
+                if key in data:
+                    candidates.append(data.get(key))
+    for candidate in candidates:
+        if isinstance(candidate, list):
+            return [item for item in candidate if isinstance(item, dict)]
+    return []
+
+
+def ave_pick(item: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = item.get(key)
+        if value not in (None, ""):
+            return value
+    return ""
+
+
+def ave_icon_url(value: Any) -> str:
+    url = str(value or "").strip()
+    if not url:
+        return ""
+    if url.startswith("//"):
+        return f"https:{url}"
+    if re.match(r"^https?://", url, re.IGNORECASE):
+        return url
+    if url.startswith("/"):
+        url = url.lstrip("/")
+    if url.startswith(("token_icon/", "ipfs/", "signals/", "upload/", "token/")):
+        return urljoin("https://www.iconaves.com/", url)
+    return urljoin("https://www.iconaves.com/", url)
+
+
+def ave_asset_fields(item: dict[str, Any]) -> dict[str, Any]:
+    target = str(ave_pick(item, "target_token", "targetToken", "token", "address", "token_address")).lower()
+    token0 = str(ave_pick(item, "token0_address", "token0Address")).lower()
+    token1 = str(ave_pick(item, "token1_address", "token1Address")).lower()
+    if target and target == token1:
+        side = "token1"
+    else:
+        side = "token0"
+    if target and target not in {token0, token1}:
+        side = ""
+    prefix = f"{side}_" if side else ""
+    camel_prefix = side if side else ""
+    symbol = ave_pick(
+        item,
+        f"{prefix}symbol",
+        f"{camel_prefix}Symbol" if camel_prefix else "",
+        "symbol",
+        "token_symbol",
+        "tokenSymbol",
+        "target_symbol",
+        "base_symbol",
+    )
+    name = ave_pick(
+        item,
+        f"{prefix}name",
+        f"{camel_prefix}Name" if camel_prefix else "",
+        "name",
+        "token_name",
+        "tokenName",
+        "target_name",
+        "base_name",
+    )
+    icon = ave_pick(
+        item,
+        f"{prefix}logo_url",
+        f"{camel_prefix}LogoUrl" if camel_prefix else "",
+        f"{prefix}logo",
+        f"{camel_prefix}Logo" if camel_prefix else "",
+        "logo_url",
+        "logoUrl",
+        "icon",
+        "image",
+    )
+    symbol_text = str(symbol or "").strip()
+    if "/" in symbol_text:
+        symbol_text = symbol_text.split("/", 1)[0]
+    symbol_text = re.sub(r"(WETH|USDT|USDC|SOL|BNB)$", "", symbol_text, flags=re.I).strip() or symbol_text
+    return {
+        "symbol": symbol_text,
+        "name": str(name or symbol_text).strip(),
+        "icon": ave_icon_url(icon),
+        "target": target or str(ave_pick(item, "pair", "pair_id", "pairId") or ""),
+        "chain": str(ave_pick(item, "chain", "chain_name", "chainName") or "").strip(),
+    }
+
+
+def ave_row_url(item: dict[str, Any], asset: dict[str, Any]) -> str:
+    target = str(asset.get("target") or "").strip()
+    chain = str(asset.get("chain") or "").strip()
+    if target and chain:
+        return f"https://ave.ai/token/{target}-{chain}"
+    if target:
+        return f"https://ave.ai/token/{target}"
+    return "https://ave.ai/"
+
+
+def fetch_ave_hot(max_rows: int = 10) -> dict[str, Any]:
+    token, udid = ave_auth_values()
+    if not token:
+        raise RuntimeError(
+            "Ave.ai hot list needs a web token. Auto-generation did not return one. "
+            "As a fallback, open ave.ai/markets, run window.vemachine.generateToken(true) in DevTools, "
+            "then put the token into AVE_X_AUTH."
+        )
+
+    payload: Any = {}
+    last_error = ""
+    for attempt in range(2):
+        response = requests.get(
+            f"{ave_api_base()}/v1api/v4/tokens/treasure/list",
+            params={
+                "category": "hot",
+                "pageNO": 1,
+                "pageSize": 50,
+                "chain": "",
+                "self_address": "",
+            },
+            headers=ave_web_headers(token, udid),
+            timeout=20,
+        )
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
+        status = payload.get("status") if isinstance(payload, dict) else None
+        message = str(payload.get("msg") or payload.get("message") or "") if isinstance(payload, dict) else ""
+        auth_failed = response.status_code in {401, 403} or status in {10001, 401, 403} or "Authorization failure" in message
+        if not auth_failed:
+            break
+        last_error = message or response.text
+        try:
+            AVE_TOKEN_CACHE_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if attempt == 0:
+            generated_auth = ave_generate_auth_with_node()
+            token = str(generated_auth.get("token") or "").strip()
+            udid = str(generated_auth.get("udid") or "").strip()
+            if token:
+                continue
+        raise RuntimeError(f"Ave.ai token expired or missing: {alert_text(last_error, 120)}")
+
+    items = ave_extract_items(payload)
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        asset = ave_asset_fields(item)
+        symbol = normalize_asset_symbol(asset.get("symbol"))
+        if not symbol or is_excluded_crypto_asset(symbol):
+            continue
+        price = safe_float(
+            ave_pick(item, "current_price_usd", "price_usd", "priceUsd", "price", "currentPriceUsd")
+        )
+        change = safe_float(
+            ave_pick(item, "price_change_24h", "priceChange24h", "change_24h", "change24h", "price_change")
+        )
+        volume = safe_float(
+            ave_pick(item, "volume_u_24h", "volume24h", "volume_24h", "vol_u_24h", "tx_volume_u_24h", "amount")
+        )
+        market_cap = safe_float(ave_pick(item, "market_cap", "marketCap", "fdv", "mcap"))
+        liquidity = safe_float(ave_pick(item, "liquidity", "liquidity_u", "pool_liquidity", "tvl"))
+        turnover = volume or liquidity or market_cap
+        chain = str(asset.get("chain") or "").strip()
+        rows.append(
+            {
+                "rank": len(rows) + 1,
+                "symbol": symbol,
+                "name": str(asset.get("name") or symbol),
+                "icon": asset.get("icon") or crypto_icon_url(symbol),
+                "icons": unique_values([asset.get("icon") or "", crypto_icon_url(symbol)]),
+                "chain": chain,
+                "chainLabel": chain_display_label(chain),
+                "price": price_usd(price) or "-",
+                "change": pct(change),
+                "heat": max(1, 100 - len(rows) * 7),
+                "amount": turnover,
+                "turnover": money_usd(turnover) if turnover else "Ave hot",
+                "tags": unique_values(["Ave.ai", str(asset.get("chain") or "").upper()]),
+                "note": "Ave hot search",
+                "url": ave_row_url(item, asset),
+            }
+        )
+        if len(rows) >= max_rows:
+            break
+
+    return source_template(
+        id="ave",
+        group="crypto",
+        title="Ave.ai 热搜榜",
+        subtitle="",
+        accent="#6c5cff",
+        source_label="AVE",
+        source_name="Ave.ai treasure hot",
+        rows=rows,
+        status="ok" if rows else "unavailable",
+        empty_title="Ave.ai 热搜榜当前为空",
+        empty_message="已请求 Ave.ai 热搜接口，但没有解析到可展示的数据。",
+    )
 
 def fetch_bitget() -> dict[str, Any]:
     index = env_value("BITGET_HOT_INDEX", "8")
@@ -6783,6 +9310,8 @@ def fetch_binance_new_coins() -> dict[str, Any]:
         for item in exchange_payload.get("symbols", [])
         if item.get("status") == "TRADING"
         and item.get("quoteAsset") == "USDT"
+        and "TRADIFI" not in str(item.get("contractType") or "").upper()
+        and "TRADFI" not in {str(value or "").upper() for value in item.get("underlyingSubType", [])}
         and not is_excluded_crypto_asset(item.get("baseAsset"))
     ]
     symbols.sort(key=lambda item: safe_float(item.get("onboardDate")), reverse=True)
@@ -6813,6 +9342,7 @@ def fetch_binance_new_coins() -> dict[str, Any]:
                 "date": onboard_ms,
                 "dateLabel": date_yyyy_mm_dd(onboard_ms),
                 "status": "永续",
+                "assetType": "tradfi" if is_tradfi else "crypto",
                 "tags": ["永续", "TradFi" if is_tradfi else "新合约"],
                 "url": f"https://www.binance.com/zh-CN/futures/{pair}",
             }
@@ -6853,6 +9383,7 @@ def fetch_okx_new_coins() -> dict[str, Any]:
         item
         for item in instruments_payload.get("data", [])
         if item.get("state") == "live" and str(item.get("instId") or "").endswith("-USDT-SWAP")
+        and str(item.get("instCategory") or "").strip() != "3"
     ]
     instruments.sort(key=lambda item: safe_float(item.get("listTime")), reverse=True)
     rows = []
@@ -6867,6 +9398,7 @@ def fetch_okx_new_coins() -> dict[str, Any]:
         turnover = last * base_volume if last and base_volume else 0
         list_ms = int(safe_float(item.get("listTime")))
         pair = inst_id.replace("-", "").replace("SWAP", "")
+        is_tradfi = str(item.get("instCategory") or "").strip() == "3"
         rows.append(
             {
                 "rank": len(rows) + 1,
@@ -6875,7 +9407,7 @@ def fetch_okx_new_coins() -> dict[str, Any]:
                 "symbol": pair,
                 "name": pair,
                 "icon": "",
-                "iconCandidates": exchange_asset_icon_candidates(asset, prefer_us_stock=True),
+                "iconCandidates": exchange_asset_icon_candidates(asset, prefer_us_stock=is_tradfi),
                 "price": price_usd(last),
                 "change": pct(change_from_open(last, ticker.get("open24h"))),
                 "amount": turnover,
@@ -6883,7 +9415,8 @@ def fetch_okx_new_coins() -> dict[str, Any]:
                 "date": list_ms,
                 "dateLabel": date_yyyy_mm_dd(list_ms),
                 "status": "永续",
-                "tags": ["永续", "OKX 新合约"],
+                "assetType": "tradfi" if is_tradfi else "crypto",
+                "tags": ["永续", "TradFi" if is_tradfi else "OKX 新合约"],
                 "url": f"https://www.okx.com/zh-hans/trade-swap/{inst_id.lower()}",
             }
         )
@@ -6902,6 +9435,163 @@ def fetch_okx_new_coins() -> dict[str, Any]:
         empty_title="OKX 新币榜当前为空",
         empty_message="已请求 OKX 官方 public instruments / market tickers，但没有返回可展示的新合约数据。",
     )
+
+
+def fetch_gate_new_coins() -> dict[str, Any]:
+    payload = requests.get(
+        "https://api.gateio.ws/api/v4/futures/usdt/contracts",
+        headers={**HEADERS, "Accept": "application/json"},
+        timeout=18,
+    )
+    payload.raise_for_status()
+    contracts = payload.json()
+    contracts = contracts if isinstance(contracts, list) else []
+    contracts.sort(
+        key=lambda item: safe_float(item.get("launch_time") or item.get("create_time")) if isinstance(item, dict) else 0,
+        reverse=True,
+    )
+    rows: list[dict[str, Any]] = []
+    for item in contracts:
+        if not isinstance(item, dict) or str(item.get("status") or "").lower() not in {"trading", "prelaunch"}:
+            continue
+        contract = str(item.get("name") or "").strip().upper()
+        asset = contract.removesuffix("_USDT")
+        if not contract or not asset or is_excluded_crypto_asset(asset):
+            continue
+        listed_at = int(safe_float(item.get("launch_time") or item.get("create_time"), 0) * 1000)
+        if listed_at <= 0:
+            continue
+        contract_type = str(item.get("contract_type") or "").strip().lower()
+        is_tradfi = contract_type in {
+            "stocks", "indices", "index", "tradfi", "metals", "commodities", "forex"
+        }
+        last = safe_float(item.get("last_price") or item.get("mark_price"), 0)
+        rows.append({
+            "rank": len(rows) + 1,
+            "group": "new-coin",
+            "source": "Gate",
+            "sourceLabel": "GT",
+            "asset": asset,
+            "symbol": contract.replace("_", ""),
+            "name": contract,
+            "title": f"Gate {'TradFi' if is_tradfi else '永续合约'}上新：{contract}",
+            "icon": "",
+            "iconCandidates": exchange_asset_icon_candidates(asset, prefer_us_stock=is_tradfi),
+            "price": price_usd(last),
+            "change": "--",
+            "amount": 0,
+            "turnover": "--",
+            "date": listed_at,
+            "dateLabel": date_yyyy_mm_dd(listed_at),
+            "status": "待上线" if str(item.get("status") or "").lower() == "prelaunch" else "永续",
+            "assetType": "tradfi" if is_tradfi else "crypto",
+            "tags": ["Gate 新合约", "TradFi" if is_tradfi else "永续"],
+            "url": f"https://www.gate.com/futures/USDT/{contract}",
+        })
+        if len(rows) >= 120:
+            break
+    return source_template(
+        id="gate-new",
+        group="new-coin",
+        title="Gate 新合约榜",
+        subtitle="Gate 官方 Futures contracts launch_time 排序，含加密与 TradFi 合约",
+        accent="#13e6b0",
+        source_label="GT",
+        source_name="Gate Futures contracts",
+        rows=rows,
+        status="ok" if rows else "unavailable",
+        empty_title="Gate 新合约榜当前为空",
+        empty_message="已请求 Gate 官方 Futures contracts，但没有返回可展示的新合约数据。",
+    )
+
+
+def htx_contract_date_ms(value: Any) -> int:
+    text = str(value or "").strip()
+    try:
+        return int(datetime.strptime(text, "%Y%m%d").replace(tzinfo=timezone(timedelta(hours=8))).timestamp() * 1000)
+    except Exception:
+        return 0
+
+
+def fetch_htx_new_coins() -> dict[str, Any]:
+    response = requests.get(
+        "https://api.hbdm.com/linear-swap-api/v1/swap_contract_info",
+        headers={**HEADERS, "Accept": "application/json"},
+        timeout=18,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    contracts = payload.get("data") if isinstance(payload, dict) else []
+    contracts = contracts if isinstance(contracts, list) else []
+    contracts.sort(
+        key=lambda item: htx_contract_date_ms(item.get("create_date")) if isinstance(item, dict) else 0,
+        reverse=True,
+    )
+    rows: list[dict[str, Any]] = []
+    for item in contracts:
+        if not isinstance(item, dict) or int(safe_float(item.get("contract_status"), 0)) not in {1, 2}:
+            continue
+        asset = str(item.get("symbol") or "").strip().upper()
+        contract = str(item.get("contract_code") or item.get("pair") or "").strip().upper()
+        listed_at = htx_contract_date_ms(item.get("create_date"))
+        if not asset or not contract or listed_at <= 0 or is_excluded_crypto_asset(asset):
+            continue
+        tradfi_labels = item.get("tradfi_labels") if isinstance(item.get("tradfi_labels"), list) else []
+        is_tradfi = bool(tradfi_labels) or str(item.get("business_type") or "").lower() == "tradfi"
+        rows.append({
+            "rank": len(rows) + 1,
+            "group": "new-coin",
+            "source": "HTX",
+            "sourceLabel": "HT",
+            "asset": asset,
+            "symbol": contract.replace("-", ""),
+            "name": contract,
+            "title": f"HTX {'TradFi' if is_tradfi else '永续合约'}上新：{contract}",
+            "icon": "",
+            "iconCandidates": exchange_asset_icon_candidates(asset, prefer_us_stock=is_tradfi),
+            "price": "--",
+            "change": "--",
+            "amount": 0,
+            "turnover": "--",
+            "date": listed_at,
+            "dateLabel": date_yyyy_mm_dd(listed_at),
+            "status": "永续",
+            "assetType": "tradfi" if is_tradfi else "crypto",
+            "tags": ["HTX 新合约", "TradFi" if is_tradfi else "永续", *[str(label) for label in tradfi_labels[:3]]],
+            "url": f"https://www.htx.com/futures/linear_swap/exchange#contract_code={contract}",
+        })
+        if len(rows) >= 120:
+            break
+    return source_template(
+        id="htx-new",
+        group="new-coin",
+        title="HTX 新合约榜",
+        subtitle="HTX 官方 USDT Swap contract info create_date 排序，含加密与 TradFi 合约",
+        accent="#2f7df6",
+        source_label="HT",
+        source_name="HTX USDT Swap contract info",
+        rows=rows,
+        status="ok" if rows else "unavailable",
+        empty_title="HTX 新合约榜当前为空",
+        empty_message="已请求 HTX 官方 USDT Swap contract info，但没有返回可展示的新合约数据。",
+    )
+
+
+def secondary_exchange_listing_events(source: dict[str, Any], limit: int = 20) -> list[dict[str, Any]]:
+    source_id = clean_feed_text(source.get("id"), 40)
+    rows = source.get("rows") if isinstance(source.get("rows"), list) else []
+    result: list[dict[str, Any]] = []
+    for row in rows[: max(1, limit)]:
+        if not isinstance(row, dict):
+            continue
+        result.append({
+            **row,
+            "id": f"{source_id}-{clean_feed_text(row.get('symbol'), 40)}-{int(safe_float(row.get('date'), 0))}",
+            "group": "crypto",
+            "metric": "TradFi 合约上新" if str(row.get("assetType") or "") == "tradfi" else "永续合约上新",
+            "tags": list(dict.fromkeys(["交易所上新", *(row.get("tags") or [])])),
+        })
+    return result
 
 
 def bitget_new_rows_from_index(index: str) -> list[dict[str, Any]]:
@@ -7027,12 +9717,281 @@ def fetch_bitget_new_coins() -> dict[str, Any]:
     )
 
 
+def hyperliquid_market_first_candle_ms(coin: str, *, timeout: float = 8) -> int:
+    now_ms = int(time.time() * 1000)
+    response = requests.post(
+        "https://api.hyperliquid.xyz/info",
+        json={
+            "type": "candleSnapshot",
+            "req": {
+                "coin": coin,
+                "interval": "1d",
+                "startTime": now_ms - 370 * 24 * 60 * 60 * 1000,
+                "endTime": now_ms,
+            },
+        },
+        headers={**HEADERS, "Content-Type": "application/json"},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    rows = response.json()
+    timestamps = [
+        int(safe_float(item.get("t") or item.get("T"), 0))
+        for item in rows if isinstance(item, dict)
+        if safe_float(item.get("t") or item.get("T"), 0) > 0
+    ] if isinstance(rows, list) else []
+    return min(timestamps) if timestamps else 0
+
+
+def fetch_hyperliquid_new_markets(*, dex: str = "") -> dict[str, Any]:
+    request_payload: dict[str, Any] = {"type": "metaAndAssetCtxs"}
+    if dex:
+        request_payload["dex"] = dex
+    response = requests.post(
+        "https://api.hyperliquid.xyz/info",
+        json=request_payload,
+        headers={**HEADERS, "Content-Type": "application/json"},
+        timeout=18,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list) or len(payload) < 2:
+        raise RuntimeError("Hyperliquid metaAndAssetCtxs returned no markets")
+    universe = payload[0].get("universe", []) if isinstance(payload[0], dict) else []
+    contexts = payload[1] if isinstance(payload[1], list) else []
+    candidates: list[tuple[dict[str, Any], dict[str, Any]]] = [
+        (meta, context if isinstance(context, dict) else {})
+        for meta, context in zip(universe, contexts)
+        if isinstance(meta, dict) and clean_price_watch_symbol(meta.get("name"))
+    ][-20:]
+    candidates.reverse()
+
+    def listing_time(pair: tuple[dict[str, Any], dict[str, Any]]) -> tuple[str, int]:
+        meta, _ = pair
+        symbol = clean_price_watch_symbol(meta.get("name"))
+        coin = f"{dex}:{symbol}" if dex else symbol
+        try:
+            return symbol, hyperliquid_market_first_candle_ms(coin)
+        except Exception:
+            return symbol, 0
+
+    first_candles: dict[str, int] = {}
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        for symbol, listed_at in executor.map(listing_time, candidates[:14]):
+            first_candles[symbol] = listed_at
+    rows: list[dict[str, Any]] = []
+    for meta, context in candidates:
+        symbol = clean_price_watch_symbol(meta.get("name"))
+        if not symbol or is_excluded_crypto_asset(symbol):
+            continue
+        mark_price = safe_float(context.get("markPx"), 0)
+        previous_price = safe_float(context.get("prevDayPx"), 0)
+        turnover = safe_float(context.get("dayNtlVlm"), 0)
+        listed_at = first_candles.get(symbol, 0)
+        rows.append({
+            "rank": len(rows) + 1,
+            "group": "new-coin",
+            "source": "Trade.xyz" if dex == "xyz" else "Hyperliquid",
+            "sourceLabel": "TX" if dex == "xyz" else "HL",
+            "asset": symbol,
+            "symbol": symbol,
+            "name": symbol,
+            "icon": "",
+            "iconCandidates": exchange_asset_icon_candidates(symbol, prefer_us_stock=dex == "xyz"),
+            "price": price_usd(mark_price),
+            "change": pct(change_from_open(mark_price, previous_price)) if mark_price and previous_price else "--",
+            "amount": turnover,
+            "turnover": money_usd(turnover) if turnover else "--",
+            "date": listed_at,
+            "dateLabel": date_yyyy_mm_dd(listed_at) if listed_at else "新近上线",
+            "status": "HIP-3" if dex else "永续",
+            "assetType": "tradfi" if dex == "xyz" else "crypto",
+            "tags": ["Trade.xyz 新市场", "HIP-3"] if dex == "xyz" else ["Hyperliquid 新市场", "永续"],
+            "url": "https://trade.xyz" if dex == "xyz" else f"https://app.hyperliquid.xyz/trade/{quote(symbol, safe='')}",
+        })
+        if len(rows) >= 10:
+            break
+    source_id = "trade-xyz-new" if dex == "xyz" else "hyperliquid-new"
+    return source_template(
+        id=source_id,
+        group="new-coin",
+        title="Trade.xyz 新币榜" if dex == "xyz" else "Hyperliquid 新币榜",
+        subtitle=(
+            "Hyperliquid 官方 HIP-3 xyz 市场，按最新市场清单与首次日 K 时间整理"
+            if dex == "xyz"
+            else "Hyperliquid 官方 metaAndAssetCtxs，按最新市场清单与首次日 K 时间整理"
+        ),
+        accent="#a78bfa" if dex == "xyz" else "#37d8a4",
+        source_label="TX" if dex == "xyz" else "HL",
+        source_name="Hyperliquid HIP-3 xyz API" if dex == "xyz" else "Hyperliquid Info API",
+        rows=rows,
+        status="ok" if rows else "unavailable",
+        empty_title="Trade.xyz 新币榜当前为空" if dex == "xyz" else "Hyperliquid 新币榜当前为空",
+        empty_message="官方市场接口暂未返回可展示的新市场。",
+    )
+
+
+def fetch_trade_xyz_new_coins() -> dict[str, Any]:
+    return fetch_hyperliquid_new_markets(dex="xyz")
+
+
+def fetch_hyperliquid_new_coins() -> dict[str, Any]:
+    return fetch_hyperliquid_new_markets()
+
+
+def fetch_aster_new_coins() -> dict[str, Any]:
+    ticker_response = requests.get(
+        "https://fapi.asterdex.com/fapi/v1/ticker/24hr",
+        headers={**HEADERS, "Accept": "application/json", "Referer": ASTER_TRADE_URL},
+        timeout=18,
+    )
+    ticker_response.raise_for_status()
+    ticker_payload = ticker_response.json()
+    ticker_rows = ticker_payload if isinstance(ticker_payload, list) else []
+    tickers = {str(item.get("symbol") or "").upper(): item for item in ticker_rows if isinstance(item, dict)}
+    rows: list[dict[str, Any]] = []
+    now_ms = int(time.time() * 1000)
+    for item in aster_contract_rows(80):
+        symbol = clean_feed_text(item.get("symbol"), 40).upper()
+        asset = clean_feed_text(item.get("baseAsset"), 30).upper()
+        listed_at = int(safe_float(item.get("date"), 0))
+        if (
+            not symbol
+            or not asset
+            or is_excluded_crypto_asset(asset)
+            or item.get("assetType") == "tradfi"
+            or listed_at > now_ms + 30 * 24 * 60 * 60 * 1000
+        ):
+            continue
+        ticker = tickers.get(symbol) or {}
+        last = safe_float(ticker.get("lastPrice"), 0)
+        turnover = safe_float(ticker.get("quoteVolume"), 0)
+        rows.append({
+            "rank": len(rows) + 1,
+            "group": "new-coin",
+            "source": "Aster",
+            "sourceLabel": "AS",
+            "asset": asset,
+            "symbol": symbol,
+            "name": symbol,
+            "icon": "",
+            "iconCandidates": exchange_asset_icon_candidates(asset),
+            "price": price_usd(last),
+            "change": pct(safe_float(ticker.get("priceChangePercent"), 0)),
+            "amount": turnover,
+            "turnover": money_usd(turnover) if turnover else "--",
+            "date": listed_at,
+            "dateLabel": date_yyyy_mm_dd(listed_at),
+            "status": item.get("status") or "永续",
+            "assetType": "crypto",
+            "tags": ["Aster 新合约", "永续"],
+            "url": ASTER_TRADE_URL,
+        })
+        if len(rows) >= 10:
+            break
+    return source_template(
+        id="aster-new",
+        group="new-coin",
+        title="Aster 新币榜",
+        subtitle="Aster 官方 Futures exchangeInfo onboardDate 排序，叠加 24h 行情",
+        accent="#f2c14e",
+        source_label="AS",
+        source_name="Aster Futures exchangeInfo",
+        rows=rows,
+        status="ok" if rows else "unavailable",
+        empty_title="Aster 新币榜当前为空",
+        empty_message="Aster 官方 Futures 接口暂未返回可展示的新合约。",
+    )
+
+
+def binance_alpha_timestamp_ms(value: Any) -> int:
+    timestamp = int(safe_float(value, 0))
+    if 0 < timestamp < 10_000_000_000:
+        timestamp *= 1000
+    return timestamp
+
+
+def fetch_binance_alpha_new_coins() -> dict[str, Any]:
+    response = requests.get(
+        "https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list",
+        headers={**HEADERS, "Accept": "application/json", "clienttype": "web", "lang": "zh-CN"},
+        timeout=18,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    data = payload.get("data") if isinstance(payload, dict) else []
+    items = data.get("tokens") if isinstance(data, dict) and isinstance(data.get("tokens"), list) else data
+    items = items if isinstance(items, list) else []
+    normalized: list[tuple[int, dict[str, Any]]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        listed_at = binance_alpha_timestamp_ms(
+            item.get("listingTime") or item.get("onlineTgeTime") or item.get("onlineTime") or item.get("createdAt")
+        )
+        normalized.append((listed_at, item))
+    normalized.sort(key=lambda value: value[0], reverse=True)
+    rows: list[dict[str, Any]] = []
+    for listed_at, item in normalized:
+        symbol = clean_price_watch_symbol(item.get("symbol") or item.get("tokenSymbol"))
+        name = clean_feed_text(item.get("name") or item.get("tokenName") or symbol, 80)
+        if not symbol or is_excluded_crypto_asset(symbol):
+            continue
+        price = safe_float(item.get("price") or item.get("priceUsd"), 0)
+        turnover = safe_float(item.get("volume24h") or item.get("volume24hUsd") or item.get("amount24h"), 0)
+        change = safe_float(item.get("percentChange24h") or item.get("change24h") or item.get("priceChangePercent"), 0)
+        chain_name = clean_feed_text(item.get("chainName") or item.get("chain"), 40)
+        contract = clean_feed_text(item.get("contractAddress"), 96)
+        rows.append({
+            "rank": len(rows) + 1,
+            "group": "new-coin",
+            "source": "Binance Alpha",
+            "sourceLabel": "BA",
+            "asset": symbol,
+            "symbol": symbol,
+            "name": name,
+            "icon": clean_feed_text(item.get("iconUrl") or item.get("logoUrl"), 800),
+            "iconCandidates": exchange_asset_icon_candidates(symbol),
+            "price": price_usd(price),
+            "change": pct(change),
+            "amount": turnover,
+            "turnover": money_usd(turnover) if turnover else "--",
+            "date": listed_at,
+            "dateLabel": date_yyyy_mm_dd(listed_at) if listed_at else "Alpha 新近收录",
+            "status": "Alpha",
+            "assetType": "crypto",
+            "tags": list(dict.fromkeys(["Binance Alpha", chain_name or "链上", contract[:8] if contract else ""])),
+            "url": "https://www.binance.com/zh-CN/alpha",
+        })
+        if len(rows) >= 10:
+            break
+    return source_template(
+        id="binance-alpha-new",
+        group="new-coin",
+        title="Binance Alpha 新币榜",
+        subtitle="Binance Alpha 官方公开代币清单，按收录时间展示最近 10 个",
+        accent="#f3ba2f",
+        source_label="BA",
+        source_name="Binance Alpha token list",
+        rows=rows,
+        status="ok" if rows else "unavailable",
+        empty_title="Binance Alpha 新币榜当前为空",
+        empty_message="Binance Alpha 公开代币接口暂未返回可展示的收录时间数据。",
+    )
+
+
 def new_coin_rankings_payload() -> dict[str, Any]:
     sources = []
     for key, fetcher in (
         ("binance-new", fetch_binance_new_coins),
         ("okx-new", fetch_okx_new_coins),
         ("bitget-new", fetch_bitget_new_coins),
+        ("gate-new", fetch_gate_new_coins),
+        ("htx-new", fetch_htx_new_coins),
+        ("trade-xyz-new", fetch_trade_xyz_new_coins),
+        ("hyperliquid-new", fetch_hyperliquid_new_coins),
+        ("aster-new", fetch_aster_new_coins),
+        ("binance-alpha-new", fetch_binance_alpha_new_coins),
     ):
         try:
             sources.append(cached(key, fetcher))
@@ -8320,6 +11279,425 @@ def extract_listing_symbols(title: str, limit: int = 4) -> str:
     return ", ".join(result)
 
 
+ASTER_FUTURES_EXCHANGE_INFO_URL = "https://fapi.asterdex.com/fapi/v1/exchangeInfo"
+ASTER_TRADE_URL = "https://www.asterdex.com/en"
+ASTER_ANNOUNCEMENT_API_URL = "https://www.asterdex.com/bapi/composite/v1/public/composite/ae/announcement/search"
+ASTER_ANNOUNCEMENT_URL = "https://www.asterdex.com/en/announcement"
+ASTER_X_HANDLE = "Aster_DEX"
+ASTER_CONTRACT_STATUSES = {"TRADING", "PENDING_TRADING"}
+ASTER_ANNOUNCEMENT_BOOTSTRAP_LOOKBACK_MS = 72 * 60 * 60 * 1000
+ASTER_ANNOUNCEMENT_BOOTSTRAP_FUTURE_MS = 14 * 24 * 60 * 60 * 1000
+ASTER_ANNOUNCEMENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
+ASTER_INVENTORY_RETENTION_MS = 90 * 24 * 60 * 60 * 1000
+ASTER_X_LISTING_CACHE_TTL_MS = 5 * 60 * 1000
+ASTER_CROSS_SOURCE_DEDUPE_MS = 72 * 60 * 60 * 1000
+
+
+def aster_contract_rows(limit: int = 80) -> list[dict[str, Any]]:
+    """Return the current Aster perpetual inventory used to detect newly added contracts."""
+    payload = requests.get(
+        ASTER_FUTURES_EXCHANGE_INFO_URL,
+        headers={**HEADERS, "Accept": "application/json", "Referer": ASTER_TRADE_URL},
+        timeout=18,
+    ).json()
+    symbols = payload.get("symbols") if isinstance(payload, dict) else []
+    rows: list[dict[str, Any]] = []
+    for item in symbols if isinstance(symbols, list) else []:
+        status = str(item.get("status") or "").strip().upper()
+        contract_type = str(item.get("contractType") or "").strip().upper()
+        if status not in ASTER_CONTRACT_STATUSES:
+            continue
+        if contract_type and contract_type != "PERPETUAL":
+            continue
+        symbol = str(item.get("symbol") or "").strip().upper()
+        base_asset = str(item.get("baseAsset") or "").strip().upper()
+        quote_asset = str(item.get("quoteAsset") or "").strip().upper()
+        if not symbol or not base_asset or not quote_asset:
+            continue
+        onboard_ms = int(safe_float(item.get("onboardDate"), 0))
+        pending = status == "PENDING_TRADING"
+        subtype_text = " ".join(
+            str(value or "")
+            for value in [
+                item.get("underlyingType"),
+                item.get("assetType"),
+                *(item.get("underlyingSubType") if isinstance(item.get("underlyingSubType"), list) else []),
+            ]
+        ).upper()
+        is_tradfi = bool(re.search(r"TRADFI|TRADIFI|STOCK|EQUITY|INDEX|FOREX|COMMODIT", subtype_text))
+        pair = f"{base_asset}/{quote_asset}"
+        rows.append(
+            {
+                "id": f"aster-{symbol}",
+                "group": "crypto",
+                "source": "Aster",
+                "sourceLabel": "AS",
+                "title": f"Aster {'将上线' if pending else '上线'} {pair} 永续合约",
+                "symbol": symbol,
+                "baseAsset": base_asset,
+                "quoteAsset": quote_asset,
+                "contractStatus": status,
+                "assetType": "tradfi" if is_tradfi else "crypto",
+                "status": "待上线" if pending else "交易中",
+                "date": onboard_ms,
+                "metric": f"{quote_asset} 永续合约",
+                "tags": ["交易所上新", "Aster", "TradFi" if is_tradfi else "永续合约"],
+                "url": ASTER_TRADE_URL,
+            }
+        )
+    rows.sort(key=lambda item: (int(safe_float(item.get("date"), 0)), item.get("symbol") or ""), reverse=True)
+    return rows[: max(1, int(limit))]
+
+
+def aster_official_listing_rows(limit: int = 80) -> list[dict[str, Any]]:
+    """Read Aster's official New listing announcement feed for the latest month."""
+    payload = requests.post(
+        ASTER_ANNOUNCEMENT_API_URL,
+        json={"category": "NEW_LISTING", "page": 1, "size": max(20, min(100, int(limit)))},
+        headers={
+            **HEADERS,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "lang": "en",
+            "Origin": "https://www.asterdex.com",
+            "Referer": f"{ASTER_ANNOUNCEMENT_URL}?category=NEW_LISTING",
+        },
+        timeout=18,
+    ).json()
+    data = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else {}
+    source_rows = data.get("rows") if isinstance(data.get("rows"), list) else []
+    now_ms = int(time.time() * 1000)
+    rows: list[dict[str, Any]] = []
+    for item in source_rows:
+        if not isinstance(item, dict):
+            continue
+        announcement_id = str(item.get("id") or item.get("announcementId") or "").strip()
+        official_title = clean_feed_text(item.get("title") or item.get("name"), 240)
+        publish_ms = int(safe_float(item.get("publishTime") or item.get("updateTime") or item.get("time"), 0))
+        if not announcement_id or not official_title or publish_ms <= 0:
+            continue
+        if now_ms - publish_ms > ASTER_ANNOUNCEMENT_RETENTION_MS or publish_ms > now_ms + ASTER_ANNOUNCEMENT_BOOTSTRAP_FUTURE_MS:
+            continue
+        assets = list(
+            dict.fromkeys(
+                match.upper()
+                for match in re.findall(r"\$([0-9A-Za-z_\u4e00-\u9fff]{1,24})", official_title)
+                if match.strip()
+            )
+        )
+        if not assets:
+            continue
+        contract_symbols = [f"{asset}USDT" for asset in assets]
+        subtitle = clean_feed_text(item.get("subtitle") or item.get("subTitle") or item.get("summary"), 240)
+        rows.append(
+            {
+                "id": f"aster-official-{announcement_id}",
+                "group": "crypto",
+                "source": "Aster",
+                "sourceLabel": "AS",
+                "title": f"Aster 官方上新公告：{'、'.join(assets)} 永续合约",
+                "officialTitle": official_title,
+                "subtitle": subtitle,
+                "symbol": contract_symbols[0] if len(contract_symbols) == 1 else ",".join(contract_symbols),
+                "symbols": assets,
+                "contractSymbols": contract_symbols,
+                "baseAsset": " · ".join(assets),
+                "quoteAsset": "USDT",
+                "contractStatus": "ANNOUNCED",
+                "status": "官方公告",
+                "date": publish_ms,
+                "announcementAt": publish_ms,
+                "firstDiscoveredAt": publish_ms,
+                "announcementReason": "Aster 官网 New listing 公告",
+                "announcementSource": "Aster 官方公告",
+                "officialAnnouncement": True,
+                "metric": subtitle or official_title,
+                "tags": ["Aster 官方公告", "New listing", "永续合约"],
+                "url": f"{ASTER_ANNOUNCEMENT_URL}/{announcement_id}",
+            }
+        )
+    rows.sort(key=lambda item: (int(safe_float(item.get("announcementAt"), 0)), item.get("id") or ""), reverse=True)
+    return rows[: max(1, int(limit))]
+
+
+def aster_official_x_listing_rows(limit: int = 80) -> list[dict[str, Any]]:
+    """Read and cache listing posts from Aster's official X account."""
+    now_ms = int(time.time() * 1000)
+    with ASTER_X_LISTING_LOCK:
+        cached_payload = read_json_cache(ASTER_X_LISTING_CACHE_PATH)
+        cached_rows = cached_payload.get("items") if isinstance(cached_payload.get("items"), list) else []
+        cached_at = int(safe_float(cached_payload.get("updatedAt"), 0))
+        if cached_rows and now_ms - cached_at < ASTER_X_LISTING_CACHE_TTL_MS:
+            return [dict(row) for row in cached_rows[: max(1, int(limit))] if isinstance(row, dict)]
+
+        source = {
+            "id": "x:aster_dex",
+            "handle": ASTER_X_HANDLE,
+            "displayName": "Aster",
+            "avatar": "",
+            "keywords": [],
+            "enabled": True,
+        }
+        try:
+            token = x_kol_token()
+            payload = x_kol_fetch_api_source(source, token) if token else x_kol_fetch_rss_source(source)
+            source_items = payload.get("items") if isinstance(payload.get("items"), list) else []
+            rows: list[dict[str, Any]] = []
+            for item in source_items:
+                if not isinstance(item, dict):
+                    continue
+                entry_type = str(item.get("entryType") or "").strip().lower()
+                if entry_type in {"retweeted", "replied_to", "retweet", "reply"}:
+                    continue
+                text = clean_feed_text(item.get("fullText") or item.get("text") or item.get("title"), 1200)
+                published_ms = int(safe_float(item.get("publishedAt"), 0))
+                if not text or published_ms <= 0 or now_ms - published_ms > ASTER_ANNOUNCEMENT_RETENTION_MS:
+                    continue
+                is_listing = bool(
+                    re.search(r"\bnew\b.{0,28}\b(?:perp|perpetual)\b.{0,28}\blisting", text, flags=re.I)
+                    or re.search(r"(?:新\s*perp|新永续|新合约).{0,18}(?:上市|上线|上新)", text, flags=re.I)
+                )
+                if not is_listing:
+                    continue
+                assets = list(
+                    dict.fromkeys(
+                        match.upper()
+                        for match in re.findall(r"\$([0-9A-Za-z_\u4e00-\u9fff]{1,24})", text)
+                        if match.strip()
+                    )
+                )
+                if not assets:
+                    continue
+                contract_symbols = [f"{asset}USDT" for asset in assets]
+                tweet_id = str(item.get("tweetId") or item.get("id") or "").strip()
+                rows.append(
+                    {
+                        "id": f"aster-x-{tweet_id or stable_feed_id(text, published_ms)}",
+                        "group": "crypto",
+                        "source": "Aster",
+                        "sourceLabel": "AS",
+                        "title": f"Aster 官方 X 上新：{'、'.join(assets)} 永续合约",
+                        "officialTitle": text,
+                        "subtitle": text,
+                        "symbol": contract_symbols[0] if len(contract_symbols) == 1 else ",".join(contract_symbols),
+                        "symbols": assets,
+                        "contractSymbols": contract_symbols,
+                        "baseAsset": " · ".join(assets),
+                        "quoteAsset": "USDT",
+                        "contractStatus": "ANNOUNCED",
+                        "status": "官方 X",
+                        "date": published_ms,
+                        "announcementAt": published_ms,
+                        "firstDiscoveredAt": published_ms,
+                        "announcementReason": "Aster 官方 X 上新帖",
+                        "announcementSource": "Aster 官方 X",
+                        "officialAnnouncement": True,
+                        "officialChannel": "x",
+                        "metrics": item.get("metrics") if isinstance(item.get("metrics"), dict) else {},
+                        "metric": text,
+                        "tags": ["Aster 官方 X", "New listing", "永续合约"],
+                        "url": item.get("url") or f"https://x.com/{ASTER_X_HANDLE}",
+                    }
+                )
+            rows.sort(key=lambda row: int(safe_float(row.get("announcementAt"), 0)), reverse=True)
+            write_json_cache(ASTER_X_LISTING_CACHE_PATH, {"updatedAt": now_ms, "items": rows})
+            return rows[: max(1, int(limit))]
+        except Exception:
+            retained = [
+                dict(row)
+                for row in cached_rows
+                if isinstance(row, dict)
+                and now_ms - int(safe_float(row.get("announcementAt"), 0)) <= ASTER_ANNOUNCEMENT_RETENTION_MS
+            ]
+            retained.sort(key=lambda row: int(safe_float(row.get("announcementAt"), 0)), reverse=True)
+            return retained[: max(1, int(limit))]
+
+
+def aster_contract_announcement_rows(limit: int = 80) -> list[dict[str, Any]]:
+    """Persist Aster contract additions as announcements instead of exposing its full inventory."""
+    now_ms = int(time.time() * 1000)
+    inventory = aster_contract_rows(600)
+    with ASTER_ANNOUNCEMENT_LOCK:
+        state = read_json_cache(ASTER_ANNOUNCEMENT_STATE_PATH)
+        initialized = bool(state.get("initializedAt"))
+        known = state.get("known") if isinstance(state.get("known"), dict) else {}
+        announcements = state.get("announcements") if isinstance(state.get("announcements"), dict) else {}
+        next_known: dict[str, dict[str, Any]] = {
+            str(symbol): dict(value)
+            for symbol, value in known.items()
+            if isinstance(value, dict)
+            and int(safe_float(value.get("lastSeenAt"), 0)) >= now_ms - ASTER_INVENTORY_RETENTION_MS
+        }
+        next_announcements: dict[str, dict[str, Any]] = {
+            str(symbol): dict(value)
+            for symbol, value in announcements.items()
+            if isinstance(value, dict)
+        }
+
+        for inventory_row in inventory:
+            symbol = str(inventory_row.get("symbol") or "").strip().upper()
+            if not symbol:
+                continue
+            previous = known.get(symbol) if isinstance(known.get(symbol), dict) else {}
+            status = str(inventory_row.get("contractStatus") or "").strip().upper()
+            onboard_ms = int(safe_float(inventory_row.get("date"), 0))
+            status_changed = bool(previous) and str(previous.get("contractStatus") or "").strip().upper() != status
+            newly_discovered = initialized and not previous
+            bootstrap_recent = (
+                not initialized
+                and onboard_ms > 0
+                and now_ms - ASTER_ANNOUNCEMENT_BOOTSTRAP_LOOKBACK_MS
+                <= onboard_ms
+                <= now_ms + ASTER_ANNOUNCEMENT_BOOTSTRAP_FUTURE_MS
+            )
+            should_record = bootstrap_recent or newly_discovered or status_changed or symbol in next_announcements
+
+            next_known[symbol] = {
+                "contractStatus": status,
+                "onboardDate": onboard_ms,
+                "firstSeenAt": int(safe_float(previous.get("firstSeenAt"), 0)) or now_ms,
+                "lastSeenAt": now_ms,
+            }
+            if not should_record:
+                continue
+
+            prior_announcement = next_announcements.get(symbol) if isinstance(next_announcements.get(symbol), dict) else {}
+            first_discovered_ms = int(safe_float(prior_announcement.get("firstDiscoveredAt"), 0)) or now_ms
+            announcement_ms = int(safe_float(prior_announcement.get("announcementAt"), 0))
+            if not announcement_ms:
+                announcement_ms = onboard_ms if bootstrap_recent else now_ms
+            pending = status == "PENDING_TRADING"
+            base_asset = str(inventory_row.get("baseAsset") or symbol).strip().upper()
+            quote_asset = str(inventory_row.get("quoteAsset") or "USDT").strip().upper()
+            pair = f"{base_asset}/{quote_asset}"
+            reason = str(prior_announcement.get("announcementReason") or "")
+            if not reason:
+                reason = "近期上线时间回溯" if bootstrap_recent else "公开合约接口首次发现"
+            next_announcements[symbol] = {
+                **inventory_row,
+                "id": str(prior_announcement.get("id") or f"aster-announcement-{symbol}-{announcement_ms}"),
+                "title": f"Aster 合约上新公告：{pair} 永续合约",
+                "status": "待上线" if pending else "已上线",
+                "date": onboard_ms,
+                "onboardDate": onboard_ms,
+                "announcementAt": announcement_ms,
+                "firstDiscoveredAt": first_discovered_ms,
+                "lastSeenAt": now_ms,
+                "announcementReason": reason,
+                "announcementSource": "Aster 公开合约接口新增记录",
+                "tags": ["Aster 上新公告", "永续合约"],
+            }
+
+        retained_announcements = {
+            symbol: row
+            for symbol, row in next_announcements.items()
+            if now_ms - int(safe_float(row.get("announcementAt"), 0) or now_ms) <= ASTER_ANNOUNCEMENT_RETENTION_MS
+        }
+        write_json_cache(
+            ASTER_ANNOUNCEMENT_STATE_PATH,
+            {
+                "initializedAt": int(safe_float(state.get("initializedAt"), 0)) or now_ms,
+                "updatedAt": now_ms,
+                "known": next_known,
+                "announcements": retained_announcements,
+            },
+        )
+
+    rows = list(retained_announcements.values())
+    rows.sort(
+        key=lambda item: (
+            int(safe_float(item.get("announcementAt"), 0)),
+            int(safe_float(item.get("date"), 0)),
+            str(item.get("symbol") or ""),
+        ),
+        reverse=True,
+    )
+    return rows[: max(1, int(limit))]
+
+
+def aster_listing_announcement_rows(limit: int = 80) -> list[dict[str, Any]]:
+    """Merge official announcements and fast first-discovery fallbacks into one monthly timeline."""
+    try:
+        website_rows = aster_official_listing_rows(limit)
+    except Exception:
+        website_rows = []
+    try:
+        x_rows = aster_official_x_listing_rows(limit)
+    except Exception:
+        x_rows = []
+    detected_rows = aster_contract_announcement_rows(limit)
+    x_symbol_times: dict[str, list[int]] = {}
+    for row in x_rows:
+        row_time = int(safe_float(row.get("announcementAt"), 0))
+        for symbol in row.get("contractSymbols") if isinstance(row.get("contractSymbols"), list) else []:
+            normalized = str(symbol).strip().upper()
+            if normalized:
+                x_symbol_times.setdefault(normalized, []).append(row_time)
+
+    official_rows = list(x_rows)
+    for row in website_rows:
+        assets = row.get("symbols") if isinstance(row.get("symbols"), list) else []
+        contracts = row.get("contractSymbols") if isinstance(row.get("contractSymbols"), list) else []
+        row_time = int(safe_float(row.get("announcementAt"), 0))
+        remaining = [
+            (str(asset).strip().upper(), str(symbol).strip().upper())
+            for asset, symbol in zip(assets, contracts)
+            if str(asset).strip()
+            and str(symbol).strip()
+            and not any(abs(row_time - x_time) <= ASTER_CROSS_SOURCE_DEDUPE_MS for x_time in x_symbol_times.get(str(symbol).strip().upper(), []))
+        ]
+        if not remaining:
+            continue
+        remaining_assets = [asset for asset, _ in remaining]
+        remaining_contracts = [symbol for _, symbol in remaining]
+        official_rows.append(
+            {
+                **row,
+                "title": f"Aster 官方上新公告：{'、'.join(remaining_assets)} 永续合约",
+                "symbol": remaining_contracts[0] if len(remaining_contracts) == 1 else ",".join(remaining_contracts),
+                "symbols": remaining_assets,
+                "contractSymbols": remaining_contracts,
+                "baseAsset": " · ".join(remaining_assets),
+                "officialChannel": "website",
+            }
+        )
+    official_symbols = {
+        str(symbol).strip().upper()
+        for row in official_rows
+        for symbol in (row.get("contractSymbols") if isinstance(row.get("contractSymbols"), list) else [])
+        if str(symbol).strip()
+    }
+    rows = list(official_rows)
+    for row in detected_rows:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if symbol and symbol in official_symbols:
+            continue
+        rows.append({**row, "officialAnnouncement": False})
+    rows.sort(
+        key=lambda item: (
+            int(safe_float(item.get("announcementAt"), 0)),
+            int(safe_float(item.get("date"), 0)),
+            str(item.get("id") or ""),
+        ),
+        reverse=True,
+    )
+    return rows[: max(1, int(limit))]
+
+
+def aster_contracts_payload() -> dict[str, Any]:
+    items = aster_listing_announcement_rows(120)
+    return {
+        "updatedAt": int(time.time() * 1000),
+        "mode": "listing-announcements",
+        "items": items,
+        "count": len(items),
+        "officialCount": sum(1 for item in items if item.get("officialAnnouncement")),
+        "officialXCount": sum(1 for item in items if item.get("officialChannel") == "x"),
+        "officialWebsiteCount": sum(1 for item in items if item.get("officialChannel") == "website"),
+        "detectedCount": sum(1 for item in items if not item.get("officialAnnouncement")),
+    }
+
+
 def binance_listing_events(limit: int = 8) -> list[dict[str, Any]]:
     payload = requests.get(
         "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query",
@@ -8430,6 +11808,9 @@ def crypto_listing_section() -> dict[str, Any]:
         ("Binance", binance_listing_events),
         ("Bitget", bitget_listing_events),
         ("OKX", okx_listing_events),
+        ("Aster", aster_listing_announcement_rows),
+        ("Gate", lambda: secondary_exchange_listing_events(fetch_gate_new_coins())),
+        ("HTX", lambda: secondary_exchange_listing_events(fetch_htx_new_coins())),
     ):
         try:
             source_rows = fetcher()
@@ -8441,10 +11822,10 @@ def crypto_listing_section() -> dict[str, Any]:
     return listing_section(
         id="exchange-listings",
         title="交易所上新",
-        subtitle="Binance / OKX / Bitget 新币、交易对与合约上新公告",
+        subtitle="Binance / OKX / Bitget / Aster / Gate / HTX 新币、交易对、加密与 TradFi 合约上新",
         accent="#58c7f3",
         source_name="Exchange announcements",
-        rows=rows[:18],
+        rows=rows[:24],
         status="ok" if rows else "unavailable",
         empty_message="；".join(errors) if errors else "暂时没有获取到交易所上新公告。",
     )
@@ -9066,15 +12447,20 @@ def market_payload() -> dict[str, Any]:
     sources = []
     fetchers = [
         ("binance", fetch_binance),
+        ("binance-wallet-hot", lambda: binance_wallet_hot_source("24h")),
         ("okx", fetch_okx),
         ("okx-dex", fetch_okx_dex_hot),
-        ("bitget", fetch_bitget),
         ("aicoin", fetch_aicoin),
+        ("bitget", fetch_bitget),
         ("futu-hk", lambda: fetch_futu_hot("hk")),
         ("futu-us", lambda: fetch_futu_hot("us")),
         ("ths", fetch_ths_hot),
+        ("ave", fetch_ave_hot),
     ]
     for key, fetcher in fetchers:
+        if key == "binance-wallet-hot":
+            sources.append(fetcher())
+            continue
         fallback_group = "hk" if "futu-hk" in key else "us" if "futu-us" in key else "cn" if key == "ths" else "crypto"
         sources.append(
             cached_or_fallback_source(
@@ -9087,7 +12473,772 @@ def market_payload() -> dict[str, Any]:
                 error_empty_title="数据源请求失败",
             )
         )
-    return {"updatedAt": int(time.time() * 1000), "sources": sources}
+    updated_at = int(time.time() * 1000)
+    market_priority_record_snapshot(sources, now_ms=updated_at)
+    return {
+        "updatedAt": updated_at,
+        "sources": sources,
+        "smartPriority": market_priority_payload(sources, now_ms=updated_at),
+    }
+
+
+def rotation_theme_groups() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": "four-meme",
+            "family": "Four.meme 家族",
+            "chain": "BNB Chain",
+            "themes": ["Four.meme", "BNB Chain", "Meme", "Binance Alpha"],
+            "members": [
+                {"symbol": "TUT", "name": "Tutorial"},
+                {"symbol": "TST", "name": "Test Token"},
+                {"symbol": "MUBARAK", "name": "Mubarak"},
+                {"symbol": "BROCCOLI714", "name": "Broccoli 714"},
+                {"symbol": "BROCCOLIF3B", "name": "Broccoli F3B"},
+                {"symbol": "BIANRENSHENG", "name": "币安人生"},
+            ],
+            "familyLabels": ["TUT", "TST", "Mubarak", "Broccoli", "币安人生", "我踏马来了", "哈基米", "龙虾"],
+        },
+        {
+            "id": "onchain-perp-dex",
+            "family": "链上交易平台",
+            "chain": "多链",
+            "themes": ["Perp DEX", "链上交易所", "平台币", "交易基础设施"],
+            "members": [
+                {"symbol": "HYPE", "name": "Hyperliquid"},
+                {"symbol": "GNS", "name": "Gains Network"},
+                {"symbol": "GMX", "name": "GMX"},
+                {"symbol": "DYDX", "name": "dYdX"},
+                {"symbol": "APEX", "name": "ApeX Protocol"},
+                {"symbol": "ORDER", "name": "Orderly Network"},
+            ],
+        },
+        {
+            "id": "ai-agent",
+            "family": "AI 与 Agent",
+            "chain": "多链",
+            "themes": ["AI", "Agent", "算力", "数据网络"],
+            "members": [
+                {"symbol": "FET", "name": "Artificial Superintelligence Alliance"},
+                {"symbol": "TAO", "name": "Bittensor"},
+                {"symbol": "RENDER", "name": "Render"},
+                {"symbol": "VIRTUAL", "name": "Virtuals Protocol"},
+                {"symbol": "KAITO", "name": "Kaito"},
+                {"symbol": "NEAR", "name": "NEAR Protocol"},
+                {"symbol": "WLD", "name": "Worldcoin"},
+            ],
+        },
+        {
+            "id": "rwa-yield",
+            "family": "RWA 与链上收益",
+            "chain": "Ethereum / 多链",
+            "themes": ["RWA", "代币化资产", "链上收益", "预言机"],
+            "members": [
+                {"symbol": "ONDO", "name": "Ondo"},
+                {"symbol": "PENDLE", "name": "Pendle"},
+                {"symbol": "LINK", "name": "Chainlink"},
+                {"symbol": "EDEN", "name": "OpenEden"},
+            ],
+        },
+        {
+            "id": "solana-launchpad",
+            "family": "Solana 发射平台",
+            "chain": "Solana",
+            "themes": ["Launchpad", "Meme", "DEX", "Solana 生态"],
+            "members": [
+                {"symbol": "PUMP", "name": "Pump.fun"},
+                {"symbol": "BONK", "name": "Bonk"},
+                {"symbol": "WIF", "name": "dogwifhat"},
+                {"symbol": "JUP", "name": "Jupiter"},
+                {"symbol": "RAY", "name": "Raydium"},
+                {"symbol": "FIDA", "name": "Bonfida"},
+            ],
+        },
+        {
+            "id": "privacy",
+            "family": "隐私资产",
+            "chain": "多链",
+            "themes": ["隐私支付", "匿名交易", "合规博弈"],
+            "members": [
+                {"symbol": "ZEC", "name": "Zcash"},
+                {"symbol": "XMR", "name": "Monero"},
+                {"symbol": "DASH", "name": "Dash"},
+                {"symbol": "SCRT", "name": "Secret"},
+            ],
+        },
+        {
+            "id": "move-ecosystem",
+            "family": "Move 生态",
+            "chain": "Move",
+            "themes": ["Move", "公链", "DeFi 生态"],
+            "members": [
+                {"symbol": "SUI", "name": "Sui"},
+                {"symbol": "APT", "name": "Aptos"},
+            ],
+        },
+        {
+            "id": "ethereum-l2",
+            "family": "Ethereum Layer 2",
+            "chain": "Ethereum",
+            "themes": ["Layer 2", "扩容", "Rollup"],
+            "members": [
+                {"symbol": "ARB", "name": "Arbitrum"},
+                {"symbol": "OP", "name": "Optimism"},
+                {"symbol": "STRK", "name": "Starknet"},
+                {"symbol": "MANTA", "name": "Manta Network"},
+            ],
+        },
+    ]
+
+
+def rotation_change_value(value: Any) -> float:
+    return safe_float(str(value or "0").replace("%", "").replace("+", "").replace(",", ""), 0.0)
+
+
+def rotation_ticker_index() -> dict[str, dict[str, Any]]:
+    index: dict[str, dict[str, Any]] = {}
+
+    def add(symbol: Any, price: Any, change: Any, turnover: Any, exchange: str, market_symbol: str = "") -> None:
+        base = clean_price_watch_symbol(symbol)
+        if not base or is_excluded_crypto_asset(base):
+            return
+        price_value = safe_float(price)
+        turnover_value = safe_float(turnover)
+        if price_value <= 0:
+            return
+        row = {
+            "symbol": base,
+            "priceValue": price_value,
+            "changeValue": safe_float(change),
+            "turnoverValue": turnover_value,
+            "exchange": exchange,
+            "marketSymbol": market_symbol or f"{base}USDT",
+        }
+        current = index.get(base)
+        exchange_priority = {"Binance Futures": 3, "OKX SWAP": 2, "Bitget Futures": 1}
+        if not current or exchange_priority.get(exchange, 0) > exchange_priority.get(str(current.get("exchange")), 0):
+            index[base] = row
+
+    try:
+        response = HTTP.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=HTTP_TIMEOUT)
+        response.raise_for_status()
+        rows = response.json()
+        if isinstance(rows, list):
+            for row in rows:
+                market_symbol = str(row.get("symbol") or "").upper()
+                if not market_symbol.endswith("USDT"):
+                    continue
+                add(
+                    market_symbol[:-4],
+                    row.get("lastPrice"),
+                    row.get("priceChangePercent"),
+                    row.get("quoteVolume"),
+                    "Binance Futures",
+                    market_symbol,
+                )
+    except Exception:
+        pass
+
+    try:
+        response = HTTP.get("https://www.okx.com/api/v5/market/tickers?instType=SWAP", timeout=HTTP_TIMEOUT)
+        response.raise_for_status()
+        payload = response.json()
+        rows = payload.get("data") if isinstance(payload, dict) else []
+        if isinstance(rows, list):
+            for row in rows:
+                inst_id = str(row.get("instId") or "").upper()
+                if not inst_id.endswith("-USDT-SWAP"):
+                    continue
+                open_price = safe_float(row.get("open24h"))
+                last_price = safe_float(row.get("last"))
+                change = ((last_price / open_price) - 1) * 100 if open_price > 0 else 0
+                add(inst_id.split("-")[0], last_price, change, row.get("volCcy24h"), "OKX SWAP", inst_id)
+    except Exception:
+        pass
+
+    try:
+        response = HTTP.get(
+            "https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES",
+            timeout=HTTP_TIMEOUT,
+        )
+        response.raise_for_status()
+        response.encoding = "utf-8"
+        payload = response.json()
+        rows = payload.get("data") if isinstance(payload, dict) else []
+        if isinstance(rows, list):
+            for row in rows:
+                market_symbol = str(row.get("symbol") or "").upper()
+                base = market_symbol[:-4] if market_symbol.endswith("USDT") else market_symbol
+                change = safe_float(row.get("price24hPcnt"))
+                if abs(change) <= 2:
+                    change *= 100
+                add(base, row.get("lastPr"), change, row.get("usdtVolume"), "Bitget Futures", market_symbol)
+    except Exception:
+        pass
+    return index
+
+
+def rotation_trade_url(ticker: dict[str, Any]) -> str:
+    direct_url = str(ticker.get("url") or "").strip()
+    if direct_url:
+        return direct_url
+    symbol = str(ticker.get("symbol") or "").upper()
+    exchange = str(ticker.get("exchange") or "")
+    if exchange == "Binance Futures":
+        return f"https://www.binance.com/zh-CN/futures/{symbol}USDT"
+    if exchange == "OKX SWAP":
+        return f"https://www.okx.com/zh-hans/trade-swap/{symbol.lower()}-usdt-swap"
+    if exchange == "Bitget Futures":
+        return f"https://www.bitget.com/zh-CN/futures/usdt/{symbol}USDT"
+    return ""
+
+
+def price_watch_trade_url(symbol: Any, provider: Any, fallback: str = "./price-watch.html") -> str:
+    """Open a monitored symbol on the derivatives venue that supplied its price."""
+    asset = clean_price_watch_symbol(symbol)
+    provider_name = str(provider or "").strip().lower()
+    if not asset:
+        return fallback
+    if "binance" in provider_name:
+        exchange = "Binance Futures"
+    elif "okx" in provider_name:
+        exchange = "OKX SWAP"
+    elif "bitget" in provider_name:
+        exchange = "Bitget Futures"
+    else:
+        return fallback
+    return rotation_trade_url({"symbol": asset, "exchange": exchange}) or fallback
+
+
+def rotation_market_number(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        return safe_float(value)
+    text = str(value or "").strip().replace(",", "").replace("$", "").replace("¥", "")
+    if not text or text in {"-", "--"}:
+        return 0.0
+    multipliers = {
+        "K": 1_000,
+        "M": 1_000_000,
+        "B": 1_000_000_000,
+        "万": 10_000,
+        "亿": 100_000_000,
+    }
+    multiplier = 1.0
+    for suffix, amount in multipliers.items():
+        normalized_text = text.upper() if suffix in {"K", "M", "B"} else text
+        if normalized_text.endswith(suffix):
+            text = text[:-len(suffix)]
+            multiplier = amount
+            break
+    return safe_float(text) * multiplier
+
+
+def rotation_market_ticker(row: dict[str, Any]) -> dict[str, Any]:
+    symbol = clean_price_watch_symbol(row.get("symbol") or row.get("asset") or row.get("name"))
+    price = rotation_market_number(row.get("priceValue")) or rotation_market_number(row.get("price"))
+    turnover = (
+        rotation_market_number(row.get("amountValue"))
+        or rotation_market_number(row.get("amount"))
+        or rotation_market_number(row.get("turnoverValue"))
+        or rotation_market_number(row.get("turnover"))
+    )
+    if not symbol or price <= 0:
+        return {}
+    source_id = str(row.get("sourceId") or "").lower()
+    exchange = {
+        "binance": "Binance Futures",
+        "okx": "OKX SWAP",
+        "bitget": "Bitget Futures",
+        "okx-dex": "OKX DEX",
+        "ave": "Ave.ai",
+        "aicoin": "AICoin",
+    }.get(source_id, str(row.get("sourceTitle") or source_id))
+    return {
+        "symbol": symbol,
+        "priceValue": price,
+        "changeValue": rotation_change_value(row.get("change")),
+        "turnoverValue": turnover,
+        "exchange": exchange,
+        "marketSymbol": row.get("marketSymbol") or symbol,
+        "url": row.get("url") or "",
+        "icon": row.get("icon") or "",
+        "name": row.get("name") or symbol,
+        "chain": row.get("chain") or "",
+        "chainLabel": row.get("chainLabel") or "",
+        "sourceId": source_id,
+    }
+
+
+def rotation_dynamic_members(leader_row: dict[str, Any], hot_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    leader_symbol = str(leader_row.get("symbol") or "")
+    leader_chain = str(leader_row.get("chain") or "").lower().strip()
+    leader_themes = set(rotation_row_themes(leader_row))
+    related: list[tuple[int, int, dict[str, Any]]] = []
+    for row in hot_rows:
+        symbol = str(row.get("symbol") or "")
+        if not symbol or symbol == leader_symbol:
+            continue
+        chain = str(row.get("chain") or "").lower().strip()
+        themes = set(rotation_row_themes(row))
+        same_chain = bool(leader_chain and chain and leader_chain == chain)
+        overlap = sorted(leader_themes.intersection(themes))
+        if not same_chain and not overlap:
+            continue
+        rank = int(safe_float(row.get("rank"), 99))
+        score = (12 if same_chain else 0) + len(overlap) * 5 + max(0, 11 - rank)
+        if same_chain and overlap:
+            relation = f"同属 {row.get('chainLabel') or leader_row.get('chainLabel') or leader_chain.upper()}，并共享 {' / '.join(overlap[:2])} 叙事"
+        elif same_chain:
+            relation = f"同属 {row.get('chainLabel') or leader_row.get('chainLabel') or leader_chain.upper()} 生态，关注资金扩散"
+        else:
+            relation = f"共享 {' / '.join(overlap[:2])} 叙事，关注强弱轮动"
+        related.append(
+            (
+                score,
+                rank,
+                {
+                    "symbol": symbol,
+                    "name": row.get("name") or symbol,
+                    "icon": row.get("icon") or "",
+                    "_relation": relation,
+                },
+            )
+        )
+    related.sort(key=lambda item: (-item[0], item[1]))
+    return [item[2] for item in related[:10]]
+
+
+def rotation_leader_metrics_from_price_watch() -> dict[str, dict[str, Any]]:
+    metrics: dict[str, dict[str, Any]] = {}
+    try:
+        rows = price_watch_active_rows()
+    except Exception:
+        return metrics
+    for row in rows:
+        item = price_watch_public_item(row)
+        symbol = clean_price_watch_symbol(item.get("symbol"))
+        impulse_gain = safe_float(item.get("fibImpulseGainPct"))
+        if not symbol or impulse_gain <= 0:
+            continue
+        metrics[symbol] = {
+            "impulseGainPct": impulse_gain,
+            "launchLow": safe_float(item.get("fibLaunchLow")),
+            "swingHigh": safe_float(item.get("fibSwingHigh")),
+            "launchAt": int(item.get("fibLaunchAt") or 0),
+            "swingHighAt": int(item.get("fibSwingHighAt") or 0),
+            "provider": item.get("provider") or "",
+            "lastCheckedAt": int(item.get("lastCheckedAt") or 0),
+        }
+    return metrics
+
+
+def rotation_candidate_metrics_from_price_watch(now_ms: int | None = None) -> dict[str, dict[str, Any]]:
+    current_ms = int(now_ms or time.time() * 1000)
+    cutoff_ms = current_ms - ROTATION_RECENT_HOT_SECONDS * 1000
+    metrics: dict[str, dict[str, Any]] = {}
+    try:
+        rows = price_watch_active_rows()
+    except Exception:
+        return metrics
+    for row in rows:
+        item = price_watch_public_item(row)
+        symbol = clean_price_watch_symbol(item.get("symbol"))
+        first_seen_at = int(item.get("firstSeenAt") or 0)
+        last_seen_at = int(item.get("lastSeenAt") or 0)
+        current_price = safe_float(item.get("currentPrice"))
+        week_high = safe_float(item.get("weekHigh"))
+        if (
+            not symbol
+            or is_excluded_crypto_asset(symbol)
+            or last_seen_at < cutoff_ms
+            or current_price <= 0
+            or week_high <= 0
+        ):
+            continue
+        distance_pct = safe_float(item.get("distancePct"), -1)
+        if distance_pct < 0:
+            distance_pct = max(0.0, (week_high - current_price) / week_high * 100)
+        if distance_pct < ROTATION_LOW_POSITION_MIN_DISTANCE_PCT:
+            continue
+        metrics[symbol] = {
+            "symbol": symbol,
+            "name": item.get("name") or symbol,
+            "icon": item.get("icon") or "",
+            "firstSeenAt": first_seen_at,
+            "lastSeenAt": last_seen_at,
+            "distancePct": round(distance_pct, 2),
+            "recentNew": bool(first_seen_at and first_seen_at >= cutoff_ms),
+            "provider": item.get("provider") or "",
+        }
+    return metrics
+
+
+def rotation_gainer_leader_history() -> list[dict[str, Any]]:
+    state = read_json_cache(RANK_MONITOR_STATE_PATH)
+    history = state.get("gainerLeaderHistory") if isinstance(state, dict) else []
+    return [dict(item) for item in history if isinstance(item, dict)] if isinstance(history, list) else []
+
+
+def rotation_metric(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (int, float)):
+        return {"impulseGainPct": safe_float(value)}
+    return {}
+
+
+def rotation_row_themes(row: dict[str, Any]) -> list[str]:
+    ignored = {
+        "热门榜", "热门币", "热门币种", "官网热门榜", "官网热门币种", "real hot list",
+        "binance", "okx", "bitget", "aicoin", "ave.ai", "24小时", "24h",
+    }
+    values: list[Any] = []
+    for key in ("tags", "themes", "theme", "narrative", "sector", "chain"):
+        value = row.get(key)
+        if isinstance(value, list):
+            values.extend(value)
+        elif value:
+            values.extend(re.split(r"[,，/|·]+", str(value)))
+    themes: list[str] = []
+    for value in values:
+        label = clean_feed_text(value, 32).strip()
+        if not label or label.lower() in ignored or label in ignored or label in themes:
+            continue
+        themes.append(label)
+    return themes[:4]
+
+
+def rotation_map_payload(
+    market: dict[str, Any] | None = None,
+    tickers: dict[str, dict[str, Any]] | None = None,
+    leader_metrics: dict[str, Any] | None = None,
+    candidate_metrics: dict[str, dict[str, Any]] | None = None,
+    gainer_history: list[dict[str, Any]] | None = None,
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    current_ms = int(now_ms or time.time() * 1000)
+    market = market or read_json_cache(api_cache_path("market-hot")) or market_payload()
+    raw_tickers = tickers if tickers is not None else rotation_ticker_index()
+    tickers = {
+        clean_price_watch_symbol(symbol): dict(ticker)
+        for symbol, ticker in (raw_tickers or {}).items()
+        if clean_price_watch_symbol(symbol) and isinstance(ticker, dict)
+    }
+    leader_metrics = leader_metrics if leader_metrics is not None else rotation_leader_metrics_from_price_watch()
+    candidate_metrics = (
+        candidate_metrics
+        if candidate_metrics is not None
+        else rotation_candidate_metrics_from_price_watch(current_ms)
+    )
+    gainer_history = gainer_history if gainer_history is not None else rotation_gainer_leader_history()
+    hot_rows: list[dict[str, Any]] = []
+    source_priority = {"binance": 5, "okx": 4, "bitget": 3, "aicoin": 2, "okx-dex": 1, "ave": 1}
+    for source in market.get("sources", []):
+        source_id = str(source.get("id") or "").lower()
+        if source_id not in source_priority or source.get("status") == "unavailable":
+            continue
+        for index, row in enumerate(source.get("rows") or []):
+            symbol = clean_price_watch_symbol(row.get("symbol") or row.get("asset") or row.get("name"))
+            if not symbol or is_excluded_crypto_asset(symbol):
+                continue
+            hot_rows.append(
+                {
+                    **row,
+                    "symbol": symbol,
+                    "rank": int(safe_float(row.get("rank"), index + 1) or index + 1),
+                    "sourceId": source_id,
+                    "sourceTitle": source.get("title") or source.get("sourceName") or source_id,
+                    "sourcePriority": source_priority[source_id],
+                }
+            )
+    hot_by_symbol: dict[str, dict[str, Any]] = {}
+    for row in sorted(hot_rows, key=lambda item: (item.get("rank", 99), -item.get("sourcePriority", 0))):
+        hot_by_symbol.setdefault(str(row.get("symbol")), row)
+
+    # The cached hot-board payload is always available before the slower exchange
+    # ticker fan-out completes. Use it as a live fallback so rotation candidates do
+    # not disappear when one external contract endpoint is temporarily unavailable.
+    for row in sorted(hot_rows, key=lambda item: (-item.get("sourcePriority", 0), item.get("rank", 99))):
+        fallback = rotation_market_ticker(row)
+        symbol = str(fallback.get("symbol") or "")
+        if not symbol:
+            continue
+        current = tickers.get(symbol)
+        if current is None:
+            tickers[symbol] = fallback
+            continue
+        for key in ("url", "icon", "chain", "chainLabel", "name", "sourceId"):
+            if fallback.get(key) and not current.get(key):
+                current[key] = fallback[key]
+
+    groups = rotation_theme_groups()
+    group_by_symbol: dict[str, dict[str, Any]] = {}
+    for group in groups:
+        for member in group.get("members") or []:
+            member_symbol = clean_price_watch_symbol(member.get("symbol"))
+            if member_symbol:
+                group_by_symbol.setdefault(member_symbol, group)
+
+    qualified_leaders: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for symbol, leader_row in hot_by_symbol.items():
+        metric = rotation_metric(leader_metrics.get(symbol))
+        if safe_float(metric.get("impulseGainPct")) < ROTATION_LEADER_MIN_GAIN_PCT:
+            continue
+        qualified_leaders.append((leader_row, metric))
+    qualified_leaders.sort(
+        key=lambda item: (
+            int(safe_float(item[0].get("rank"), 99)),
+            -int(safe_float(item[0].get("sourcePriority"), 0)),
+            -safe_float(item[1].get("impulseGainPct")),
+        )
+    )
+
+    maps: list[dict[str, Any]] = []
+    for leader_row, metric in qualified_leaders:
+        leader_symbol = str(leader_row.get("symbol"))
+        predefined_group = group_by_symbol.get(leader_symbol)
+        dynamic_members = rotation_dynamic_members(leader_row, hot_rows)
+        if predefined_group is None:
+            dynamic_themes = rotation_row_themes(leader_row)
+            members = [
+                {
+                    "symbol": leader_symbol,
+                    "name": leader_row.get("name") or leader_symbol,
+                    "icon": leader_row.get("icon") or "",
+                },
+                *dynamic_members,
+            ]
+            candidate_labels = [member.get("name") or member.get("symbol") for member in dynamic_members[:4]]
+            group = {
+                "id": f"live-{leader_symbol.lower()}",
+                "family": f"{leader_row.get('name') or leader_symbol} 实时映射",
+                "chain": leader_row.get("chainLabel") or leader_row.get("chain") or "多链",
+                "themes": dynamic_themes or ["题材分析中"],
+                "members": members,
+                "familyLabels": [leader_row.get("name") or leader_symbol, *(candidate_labels or ["同题材候选分析中"])],
+            }
+        else:
+            members = [dict(member) for member in predefined_group.get("members") or []]
+            member_symbols = {clean_price_watch_symbol(member.get("symbol")) for member in members}
+            for member in dynamic_members:
+                symbol = clean_price_watch_symbol(member.get("symbol"))
+                if symbol and symbol not in member_symbols:
+                    members.append(member)
+                    member_symbols.add(symbol)
+            group = {
+                **predefined_group,
+                "members": members,
+            }
+        leader_ticker = tickers.get(leader_symbol) or {}
+        leader_change = safe_float(leader_ticker.get("changeValue"), rotation_change_value(leader_row.get("change")))
+        leader_price = safe_float(leader_ticker.get("priceValue")) or rotation_market_number(leader_row.get("price"))
+        leader_turnover = safe_float(leader_ticker.get("turnoverValue")) or rotation_market_number(leader_row.get("amount") or leader_row.get("turnover"))
+        leader_spec = next((member for member in members if member.get("symbol") == leader_symbol), {})
+
+        family_members: list[dict[str, Any]] = []
+        candidate_specs: dict[str, dict[str, Any]] = {}
+
+        def add_candidate_spec(
+            symbol: Any,
+            name: Any = "",
+            icon: Any = "",
+            signal: str = "",
+            reason: str = "",
+            base_score: float = 0.0,
+            recent_new: bool = False,
+        ) -> None:
+            candidate_symbol = clean_price_watch_symbol(symbol)
+            if (
+                not candidate_symbol
+                or candidate_symbol == leader_symbol
+                or is_excluded_crypto_asset(candidate_symbol)
+            ):
+                return
+            spec = candidate_specs.setdefault(
+                candidate_symbol,
+                {
+                    "symbol": candidate_symbol,
+                    "name": name or candidate_symbol,
+                    "icon": icon or "",
+                    "signals": [],
+                    "reasons": [],
+                    "baseScore": 0.0,
+                    "recentNew": False,
+                },
+            )
+            if name and (not spec.get("name") or spec.get("name") == candidate_symbol):
+                spec["name"] = name
+            if icon and not spec.get("icon"):
+                spec["icon"] = icon
+            if signal and signal not in spec["signals"]:
+                spec["signals"].append(signal)
+            if reason and reason not in spec["reasons"]:
+                spec["reasons"].append(reason)
+            spec["baseScore"] = max(safe_float(spec.get("baseScore")), base_score)
+            spec["recentNew"] = bool(spec.get("recentNew") or recent_new)
+
+        for member in members:
+            symbol = clean_price_watch_symbol(member.get("symbol"))
+            ticker = tickers.get(symbol)
+            family_members.append(
+                {
+                    "symbol": symbol,
+                    "name": member.get("name") or symbol,
+                    "tradable": bool(ticker),
+                    "exchange": ticker.get("exchange") if ticker else "",
+                    "icon": member.get("icon") or (ticker.get("icon") if ticker else "") or crypto_icon_url(symbol),
+                }
+            )
+            if symbol == leader_symbol:
+                continue
+            relation = str(member.get("_relation") or "").strip()
+            add_candidate_spec(
+                symbol,
+                member.get("name") or symbol,
+                member.get("icon") or (ticker.get("icon") if ticker else ""),
+                "family",
+                relation or f"同属 {group.get('family')}，共享 {group.get('themes', ['同题材'])[0]} 叙事",
+                45.0,
+            )
+
+        leader_launch_at = int(metric.get("launchAt") or 0)
+        recent_cutoff_ms = current_ms - ROTATION_RECENT_HOT_SECONDS * 1000
+        if leader_launch_at > 0:
+            for symbol, recent in candidate_metrics.items():
+                candidate_symbol = clean_price_watch_symbol(symbol)
+                last_seen_at = int(recent.get("lastSeenAt") or 0)
+                if last_seen_at < max(leader_launch_at, recent_cutoff_ms):
+                    continue
+                distance_pct = safe_float(recent.get("distancePct"), -1)
+                if distance_pct < ROTATION_LOW_POSITION_MIN_DISTANCE_PCT:
+                    continue
+                recent_new = bool(recent.get("recentNew"))
+                hot_label = "近 7 天新进 AICoin 热门榜" if recent_new else "近期进入 AICoin 热门榜"
+                add_candidate_spec(
+                    candidate_symbol,
+                    recent.get("name") or candidate_symbol,
+                    recent.get("icon") or "",
+                    "recent-hot-low",
+                    f"{hot_label}，现价较 7 日高点低 {distance_pct:.1f}%",
+                    34.0,
+                    recent_new,
+                )
+
+            gainer_cutoff_ms = current_ms - ROTATION_GAINER_HISTORY_SECONDS * 1000
+            for event in gainer_history:
+                observed_at = int(event.get("observedAt") or 0)
+                if observed_at < max(leader_launch_at, gainer_cutoff_ms):
+                    continue
+                asset_key = str(event.get("assetKey") or "")
+                event_symbol = event.get("symbol") or (asset_key.split(":", 1)[-1] if ":" in asset_key else asset_key)
+                candidate_symbol = clean_price_watch_symbol(event_symbol)
+                source_title = clean_feed_text(event.get("sourceTitle") or "交易所涨幅榜", 60)
+                add_candidate_spec(
+                    candidate_symbol,
+                    event.get("name") or candidate_symbol,
+                    event.get("icon") or "",
+                    "post-leader-gainer-top",
+                    f"龙头启动后成为 {source_title} 榜首",
+                    32.0,
+                )
+
+        candidates: list[dict[str, Any]] = []
+        for symbol, spec in candidate_specs.items():
+            ticker = tickers.get(symbol)
+            if not ticker or safe_float(ticker.get("turnoverValue")) < 250_000:
+                continue
+            candidate_change = safe_float(ticker.get("changeValue"))
+            lag = leader_change - candidate_change
+            liquidity_score = min(20.0, max(0.0, math.log10(max(safe_float(ticker.get("turnoverValue")), 1)) - 5) * 5)
+            lag_score = min(42.0, max(-12.0, lag * 0.8))
+            evidence_bonus = max(0, len(spec.get("signals") or []) - 1) * 8
+            new_bonus = 4 if spec.get("recentNew") else 0
+            score = round(
+                max(
+                    1.0,
+                    min(
+                        99.0,
+                        safe_float(spec.get("baseScore")) + liquidity_score + lag_score + evidence_bonus + new_bonus,
+                    ),
+                ),
+                1,
+            )
+            reasons = list(spec.get("reasons") or [])
+            if lag > 1:
+                reasons.append(f"24h 相对 {leader_symbol} 落后 {lag:.1f} 个百分点")
+            else:
+                reasons.append(f"与 {leader_symbol} 同步活跃，等待强弱重新排序")
+            reasons.append(f"{ticker.get('exchange')} 有实时行情")
+            candidates.append(
+                {
+                    "symbol": symbol,
+                    "name": spec.get("name") or ticker.get("name") or symbol,
+                    "icon": spec.get("icon") or ticker.get("icon") or crypto_icon_url(symbol),
+                    "price": price_usd(ticker.get("priceValue")),
+                    "priceValue": safe_float(ticker.get("priceValue")),
+                    "change": pct(candidate_change),
+                    "changeValue": candidate_change,
+                    "turnover": money_usd(ticker.get("turnoverValue")),
+                    "turnoverValue": safe_float(ticker.get("turnoverValue")),
+                    "exchange": ticker.get("exchange"),
+                    "score": score,
+                    "lagPct": round(lag, 2),
+                    "signals": list(spec.get("signals") or []),
+                    "reasons": list(dict.fromkeys(reasons)),
+                    "url": rotation_trade_url(ticker),
+                }
+            )
+        candidates.sort(key=lambda item: (-safe_float(item.get("score")), -safe_float(item.get("turnoverValue"))))
+        maps.append(
+            {
+                "id": f"{group.get('id')}-{leader_symbol.lower()}",
+                "family": group.get("family"),
+                "chain": group.get("chain"),
+                "themes": group.get("themes") or [],
+                "mappingStatus": "mapped" if candidates else "analyzing",
+                "leader": {
+                    "symbol": leader_symbol,
+                    "name": leader_spec.get("name") or leader_row.get("name") or leader_symbol,
+                    "icon": leader_row.get("icon") or leader_ticker.get("icon") or crypto_icon_url(leader_symbol),
+                    "rank": leader_row.get("rank"),
+                    "source": leader_row.get("sourceTitle"),
+                    "price": price_usd(leader_price) or leader_row.get("price") or "--",
+                    "change": pct(leader_change),
+                    "changeValue": leader_change,
+                    "turnover": money_usd(leader_turnover) if leader_turnover else leader_row.get("turnover") or "--",
+                    "impulseGainPct": round(safe_float(metric.get("impulseGainPct")), 2),
+                    "launchLow": safe_float(metric.get("launchLow")) or None,
+                    "swingHigh": safe_float(metric.get("swingHigh")) or None,
+                    "launchAt": int(metric.get("launchAt") or 0),
+                    "swingHighAt": int(metric.get("swingHighAt") or 0),
+                    "provider": metric.get("provider") or leader_ticker.get("exchange") or "",
+                },
+                "familyMembers": family_members,
+                "familyLabels": group.get("familyLabels") or [member.get("name") or member.get("symbol") for member in members],
+                "candidates": candidates[:ROTATION_MAX_CANDIDATES],
+                "disclaimer": "题材映射只表示同生态资金扩散线索，不代表候选一定补涨。",
+            }
+        )
+    maps.sort(
+        key=lambda item: (
+            int(safe_float(item.get("leader", {}).get("rank"), 99)),
+            -safe_float(item.get("leader", {}).get("impulseGainPct")),
+        )
+    )
+    return {
+        "ok": True,
+        "updatedAt": int(time.time() * 1000),
+        "maps": maps[:ROTATION_MAX_LEADERS],
+        "summary": {
+            "leaders": len(maps),
+            "qualified": len(qualified_leaders),
+            "mapped": sum(1 for item in maps if item.get("mappingStatus") == "mapped"),
+            "analyzing": sum(1 for item in maps if item.get("mappingStatus") == "analyzing"),
+            "candidates": sum(len(item.get("candidates") or []) for item in maps),
+            "hotScanned": len(hot_by_symbol),
+            "thresholdPct": ROTATION_LEADER_MIN_GAIN_PCT,
+        },
+    }
 
 
 def deepseek_enabled(settings: dict[str, Any] | None = None) -> bool:
@@ -10008,6 +14159,8 @@ def alert_dedupe_keys(item: dict[str, Any]) -> list[str]:
     source_label = alert_text(item.get("source") or item.get("sourceLabel"), 80)
     if "公众号授权" in kind or "公众号授权" in source_label or primary.startswith(("wechat-auth-required:", "wechat-auth-qr:")):
         return [primary] if primary else []
+    if kind == "价格监控" or source_label == "币种价格监控" or primary.startswith("price-watch:"):
+        return [primary] if primary else []
     title = alert_dedupe_title(item.get("title"))
     source = item.get("source") or item.get("sourceLabel")
     url = item.get("url")
@@ -10162,10 +14315,13 @@ def site_heat_info(row: dict[str, Any], rank: int = 99) -> dict[str, Any]:
 
 
 def normalize_desktop_alert(payload: dict[str, Any]) -> dict[str, Any]:
+    translation_text = alert_text(payload.get("translationText"), 1800)
+    kind = alert_text(payload.get("kind") or "市场信息", 24)
+    source = alert_text(payload.get("source") or "星云社", 42)
     return {
         "key": alert_text(payload.get("key"), 220),
-        "kind": alert_text(payload.get("kind") or "市场信息", 24),
-        "source": alert_text(payload.get("source") or "星云社", 42),
+        "kind": kind,
+        "source": source,
         "sourceLabel": alert_text(payload.get("sourceLabel") or "NX", 8),
         "title": alert_text(payload.get("title") or "市场信息", 92),
         "body": alert_text(payload.get("body"), 180),
@@ -10173,10 +14329,175 @@ def normalize_desktop_alert(payload: dict[str, Any]) -> dict[str, Any]:
         "imageUrl": alert_text(payload.get("imageUrl"), 600),
         "imagePath": alert_text(payload.get("imagePath"), 600),
         "time": payload.get("time") or int(time.time() * 1000),
+        "queuedAt": int(safe_float(payload.get("queuedAt"), 0)) or int(time.time() * 1000),
         "priority": alert_text(payload.get("priority") or "实时", 18),
         "clientMode": alert_text(payload.get("clientMode") or "web", 18),
+        "translationText": translation_text,
+        "translateEndpoint": alert_text(
+            payload.get("translateEndpoint")
+            or (f"http://127.0.0.1:{env_value('PORT') or env_value('XINGYUN_PORT') or '8765'}/api/x-kol-translate" if translation_text else ""),
+            600,
+        ),
+        "confirmEndpoint": alert_text(payload.get("confirmEndpoint"), 600),
+        "confirmSymbol": alert_text(payload.get("confirmSymbol"), 32),
+        "confirmEpisode": int(safe_float(payload.get("confirmEpisode"), 0)),
+        "confirmLabel": alert_text(payload.get("confirmLabel") or "确认有效", 16),
+        "excludeEndpoint": alert_text(payload.get("excludeEndpoint"), 600),
+        "excludeSymbol": alert_text(payload.get("excludeSymbol"), 32),
+        "excludeLabel": alert_text(payload.get("excludeLabel") or "剔除前高", 16),
+        "excludeAction": (
+            alert_text(payload.get("excludeAction"), 40).lower()
+            if alert_text(payload.get("excludeAction"), 40).lower() in {"exclude_prior_high", "exclude_structure"}
+            else "exclude_prior_high"
+        ),
+        "speech": alert_text(payload.get("speech"), 160),
         "sound": payload.get("sound") is not False,
+        "queuePriority": int(safe_float(payload.get("queuePriority"), 0)),
+        "allowPoliticalCryptoMapping": bool(
+            payload.get("allowPoliticalCryptoMapping")
+            and kind.startswith("News Trade")
+            and source == "News Trade 监控"
+        ),
     }
+
+
+def desktop_alert_political_military_reason(item: dict[str, Any]) -> str:
+    """Suppress geopolitical news at the shared desktop boundary, not in page feeds."""
+    kind = alert_text(item.get("kind"), 40)
+    source = alert_text(item.get("source") or item.get("sourceLabel"), 80)
+    key = alert_text(item.get("key"), 220)
+    if kind == "价格监控" or source == "币种价格监控" or key.startswith("price-watch:"):
+        return ""
+    text = " ".join(
+        part for part in (
+            alert_text(item.get("title"), 240),
+            alert_text(item.get("body"), 1000),
+            alert_text(item.get("translationText"), 1800),
+            alert_text(item.get("speech"), 500),
+        )
+        if part
+    )
+    if not text:
+        return ""
+    if DESKTOP_ALERT_WHALE_PNL_PATTERN.search(text):
+        return "whale profit/loss update filtered"
+    if item.get("allowPoliticalCryptoMapping") and kind.startswith("News Trade") and source == "News Trade 监控":
+        return ""
+    if DESKTOP_ALERT_MILITARY_PATTERN.search(text):
+        return "military situation filtered"
+    if DESKTOP_ALERT_POLITICAL_PATTERN.search(text):
+        return "political situation filtered"
+    if DESKTOP_ALERT_POLITICAL_ACTOR_PATTERN.search(text):
+        return "political actor update filtered"
+    if DESKTOP_ALERT_POLITICAL_FIGURE_PATTERN.search(text):
+        return "political figure update filtered"
+    if DESKTOP_ALERT_GEOPOLITICAL_ACTOR_PATTERN.search(text):
+        return "geopolitical situation filtered"
+    return ""
+
+
+def desktop_alert_is_news_trade_intake(item: dict[str, Any]) -> bool:
+    """Only route accepted news-like popups back into the existing News Trade source funnel."""
+    kind = clean_feed_text(item.get("kind"), 80)
+    source = clean_feed_text(item.get("source"), 100)
+    key = clean_feed_text(item.get("key"), 240)
+    if not clean_feed_text(item.get("title"), 200):
+        return False
+    if (
+        kind == "价格监控"
+        or source in {"币种价格监控", "News Trade 监控"}
+        or key.startswith("price-watch:")
+        or kind.startswith("News Trade")
+    ):
+        return False
+    if kind in {"公众号授权", "自动简报", "微信群聊机会"}:
+        return False
+    # These are the news/event families currently capable of producing a popup.
+    # Market rank/price movement popups are intentionally not treated as news.
+    return bool(
+        re.search(r"快讯|新闻|动态|公告|上新|上币|上市|新币新股|事件", kind, flags=re.I)
+        or source.casefold() in {"blockbeats", "律动快讯"}
+    )
+
+
+def record_desktop_alert_news_trade_intake(item: dict[str, Any]) -> None:
+    """Persist the exact accepted popup as another input to the current topic-clustering pipeline."""
+    if not desktop_alert_is_news_trade_intake(item):
+        return
+    now_ms = int(time.time() * 1000)
+    event_ms = alert_event_ms(item.get("time")) or now_ms
+    kind = clean_feed_text(item.get("kind"), 80)
+    source_type = (
+        "x-kol"
+        if "X KOL" in kind
+        else "listing"
+        if re.search(r"上新|上币|上市|新币新股|公告", kind)
+        else "newsflash"
+    )
+    identity = clean_feed_text(item.get("key"), 240) or js_stable_key(
+        "desktop-news", item.get("source"), item.get("title"), event_ms
+    )
+    row = {
+        "id": f"desktop-alert:{identity}",
+        "desktopAlertKey": identity,
+        "sourceType": source_type,
+        "source": clean_feed_text(item.get("source") or "桌面新闻弹窗", 100),
+        "sourceLabel": clean_feed_text(item.get("sourceLabel") or "弹", 12),
+        "title": clean_feed_text(item.get("title"), 240),
+        "body": clean_feed_text(item.get("body"), 1800),
+        "url": clean_feed_text(item.get("url"), 800),
+        "timestamp": event_ms,
+        "capturedAt": now_ms,
+        "claimStatus": "source-reported",
+        "fromDesktopAlert": True,
+    }
+    with NEWS_TRADE_DESKTOP_INTAKE_LOCK:
+        payload = read_json_cache(NEWS_TRADE_DESKTOP_INTAKE_PATH)
+        stored_rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+        by_id = {
+            clean_feed_text(stored.get("id"), 320): stored
+            for stored in stored_rows
+            if isinstance(stored, dict) and stored.get("id")
+            and now_ms - alert_event_ms(stored.get("capturedAt") or stored.get("timestamp")) <= 7 * 24 * 60 * 60 * 1000
+        }
+        by_id[row["id"]] = row
+        rows = sorted(
+            by_id.values(),
+            key=lambda stored: alert_event_ms(stored.get("capturedAt") or stored.get("timestamp")),
+            reverse=True,
+        )[:800]
+        write_json_cache(NEWS_TRADE_DESKTOP_INTAKE_PATH, {"updatedAt": now_ms, "rows": rows})
+
+
+def desktop_alert_queue_priority(item: dict[str, Any]) -> int:
+    """Keep trading signals ahead of informational alerts without dropping either."""
+    explicit = int(safe_float(item.get("queuePriority"), 0))
+    primary = alert_text(item.get("key"), 220)
+    kind = alert_text(item.get("kind"), 40)
+    source_label = alert_text(item.get("source") or item.get("sourceLabel"), 80)
+    if kind == "价格监控" or source_label == "币种价格监控" or primary.startswith("price-watch:"):
+        return max(100, explicit)
+    return explicit
+
+
+def desktop_alert_interval_seconds(item: dict[str, Any]) -> float:
+    priority = desktop_alert_queue_priority(item)
+    if priority >= DESKTOP_ALERT_CRITICAL_PRIORITY:
+        return DESKTOP_ALERT_CRITICAL_INTERVAL_SECONDS
+    if priority >= 100:
+        return DESKTOP_ALERT_URGENT_INTERVAL_SECONDS
+    return DESKTOP_ALERT_MIN_INTERVAL_SECONDS
+
+
+def enqueue_desktop_alert(normalized: dict[str, Any]) -> None:
+    """Insert by descending priority while preserving arrival order within each tier."""
+    priority = desktop_alert_queue_priority(normalized)
+    insert_at = len(DESKTOP_ALERT_QUEUE)
+    for index, queued in enumerate(DESKTOP_ALERT_QUEUE):
+        if desktop_alert_queue_priority(queued) < priority:
+            insert_at = index
+            break
+    DESKTOP_ALERT_QUEUE.insert(insert_at, normalized)
 
 
 def desktop_alert_bridge_url() -> str:
@@ -10199,16 +14520,16 @@ def forward_desktop_alert_to_bridge(normalized: dict[str, Any]) -> None:
             raise RuntimeError(f"desktop alert bridge returned HTTP {response.status}")
 
 
-def spawn_desktop_alert_process(normalized: dict[str, Any], slot: int) -> None:
+def spawn_desktop_alert_process(normalized: dict[str, Any], slot: int) -> Any:
     if os.name != "nt":
         forward_desktop_alert_to_bridge(normalized)
-        return
+        return None
 
     encoded = base64.b64encode(json.dumps(normalized, ensure_ascii=False).encode("utf-8")).decode("ascii")
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     log_file = DESKTOP_ALERT_LOG_PATH.open("a", encoding="utf-8")
     try:
-        subprocess.Popen(
+        return subprocess.Popen(
             [sys.executable, str(ROOT / "desktop_alert.py"), "--payload", encoded, "--slot", str(slot)],
             cwd=str(ROOT),
             stdin=subprocess.DEVNULL,
@@ -10223,22 +14544,55 @@ def spawn_desktop_alert_process(normalized: dict[str, Any], slot: int) -> None:
 
 def desktop_alert_queue_worker() -> None:
     global DESKTOP_ALERT_QUEUE_ACTIVE, DESKTOP_ALERT_LAST_LAUNCHED_AT
+    global DESKTOP_ALERT_LAST_LAUNCHED_PRIORITY, DESKTOP_ALERT_ACTIVE_PROCESS
     while True:
         with DESKTOP_ALERT_LOCK:
             if not DESKTOP_ALERT_QUEUE:
                 DESKTOP_ALERT_QUEUE_ACTIVE = False
                 return
-            normalized = DESKTOP_ALERT_QUEUE.popleft()
+            next_item = DESKTOP_ALERT_QUEUE[0]
             now = time.time()
-            wait_seconds = max(0.0, DESKTOP_ALERT_MIN_INTERVAL_SECONDS - (now - DESKTOP_ALERT_LAST_LAUNCHED_AT))
+            next_priority = desktop_alert_queue_priority(next_item)
+            # A trading signal must not inherit a long informational-news cooldown.
+            # Signals themselves remain serialized so TTS and popups never pile up.
+            interval = (
+                0.0
+                if next_priority >= DESKTOP_ALERT_CRITICAL_PRIORITY
+                and DESKTOP_ALERT_LAST_LAUNCHED_PRIORITY < DESKTOP_ALERT_CRITICAL_PRIORITY
+                else desktop_alert_interval_seconds(next_item)
+            )
+            wait_seconds = max(0.0, interval - (now - DESKTOP_ALERT_LAST_LAUNCHED_AT))
         if wait_seconds:
-            time.sleep(wait_seconds)
+            # A newly queued trading signal interrupts the normal-alert cooldown.
+            if DESKTOP_ALERT_QUEUE_WAKE.wait(wait_seconds):
+                DESKTOP_ALERT_QUEUE_WAKE.clear()
+                continue
+        with DESKTOP_ALERT_LOCK:
+            if not DESKTOP_ALERT_QUEUE:
+                continue
+            normalized = DESKTOP_ALERT_QUEUE.popleft()
+        priority = desktop_alert_queue_priority(normalized)
+        queued_at = safe_float(normalized.get("queuedAt"), 0) / 1000
+        if (
+            priority >= DESKTOP_ALERT_CRITICAL_PRIORITY
+            and queued_at > 0
+            and time.time() - queued_at > DESKTOP_ALERT_CRITICAL_MAX_QUEUE_AGE_SECONDS
+        ):
+            # A late trading alert is worse than silence: the entry window has gone.
+            continue
         try:
-            spawn_desktop_alert_process(normalized, 0)
+            previous_process = DESKTOP_ALERT_ACTIVE_PROCESS
+            if previous_process is not None and getattr(previous_process, "poll", lambda: 0)() is None:
+                try:
+                    previous_process.terminate()
+                except Exception:
+                    pass
+            DESKTOP_ALERT_ACTIVE_PROCESS = spawn_desktop_alert_process(normalized, 0)
         except Exception as exc:
             print(f"Desktop alert spawn failed: {exc}", file=sys.stderr)
         with DESKTOP_ALERT_LOCK:
             DESKTOP_ALERT_LAST_LAUNCHED_AT = time.time()
+            DESKTOP_ALERT_LAST_LAUNCHED_PRIORITY = priority
 
 
 def desktop_alert_marker_id(keys: list[str]) -> str:
@@ -10288,10 +14642,18 @@ def launch_desktop_alert(payload: dict[str, Any]) -> dict[str, Any]:
     global DESKTOP_ALERT_SEEN_LOADED, DESKTOP_ALERT_QUEUE_ACTIVE
     if env_flag("XINGYUN_DISABLE_DESKTOP_ALERT", default=is_production_mode()):
         return {"ok": True, "skipped": True, "reason": "desktop alerts disabled"}
+    normalized = normalize_desktop_alert(payload)
+    suppression_reason = desktop_alert_political_military_reason(normalized)
+    if suppression_reason:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": suppression_reason,
+            "category": "political-military",
+        }
     if os.name != "nt" and not desktop_alert_bridge_url():
         return {"ok": False, "error": "desktop alerts are only enabled on Windows"}
 
-    normalized = normalize_desktop_alert(payload)
     keys = alert_dedupe_keys(normalized)
     now = time.time()
     should_start_worker = False
@@ -10320,15 +14682,10541 @@ def launch_desktop_alert(payload: dict[str, Any]) -> dict[str, Any]:
         DESKTOP_ALERT_SEEN.update(recent_seen)
         write_json_cache(DESKTOP_ALERT_STATE_PATH, {"seen": recent_seen})
         while len(DESKTOP_ALERT_QUEUE) >= DESKTOP_ALERT_QUEUE_LIMIT:
-            DESKTOP_ALERT_QUEUE.popleft()
-        DESKTOP_ALERT_QUEUE.append(normalized)
+            DESKTOP_ALERT_QUEUE.pop()
+        enqueue_desktop_alert(normalized)
+        if desktop_alert_queue_priority(normalized) >= 100:
+            DESKTOP_ALERT_QUEUE_WAKE.set()
         if not DESKTOP_ALERT_QUEUE_ACTIVE:
             DESKTOP_ALERT_QUEUE_ACTIVE = True
             should_start_worker = True
 
+    # Recording happens only after global filtering and desktop-alert dedupe, so
+    # suppressed military/whale items and duplicate popups never enter News Trade.
+    try:
+        record_desktop_alert_news_trade_intake(normalized)
+    except Exception as exc:
+        print(f"News Trade desktop intake failed: {safe_error_text(str(exc))}", file=sys.stderr)
     if should_start_worker:
         threading.Thread(target=desktop_alert_queue_worker, daemon=True).start()
     return {"ok": True, "deduped": False, "queued": True, "queueSize": len(DESKTOP_ALERT_QUEUE)}
+
+
+def send_chain_ecosystem_desktop_alert(alert: dict[str, Any]) -> dict[str, Any]:
+    """Route only persisted high-value ecosystem changes into the shared desktop queue."""
+    if str(alert.get("eventType") or "") == "token_trading":
+        return {"ok": True, "skipped": True, "reason": "token trading alerts disabled"}
+    chain = CHAIN_ECOSYSTEM_MONITOR.store.get_chain(int(alert.get("chainId") or 0)) or {}
+    project = next(
+        (
+            row
+            for row in CHAIN_ECOSYSTEM_MONITOR.store.list_projects(int(alert.get("chainId") or 0))
+            if int(row.get("id") or 0) == int(alert.get("projectId") or 0)
+        ),
+        {},
+    )
+    event_labels = {
+        "stage_upgrade": "阶段升级",
+        "new_market": "新市场",
+        "leader_change": "Top1 变化",
+        "market_surge": "市场放量",
+    }
+    event_type = str(alert.get("eventType") or "")
+    event_label = event_labels.get(event_type, "生态变化")
+    details = alert.get("details") if isinstance(alert.get("details"), dict) else {}
+    context_parts = [str(chain.get("name") or "公链生态")]
+    if alert.get("marketKey"):
+        context_parts.append(str(alert["marketKey"]))
+    if project.get("name"):
+        context_parts.append(str(project["name"]))
+    if details.get("from") and details.get("to"):
+        context_parts.append(f"{details['from']} → {details['to']}")
+    local_base = f"http://127.0.0.1:{env_value('PORT') or env_value('XINGYUN_PORT') or '8765'}"
+    chain_slug = quote(str(chain.get("slug") or ""))
+    return launch_desktop_alert(
+        {
+            "key": f"chain-ecosystem:{alert.get('dedupeKey') or alert.get('id')}",
+            "kind": "公链生态监控",
+            "source": "公链生态监控",
+            "sourceLabel": "CE",
+            "title": alert.get("title") or f"{chain.get('name') or '公链'} · {event_label}",
+            "body": " / ".join(context_parts),
+            "url": f"{local_base}/price-watch.html?mode=chains&chain={chain_slug}",
+            "time": int(alert.get("observedAt") or time.time() * 1000),
+            "priority": event_label,
+            "queuePriority": 60,
+            "speech": f"公链生态提醒，{alert.get('title') or event_label}",
+        }
+    )
+
+
+def start_chain_ecosystem_monitor() -> bool:
+    if env_flag("XINGYUN_DISABLE_CHAIN_ECOSYSTEM_MONITOR", default=False):
+        return False
+    CHAIN_ECOSYSTEM_MONITOR.alert_sink = send_chain_ecosystem_desktop_alert
+    return CHAIN_ECOSYSTEM_MONITOR.start()
+
+
+PRICE_WATCH_SYMBOL_ALIASES = {
+    # TradingView 的拉丁转写和 Binance 官方中文原生 symbol 指向同一合约。
+    # 这里保留 ASCII 内部键，发往 Binance 时再还原原生交易对。
+    "币安人生": "BIANRENSHENG",
+    "币安人生USDT": "BIANRENSHENG",
+    "BIANRENSHENG": "BIANRENSHENG",
+    "BIANRENSHENGUSDT": "BIANRENSHENG",
+    "BIANRENSHENGUSDT.P": "BIANRENSHENG",
+}
+
+BINANCE_NATIVE_PRICE_WATCH_PAIRS = {
+    "BIANRENSHENG": "币安人生USDT",
+}
+
+
+def clean_price_watch_symbol(value: Any) -> str:
+    raw = str(value or "").strip().upper().replace("/", "-").replace("_", "-")
+    raw = re.sub(r"\s+", "", raw)
+    if raw in PRICE_WATCH_SYMBOL_ALIASES:
+        return PRICE_WATCH_SYMBOL_ALIASES[raw]
+    for suffix in ("-USDT-SWAP", "-USDT", "-USDC", "USDT", "USDC"):
+        if raw.endswith(suffix) and len(raw) > len(suffix):
+            raw = raw[: -len(suffix)]
+            break
+    return re.sub(r"[^0-9A-Z]", "", raw)[:20]
+
+
+def price_structure_monitor_symbol(value: Any) -> str:
+    """Keep Unicode on-chain tickers usable without loosening CEX symbol parsing globally."""
+    normalized = clean_price_watch_symbol(value)
+    if normalized:
+        return normalized
+    return re.sub(r"[^0-9A-Za-z\u3400-\u9fff]", "", clean_feed_text(value, 100))[:40]
+
+
+def binance_price_watch_pair(value: Any) -> str:
+    symbol = clean_price_watch_symbol(value)
+    return BINANCE_NATIVE_PRICE_WATCH_PAIRS.get(symbol, f"{symbol}USDT")
+
+
+STRATEGY_ADAPTIVE_STAGE_CONFIG = {
+    "mentioned": {
+        "label": "个人 X 提及",
+        "mainWaveStage": "",
+        "modeTtlSeconds": PERSONAL_X_MONITOR_RETENTION_SECONDS,
+        "contextTtlSeconds": PERSONAL_X_MONITOR_RETENTION_SECONDS,
+    },
+    "watch": {
+        "label": "重点看",
+        "mainWaveStage": "",
+        "modeTtlSeconds": 4 * 60 * 60,
+        "contextTtlSeconds": 4 * 60 * 60,
+    },
+    "rapid": {
+        "label": "急拉应变",
+        "mainWaveStage": "expected",
+        "modeTtlSeconds": 45 * 60,
+        "contextTtlSeconds": 45 * 60,
+    },
+    "expected": {
+        "label": "主升浪预期",
+        "mainWaveStage": "expected",
+        "modeTtlSeconds": 4 * 60 * 60,
+        "contextTtlSeconds": 4 * 60 * 60,
+    },
+    "active": {
+        "label": "主升浪阶段",
+        "mainWaveStage": "active",
+        "modeTtlSeconds": 8 * 60 * 60,
+        "contextTtlSeconds": 8 * 60 * 60,
+    },
+    "acceleration": {
+        "label": "主升加速段",
+        "mainWaveStage": "active",
+        "modeTtlSeconds": 2 * 60 * 60,
+        "contextTtlSeconds": 8 * 60 * 60,
+    },
+}
+
+
+def strategy_adaptive_stage_from_text(value: Any) -> str:
+    """Read an explicit live-market declaration without treating hypotheticals as permission."""
+    text = re.sub(r"\s+", "", str(value or "")).lower()
+    if not text:
+        return ""
+    cancellation_patterns = (
+        r"(?:取消|撤销|不再|结束|终止).{0,8}(?:重点看|重点观察|重点关注|主升浪|主升预期|加速段|急拉)",
+        r"(?:重点看|重点观察|重点关注|主升浪|主升预期|加速段|急拉).{0,8}(?:结束|失效|取消|不成立)",
+        r"(?:不是|不属于).{0,5}(?:主升浪|加速段)",
+    )
+    if any(re.search(pattern, text) for pattern in cancellation_patterns):
+        return "cancel"
+    stage_patterns = (
+        ("acceleration", r"(?:进入|开始|正在|已经|主升)?(?:主升)?加速(?:段|阶段|拉升)?|二次加速"),
+        ("expected", r"(?:有|给出|建立|维持|仍有)?主升浪?预期|预期(?:进入|走出)?主升浪"),
+        ("active", r"(?:进入|启动|确认|属于|已经|处于|走出|开启|正在)主升浪|主升浪(?:启动|成立|阶段|已经开始)"),
+        ("rapid", r"(?:走势|盘面|临盘|价格)?(?:拉得|拉的|走得|走的)?(?:很|太|比较)?急|急拉|快速拉升|加速拉升|快速启动"),
+        ("watch", r"重点(?:看|观察|关注)"),
+    )
+    for stage, pattern in stage_patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        prefix = text[max(0, match.start() - 12):match.start()]
+        if re.search(r"(?:如果|假如|若是|若|可能|也许|等待|关注是否|一旦)", prefix):
+            continue
+        return stage
+    return ""
+
+
+def strategy_tactical_signal_type_from_text(value: Any) -> str:
+    """Extract only the two explicit operator signals that unlock 1m forecasts."""
+    text = re.sub(r"\s+", "", str(value or "")).lower()
+    if not text or strategy_adaptive_stage_from_text(text) == "cancel":
+        return ""
+    if re.search(r"(?:有|给出|建立|维持|仍有)?主升浪?预期|预期(?:进入|走出)?主升浪", text):
+        return "main-wave-expected"
+    match = re.search(r"重点(?:看|观察|关注)", text)
+    if match:
+        prefix = text[max(0, match.start() - 12):match.start()]
+        if not re.search(r"(?:如果|假如|若是|若|可能|也许|等待|关注是否|一旦)", prefix):
+            return "watch"
+    return ""
+
+
+def strategy_adaptive_symbols_from_text(value: Any) -> list[str]:
+    text = str(value or "")
+    symbols = list(extract_candidate_symbols(text))
+    for raw in re.findall(r"\$([A-Za-z][A-Za-z0-9]{1,9})(?![A-Za-z0-9])", text):
+        symbol = clean_price_watch_symbol(raw)
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+    for raw in re.findall(r"\b([A-Za-z][A-Za-z0-9]{1,9})(?:USDT|USDC)\b", text, flags=re.I):
+        symbol = clean_price_watch_symbol(raw)
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+    blocked = {"USDT", "USDC", "USD", "BTC", "ETH", "API", "APP", "ETF", "IPO", "SEC", "TGE", "AI"}
+    return [symbol for symbol in symbols if symbol not in blocked][:8]
+
+
+def strategy_adaptive_context_state() -> dict[str, Any]:
+    payload = read_json_cache(STRATEGY_ADAPTIVE_CONTEXT_PATH)
+    contexts = payload.get("contexts") if isinstance(payload.get("contexts"), dict) else {}
+    return {"version": 1, "contexts": contexts, "updatedAt": int(safe_float(payload.get("updatedAt"), 0))}
+
+
+def update_strategy_adaptive_context_from_text(
+    value: Any,
+    *,
+    source_kind: str,
+    source_name: str,
+    observed_at: int | None = None,
+    now_ms: int | None = None,
+    allow_mention_priority: bool = False,
+) -> list[dict[str, Any]]:
+    """Persist short-lived, symbol-scoped live judgement from WeChat or the user's X account."""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    stage = strategy_adaptive_stage_from_text(text)
+    tactical_signal_type = strategy_tactical_signal_type_from_text(text)
+    symbols = strategy_adaptive_symbols_from_text(text)
+    if not stage and allow_mention_priority and source_kind == "personal-x":
+        stage = "mentioned"
+    now_value = int(now_ms or time.time() * 1000)
+    observed_value = int(observed_at or now_value)
+    if not stage or not symbols or observed_value > now_value + 10 * 60_000:
+        return []
+    if now_value - observed_value > 8 * 60 * 60_000:
+        return []
+    changed: list[dict[str, Any]] = []
+    with STRATEGY_ADAPTIVE_CONTEXT_LOCK:
+        state = strategy_adaptive_context_state()
+        contexts = dict(state["contexts"])
+        for symbol in symbols:
+            current = contexts.get(symbol) if isinstance(contexts.get(symbol), dict) else {}
+            if int(safe_float(current.get("observedAt"), 0)) > observed_value:
+                continue
+            if stage == "cancel":
+                if symbol in contexts:
+                    contexts.pop(symbol, None)
+                    changed.append({"symbol": symbol, "cancelled": True, "observedAt": observed_value})
+                continue
+            config = STRATEGY_ADAPTIVE_STAGE_CONFIG[stage]
+            mode_expires_at = observed_value + int(config["modeTtlSeconds"]) * 1000
+            expires_at = observed_value + int(config["contextTtlSeconds"]) * 1000
+            if expires_at <= now_value:
+                continue
+            record = {
+                "symbol": symbol,
+                "mode": stage,
+                "label": config["label"],
+                "mainWaveStage": config["mainWaveStage"],
+                "sourceKind": clean_feed_text(source_kind, 24),
+                "sourceName": clean_feed_text(source_name, 80),
+                "sourceText": clean_feed_text(text, 180),
+                "sourceHash": hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:20],
+                "observedAt": observed_value,
+                "modeExpiresAt": mode_expires_at,
+                "expiresAt": expires_at,
+            }
+            signal_type = tactical_signal_type
+            signal_expires_at = expires_at if signal_type else 0
+            if (
+                not signal_type
+                and current.get("signalType") in {"watch", "main-wave-expected"}
+                and int(safe_float(current.get("signalExpiresAt"), 0)) > now_value
+                and current.get("sourceKind") == clean_feed_text(source_kind, 24)
+            ):
+                signal_type = str(current["signalType"])
+                signal_expires_at = int(current["signalExpiresAt"])
+            if signal_type:
+                record.update({
+                    "signalType": signal_type,
+                    "signalLabel": "重点看" if signal_type == "watch" else "有主升浪预期",
+                    "signalExpiresAt": signal_expires_at,
+                })
+            if current.get("sourceHash") == record["sourceHash"] and current.get("observedAt") == observed_value:
+                continue
+            contexts[symbol] = record
+            changed.append(record)
+        if changed:
+            write_json_cache(STRATEGY_ADAPTIVE_CONTEXT_PATH, {
+                "version": 1,
+                "contexts": contexts,
+                "updatedAt": now_value,
+            })
+    if changed:
+        with PRICE_STRUCTURE_CACHE_LOCK:
+            PRICE_STRUCTURE_CACHE.clear()
+    return changed
+
+
+def strategy_adaptive_context_for_symbol(symbol: Any, *, now_ms: int | None = None) -> dict[str, Any] | None:
+    normalized = clean_price_watch_symbol(symbol)
+    now_value = int(now_ms or time.time() * 1000)
+    with STRATEGY_ADAPTIVE_CONTEXT_LOCK:
+        state = strategy_adaptive_context_state()
+        record = state["contexts"].get(normalized)
+    if not isinstance(record, dict) or int(safe_float(record.get("expiresAt"), 0)) <= now_value:
+        return None
+    effective = dict(record)
+    if int(safe_float(record.get("modeExpiresAt"), 0)) <= now_value and record.get("mainWaveStage") == "active":
+        effective["mode"] = "active"
+        effective["label"] = "主升浪阶段"
+    effective["remainingSeconds"] = max(0, int((int(record["expiresAt"]) - now_value) / 1000))
+    if int(safe_float(effective.get("signalExpiresAt"), 0)) <= now_value:
+        effective.pop("signalType", None)
+        effective.pop("signalLabel", None)
+        effective.pop("signalExpiresAt", None)
+    return effective
+
+
+def strategy_active_adaptive_contexts(*, now_ms: int | None = None) -> list[dict[str, Any]]:
+    now_value = int(now_ms or time.time() * 1000)
+    with STRATEGY_ADAPTIVE_CONTEXT_LOCK:
+        symbols = list(strategy_adaptive_context_state()["contexts"])
+    rows = [strategy_adaptive_context_for_symbol(symbol, now_ms=now_value) for symbol in symbols]
+    return sorted(
+        (row for row in rows if row),
+        key=lambda row: int(safe_float(row.get("observedAt"), 0)),
+        reverse=True,
+    )
+
+
+def strategy_tactical_signal_rows(*, now_ms: int | None = None) -> list[dict[str, Any]]:
+    now_value = int(now_ms or time.time() * 1000)
+    rows: list[dict[str, Any]] = []
+    for context in strategy_active_adaptive_contexts(now_ms=now_value):
+        signal_type = str(context.get("signalType") or "")
+        # Backward compatibility for contexts created before signalType existed.
+        if not signal_type and context.get("mode") == "expected":
+            signal_type = "main-wave-expected"
+        if signal_type not in {"watch", "main-wave-expected"}:
+            continue
+        source_kind = str(context.get("sourceKind") or "")
+        if source_kind not in {"personal-x", "wechat", "qq"}:
+            continue
+        signal_expires_at = int(safe_float(context.get("signalExpiresAt") or context.get("expiresAt"), 0))
+        if signal_expires_at <= now_value:
+            continue
+        rows.append({
+            **context,
+            "signalType": signal_type,
+            "signalLabel": "重点看" if signal_type == "watch" else "有主升浪预期",
+            "signalExpiresAt": signal_expires_at,
+            "signalRemainingSeconds": max(0, int((signal_expires_at - now_value) / 1000)),
+        })
+    return rows
+
+
+def upsert_personal_x_monitor_symbol(
+    value: Any,
+    *,
+    source_name: str,
+    source_text: str,
+    observed_at: int,
+    now_ms: int | None = None,
+    max_age_seconds: int | None = None,
+) -> dict[str, Any] | None:
+    """Put a genuinely new personal-X mention at the front of both watchlists."""
+    symbol = clean_price_watch_symbol(value)
+    now_value = int(now_ms or time.time() * 1000)
+    observed_value = int(observed_at or 0)
+    accepted_age_seconds = max(
+        PERSONAL_X_MONITOR_INGEST_MAX_AGE_SECONDS,
+        int(max_age_seconds or PERSONAL_X_MONITOR_INGEST_MAX_AGE_SECONDS),
+    )
+    if (
+        not symbol
+        or is_excluded_crypto_asset(symbol)
+        or symbol in {"USDT", "USDC", "BUSD", "FDUSD", "DAI", "TUSD", "USDE", "USDD"}
+        or observed_value <= 0
+        or observed_value > now_value + 10 * 60_000
+        or now_value - observed_value > accepted_age_seconds * 1000
+    ):
+        return None
+    clean_source_name = clean_feed_text(source_name, 80)
+    clean_source_text = clean_feed_text(source_text, 180)
+    restored_prior_high = False
+    with AUTH_DB_LOCK, auth_db() as conn:
+        existing = conn.execute(
+            """
+            SELECT personal_x_mentioned_at, prior_high_excluded_at
+            FROM price_watch_assets
+            WHERE symbol = ?
+            """,
+            (symbol,),
+        ).fetchone()
+        previous_mention = int(existing["personal_x_mentioned_at"] or 0) if existing else 0
+        if observed_value <= previous_mention:
+            return None
+        restored_prior_high = bool(existing and int(existing["prior_high_excluded_at"] or 0) > 0)
+        conn.execute(
+            """
+            INSERT INTO price_watch_assets (
+                symbol, name, manual_pinned, personal_x_mentioned_at,
+                personal_x_source_name, personal_x_source_text,
+                dismissed_until, prior_high_excluded_at, prior_high_absent_at,
+                status, created_at, updated_at
+            ) VALUES (?, ?, 0, ?, ?, ?, 0, 0, 0, 'pending', ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                name = CASE WHEN price_watch_assets.name != '' THEN price_watch_assets.name ELSE excluded.name END,
+                personal_x_mentioned_at = excluded.personal_x_mentioned_at,
+                personal_x_source_name = excluded.personal_x_source_name,
+                personal_x_source_text = excluded.personal_x_source_text,
+                dismissed_until = 0,
+                prior_high_excluded_at = 0,
+                prior_high_absent_at = 0,
+                dead_at = 0,
+                dead_reason = '',
+                updated_at = excluded.updated_at
+            """,
+            (
+                symbol,
+                symbol,
+                observed_value,
+                clean_source_name,
+                clean_source_text,
+                now_value,
+                now_value,
+            ),
+        )
+        # A newer post is a deliberate re-entry. Re-reading the same cached post
+        # never reaches this branch, so a later manual exclusion remains stable.
+        conn.execute("DELETE FROM price_structure_exclusions WHERE symbol = ?", (symbol,))
+        if restored_prior_high:
+            conn.execute("DELETE FROM price_watch_alert_state WHERE symbol = ?", (symbol,))
+            conn.execute("DELETE FROM price_watch_first_confirmations WHERE symbol = ?", (symbol,))
+    with PRICE_STRUCTURE_CACHE_LOCK:
+        PRICE_STRUCTURE_CACHE.clear()
+    return {
+        "symbol": symbol,
+        "personalXMentionedAt": observed_value,
+        "sourceKind": "personal-x",
+        "sourceName": clean_source_name,
+        "sourceText": clean_source_text,
+        "priorHighRestored": restored_prior_high,
+    }
+
+
+def refresh_personal_x_structure_priority(symbols: list[str]) -> None:
+    wanted = {clean_price_watch_symbol(symbol) for symbol in symbols if clean_price_watch_symbol(symbol)}
+    if not wanted:
+        return
+    try:
+        rows = price_structure_watch_rows()
+        for row in rows:
+            if clean_price_watch_symbol(row.get("symbol")) in wanted:
+                refresh_price_structure_strategy_monitor_item(row, rows)
+    except Exception as exc:
+        print(f"Personal X structure priority refresh failed: {safe_error_text(str(exc))}", file=sys.stderr)
+
+
+def queue_personal_x_monitor_priority_refresh(symbols: list[str]) -> None:
+    wanted = sorted({clean_price_watch_symbol(symbol) for symbol in symbols if clean_price_watch_symbol(symbol)})
+    if not wanted:
+        return
+    threading.Thread(
+        target=sync_price_watch_monitor,
+        kwargs={"symbols": wanted},
+        name="personal-x-prior-high-refresh",
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=refresh_personal_x_structure_priority,
+        args=(wanted,),
+        name="personal-x-structure-refresh",
+        daemon=True,
+    ).start()
+
+
+def update_strategy_contexts_from_personal_x_payload(
+    payload: dict[str, Any], *, now_ms: int | None = None, monitor_max_age_seconds: int | None = None
+) -> list[dict[str, Any]]:
+    priority_handles = {handle.lower() for handle in x_kol_priority_handles()}
+    changed: list[dict[str, Any]] = []
+    priority_symbols: list[str] = []
+    for item in payload.get("items") if isinstance(payload.get("items"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        handle = normalize_x_handle(item.get("handle")).lower()
+        if not handle or handle not in priority_handles:
+            continue
+        text = str(item.get("fullText") or item.get("text") or "")
+        observed_at = int(safe_float(item.get("publishedAt"), 0))
+        changed.extend(update_strategy_adaptive_context_from_text(
+            text,
+            source_kind="personal-x",
+            source_name=f"@{handle}",
+            observed_at=observed_at or None,
+            now_ms=now_ms,
+            allow_mention_priority=True,
+        ))
+        for symbol in strategy_adaptive_symbols_from_text(text):
+            priority = upsert_personal_x_monitor_symbol(
+                symbol,
+                source_name=f"@{handle}",
+                source_text=text,
+                observed_at=observed_at,
+                now_ms=now_ms,
+                max_age_seconds=monitor_max_age_seconds,
+            )
+            if priority:
+                priority_symbols.append(priority["symbol"])
+    if priority_symbols:
+        queue_personal_x_monitor_priority_refresh(priority_symbols)
+    return changed
+
+
+def price_watch_numeric(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = re.sub(r"[^0-9.eE+-]", "", str(value or ""))
+    return safe_float(text)
+
+
+def price_watch_aicoin_source() -> dict[str, Any]:
+    payload = read_json_cache(api_cache_path("market-hot"))
+    sources = payload.get("sources") if isinstance(payload.get("sources"), list) else []
+    return next((source for source in sources if str(source.get("id") or "") == "aicoin"), {})
+
+
+def is_price_watch_auto_crypto_candidate(symbol: str, name: str = "", pair_hint: str = "") -> bool:
+    """Keep the automatic list limited to crypto assets with usable exchange candles."""
+    symbol = clean_price_watch_symbol(symbol)
+    hint = str(pair_hint or "").lower()
+    name_key = str(name or "").strip().lower()
+    non_crypto_symbols = {
+        "XAU", "XAG", "CL", "WTI", "BRENT",
+        "AAPL", "AMZN", "GOOGL", "META", "MSFT", "MU", "NVDA", "SNDK", "TSLA",
+    }
+    non_crypto_names = {
+        "gold", "silver", "wti crude oil", "crude oil", "micron technology inc",
+        "sandisk corporation", "nvidia corporation", "tesla inc", "microsoft corporation",
+    }
+    if not symbol or is_excluded_crypto_asset(symbol) or symbol in non_crypto_symbols:
+        return False
+    if hint.startswith("xyz") or ":stocks" in hint or "stock perpetual" in hint:
+        return False
+    return name_key not in non_crypto_names
+
+
+def new_contract_1m_expires_at(listed_at: Any) -> int:
+    """Close the automatic 1m window at 24:00 China time on the next calendar day."""
+    listed_value = int(safe_float(listed_at, 0))
+    if listed_value <= 0:
+        return 0
+    china_tz = timezone(timedelta(hours=8))
+    listed_time = datetime.fromtimestamp(listed_value / 1000, tz=china_tz)
+    listing_day = listed_time.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int((listing_day + timedelta(days=2)).timestamp() * 1000)
+
+
+def upsert_new_contract_monitor_symbol(
+    value: Any,
+    *,
+    source_name: str,
+    pair: str,
+    listed_at: int,
+    now_ms: int | None = None,
+    allow_tradfi: bool = False,
+) -> dict[str, Any] | None:
+    """Persist an official listing for listing/news features, not structure-pool membership."""
+    symbol = clean_price_watch_symbol(value)
+    now_value = int(now_ms or time.time() * 1000)
+    listed_value = int(listed_at or 0)
+    if (
+        (not symbol or (not allow_tradfi and not is_price_watch_auto_crypto_candidate(symbol, symbol, pair)))
+        or listed_value <= 0
+        or listed_value > now_value + 10 * 60_000
+        or now_value - listed_value > NEW_CONTRACT_MONITOR_RETENTION_SECONDS * 1000
+    ):
+        return None
+    clean_source_name = clean_feed_text(source_name, 80)
+    clean_pair = clean_feed_text(pair, 80)
+    with AUTH_DB_LOCK, auth_db() as conn:
+        existing = conn.execute(
+            """
+            SELECT new_contract_listed_at
+            FROM price_watch_assets
+            WHERE symbol = ?
+            """,
+            (symbol,),
+        ).fetchone()
+        previous_listing = int(existing["new_contract_listed_at"] or 0) if existing else 0
+        if listed_value <= previous_listing:
+            return None
+        conn.execute(
+            """
+            INSERT INTO price_watch_assets (
+                symbol, name, pair_hint, manual_pinned,
+                new_contract_listed_at, new_contract_source, new_contract_pair,
+                dismissed_until, prior_high_excluded_at, prior_high_absent_at,
+                status, created_at, updated_at
+            ) VALUES (?, ?, ?, 0, ?, ?, ?, 0, 0, 0, 'pending', ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                name = CASE WHEN price_watch_assets.name != '' THEN price_watch_assets.name ELSE excluded.name END,
+                pair_hint = CASE WHEN excluded.pair_hint != '' THEN excluded.pair_hint ELSE price_watch_assets.pair_hint END,
+                new_contract_listed_at = excluded.new_contract_listed_at,
+                new_contract_source = excluded.new_contract_source,
+                new_contract_pair = excluded.new_contract_pair,
+                dismissed_until = 0,
+                dead_at = 0,
+                dead_reason = '',
+                updated_at = excluded.updated_at
+            """,
+            (
+                symbol,
+                symbol,
+                clean_pair,
+                listed_value,
+                clean_source_name,
+                clean_pair,
+                now_value,
+                now_value,
+            ),
+        )
+    with PRICE_STRUCTURE_CACHE_LOCK:
+        PRICE_STRUCTURE_CACHE.clear()
+    return {
+        "symbol": symbol,
+        "newContractListedAt": listed_value,
+        "newContractSource": clean_source_name,
+        "newContractPair": clean_pair,
+        "newContract1mExpiresAt": new_contract_1m_expires_at(listed_value),
+        "priorHighRestored": False,
+    }
+
+
+def price_watch_aster_new_contract_source() -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    for announcement in aster_listing_announcement_rows(120):
+        assets = announcement.get("symbols") if isinstance(announcement.get("symbols"), list) else []
+        for asset_value in assets:
+            asset = clean_price_watch_symbol(asset_value)
+            if not asset:
+                continue
+            listed_at = int(safe_float(
+                announcement.get("announcementAt") or announcement.get("date") or announcement.get("firstDiscoveredAt"),
+                0,
+            ))
+            rows.append({
+                "asset": asset,
+                "symbol": f"{asset}USDT",
+                "date": listed_at,
+                "assetType": "crypto",
+                "tags": ["Aster 新合约", "官方公告"],
+            })
+    return {"id": "aster-new", "status": "ok" if rows else "unavailable", "rows": rows}
+
+
+def sync_price_watch_new_contract_candidates(
+    *,
+    now_ms: int | None = None,
+    sources: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    now_value = int(now_ms or time.time() * 1000)
+    if sources is None:
+        sources = []
+        for source_key, source_label, fetcher in (
+            ("binance-new", "Binance 新合约", fetch_binance_new_coins),
+            ("okx-new", "OKX 新合约", fetch_okx_new_coins),
+            ("gate-new", "Gate 新合约", fetch_gate_new_coins),
+            ("htx-new", "HTX 新合约", fetch_htx_new_coins),
+            ("aster-new", "Aster 新合约", price_watch_aster_new_contract_source),
+        ):
+            try:
+                source = cached(source_key, fetcher)
+                sources.append({**source, "monitorSourceLabel": source_label})
+            except Exception as exc:
+                print(f"{source_label} monitor refresh failed: {safe_error_text(str(exc))}", file=sys.stderr)
+    changed: list[dict[str, Any]] = []
+    for source in sources:
+        if not isinstance(source, dict) or str(source.get("status") or "").lower() != "ok":
+            continue
+        source_id = clean_feed_text(source.get("id"), 40)
+        source_label = clean_feed_text(
+            source.get("monitorSourceLabel")
+            or {
+                "binance-new": "Binance 新合约",
+                "okx-new": "OKX 新合约",
+                "gate-new": "Gate 新合约",
+                "htx-new": "HTX 新合约",
+                "aster-new": "Aster 新合约",
+            }.get(source_id, "交易所新合约"),
+            80,
+        )
+        allow_tradfi = source_id in {"gate-new", "htx-new"} or bool(source.get("allowTradfi"))
+        rows = source.get("rows") if isinstance(source.get("rows"), list) else []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            tags = {str(tag or "").strip().lower() for tag in row.get("tags", []) if tag}
+            if (str(row.get("assetType") or "").lower() == "tradfi" or "tradfi" in tags) and not allow_tradfi:
+                continue
+            result = upsert_new_contract_monitor_symbol(
+                row.get("asset") or row.get("symbol"),
+                source_name=source_label,
+                pair=str(row.get("symbol") or row.get("name") or ""),
+                listed_at=int(safe_float(row.get("date"), 0)),
+                now_ms=now_value,
+                allow_tradfi=allow_tradfi,
+            )
+            if result:
+                changed.append(result)
+    return changed
+
+
+def sync_price_watch_aicoin_candidates() -> int:
+    source = price_watch_aicoin_source()
+    rows = source.get("rows") if isinstance(source.get("rows"), list) else []
+    now_ms = int(time.time() * 1000)
+    synced = 0
+    candidates: list[tuple[str, str, str, str]] = []
+    for raw_row in rows[:10]:
+        symbol = clean_price_watch_symbol(raw_row.get("symbol") or raw_row.get("asset"))
+        name = clean_feed_text(raw_row.get("name") or symbol, 80)
+        icon = clean_feed_text(raw_row.get("icon"), 600)
+        pair_hint = clean_feed_text(raw_row.get("note"), 160)
+        if is_price_watch_auto_crypto_candidate(symbol, name, pair_hint):
+            candidates.append((symbol, name, icon, pair_hint))
+    current_symbols = {candidate[0] for candidate in candidates}
+    source_is_current = str(source.get("status") or "").lower() == "ok" and bool(current_symbols)
+    with AUTH_DB_LOCK, auth_db() as conn:
+        for symbol, name, icon, pair_hint in candidates:
+            existing = conn.execute(
+                """
+                SELECT aicoin_first_seen_at, prior_high_excluded_at, prior_high_absent_at
+                FROM price_watch_assets
+                WHERE symbol = ?
+                """,
+                (symbol,),
+            ).fetchone()
+            first_seen_at = int(existing["aicoin_first_seen_at"] or 0) if existing else 0
+            returned_after_absence = bool(
+                existing
+                and int(existing["prior_high_excluded_at"] or 0) > 0
+                and int(existing["prior_high_absent_at"] or 0) > 0
+            )
+            if returned_after_absence:
+                first_seen_at = now_ms
+            if first_seen_at <= 0:
+                first_seen_at = now_ms
+            conn.execute(
+                """
+                INSERT INTO price_watch_assets (
+                    symbol, name, icon, pair_hint, manual_pinned,
+                    aicoin_first_seen_at, aicoin_last_seen_at, dismissed_until,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 0, ?, ?, 0, 'pending', ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    name = CASE WHEN excluded.name != '' THEN excluded.name ELSE price_watch_assets.name END,
+                    icon = CASE WHEN excluded.icon != '' THEN excluded.icon ELSE price_watch_assets.icon END,
+                    pair_hint = CASE WHEN excluded.pair_hint != '' THEN excluded.pair_hint ELSE price_watch_assets.pair_hint END,
+                    aicoin_first_seen_at = CASE
+                        WHEN price_watch_assets.prior_high_excluded_at > 0
+                         AND price_watch_assets.prior_high_absent_at > 0 THEN excluded.aicoin_first_seen_at
+                        WHEN price_watch_assets.aicoin_first_seen_at > 0 THEN price_watch_assets.aicoin_first_seen_at
+                        ELSE excluded.aicoin_first_seen_at
+                    END,
+                    aicoin_last_seen_at = excluded.aicoin_last_seen_at,
+                    prior_high_excluded_at = CASE
+                        WHEN price_watch_assets.prior_high_excluded_at > 0
+                         AND price_watch_assets.prior_high_absent_at > 0 THEN 0
+                        ELSE price_watch_assets.prior_high_excluded_at
+                    END,
+                    prior_high_absent_at = CASE
+                        WHEN price_watch_assets.prior_high_excluded_at > 0
+                         AND price_watch_assets.prior_high_absent_at > 0 THEN 0
+                        ELSE price_watch_assets.prior_high_absent_at
+                    END,
+                    updated_at = excluded.updated_at
+                """,
+                (symbol, name, icon, pair_hint, first_seen_at, now_ms, now_ms, now_ms),
+            )
+            if returned_after_absence:
+                conn.execute("DELETE FROM price_watch_alert_state WHERE symbol = ?", (symbol,))
+                conn.execute("DELETE FROM price_watch_first_confirmations WHERE symbol = ?", (symbol,))
+            synced += 1
+        if source_is_current:
+            placeholders = ",".join("?" for _ in current_symbols)
+            conn.execute(
+                f"""
+                UPDATE price_watch_assets
+                SET prior_high_absent_at = CASE
+                        WHEN prior_high_absent_at > 0 THEN prior_high_absent_at
+                        ELSE ?
+                    END,
+                    updated_at = ?
+                WHERE prior_high_excluded_at > 0
+                  AND symbol NOT IN ({placeholders})
+                """,
+                (now_ms, now_ms, *sorted(current_symbols)),
+            )
+        existing_auto_rows = conn.execute(
+            """
+            SELECT symbol, name, pair_hint, opportunity_first_seen_at,
+                   personal_x_mentioned_at, new_contract_listed_at
+            FROM price_watch_assets
+            WHERE manual_pinned = 0
+            """
+        ).fetchall()
+        for existing_auto in existing_auto_rows:
+            if not is_price_watch_auto_crypto_candidate(
+                existing_auto["symbol"], existing_auto["name"], existing_auto["pair_hint"]
+            ):
+                if (
+                    int(existing_auto["opportunity_first_seen_at"] or 0) > 0
+                    or int(existing_auto["personal_x_mentioned_at"] or 0)
+                    >= now_ms - PERSONAL_X_MONITOR_RETENTION_SECONDS * 1000
+                    or int(existing_auto["new_contract_listed_at"] or 0)
+                    >= now_ms - NEW_CONTRACT_MONITOR_RETENTION_SECONDS * 1000
+                ):
+                    conn.execute(
+                        """
+                        UPDATE price_watch_assets
+                        SET aicoin_first_seen_at = 0,
+                            aicoin_last_seen_at = 0,
+                            updated_at = ?
+                        WHERE symbol = ?
+                        """,
+                        (now_ms, existing_auto["symbol"]),
+                    )
+                    continue
+                conn.execute("DELETE FROM price_watch_assets WHERE symbol = ?", (existing_auto["symbol"],))
+                conn.execute("DELETE FROM price_watch_alert_state WHERE symbol = ?", (existing_auto["symbol"],))
+                conn.execute("DELETE FROM price_watch_oversold_alert_state WHERE symbol = ?", (existing_auto["symbol"],))
+                conn.execute("DELETE FROM price_watch_fib_alert_state WHERE symbol = ?", (existing_auto["symbol"],))
+                conn.execute("DELETE FROM price_watch_first_confirmations WHERE symbol = ?", (existing_auto["symbol"],))
+        conn.execute(
+            """
+            DELETE FROM price_watch_assets
+            WHERE manual_pinned = 0
+              AND opportunity_first_seen_at = 0
+              AND personal_x_mentioned_at < ?
+              AND new_contract_listed_at < ?
+              AND aicoin_last_seen_at < ?
+            """,
+            (
+                now_ms - PERSONAL_X_MONITOR_RETENTION_SECONDS * 1000,
+                now_ms - NEW_CONTRACT_MONITOR_RETENTION_SECONDS * 1000,
+                now_ms - PRICE_WATCH_RETENTION_SECONDS * 1000,
+            ),
+        )
+        conn.execute(
+            "DELETE FROM price_watch_alert_state WHERE symbol NOT IN (SELECT symbol FROM price_watch_assets)"
+        )
+        conn.execute(
+            "DELETE FROM price_watch_oversold_alert_state WHERE symbol NOT IN (SELECT symbol FROM price_watch_assets)"
+        )
+        conn.execute(
+            "DELETE FROM price_watch_fib_alert_state WHERE symbol NOT IN (SELECT symbol FROM price_watch_assets)"
+        )
+        conn.execute(
+            "DELETE FROM price_watch_first_confirmations WHERE symbol NOT IN (SELECT symbol FROM price_watch_assets)"
+        )
+    return synced
+
+
+def price_watch_active_rows() -> list[dict[str, Any]]:
+    now_ms = int(time.time() * 1000)
+    cutoff_ms = now_ms - PRICE_WATCH_RETENTION_SECONDS * 1000
+    with AUTH_DB_LOCK, auth_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                assets.*,
+                alert_state.episode AS latest_alert_episode,
+                alert_state.last_alert_at AS latest_alert_at,
+                oversold_state.episode AS oversold_alert_episode,
+                oversold_state.last_alert_at AS oversold_last_alert_at,
+                confirmation.episode AS first_valid_episode,
+                confirmation.confirmed_at AS first_valid_confirmed_at,
+                confirmation.current_price AS first_valid_price,
+                confirmation.reference_high AS first_valid_reference_high,
+                confirmation.distance_pct AS first_valid_distance_pct,
+                confirmation.provider AS first_valid_provider,
+                confirmation.setup_type AS first_valid_setup_type
+            FROM price_watch_assets AS assets
+            LEFT JOIN price_watch_alert_state AS alert_state ON alert_state.symbol = assets.symbol
+            LEFT JOIN price_watch_oversold_alert_state AS oversold_state ON oversold_state.symbol = assets.symbol
+            LEFT JOIN price_watch_first_confirmations AS confirmation ON confirmation.symbol = assets.symbol
+            WHERE assets.personal_x_mentioned_at >= ?
+               OR assets.new_contract_listed_at >= ?
+               OR assets.manual_pinned = 1
+               OR (assets.aicoin_last_seen_at >= ? AND assets.dismissed_until < ?)
+               OR (
+                    assets.opportunity_active = 1
+                    AND assets.opportunity_manual_removed_at = 0
+                    AND assets.dead_at = 0
+               )
+            ORDER BY
+                CASE WHEN assets.personal_x_mentioned_at >= ? OR assets.new_contract_listed_at >= ? THEN 1 ELSE 0 END DESC,
+                CASE
+                    WHEN assets.personal_x_mentioned_at > assets.new_contract_listed_at
+                    THEN assets.personal_x_mentioned_at
+                    ELSE assets.new_contract_listed_at
+                END DESC,
+                assets.manual_pinned DESC,
+                assets.opportunity_active DESC,
+                assets.opportunity_last_seen_at DESC,
+                assets.aicoin_last_seen_at DESC,
+                assets.created_at DESC
+            """,
+            (cutoff_ms, cutoff_ms, cutoff_ms, now_ms, cutoff_ms, cutoff_ms),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def price_watch_prior_high_source_enabled(row: sqlite3.Row | dict[str, Any] | None, *, now_ms: int | None = None) -> bool:
+    """Prior-high monitoring is intentionally sourced only by AiCoin or personal X."""
+    item = row_dict(row)
+    if not item or int(item.get("prior_high_excluded_at") or 0) > 0:
+        return False
+    current_ms = int(now_ms or time.time() * 1000)
+    personal_x_active = int(item.get("personal_x_mentioned_at") or 0) >= (
+        current_ms - PERSONAL_X_MONITOR_RETENTION_SECONDS * 1000
+    )
+    aicoin_active = bool(
+        int(item.get("aicoin_last_seen_at") or 0) >= current_ms - PRICE_WATCH_RETENTION_SECONDS * 1000
+        and int(item.get("dismissed_until") or 0) < current_ms
+    )
+    return personal_x_active or aicoin_active
+
+
+def price_watch_public_item(row: dict[str, Any]) -> dict[str, Any]:
+    now_ms = int(time.time() * 1000)
+    first_seen_at = int(row.get("aicoin_first_seen_at") or 0)
+    last_seen_at = int(row.get("aicoin_last_seen_at") or 0)
+    opportunity_active = bool(row.get("opportunity_active"))
+    opportunity_first_seen_at = int(row.get("opportunity_first_seen_at") or 0)
+    opportunity_last_seen_at = int(row.get("opportunity_last_seen_at") or 0)
+    personal_x_mentioned_at = int(row.get("personal_x_mentioned_at") or 0)
+    personal_x_priority = bool(
+        personal_x_mentioned_at
+        >= now_ms - PERSONAL_X_MONITOR_RETENTION_SECONDS * 1000
+    )
+    new_contract_listed_at = int(row.get("new_contract_listed_at") or 0)
+    new_contract_priority = bool(
+        new_contract_listed_at
+        >= now_ms - NEW_CONTRACT_MONITOR_RETENTION_SECONDS * 1000
+    )
+    new_contract_1m_until = new_contract_1m_expires_at(new_contract_listed_at)
+    priority_origin = (
+        "personal-x"
+        if personal_x_priority and personal_x_mentioned_at >= new_contract_listed_at
+        else "new-contract"
+        if new_contract_priority
+        else ""
+    )
+    current_price = safe_float(row.get("current_price"))
+    week_high = safe_float(row.get("week_high"))
+    distance = safe_float(row.get("distance_pct"), -1)
+    oversold_drawdown = safe_float(row.get("oversold_drawdown_pct"), -1)
+    oversold_distance = safe_float(row.get("oversold_distance_pct"), -1)
+    try:
+        fib = json.loads(row.get("fib_json") or "{}")
+    except (TypeError, ValueError):
+        fib = {}
+    if not isinstance(fib, dict):
+        fib = {}
+    latest_alert_episode = int(row.get("latest_alert_episode") or 0)
+    latest_alert_at = int(row.get("latest_alert_at") or 0)
+    first_valid_episode = int(row.get("first_valid_episode") or 0)
+    first_valid_confirmed_at = int(row.get("first_valid_confirmed_at") or 0)
+    prior_high_excluded_at = int(row.get("prior_high_excluded_at") or 0)
+    prior_high_absent_at = int(row.get("prior_high_absent_at") or 0)
+    prior_high_enabled = price_watch_prior_high_source_enabled(row, now_ms=now_ms)
+    has_confirmed_first = bool(first_valid_episode and first_valid_confirmed_at)
+    is_first_candidate = bool(prior_high_enabled and latest_alert_episode > 0 and not has_confirmed_first)
+    is_confirmed_episode = bool(prior_high_enabled and has_confirmed_first and latest_alert_episode == first_valid_episode)
+    is_later_episode = bool(prior_high_enabled and has_confirmed_first and latest_alert_episode > first_valid_episode)
+    signal_label = ""
+    if is_first_candidate:
+        signal_label = "待确认首次有效突破"
+    elif is_confirmed_episode:
+        signal_label = "首次有效突破已确认"
+    elif is_later_episode:
+        signal_label = "非首次突破"
+    return {
+        "symbol": row.get("symbol") or "",
+        "name": row.get("name") or row.get("symbol") or "",
+        "icon": row.get("icon") or crypto_icon_url(row.get("symbol")),
+        "marketActivity": row.get("marketActivity") if isinstance(row.get("marketActivity"), dict) else {},
+        "origin": (
+            priority_origin
+            if priority_origin
+            else "manual"
+            if row.get("manual_pinned")
+            else "opportunity"
+            if opportunity_active or opportunity_first_seen_at
+            else "aicoin"
+        ),
+        "manual": bool(row.get("manual_pinned")),
+        "personalXPriority": personal_x_priority,
+        "personalXMentionedAt": personal_x_mentioned_at,
+        "personalXSourceName": row.get("personal_x_source_name") or "",
+        "personalXSourceText": row.get("personal_x_source_text") or "",
+        "newContractPriority": new_contract_priority,
+        "newContractListedAt": new_contract_listed_at,
+        "newContractSource": row.get("new_contract_source") or "",
+        "newContractPair": row.get("new_contract_pair") or "",
+        "newContract1mExpiresAt": new_contract_1m_until,
+        "newContract1mActive": bool(new_contract_1m_until > now_ms),
+        "structure1mOverride": int(row.get("structure_1m_override") if row.get("structure_1m_override") is not None else -1),
+        "structureIntervalOverrides": parse_price_structure_interval_overrides(
+            row.get("structure_interval_overrides_json")
+        ),
+        "priorHighEnabled": prior_high_enabled,
+        "priorHighExcludedAt": prior_high_excluded_at,
+        "priorHighAbsentAt": prior_high_absent_at,
+        "firstSeenAt": first_seen_at,
+        "lastSeenAt": last_seen_at,
+        "expiresAt": max(
+            last_seen_at + PRICE_WATCH_RETENTION_SECONDS * 1000 if last_seen_at else 0,
+            personal_x_mentioned_at + PERSONAL_X_MONITOR_RETENTION_SECONDS * 1000
+            if personal_x_mentioned_at else 0,
+            new_contract_listed_at + NEW_CONTRACT_MONITOR_RETENTION_SECONDS * 1000
+            if new_contract_listed_at else 0,
+        ),
+        "opportunityActive": opportunity_active,
+        "opportunityFirstSeenAt": opportunity_first_seen_at,
+        "opportunityLastSeenAt": opportunity_last_seen_at,
+        "opportunitySource": row.get("opportunity_source") or "",
+        "opportunitySources": parse_json_list(row.get("opportunity_sources_json")),
+        "opportunityManualRemovedAt": int(row.get("opportunity_manual_removed_at") or 0),
+        "lastQuoteSuccessAt": int(row.get("last_quote_success_at") or 0),
+        "quoteFailureStreak": int(row.get("quote_failure_streak") or 0),
+        "deadAt": int(row.get("dead_at") or 0),
+        "deadReason": row.get("dead_reason") or "",
+        "currentPrice": current_price if current_price > 0 else None,
+        "weekHigh": week_high if week_high > 0 else None,
+        "distancePct": round(distance, 3) if distance >= 0 else None,
+        "provider": row.get("provider") or "",
+        "status": row.get("status") or "pending",
+        "setupType": row.get("setup_type") or row.get("first_valid_setup_type") or "",
+        "structureLow": safe_float(row.get("structure_low")) or None,
+        "structureHigh": safe_float(row.get("structure_high")) or None,
+        "oversoldCandidate": oversold_drawdown >= PRICE_WATCH_OVERSOLD_DRAWDOWN_PCT,
+        "oversoldStatus": row.get("oversold_status") or "normal",
+        "oversoldDrawdownPct": round(oversold_drawdown, 3) if oversold_drawdown >= 0 else None,
+        "oversoldRangeLow": safe_float(row.get("oversold_range_low")) or None,
+        "oversoldRangeHigh": safe_float(row.get("oversold_range_high")) or None,
+        "oversoldDistancePct": round(oversold_distance, 3) if oversold_distance >= 0 else None,
+        "oversoldAlertEpisode": int(row.get("oversold_alert_episode") or 0),
+        "oversoldLastAlertAt": int(row.get("oversold_last_alert_at") or 0),
+        "fibCandidate": bool(fib.get("candidate")),
+        "fibStatus": row.get("fib_status") or fib.get("status") or "normal",
+        "fibLaunchLow": safe_float(fib.get("launchLow")) or None,
+        "fibSwingHigh": safe_float(fib.get("swingHigh")) or None,
+        "fibLevel05": safe_float(fib.get("level05")) or None,
+        "fibLevel0618": safe_float(fib.get("level0618")) or None,
+        "fibDistance05Pct": safe_float(fib.get("distance05Pct"), -1) if fib.get("distance05Pct") is not None else None,
+        "fibDistance0618Pct": safe_float(fib.get("distance0618Pct"), -1) if fib.get("distance0618Pct") is not None else None,
+        "fibImpulseGainPct": safe_float(fib.get("impulseGainPct")) or None,
+        "fibLaunchAt": int(fib.get("launchAt") or 0),
+        "fibSwingHighAt": int(fib.get("swingHighAt") or 0),
+        "lastCheckedAt": int(row.get("last_checked_at") or 0),
+        "error": safe_error_text(row.get("last_error") or "")[:180],
+        "latestAlertEpisode": latest_alert_episode,
+        "latestAlertAt": latest_alert_at,
+        "firstValidEpisode": first_valid_episode,
+        "firstValidConfirmedAt": first_valid_confirmed_at,
+        "firstValidPrice": safe_float(row.get("first_valid_price")) or None,
+        "firstValidReferenceHigh": safe_float(row.get("first_valid_reference_high")) or None,
+        "firstValidDistancePct": safe_float(row.get("first_valid_distance_pct")) if has_confirmed_first else None,
+        "firstValidProvider": row.get("first_valid_provider") or "",
+        "hasConfirmedFirst": has_confirmed_first,
+        "isFirstCandidate": is_first_candidate,
+        "isConfirmedEpisode": is_confirmed_episode,
+        "isLaterEpisode": is_later_episode,
+        "confirmable": is_first_candidate,
+        "signalLabel": signal_label,
+    }
+
+
+def price_watch_payload(*, sync_candidates: bool = True) -> dict[str, Any]:
+    if sync_candidates:
+        sync_price_watch_new_contract_candidates()
+        sync_price_watch_aicoin_candidates()
+    rows = filter_price_monitor_rows_by_activity(price_watch_active_rows())
+    items = [price_watch_public_item(row) for row in rows]
+    prior_high_items = [item for item in items if item.get("priorHighEnabled")]
+    near_count = sum(1 for item in prior_high_items if item.get("status") == "near")
+    oversold_count = sum(
+        1 for item in items if item.get("oversoldCandidate") or item.get("fibCandidate")
+    )
+    oversold_near_count = sum(
+        1
+        for item in items
+        if item.get("oversoldStatus") == "near"
+        or str(item.get("fibStatus") or "").startswith("near-")
+    )
+    return {
+        "ok": True,
+        "updatedAt": int(time.time() * 1000),
+        "items": items,
+        "summary": {
+            "total": len(items),
+            "auto": sum(1 for item in items if item.get("origin") == "aicoin"),
+            "opportunity": sum(1 for item in items if item.get("opportunityActive")),
+            "manual": sum(1 for item in items if item.get("manual")),
+            "personalX": sum(1 for item in items if item.get("personalXPriority")),
+            "newContract": sum(1 for item in items if item.get("newContractPriority")),
+            "near": near_count,
+            "priorHighTotal": len(prior_high_items),
+            "priorHighAuto": sum(1 for item in prior_high_items if item.get("origin") == "aicoin"),
+            "priorHighManual": sum(1 for item in prior_high_items if item.get("manual")),
+            "priorHighPersonalX": sum(1 for item in prior_high_items if item.get("personalXPriority")),
+            "priorHighNewContract": sum(1 for item in prior_high_items if item.get("newContractPriority")),
+            "priorHighExcluded": len(items) - len(prior_high_items),
+            "oversold": oversold_count,
+            "oversoldNear": oversold_near_count,
+            "limit": None,
+            "unlimited": True,
+            "thresholdPct": PRICE_WATCH_THRESHOLD_PCT,
+            "oversoldDrawdownPct": PRICE_WATCH_OVERSOLD_DRAWDOWN_PCT,
+            "oversoldThresholdPct": PRICE_WATCH_OVERSOLD_THRESHOLD_PCT,
+            "fibThresholdPct": PRICE_WATCH_FIB_THRESHOLD_PCT,
+            "fibMinImpulseGainPct": PRICE_WATCH_FIB_MIN_IMPULSE_GAIN_PCT,
+            "windowDays": 7,
+            "retentionDays": 30,
+            "inactiveExcluded": int(safe_float(PRICE_MONITOR_ACTIVITY_SUMMARY.get("excluded"), 0)),
+            "activityUnavailable": int(safe_float(PRICE_MONITOR_ACTIVITY_SUMMARY.get("unavailable"), 0)),
+            "activityThresholdUsd": safe_float(PRICE_MONITOR_ACTIVITY_SUMMARY.get("thresholdUsd"), 0),
+        },
+        "monitorActive": PRICE_WATCH_MONITOR_ACTIVE,
+    }
+
+
+def add_price_watch_symbol(value: Any, name: Any = "") -> dict[str, Any]:
+    symbol = clean_price_watch_symbol(value)
+    if not symbol:
+        raise ValueError("请输入有效币种，例如 HYPE 或 HYPEUSDT")
+    if symbol in {"USDT", "USDC", "BUSD", "FDUSD", "DAI", "TUSD", "USDE", "USDD"}:
+        raise ValueError("稳定币不加入价格监控")
+    now_ms = int(time.time() * 1000)
+    with AUTH_DB_LOCK, auth_db() as conn:
+        clean_name = clean_feed_text(name or symbol, 80)
+        conn.execute(
+            """
+            INSERT INTO price_watch_assets (
+                symbol, name, manual_pinned, status, created_at, updated_at
+            ) VALUES (?, ?, 1, 'pending', ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                name = CASE WHEN excluded.name != '' THEN excluded.name ELSE price_watch_assets.name END,
+                manual_pinned = 1,
+                dismissed_until = 0,
+                prior_high_excluded_at = 0,
+                prior_high_absent_at = 0,
+                opportunity_manual_removed_at = 0,
+                dead_at = 0,
+                dead_reason = '',
+                updated_at = excluded.updated_at
+            """,
+            (symbol, clean_name, now_ms, now_ms),
+        )
+    threading.Thread(target=sync_price_watch_monitor, kwargs={"symbols": [symbol]}, daemon=True).start()
+    return price_watch_payload(sync_candidates=False)
+
+
+def exclude_price_watch_prior_high(value: Any) -> dict[str, Any]:
+    """Hide one symbol from the prior-high/AICoin pool without touching other monitors."""
+    symbol = clean_price_watch_symbol(value)
+    if not symbol:
+        raise ValueError("币种代码无效")
+    now_ms = int(time.time() * 1000)
+    with AUTH_DB_LOCK, auth_db() as conn:
+        asset = conn.execute(
+            "SELECT symbol FROM price_watch_assets WHERE symbol = ?",
+            (symbol,),
+        ).fetchone()
+        if not asset:
+            raise ValueError("该币种已不在前高监控池中")
+        conn.execute(
+            """
+            UPDATE price_watch_assets
+            SET prior_high_excluded_at = ?,
+                prior_high_absent_at = 0,
+                updated_at = ?
+            WHERE symbol = ?
+            """,
+            (now_ms, now_ms, symbol),
+        )
+        # These two tables only belong to the prior-high signal. Oversold/Fib
+        # state and the shared quote snapshot deliberately remain intact.
+        conn.execute("DELETE FROM price_watch_alert_state WHERE symbol = ?", (symbol,))
+        conn.execute("DELETE FROM price_watch_first_confirmations WHERE symbol = ?", (symbol,))
+    payload = price_watch_payload(sync_candidates=False)
+    payload["exclusion"] = {
+        "symbol": symbol,
+        "priorHighEnabled": False,
+        "excludedAt": now_ms,
+        "restoreRule": "aicoin_leave_then_reenter",
+    }
+    payload["message"] = f"{symbol} 已从 AICoin 前高监控池剔除"
+    return payload
+
+
+def remove_price_watch_symbol(value: Any) -> dict[str, Any]:
+    symbol = clean_price_watch_symbol(value)
+    if not symbol:
+        raise ValueError("币种代码无效")
+    now_ms = int(time.time() * 1000)
+    with AUTH_DB_LOCK, auth_db() as conn:
+        row = conn.execute(
+            """
+            SELECT manual_pinned, aicoin_last_seen_at, opportunity_first_seen_at
+            FROM price_watch_assets
+            WHERE symbol = ?
+            """,
+            (symbol,),
+        ).fetchone()
+        has_opportunity_history = bool(row and int(row["opportunity_first_seen_at"] or 0) > 0)
+        has_recent_aicoin = bool(
+            row
+            and int(row["aicoin_last_seen_at"] or 0)
+            >= now_ms - PRICE_WATCH_RETENTION_SECONDS * 1000
+        )
+        if has_opportunity_history:
+            conn.execute(
+                """
+                UPDATE price_watch_assets
+                SET manual_pinned = 0,
+                    opportunity_active = 0,
+                    opportunity_manual_removed_at = ?,
+                    dismissed_until = ?,
+                    updated_at = ?
+                WHERE symbol = ?
+                """,
+                (now_ms, now_ms + PRICE_WATCH_RETENTION_SECONDS * 1000, now_ms, symbol),
+            )
+        elif has_recent_aicoin:
+            conn.execute(
+                "UPDATE price_watch_assets SET manual_pinned = 0, dismissed_until = ?, updated_at = ? WHERE symbol = ?",
+                (now_ms + PRICE_WATCH_RETENTION_SECONDS * 1000, now_ms, symbol),
+            )
+        else:
+            conn.execute("DELETE FROM price_watch_assets WHERE symbol = ?", (symbol,))
+        conn.execute("DELETE FROM price_watch_alert_state WHERE symbol = ?", (symbol,))
+        conn.execute("DELETE FROM price_watch_oversold_alert_state WHERE symbol = ?", (symbol,))
+        conn.execute("DELETE FROM price_watch_fib_alert_state WHERE symbol = ?", (symbol,))
+        conn.execute("DELETE FROM price_watch_first_confirmations WHERE symbol = ?", (symbol,))
+    return price_watch_payload(sync_candidates=False)
+
+
+def confirm_price_watch_signal(value: Any, episode_value: Any = 0) -> dict[str, Any]:
+    symbol = clean_price_watch_symbol(value)
+    if not symbol:
+        raise ValueError("币种代码无效")
+    try:
+        requested_episode = int(episode_value or 0)
+    except (TypeError, ValueError):
+        requested_episode = 0
+    now_ms = int(time.time() * 1000)
+    accepted = False
+    already_confirmed = False
+    confirmed_episode = 0
+    with AUTH_DB_LOCK, auth_db() as conn:
+        asset = conn.execute(
+            "SELECT * FROM price_watch_assets WHERE symbol = ?",
+            (symbol,),
+        ).fetchone()
+        if not asset:
+            raise ValueError("该币种已不在监控列表中")
+        state = conn.execute(
+            "SELECT episode FROM price_watch_alert_state WHERE symbol = ?",
+            (symbol,),
+        ).fetchone()
+        latest_episode = int(state["episode"] or 0) if state else 0
+        if latest_episode <= 0:
+            raise ValueError("该币种还没有可确认的预警")
+        episode = requested_episode or latest_episode
+        if episode <= 0 or episode > latest_episode:
+            raise ValueError("该预警轮次无效")
+
+        existing = conn.execute(
+            "SELECT episode FROM price_watch_first_confirmations WHERE symbol = ?",
+            (symbol,),
+        ).fetchone()
+        if existing:
+            already_confirmed = True
+            confirmed_episode = int(existing["episode"] or 0)
+        else:
+            conn.execute(
+                """
+                INSERT INTO price_watch_first_confirmations (
+                    symbol, episode, confirmed_at, current_price, reference_high,
+                    distance_pct, provider, setup_type
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    symbol,
+                    episode,
+                    now_ms,
+                    asset["current_price"],
+                    asset["week_high"],
+                    asset["distance_pct"],
+                    asset["provider"] or "",
+                    asset["setup_type"] or "",
+                ),
+            )
+            accepted = True
+            confirmed_episode = episode
+
+    payload = price_watch_payload(sync_candidates=False)
+    payload["confirmation"] = {
+        "symbol": symbol,
+        "episode": confirmed_episode,
+        "accepted": accepted,
+        "alreadyConfirmed": already_confirmed,
+        "label": "首次有效突破已确认",
+    }
+    return payload
+
+
+def price_watch_candles_from_binance(
+    symbol: str,
+    futures: bool = False,
+    *,
+    interval: str = "1h",
+    limit: int = 169,
+) -> tuple[list[tuple[int, float, float]], str]:
+    host = "https://fapi.binance.com/fapi/v1/klines" if futures else "https://api.binance.com/api/v3/klines"
+    response = requests.get(host, params={"symbol": binance_price_watch_pair(symbol), "interval": interval, "limit": limit}, headers=HEADERS, timeout=8)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list) or len(payload) < 24:
+        raise RuntimeError("no Binance candles")
+    candles = [(int(row[0]), safe_float(row[2]), safe_float(row[4])) for row in payload if isinstance(row, list) and len(row) >= 5]
+    return candles, "Binance Futures" if futures else "Binance Spot"
+
+
+def price_watch_candles_from_okx(
+    symbol: str,
+    swap: bool = False,
+    *,
+    bar: str = "1H",
+    limit: int = 169,
+) -> tuple[list[tuple[int, float, float]], str]:
+    inst_id = f"{symbol}-USDT-SWAP" if swap else f"{symbol}-USDT"
+    response = requests.get(
+        "https://www.okx.com/api/v5/market/candles",
+        params={"instId": inst_id, "bar": bar, "limit": limit},
+        headers=HEADERS,
+        timeout=8,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload.get("data") if isinstance(payload, dict) else []
+    if not isinstance(rows, list) or len(rows) < 24:
+        raise RuntimeError("no OKX candles")
+    candles = [(int(row[0]), safe_float(row[2]), safe_float(row[4])) for row in reversed(rows) if isinstance(row, list) and len(row) >= 5]
+    return candles, "OKX Swap" if swap else "OKX Spot"
+
+
+def price_watch_candles_from_bitget(symbol: str) -> tuple[list[tuple[int, float, float]], str]:
+    response = requests.get(
+        "https://api.bitget.com/api/v2/spot/market/candles",
+        params={"symbol": f"{symbol}USDT", "granularity": "1h", "limit": 169},
+        headers=HEADERS,
+        timeout=8,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload.get("data") if isinstance(payload, dict) else []
+    if not isinstance(rows, list) or len(rows) < 24:
+        raise RuntimeError("no Bitget candles")
+    candles = [(int(row[0]), safe_float(row[2]), safe_float(row[4])) for row in rows if isinstance(row, list) and len(row) >= 5]
+    candles.sort(key=lambda item: item[0])
+    return candles, "Bitget Spot"
+
+
+def price_watch_candles_from_bitget_futures(
+    symbol: str,
+    *,
+    granularity: str = "1H",
+    limit: int = 169,
+) -> tuple[list[tuple[int, float, float]], str]:
+    response = requests.get(
+        "https://api.bitget.com/api/v2/mix/market/candles",
+        params={
+            "symbol": f"{symbol}USDT",
+            "productType": "USDT-FUTURES",
+            "granularity": granularity,
+            "limit": limit,
+        },
+        headers=HEADERS,
+        timeout=8,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload.get("data") if isinstance(payload, dict) else []
+    if not isinstance(rows, list) or len(rows) < 24:
+        raise RuntimeError("no Bitget futures candles")
+    candles = [(int(row[0]), safe_float(row[2]), safe_float(row[4])) for row in rows if isinstance(row, list) and len(row) >= 5]
+    candles.sort(key=lambda item: item[0])
+    return candles, "Bitget Futures"
+
+
+def price_structure_candles_from_binance(
+    symbol: str, interval: str, *, limit: int = 140, min_rows: int = 30, timeout: float = 8
+) -> tuple[list[tuple[int, float, float, float, float, float]], str]:
+    response = requests.get(
+        "https://fapi.binance.com/fapi/v1/klines",
+        params={"symbol": binance_price_watch_pair(symbol), "interval": interval, "limit": limit},
+        headers=HEADERS,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    rows = response.json()
+    if not isinstance(rows, list) or len(rows) < max(2, min_rows):
+        raise RuntimeError("no Binance structure candles")
+    candles = [
+        (
+            int(row[0]),
+            safe_float(row[1]),
+            safe_float(row[2]),
+            safe_float(row[3]),
+            safe_float(row[4]),
+            safe_float(row[5]),
+        )
+        for row in rows
+        if isinstance(row, list) and len(row) >= 6
+    ]
+    return candles, "Binance Futures"
+
+
+def price_structure_candles_from_okx(
+    symbol: str, bar: str, *, limit: int = 140, min_rows: int = 30, timeout: float = 8
+) -> tuple[list[tuple[int, float, float, float, float, float]], str]:
+    response = requests.get(
+        "https://www.okx.com/api/v5/market/candles",
+        params={"instId": f"{symbol}-USDT-SWAP", "bar": bar, "limit": limit},
+        headers=HEADERS,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload.get("data") if isinstance(payload, dict) else []
+    if not isinstance(rows, list) or len(rows) < max(2, min_rows):
+        raise RuntimeError("no OKX structure candles")
+    candles = [
+        (
+            int(row[0]),
+            safe_float(row[1]),
+            safe_float(row[2]),
+            safe_float(row[3]),
+            safe_float(row[4]),
+            safe_float(row[5]),
+        )
+        for row in reversed(rows)
+        if isinstance(row, list) and len(row) >= 6
+    ]
+    return candles, "OKX Swap"
+
+
+def price_structure_candles_from_bitget(
+    symbol: str, granularity: str, *, limit: int = 140, min_rows: int = 30, timeout: float = 8
+) -> tuple[list[tuple[int, float, float, float, float, float]], str]:
+    response = requests.get(
+        "https://api.bitget.com/api/v2/mix/market/candles",
+        params={
+            "symbol": f"{symbol}USDT",
+            "productType": "USDT-FUTURES",
+            "granularity": granularity,
+            "limit": limit,
+        },
+        headers=HEADERS,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload.get("data") if isinstance(payload, dict) else []
+    if not isinstance(rows, list) or len(rows) < max(2, min_rows):
+        raise RuntimeError("no Bitget structure candles")
+    candles = [
+        (
+            int(row[0]),
+            safe_float(row[1]),
+            safe_float(row[2]),
+            safe_float(row[3]),
+            safe_float(row[4]),
+            safe_float(row[5]),
+        )
+        for row in rows
+        if isinstance(row, list) and len(row) >= 6
+    ]
+    candles.sort(key=lambda item: item[0])
+    return candles, "Bitget Futures"
+
+
+def price_structure_candles_from_gate(
+    symbol: str, interval: str, *, limit: int = 140, min_rows: int = 30, timeout: float = 8
+) -> tuple[list[tuple[int, float, float, float, float, float]], str]:
+    response = requests.get(
+        "https://api.gateio.ws/api/v4/futures/usdt/candlesticks",
+        params={"contract": f"{symbol}_USDT", "interval": interval, "limit": min(2000, limit)},
+        headers=HEADERS,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    rows = response.json()
+    if not isinstance(rows, list) or len(rows) < max(2, min_rows):
+        raise RuntimeError("no Gate futures structure candles")
+    candles = [
+        (
+            int(safe_float(row.get("t"), 0) * 1000),
+            safe_float(row.get("o")),
+            safe_float(row.get("h")),
+            safe_float(row.get("l")),
+            safe_float(row.get("c")),
+            safe_float(row.get("v")),
+        )
+        for row in rows
+        if isinstance(row, dict)
+    ]
+    candles.sort(key=lambda item: item[0])
+    return candles, "Gate Futures"
+
+
+def price_structure_candles_from_kucoin(
+    symbol: str, interval: str, *, limit: int = 140, min_rows: int = 30, timeout: float = 8
+) -> tuple[list[tuple[int, float, float, float, float, float]], str]:
+    interval_type = {
+        "1m": "1min",
+        "5m": "5min",
+        "15m": "15min",
+        "1h": "1hour",
+        "4h": "4hour",
+        "1d": "1day",
+    }.get(str(interval or "").strip().lower())
+    if not interval_type:
+        raise RuntimeError("unsupported KuCoin spot candle interval")
+    response = requests.get(
+        "https://api.kucoin.com/api/v1/market/candles",
+        params={"symbol": f"{symbol}-USDT", "type": interval_type},
+        headers=HEADERS,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload.get("data") if isinstance(payload, dict) and str(payload.get("code") or "") == "200000" else []
+    if not isinstance(rows, list) or len(rows) < max(2, min_rows):
+        raise RuntimeError("no KuCoin spot structure candles")
+    candles = [
+        (
+            int(safe_float(row[0], 0) * 1000),
+            safe_float(row[1]),
+            safe_float(row[3]),
+            safe_float(row[4]),
+            safe_float(row[2]),
+            safe_float(row[5]),
+        )
+        for row in rows[:max(2, limit)]
+        if isinstance(row, list) and len(row) >= 6
+    ]
+    candles.sort(key=lambda item: item[0])
+    return candles, "KuCoin Spot"
+
+
+def price_structure_candles_from_htx(
+    symbol: str, period: str, *, limit: int = 140, min_rows: int = 30, timeout: float = 8
+) -> tuple[list[tuple[int, float, float, float, float, float]], str]:
+    response = requests.get(
+        "https://api.hbdm.com/linear-swap-ex/market/history/kline",
+        params={"contract_code": f"{symbol}-USDT", "period": period, "size": min(2000, limit)},
+        headers=HEADERS,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload.get("data") if isinstance(payload, dict) else []
+    if not isinstance(rows, list) or len(rows) < max(2, min_rows):
+        raise RuntimeError("no HTX futures structure candles")
+    candles = [
+        (
+            int(safe_float(row.get("id"), 0) * 1000),
+            safe_float(row.get("open")),
+            safe_float(row.get("high")),
+            safe_float(row.get("low")),
+            safe_float(row.get("close")),
+            safe_float(row.get("amount") or row.get("vol")),
+        )
+        for row in rows
+        if isinstance(row, dict)
+    ]
+    candles.sort(key=lambda item: item[0])
+    return candles, "HTX Futures"
+
+
+def price_structure_candles_from_aster(
+    symbol: str, interval: str, *, limit: int = 140, min_rows: int = 30, timeout: float = 8
+) -> tuple[list[tuple[int, float, float, float, float, float]], str]:
+    response = requests.get(
+        "https://fapi.asterdex.com/fapi/v1/klines",
+        params={"symbol": f"{symbol}USDT", "interval": interval, "limit": min(1500, limit)},
+        headers={**HEADERS, "Referer": ASTER_TRADE_URL},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    rows = response.json()
+    if not isinstance(rows, list) or len(rows) < max(2, min_rows):
+        raise RuntimeError("no Aster structure candles")
+    candles = [
+        (
+            int(row[0]),
+            safe_float(row[1]),
+            safe_float(row[2]),
+            safe_float(row[3]),
+            safe_float(row[4]),
+            safe_float(row[5]),
+        )
+        for row in rows
+        if isinstance(row, list) and len(row) >= 6
+    ]
+    candles.sort(key=lambda item: item[0])
+    return candles, "Aster Futures"
+
+
+def price_structure_interval_ms(interval: str) -> int:
+    return {
+        "1m": 60_000,
+        "5m": 5 * 60_000,
+        "15m": 15 * 60_000,
+        "1h": 60 * 60_000,
+        "4h": 4 * 60 * 60_000,
+        "1d": 24 * 60 * 60_000,
+    }.get(str(interval or "").lower(), 60_000)
+
+
+def price_structure_candles_from_hyperliquid(
+    symbol: str,
+    interval: str,
+    *,
+    limit: int = 140,
+    min_rows: int = 30,
+    dex_prefix: str = "",
+    timeout: float = 8,
+) -> tuple[list[tuple[int, float, float, float, float, float]], str]:
+    now_ms = int(time.time() * 1000)
+    coin = f"{dex_prefix}:{symbol}" if dex_prefix else symbol
+    response = requests.post(
+        "https://api.hyperliquid.xyz/info",
+        json={
+            "type": "candleSnapshot",
+            "req": {
+                "coin": coin,
+                "interval": interval,
+                "startTime": now_ms - price_structure_interval_ms(interval) * (max(2, limit) + 2),
+                "endTime": now_ms,
+            },
+        },
+        headers={**HEADERS, "Content-Type": "application/json"},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    rows = response.json()
+    if not isinstance(rows, list) or len(rows) < max(2, min_rows):
+        raise RuntimeError(f"no Hyperliquid {coin} structure candles")
+    candles = [
+        (
+            int(safe_float(row.get("t"), 0)),
+            safe_float(row.get("o")),
+            safe_float(row.get("h")),
+            safe_float(row.get("l")),
+            safe_float(row.get("c")),
+            safe_float(row.get("v")),
+        )
+        for row in rows
+        if isinstance(row, dict)
+    ]
+    candles.sort(key=lambda item: item[0])
+    return candles, "Trade.xyz" if dex_prefix == "xyz" else "Hyperliquid"
+
+
+BINANCE_WALLET_KLINE_CHAINS = {
+    "1": ("1", "ethereum"),
+    "ethereum": ("1", "ethereum"),
+    "eth": ("1", "ethereum"),
+    "56": ("56", "bsc"),
+    "bsc": ("56", "bsc"),
+    "bnb": ("56", "bsc"),
+    "8453": ("8453", "base"),
+    "base": ("8453", "base"),
+    "ct_501": ("CT_501", "solana"),
+    "solana": ("CT_501", "solana"),
+    "sol": ("CT_501", "solana"),
+}
+BINANCE_WALLET_DQUERY_INTERVALS = {
+    "1m": "1min",
+    "5m": "5min",
+    "15m": "15min",
+    "1h": "1h",
+    "4h": "4h",
+    "1d": "1d",
+}
+
+
+def price_structure_candles_from_binance_wallet(
+    contract_address: Any,
+    chain: Any,
+    interval: str,
+    *,
+    limit: int = 300,
+    min_rows: int = 2,
+    timeout: float = 8,
+) -> tuple[list[tuple[int, float, float, float, float, float]], str]:
+    """Fetch contract-first OHLCV from Binance Wallet, with its chart backend as fallback."""
+    contract = clean_feed_text(contract_address, 180)
+    chain_meta = BINANCE_WALLET_KLINE_CHAINS.get(str(chain or "").strip().lower())
+    interval_key = clean_feed_text(interval, 12).lower()
+    if not contract or not chain_meta or interval_key not in BINANCE_WALLET_DQUERY_INTERVALS:
+        raise RuntimeError("unsupported Binance Wallet onchain kline identity")
+    chain_id, platform = chain_meta
+    request_limit = max(2, min(300, int(limit or 300)))
+    headers = {
+        **HEADERS,
+        "Accept": "application/json",
+        "Accept-Encoding": "identity",
+        "User-Agent": "binance-web3/1.1 (Xingyun Market Dashboard)",
+    }
+    errors: list[str] = []
+
+    try:
+        response = requests.get(
+            "https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/dex/market/token/kline/ai",
+            params={
+                "chainId": chain_id,
+                "contractAddress": contract,
+                "interval": interval_key,
+                "limit": request_limit,
+            },
+            headers=headers,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else {}
+        rows = data.get("klineInfos") if isinstance(data.get("klineInfos"), list) else []
+        candles = [
+            (
+                int(safe_float(row[0], 0)),
+                safe_float(row[1]),
+                safe_float(row[2]),
+                safe_float(row[3]),
+                safe_float(row[4]),
+                safe_float(row[5]),
+            )
+            for row in rows
+            if isinstance(row, list)
+            and len(row) >= 6
+            and int(safe_float(row[0], 0)) > 0
+            and safe_float(row[1], 0) > 0
+            and safe_float(row[2], 0) > 0
+            and safe_float(row[3], 0) > 0
+            and safe_float(row[4], 0) > 0
+        ]
+        candles.sort(key=lambda item: item[0])
+        if len(candles) >= max(2, min_rows):
+            return candles[-request_limit:], "Binance Wallet K线"
+        errors.append("Binance Wallet kline rows insufficient")
+    except Exception as exc:
+        errors.append(safe_error_text(str(exc)))
+
+    try:
+        response = requests.get(
+            "https://dquery.sintral.io/u-kline/v1/k-line/candles",
+            params={
+                "address": contract,
+                "platform": platform,
+                "interval": BINANCE_WALLET_DQUERY_INTERVALS[interval_key],
+                "limit": request_limit,
+                "pm": "p",
+            },
+            headers=headers,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        rows = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), list) else []
+        candles = [
+            (
+                int(safe_float(row[5], 0)),
+                safe_float(row[0]),
+                safe_float(row[1]),
+                safe_float(row[2]),
+                safe_float(row[3]),
+                safe_float(row[4]),
+            )
+            for row in rows
+            if isinstance(row, list)
+            and len(row) >= 6
+            and int(safe_float(row[5], 0)) > 0
+            and safe_float(row[0], 0) > 0
+            and safe_float(row[1], 0) > 0
+            and safe_float(row[2], 0) > 0
+            and safe_float(row[3], 0) > 0
+        ]
+        candles.sort(key=lambda item: item[0])
+        if len(candles) >= max(2, min_rows):
+            return candles[-request_limit:], "Binance Wallet K线"
+        errors.append("Binance Wallet chart rows insufficient")
+    except Exception as exc:
+        errors.append(safe_error_text(str(exc)))
+    raise RuntimeError("; ".join(errors[-2:]) or "no Binance Wallet onchain candles")
+
+
+def price_structure_geckoterminal_network(value: Any) -> str:
+    return {
+        "1": "eth",
+        "56": "bsc",
+        "8453": "base",
+        "ct_501": "solana",
+        "ethereum": "eth",
+        "eth": "eth",
+        "bsc": "bsc",
+        "bnb": "bsc",
+        "solana": "solana",
+        "base": "base",
+        "arbitrum": "arbitrum",
+        "optimism": "optimism",
+        "polygon": "polygon_pos",
+        "polygon_pos": "polygon_pos",
+        "avalanche": "avax",
+        "sui": "sui-network",
+        "aptos": "aptos",
+    }.get(str(value or "").strip().lower(), str(value or "").strip().lower())
+
+
+def price_structure_onchain_pool(
+    symbol: str,
+    *,
+    contract_address: Any = "",
+    chain: Any = "",
+    timeout: float = 8,
+) -> dict[str, Any]:
+    symbol_key = price_structure_monitor_symbol(symbol)
+    contract_filter = clean_feed_text(contract_address, 180)
+    contract_identity = contract_filter.casefold()
+    requested_network = price_structure_geckoterminal_network(chain)
+    cache_identity = contract_identity or symbol_key.casefold()
+    cache_key = f"{requested_network}:{cache_identity}" if requested_network else cache_identity
+    now = time.time()
+    with PRICE_STRUCTURE_ONCHAIN_POOL_CACHE_LOCK:
+        cached_pool = PRICE_STRUCTURE_ONCHAIN_POOL_CACHE.get(cache_key)
+    if cached_pool and now - cached_pool[0] < PRICE_STRUCTURE_ONCHAIN_POOL_CACHE_TTL_SECONDS:
+        return dict(cached_pool[1])
+
+    candidates: list[dict[str, Any]] = []
+    try:
+        for chain in CHAIN_ECOSYSTEM_MONITOR.store.list_chains():
+            network = price_structure_geckoterminal_network(chain.get("geckoterminalNetwork"))
+            if not network:
+                continue
+            for asset in CHAIN_ECOSYSTEM_MONITOR.store.list_assets(int(chain.get("id") or 0)):
+                asset_contract = str(asset.get("contractAddress") or "").strip().casefold()
+                if (
+                    not asset.get("poolAddress")
+                    or (contract_filter and asset_contract != contract_identity)
+                    or (not contract_filter and price_structure_monitor_symbol(asset.get("symbol")) != symbol_key)
+                ):
+                    continue
+                candidates.append({
+                    "network": network,
+                    "poolAddress": str(asset.get("poolAddress") or "").strip(),
+                    "contractAddress": str(asset.get("contractAddress") or "").strip(),
+                    "liquidityUsd": 0.0,
+                    "volume24hUsd": 0.0,
+                    "source": "公链生态池",
+                })
+    except Exception:
+        pass
+
+    # DexScreener is also queried when the ecosystem store already knows a pool:
+    # the store supplies identity, while the live response supplies liquidity and
+    # aggregate 24h turnover needed by the shared USD 10m activity gate.
+    try:
+        response = requests.get(
+            (
+                f"https://api.dexscreener.com/latest/dex/tokens/{quote(contract_filter, safe='')}"
+                if contract_filter
+                else "https://api.dexscreener.com/latest/dex/search"
+            ),
+            params={} if contract_filter else {"q": symbol_key},
+            headers={**HEADERS, "Accept": "application/json"},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        pairs = payload.get("pairs") if isinstance(payload, dict) and isinstance(payload.get("pairs"), list) else []
+        for pair in pairs:
+            if not isinstance(pair, dict):
+                continue
+            base = pair.get("baseToken") if isinstance(pair.get("baseToken"), dict) else {}
+            base_contract = str(base.get("address") or "").strip().casefold()
+            if (
+                (contract_filter and base_contract != contract_identity)
+                or (not contract_filter and price_structure_monitor_symbol(base.get("symbol")) != symbol_key)
+            ):
+                continue
+            network = price_structure_geckoterminal_network(pair.get("chainId"))
+            if requested_network and network != requested_network:
+                continue
+            pool_address = str(pair.get("pairAddress") or "").strip()
+            if not network or not pool_address:
+                continue
+            candidates.append({
+                "network": network,
+                "poolAddress": pool_address,
+                "contractAddress": str(base.get("address") or "").strip(),
+                "liquidityUsd": safe_float((pair.get("liquidity") or {}).get("usd"), 0),
+                "volume24hUsd": safe_float((pair.get("volume") or {}).get("h24"), 0),
+                "source": "DexScreener 链上主池",
+            })
+    except Exception:
+        pass
+
+    groups: dict[str, dict[str, Any]] = {}
+    seen_pools: set[str] = set()
+    for candidate in candidates:
+        pool_key = f"{candidate.get('network')}:{str(candidate.get('poolAddress') or '').lower()}"
+        if pool_key in seen_pools:
+            continue
+        seen_pools.add(pool_key)
+        contract_key = str(candidate.get("contractAddress") or "").strip().lower() or pool_key
+        group = groups.setdefault(contract_key, {
+            "liquidityUsd": 0.0,
+            "volume24hUsd": 0.0,
+            "pools": [],
+        })
+        group["liquidityUsd"] += max(0.0, safe_float(candidate.get("liquidityUsd"), 0))
+        group["volume24hUsd"] += max(0.0, safe_float(candidate.get("volume24hUsd"), 0))
+        group["pools"].append(candidate)
+    selected_group = max(
+        groups.values(),
+        key=lambda item: (safe_float(item.get("liquidityUsd"), 0), safe_float(item.get("volume24hUsd"), 0)),
+        default={},
+    )
+    selected = max(
+        selected_group.get("pools") or [],
+        key=lambda item: safe_float(item.get("liquidityUsd"), 0),
+        default={},
+    )
+    if selected:
+        selected = {
+            **selected,
+            "aggregateLiquidityUsd": round(safe_float(selected_group.get("liquidityUsd"), 0), 2),
+            "volume24hUsd": round(safe_float(selected_group.get("volume24hUsd"), 0), 2),
+            "poolCount": len(selected_group.get("pools") or []),
+        }
+    with PRICE_STRUCTURE_ONCHAIN_POOL_CACHE_LOCK:
+        PRICE_STRUCTURE_ONCHAIN_POOL_CACHE[cache_key] = (time.time(), dict(selected))
+    return dict(selected)
+
+
+def price_structure_resample_candles(
+    candles: list[tuple[int, float, float, float, float, float]],
+    target_ms: int,
+) -> list[tuple[int, float, float, float, float, float]]:
+    buckets: dict[int, list[tuple[int, float, float, float, float, float]]] = {}
+    for candle in candles:
+        buckets.setdefault((int(candle[0]) // target_ms) * target_ms, []).append(candle)
+    result: list[tuple[int, float, float, float, float, float]] = []
+    for bucket, rows in sorted(buckets.items()):
+        rows.sort(key=lambda item: item[0])
+        result.append((
+            bucket,
+            rows[0][1],
+            max(row[2] for row in rows),
+            min(row[3] for row in rows),
+            rows[-1][4],
+            sum(max(0.0, row[5]) for row in rows),
+        ))
+    return result
+
+
+def price_structure_geckoterminal_base_candles(
+    pool: dict[str, Any], timeframe: str, *, timeout: float = 10
+) -> list[tuple[int, float, float, float, float, float]]:
+    network = str(pool.get("network") or "").strip()
+    pool_address = str(pool.get("poolAddress") or "").strip()
+    cache_key = f"{network}:{pool_address.lower()}:{timeframe}"
+    now = time.time()
+    with PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE_LOCK:
+        cached = PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE.get(cache_key)
+    if cached and now - cached[0] < PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE_TTL_SECONDS:
+        return list(cached[1])
+
+    # Never hold the global candle-cache lock while waiting on the network.
+    # One slow pool used to serialize every other symbol behind it and leave
+    # the whole structure page showing stale provider errors for minutes.
+    response = requests.get(
+        f"https://api.geckoterminal.com/api/v2/networks/{network}/pools/{pool_address}/ohlcv/{timeframe}",
+        params={"aggregate": 1, "limit": 300, "currency": "usd", "token": "base"},
+        headers={**HEADERS, "Accept": "application/json"},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    attributes = ((payload.get("data") or {}).get("attributes") or {}) if isinstance(payload, dict) else {}
+    rows = attributes.get("ohlcv_list") if isinstance(attributes.get("ohlcv_list"), list) else []
+    candles = [
+        (
+            int(safe_float(row[0], 0) * 1000),
+            safe_float(row[1]),
+            safe_float(row[2]),
+            safe_float(row[3]),
+            safe_float(row[4]),
+            safe_float(row[5]),
+        )
+        for row in rows
+        if isinstance(row, list) and len(row) >= 6
+    ]
+    candles.sort(key=lambda item: item[0])
+    with PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE_LOCK:
+        PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE[cache_key] = (time.time(), candles)
+    return list(candles)
+
+
+def price_structure_candles_from_geckoterminal(
+    symbol: str,
+    interval: str,
+    *,
+    contract_address: Any = "",
+    chain: Any = "",
+    limit: int = 140,
+    min_rows: int = 2,
+    timeout: float = 8,
+) -> tuple[list[tuple[int, float, float, float, float, float]], str]:
+    pool = price_structure_onchain_pool(
+        symbol,
+        contract_address=contract_address,
+        chain=chain,
+        timeout=timeout,
+    )
+    if not pool:
+        raise RuntimeError("no onchain pool resolved")
+    interval_key = str(interval or "").lower()
+    base_timeframe = "minute" if interval_key in {"1m", "5m", "15m"} else "hour"
+    candles = price_structure_geckoterminal_base_candles(pool, base_timeframe, timeout=timeout)
+    if interval_key != ("1m" if base_timeframe == "minute" else "1h"):
+        candles = price_structure_resample_candles(candles, price_structure_interval_ms(interval_key))
+    candles = candles[-max(2, limit):]
+    if len(candles) < max(2, min_rows):
+        raise RuntimeError("insufficient GeckoTerminal structure candles")
+    network = clean_feed_text(pool.get("network"), 24)
+    return candles, f"链上 K线 · {network}"
+
+
+def dragon_wave_monitor_node_binary() -> str:
+    configured = str(os.getenv("DRAGON_WAVE_NODE_BINARY") or "").strip()
+    if configured and Path(configured).exists():
+        return configured
+    discovered = shutil.which("node")
+    if discovered:
+        return discovered
+    raise RuntimeError("龙头策略监控需要 Node.js 运行环境")
+
+
+def run_dragon_wave_monitor_strategy(
+    timeframes: dict[str, list[tuple[int, float, float, float, float, float]]],
+    *,
+    now_ms: int | None = None,
+    adaptive_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run the exact shared strategy engine; never maintain a second monitor-only ruleset."""
+    if not DRAGON_WAVE_MONITOR_BRIDGE.exists():
+        raise RuntimeError("龙头策略监控桥接文件不存在")
+    payload = {
+        "now": int(now_ms or time.time() * 1000),
+        "preselectedLeader": True,
+        "strategyVersion": PRICE_STRUCTURE_STRATEGY_VERSION,
+        "timeframes": timeframes,
+    }
+    if isinstance(adaptive_context, dict) and adaptive_context.get("mainWaveStage") in {"active", "expected"}:
+        payload.update({
+            "mainWaveStage": adaptive_context["mainWaveStage"],
+            "mainWaveContextSource": f"live-{adaptive_context.get('sourceKind') or 'analysis'}",
+            "mainWaveContextLabel": f"临盘{adaptive_context.get('label') or '应变判断'}",
+            "adaptiveContext": adaptive_context,
+        })
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    completed = subprocess.run(
+        [dragon_wave_monitor_node_binary(), str(DRAGON_WAVE_MONITOR_BRIDGE)],
+        input=json.dumps(payload, ensure_ascii=False),
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=str(ROOT),
+        timeout=30,
+        creationflags=creationflags,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = safe_error_text(completed.stderr or completed.stdout or "策略引擎执行失败")[:260]
+        raise RuntimeError(detail)
+    try:
+        result = json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("龙头策略引擎返回了无效结果") from exc
+    if not isinstance(result, dict) or result.get("ok") is False:
+        raise RuntimeError(safe_error_text(str(result.get("error") or "龙头策略分析失败")))
+    return result
+
+
+def price_structure_excluded_symbols() -> set[str]:
+    with AUTH_DB_LOCK, auth_db() as conn:
+        rows = conn.execute("SELECT symbol FROM price_structure_exclusions").fetchall()
+    return {clean_price_watch_symbol(row["symbol"]) for row in rows if row["symbol"]}
+
+
+def price_structure_symbol_excluded(value: Any) -> bool:
+    symbol = clean_price_watch_symbol(value)
+    if not symbol:
+        return False
+    with AUTH_DB_LOCK, auth_db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM price_structure_exclusions WHERE symbol = ?",
+            (symbol,),
+        ).fetchone()
+    return bool(row)
+
+
+def reconcile_price_structure_exclusions(current_symbols: set[str], *, source_is_current: bool) -> set[str]:
+    """Restore a manual exclusion only after the symbol actually leaves and re-enters AICoin."""
+    normalized = {clean_price_watch_symbol(symbol) for symbol in current_symbols}
+    normalized.discard("")
+    now_ms = int(time.time() * 1000)
+    with AUTH_DB_LOCK, auth_db() as conn:
+        if source_is_current and normalized:
+            placeholders = ",".join("?" for _ in normalized)
+            conn.execute(
+                f"""
+                DELETE FROM price_structure_exclusions
+                WHERE absent_at > 0
+                  AND symbol IN ({placeholders})
+                """,
+                tuple(sorted(normalized)),
+            )
+            conn.execute(
+                f"""
+                UPDATE price_structure_exclusions
+                SET absent_at = CASE WHEN absent_at > 0 THEN absent_at ELSE ? END,
+                    updated_at = ?
+                WHERE symbol NOT IN ({placeholders})
+                """,
+                (now_ms, now_ms, *sorted(normalized)),
+            )
+        rows = conn.execute("SELECT symbol FROM price_structure_exclusions").fetchall()
+    return {clean_price_watch_symbol(row["symbol"]) for row in rows if row["symbol"]}
+
+
+def exclude_price_structure_symbol(value: Any) -> dict[str, Any]:
+    symbol = clean_price_watch_symbol(value)
+    if not symbol:
+        raise ValueError("币种代码无效")
+    now_ms = int(time.time() * 1000)
+    with AUTH_DB_LOCK, auth_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO price_structure_exclusions (symbol, excluded_at, absent_at, updated_at)
+            VALUES (?, ?, 0, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                excluded_at = excluded.excluded_at,
+                absent_at = 0,
+                updated_at = excluded.updated_at
+            """,
+            (symbol, now_ms, now_ms),
+        )
+    with PRICE_STRUCTURE_CACHE_LOCK:
+        PRICE_STRUCTURE_CACHE.clear()
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "excludedAt": now_ms,
+        "structureEnabled": False,
+        "restoreRule": "aicoin_leave_then_reenter",
+        "message": f"{symbol} 已从多周期结构监控剔除",
+    }
+
+
+def price_structure_1m_override_for_symbol(value: Any) -> int:
+    symbol = clean_price_watch_symbol(value)
+    if not symbol:
+        return -1
+    with AUTH_DB_LOCK, auth_db() as conn:
+        row = conn.execute(
+            "SELECT structure_1m_override FROM price_watch_assets WHERE symbol = ?",
+            (symbol,),
+        ).fetchone()
+    return int(row["structure_1m_override"] if row and row["structure_1m_override"] is not None else -1)
+
+
+def normalize_price_structure_interval(value: Any) -> str:
+    interval = clean_feed_text(value, 10).lower()
+    if interval not in PRICE_STRUCTURE_INTERVAL_LABELS:
+        raise ValueError("结构监控周期无效")
+    return interval
+
+
+def parse_price_structure_interval_overrides(value: Any) -> dict[str, int]:
+    payload: Any = value
+    if isinstance(value, str):
+        try:
+            payload = json.loads(value or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+    if not isinstance(payload, dict):
+        return {}
+    result: dict[str, int] = {}
+    for key, raw_override in payload.items():
+        interval = clean_feed_text(key, 10).lower()
+        if interval == "1m" or interval not in PRICE_STRUCTURE_INTERVAL_LABELS:
+            continue
+        try:
+            override = int(raw_override)
+        except (TypeError, ValueError):
+            continue
+        if override in {0, 1}:
+            result[interval] = override
+    return result
+
+
+def price_structure_interval_overrides_for_symbol(value: Any) -> dict[str, int]:
+    symbol = clean_price_watch_symbol(value)
+    overrides = {interval: -1 for interval in PRICE_STRUCTURE_INTERVAL_LABELS}
+    if not symbol:
+        return overrides
+    with AUTH_DB_LOCK, auth_db() as conn:
+        row = conn.execute(
+            """
+            SELECT structure_1m_override, structure_interval_overrides_json
+            FROM price_watch_assets
+            WHERE symbol = ?
+            """,
+            (symbol,),
+        ).fetchone()
+    if not row:
+        return overrides
+    overrides.update(parse_price_structure_interval_overrides(row["structure_interval_overrides_json"]))
+    overrides["1m"] = int(row["structure_1m_override"] if row["structure_1m_override"] is not None else -1)
+    return overrides
+
+
+def price_structure_priority_context(row: dict[str, Any], *, now_ms: int | None = None) -> dict[str, Any] | None:
+    symbol = clean_price_watch_symbol(row.get("symbol"))
+    now_value = int(now_ms or time.time() * 1000)
+    adaptive_context = strategy_adaptive_context_for_symbol(symbol)
+    # Exchange listings and WeChat are context/data feeds, not membership
+    # sources for the main multi-timeframe structure pool.  Only a personal-X
+    # signal may alter the priority/1m behaviour of an eligible AiCoin/X asset.
+    if adaptive_context and str(adaptive_context.get("sourceKind") or "") == "personal-x":
+        return adaptive_context
+    personal_x_mentioned_at = int(row.get("personal_x_mentioned_at") or row.get("personalXMentionedAt") or 0)
+    if personal_x_mentioned_at > 0:
+        return {
+            "symbol": symbol,
+            "mode": "mentioned",
+            "label": "个人 X 提及",
+            "mainWaveStage": "",
+            "sourceKind": "personal-x",
+            "sourceName": row.get("personal_x_source_name") or row.get("personalXSourceName") or "",
+            "sourceText": row.get("personal_x_source_text") or row.get("personalXSourceText") or "",
+            "observedAt": personal_x_mentioned_at,
+            "expiresAt": personal_x_mentioned_at + PERSONAL_X_MONITOR_RETENTION_SECONDS * 1000,
+        }
+    return None
+
+
+def price_structure_1m_state(item: dict[str, Any], *, now_ms: int | None = None) -> dict[str, Any]:
+    now_value = int(now_ms or time.time() * 1000)
+    raw_override = item.get("structure1mOverride", item.get("structure_1m_override", -1))
+    try:
+        override = int(raw_override)
+    except (TypeError, ValueError):
+        override = -1
+    if override == 1:
+        return {"enabled": True, "override": 1, "mode": "manual-on", "label": "手动开启"}
+    if override == 0:
+        return {"enabled": False, "override": 0, "mode": "manual-off", "label": "手动关闭"}
+    adaptive_context = item.get("adaptiveContext") if isinstance(item.get("adaptiveContext"), dict) else {}
+    source_kind = str(adaptive_context.get("sourceKind") or "")
+    signal_type = str(adaptive_context.get("signalType") or "")
+    if not signal_type and adaptive_context.get("mode") == "expected":
+        signal_type = "main-wave-expected"
+    signal_expires_at = int(safe_float(
+        adaptive_context.get("signalExpiresAt")
+        or adaptive_context.get("newContract1mExpiresAt")
+        or adaptive_context.get("expiresAt"),
+        0,
+    ))
+    personal_focus = bool(
+        source_kind == "personal-x"
+        and signal_type in {"watch", "main-wave-expected"}
+        and signal_expires_at > now_value
+    )
+    if personal_focus:
+        return {"enabled": True, "override": -1, "mode": "auto-focus", "label": "重点关注自动开启"}
+    return {"enabled": False, "override": -1, "mode": "auto-off", "label": "按原规则关闭"}
+
+
+def price_structure_interval_states(
+    item: dict[str, Any],
+    *,
+    now_ms: int | None = None,
+) -> dict[str, dict[str, Any]]:
+    overrides = {interval: -1 for interval in PRICE_STRUCTURE_INTERVAL_LABELS}
+    raw_overrides = item.get(
+        "structureIntervalOverrides",
+        item.get("structure_interval_overrides_json", {}),
+    )
+    overrides.update(parse_price_structure_interval_overrides(raw_overrides))
+    raw_one_minute = item.get("structure1mOverride", item.get("structure_1m_override", -1))
+    try:
+        overrides["1m"] = int(raw_one_minute)
+    except (TypeError, ValueError):
+        overrides["1m"] = -1
+    states: dict[str, dict[str, Any]] = {}
+    for interval, label in PRICE_STRUCTURE_INTERVAL_LABELS.items():
+        if interval == "1m":
+            state = price_structure_1m_state({
+                **item,
+                "structure1mOverride": overrides["1m"],
+            }, now_ms=now_ms)
+        elif overrides[interval] == 0:
+            state = {"enabled": False, "override": 0, "mode": "manual-off", "label": "手动关闭"}
+        elif overrides[interval] == 1:
+            state = {"enabled": True, "override": 1, "mode": "manual-on", "label": "手动开启"}
+        else:
+            state = {"enabled": True, "override": -1, "mode": "default-on", "label": "默认开启"}
+        states[interval] = {"interval": interval, "intervalLabel": label, **state}
+    return states
+
+
+def set_price_structure_1m_override(value: Any, enabled: Any) -> dict[str, Any]:
+    symbol = clean_price_watch_symbol(value)
+    if not symbol:
+        raise ValueError("币种代码无效")
+    enabled_value = bool(enabled)
+    now_ms = int(time.time() * 1000)
+    with AUTH_DB_LOCK, auth_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO price_watch_assets (
+                symbol, name, manual_pinned, structure_1m_override,
+                status, created_at, updated_at
+            ) VALUES (?, ?, 0, ?, 'pending', ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                structure_1m_override = excluded.structure_1m_override,
+                updated_at = excluded.updated_at
+            """,
+            (symbol, symbol, 1 if enabled_value else 0, now_ms, now_ms),
+        )
+    with PRICE_STRUCTURE_CACHE_LOCK:
+        PRICE_STRUCTURE_CACHE.clear()
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "structure1mOverride": 1 if enabled_value else 0,
+        "structure1mEnabled": enabled_value,
+        "message": f"{symbol} 1分钟结构播报已{'开启' if enabled_value else '关闭'}",
+    }
+
+
+def set_price_structure_interval_override(value: Any, interval_value: Any, enabled: Any) -> dict[str, Any]:
+    symbol = clean_price_watch_symbol(value)
+    if not symbol:
+        raise ValueError("币种代码无效")
+    interval = normalize_price_structure_interval(interval_value)
+    enabled_value = bool_value(enabled, True)
+    if interval == "1m":
+        result = set_price_structure_1m_override(symbol, enabled_value)
+    else:
+        now_ms = int(time.time() * 1000)
+        with AUTH_DB_LOCK, auth_db() as conn:
+            row = conn.execute(
+                "SELECT structure_interval_overrides_json FROM price_watch_assets WHERE symbol = ?",
+                (symbol,),
+            ).fetchone()
+            overrides = parse_price_structure_interval_overrides(
+                row["structure_interval_overrides_json"] if row else "{}"
+            )
+            overrides[interval] = 1 if enabled_value else 0
+            encoded = json.dumps(overrides, ensure_ascii=False, separators=(",", ":"))
+            conn.execute(
+                """
+                INSERT INTO price_watch_assets (
+                    symbol, name, manual_pinned, structure_interval_overrides_json,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, 0, ?, 'pending', ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    structure_interval_overrides_json = excluded.structure_interval_overrides_json,
+                    updated_at = excluded.updated_at
+                """,
+                (symbol, symbol, encoded, now_ms, now_ms),
+            )
+        with PRICE_STRUCTURE_CACHE_LOCK:
+            PRICE_STRUCTURE_CACHE.clear()
+        result = {"ok": True, "symbol": symbol}
+    persisted = price_structure_interval_overrides_for_symbol(symbol)
+    states = price_structure_interval_states({
+        "structure1mOverride": persisted["1m"],
+        "structureIntervalOverrides": persisted,
+    })
+    state = states[interval]
+    return {
+        **result,
+        "interval": interval,
+        "intervalLabel": PRICE_STRUCTURE_INTERVAL_LABELS[interval],
+        "structureIntervalEnabled": bool(state["enabled"]),
+        "structureIntervalOverrides": {
+            key: override for key, override in persisted.items() if key != "1m" and override in {0, 1}
+        },
+        "structureIntervalStates": states,
+        "structure1mOverride": persisted["1m"],
+        "structure1mEnabled": bool(states["1m"]["enabled"]),
+        "structure1mMode": states["1m"]["mode"],
+        "structure1mLabel": states["1m"]["label"],
+        "message": f"{symbol} {PRICE_STRUCTURE_INTERVAL_LABELS[interval]}结构播报已{'开启' if enabled_value else '关闭'}",
+    }
+
+
+def price_structure_watch_rows() -> list[dict[str, Any]]:
+    source = price_watch_aicoin_source()
+    source_rows = source.get("rows") if isinstance(source.get("rows"), list) else []
+    hot_metadata = {
+        clean_price_watch_symbol(raw.get("symbol") or raw.get("asset")): {
+            "hotRank": int(safe_float(raw.get("rank"), 0)),
+            "heat": safe_float(raw.get("heat"), 0),
+        }
+        for raw in source_rows
+        if isinstance(raw, dict) and clean_price_watch_symbol(raw.get("symbol") or raw.get("asset"))
+    }
+    current_symbols = {
+        clean_price_watch_symbol(raw.get("symbol") or raw.get("asset"))
+        for raw in source_rows
+        if isinstance(raw, dict)
+    }
+    current_symbols.discard("")
+    excluded_symbols = reconcile_price_structure_exclusions(
+        current_symbols,
+        source_is_current=str(source.get("status") or "").lower() == "ok" and bool(current_symbols),
+    )
+    now_ms = int(time.time() * 1000)
+    priority_cutoff = now_ms - PRICE_WATCH_RETENTION_SECONDS * 1000
+    wallet_rows = binance_wallet_4h_structure_rows(now_ms=now_ms)
+    wallet_by_symbol = {
+        price_structure_monitor_symbol(row.get("symbol") or row.get("name")): row
+        for row in wallet_rows
+        if price_structure_monitor_symbol(row.get("symbol") or row.get("name"))
+    }
+    active_rows = filter_price_monitor_rows_by_activity(price_watch_active_rows())
+    active_by_symbol = {
+        price_structure_monitor_symbol(row.get("symbol")): row
+        for row in active_rows
+        if price_structure_monitor_symbol(row.get("symbol"))
+    }
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def append_candidate(
+        raw_row: dict[str, Any],
+        *,
+        context: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> bool:
+        symbol = price_structure_monitor_symbol(raw_row.get("symbol") or raw_row.get("asset"))
+        if not symbol or symbol in seen or symbol in excluded_symbols:
+            return False
+        db_row = active_by_symbol.get(symbol, {})
+        wallet_row = wallet_by_symbol.get(symbol, {})
+        merged = {**wallet_row, **db_row, **raw_row}
+        aicoin_last_seen_at = int(merged.get("aicoin_last_seen_at") or 0)
+        personal_x_mentioned_at = int(merged.get("personal_x_mentioned_at") or 0)
+        wallet_last_seen_at = int(safe_float(wallet_row.get("lastSeenAt"), 0))
+        if not (
+            symbol in current_symbols
+            or aicoin_last_seen_at >= priority_cutoff
+            or personal_x_mentioned_at >= priority_cutoff
+            or wallet_last_seen_at >= priority_cutoff
+        ):
+            return False
+        adaptive_context = context if isinstance(context, dict) else price_structure_priority_context(merged, now_ms=now_ms)
+        if adaptive_context and str(adaptive_context.get("sourceKind") or "") != "personal-x":
+            adaptive_context = price_structure_priority_context(merged, now_ms=now_ms)
+        raw_override = merged.get("structure_1m_override", merged.get("structure1mOverride", -1))
+        try:
+            one_minute_override = int(raw_override)
+        except (TypeError, ValueError):
+            one_minute_override = price_structure_1m_override_for_symbol(symbol)
+        interval_overrides = parse_price_structure_interval_overrides(
+            merged.get("structure_interval_overrides_json", merged.get("structureIntervalOverrides", {}))
+        )
+        membership_sources = []
+        if symbol in current_symbols or aicoin_last_seen_at >= priority_cutoff:
+            membership_sources.append("AiCoin")
+        if personal_x_mentioned_at >= priority_cutoff:
+            membership_sources.append("个人X")
+        if wallet_last_seen_at >= priority_cutoff:
+            membership_sources.append("币安钱包4H")
+        market_activity = merged.get("marketActivity") if isinstance(merged.get("marketActivity"), dict) else {}
+        if wallet_last_seen_at >= priority_cutoff and not market_activity:
+            market_activity = {
+                "active": True,
+                "status": "active",
+                "reason": "binance-wallet-4h-hot-membership",
+                "source": "币安钱包4小时热门榜",
+                "turnover4hUsd": safe_float(wallet_row.get("wallet4hVolumeUsd"), 0),
+            }
+        item = {
+            "symbol": symbol,
+            "name": merged.get("name") or symbol,
+            "icon": merged.get("icon") or crypto_icon_url(symbol),
+            "monitorPool": "aicoin-x-wallet",
+            "structureMembershipSources": membership_sources,
+            "marketActivity": market_activity,
+            "chain": clean_feed_text(merged.get("chain"), 40),
+            "chainLabel": clean_feed_text(merged.get("chainLabel"), 40),
+            "contractAddress": clean_feed_text(merged.get("contractAddress"), 180),
+            "wallet4hFirstSeenAt": int(safe_float(wallet_row.get("firstSeenAt"), 0)),
+            "wallet4hLastSeenAt": wallet_last_seen_at,
+            "walletHotRank": int(safe_float(wallet_row.get("walletHotRank"), 0)),
+            "adaptiveContext": adaptive_context,
+            "personalXPriority": int(merged.get("personal_x_mentioned_at") or 0) >= priority_cutoff,
+            "personalXMentionedAt": int(merged.get("personal_x_mentioned_at") or 0),
+            "newContractPriority": int(merged.get("new_contract_listed_at") or 0) >= priority_cutoff,
+            "newContractListedAt": int(merged.get("new_contract_listed_at") or 0),
+            "newContractSource": merged.get("new_contract_source") or "",
+            "structure1mOverride": one_minute_override,
+            "structureIntervalOverrides": interval_overrides,
+            **(metadata or {}),
+        }
+        one_minute_state = price_structure_1m_state(item, now_ms=now_ms)
+        interval_states = price_structure_interval_states(item, now_ms=now_ms)
+        item.update({
+            "structure1mEnabled": one_minute_state["enabled"],
+            "structure1mMode": one_minute_state["mode"],
+            "structure1mLabel": one_minute_state["label"],
+            "structureIntervalStates": interval_states,
+        })
+        seen.add(symbol)
+        selected.append(item)
+        return True
+
+    # Personal-X mentions are the only non-AiCoin membership source and stay at
+    # the front for 30 days. Exchange listings never enter this pool by themselves.
+    for row in active_rows:
+        priority_at = int(row.get("personal_x_mentioned_at") or 0)
+        if priority_at < priority_cutoff:
+            continue
+        append_candidate(row, metadata=hot_metadata.get(clean_price_watch_symbol(row.get("symbol")), {}))
+
+    for context in strategy_active_adaptive_contexts(now_ms=now_ms):
+        if str(context.get("sourceKind") or "") != "personal-x":
+            continue
+        symbol = clean_price_watch_symbol(context.get("symbol"))
+        append_candidate(
+            active_by_symbol.get(symbol, {"symbol": symbol, "name": symbol}),
+            context=context,
+            metadata=hot_metadata.get(symbol, {}),
+        )
+    # Every asset observed on Binance Wallet's 4-hour hot ranking remains in
+    # the existing multi-timeframe pool for 30 days. The saved chain/contract
+    # identity lets on-chain-only assets use the shared GeckoTerminal fallback.
+    for row in wallet_rows:
+        symbol = price_structure_monitor_symbol(row.get("symbol") or row.get("name"))
+        if not symbol or symbol in seen or symbol in excluded_symbols:
+            continue
+        append_candidate(
+            row,
+            metadata={
+                "hotRank": int(safe_float(row.get("walletHotRank"), 0)),
+                "heat": safe_float(row.get("walletHeat"), 0),
+            },
+        )
+    for raw in source_rows:
+        symbol = clean_price_watch_symbol(raw.get("symbol") or raw.get("asset"))
+        name = clean_feed_text(raw.get("name") or symbol, 80)
+        pair_hint = clean_feed_text(raw.get("note"), 160)
+        if symbol in seen or symbol in excluded_symbols or not is_price_watch_auto_crypto_candidate(symbol, name, pair_hint):
+            continue
+        append_candidate(
+            {
+                "symbol": symbol,
+                "name": name or symbol,
+                "icon": clean_feed_text(raw.get("icon"), 600) or crypto_icon_url(symbol),
+            },
+            metadata={
+                "hotRank": int(safe_float(raw.get("rank"), 0)),
+                "heat": safe_float(raw.get("heat"), 0),
+            },
+        )
+
+    # Keep every symbol that appeared on AiCoin for 30 days from its latest
+    # appearance, and every personal-X mention for the same rolling window.
+    # This final pass is essential when a symbol temporarily drops out of the
+    # current hot list: source rotation must not silently remove monitoring.
+    for row in active_rows:
+        symbol = clean_price_watch_symbol(row.get("symbol"))
+        if not symbol or symbol in seen or symbol in excluded_symbols:
+            continue
+        append_candidate(row)
+    return selected
+
+
+def price_structure_intraday_repricing(
+    candles: list[tuple[int, float, float, float, float, float]],
+) -> dict[str, Any]:
+    """Measure whether recent capital flow has established a new accepted price regime."""
+    clean = [
+        item for item in candles
+        if len(item) >= 6
+        and int(safe_float(item[0], 0)) > 0
+        and safe_float(item[2], 0) > 0
+        and safe_float(item[3], 0) > 0
+        and safe_float(item[4], 0) > 0
+    ][-PRICE_STRUCTURE_REPRICING_LOOKBACK_BARS:]
+    if len(clean) < 16:
+        return {"qualified": False, "reason": "insufficient-15m-history"}
+
+    peak_search_start = max(4, len(clean) - PRICE_STRUCTURE_REPRICING_PEAK_MAX_AGE_BARS)
+    peak_index = max(
+        range(peak_search_start, len(clean)),
+        key=lambda index: safe_float(clean[index][2], 0),
+    )
+    base_search_start = max(0, peak_index - 96)
+    if peak_index - base_search_start < 4:
+        return {"qualified": False, "reason": "insufficient-pre-impulse-base"}
+    base_index = min(
+        range(base_search_start, peak_index),
+        key=lambda index: safe_float(clean[index][3], 0),
+    )
+    base = safe_float(clean[base_index][3], 0)
+    peak = safe_float(clean[peak_index][2], 0)
+    current = safe_float(clean[-1][4], 0)
+    if base <= 0 or peak <= base or current <= 0:
+        return {"qualified": False, "reason": "invalid-15m-repricing-range"}
+
+    impulse_gain_pct = (peak / base - 1) * 100
+    current_gain_pct = (current / base - 1) * 100
+    retained_pct = (current - base) / (peak - base) * 100
+    peak_age_bars = max(0, len(clean) - 1 - peak_index)
+    baseline_volumes = sorted(
+        safe_float(item[5], 0)
+        for item in clean[max(0, base_index - 24):peak_index]
+        if safe_float(item[5], 0) > 0
+    )
+    baseline_volume = (
+        baseline_volumes[len(baseline_volumes) // 2]
+        if baseline_volumes
+        else 0.0
+    )
+    impulse_volume = max(
+        (safe_float(item[5], 0) for item in clean[base_index:peak_index + 1]),
+        default=0.0,
+    )
+    volume_ratio = impulse_volume / baseline_volume if baseline_volume > 0 else 0.0
+    magnitude_score = (
+        25 if impulse_gain_pct >= 300
+        else 20 if impulse_gain_pct >= 150
+        else 15 if impulse_gain_pct >= 100
+        else 0
+    )
+    retention_score = (
+        25 if retained_pct >= 50
+        else 20 if retained_pct >= 30
+        else 12 if retained_pct >= 20
+        else 0
+    )
+    acceptance_score = (
+        15 if current_gain_pct >= 150
+        else 10 if current_gain_pct >= 80
+        else 5 if current_gain_pct >= 50
+        else 0
+    )
+    volume_score = (
+        25 if volume_ratio >= 8
+        else 20 if volume_ratio >= 3
+        else 10 if volume_ratio >= 1.5
+        else 0
+    )
+    freshness_score = (
+        10 if peak_age_bars <= 48
+        else 6 if peak_age_bars <= PRICE_STRUCTURE_REPRICING_PEAK_MAX_AGE_BARS
+        else 0
+    )
+    reset_score = magnitude_score + retention_score + acceptance_score + volume_score + freshness_score
+    core_repricing = bool(
+        impulse_gain_pct >= 100
+        and current_gain_pct >= 50
+        and retained_pct >= 20
+        and peak_age_bars <= PRICE_STRUCTURE_REPRICING_PEAK_MAX_AGE_BARS
+    )
+    return {
+        "qualified": core_repricing,
+        "reason": "fresh-price-regime-candidate" if core_repricing else "no-price-regime-reset",
+        "resetScore": reset_score,
+        "base": round(base, 12),
+        "peak": round(peak, 12),
+        "current": round(current, 12),
+        "impulseGainPct": round(impulse_gain_pct, 2),
+        "currentGainPct": round(current_gain_pct, 2),
+        "retainedPct": round(retained_pct, 2),
+        "peakAgeMinutes": peak_age_bars * 15,
+        "volumeRatio": round(volume_ratio, 2),
+        "capitalConfirmed": volume_ratio >= 1.5,
+    }
+
+
+def price_structure_recent_event_context(
+    symbol: Any,
+    *,
+    now_ms: int | None = None,
+) -> dict[str, Any] | None:
+    normalized = clean_price_watch_symbol(symbol)
+    current_ms = int(now_ms or time.time() * 1000)
+    with PRICE_STRUCTURE_EVENT_CONTEXT_LOCK:
+        context = PRICE_STRUCTURE_EVENT_CONTEXTS.get(normalized)
+    if not isinstance(context, dict) or int(safe_float(context.get("expiresAt"), 0)) <= current_ms:
+        return None
+    return dict(context)
+
+
+def price_structure_broadcast_eligibility(
+    row: dict[str, Any],
+    timeframes: dict[str, list[tuple[int, float, float, float, float, float]]],
+    adaptive_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    adaptive_context = adaptive_context if isinstance(adaptive_context, dict) else {}
+    main_wave_stage = clean_feed_text(adaptive_context.get("mainWaveStage"), 30).lower()
+    signal_type = clean_feed_text(adaptive_context.get("signalType"), 40).lower()
+    new_contract_window = bool(
+        adaptive_context.get("sourceKind") == "new-contract"
+        and signal_type == "new-contract-launch"
+        and int(safe_float(adaptive_context.get("signalExpiresAt"), 0)) > int(time.time() * 1000)
+    )
+    explicit_main_wave = bool(
+        main_wave_stage in {"active", "expected"}
+        or signal_type == "main-wave-expected"
+        or adaptive_context.get("mode") in {"acceleration", "expected"}
+    )
+    daily = timeframes.get("1d") if isinstance(timeframes.get("1d"), list) else []
+    daily_clean = [
+        item for item in daily
+        if len(item) >= 6
+        and int(safe_float(item[0], 0)) > 0
+        and safe_float(item[2], 0) > 0
+        and safe_float(item[3], 0) > 0
+        and safe_float(item[4], 0) > 0
+    ]
+    if not daily_clean and not explicit_main_wave and not new_contract_window:
+        return {
+            "eligible": False,
+            "reason": "daily-qualification-unavailable",
+            "allowedIntervals": [],
+        }
+
+    current = safe_float(daily_clean[-1][4], 0) if daily_clean else 0.0
+    historical_peak = max((safe_float(item[2], 0) for item in daily_clean), default=0.0)
+    drawdown_pct = (
+        max(0.0, (historical_peak - current) / historical_peak * 100)
+        if historical_peak > 0 and current > 0
+        else 0.0
+    )
+    history_age_days = (
+        max(0.0, (int(daily_clean[-1][0]) - int(daily_clean[0][0])) / 86_400_000)
+        if len(daily_clean) >= 2
+        else 999.0
+    )
+    new_coin = bool(len(daily_clean) >= 2 and history_age_days <= PRICE_STRUCTURE_NEW_COIN_MAX_AGE_DAYS)
+    fib_candles = [
+        (item[0], item[2], item[3], item[4], item[5])
+        for item in daily_clean
+    ]
+    fib = price_watch_fib_structure(fib_candles, current) if fib_candles else {}
+    recent_main_wave = bool(fib.get("mainWaveQualified"))
+    deep_drawdown = drawdown_pct >= PRICE_STRUCTURE_DEEP_DRAWDOWN_PCT
+    rank = int(safe_float(row.get("hotRank") or row.get("rank"), 0))
+    heat = safe_float(row.get("heat"), 0)
+    extreme_heat = bool(
+        (0 < rank <= PRICE_STRUCTURE_EXTREME_HEAT_MAX_RANK)
+        or heat >= PRICE_STRUCTURE_EXTREME_HEAT_MIN
+    )
+    repricing = price_structure_intraday_repricing(timeframes.get("15m") or [])
+    regime_reset_score = int(safe_float(repricing.get("resetScore"), 0)) + (
+        20 if extreme_heat else 0
+    )
+    capital_confirmed = bool(repricing.get("capitalConfirmed") or extreme_heat)
+    market_regime_reset = bool(
+        deep_drawdown
+        and repricing.get("qualified")
+        and capital_confirmed
+        and regime_reset_score >= PRICE_STRUCTURE_REGIME_RESET_MIN_SCORE
+    )
+    event_context = price_structure_recent_event_context(row.get("symbol"))
+    event_price_response = bool(
+        repricing.get("capitalConfirmed")
+        and safe_float(repricing.get("resetScore"), 0) >= 45
+        and safe_float(repricing.get("currentGainPct"), 0) >= 20
+    )
+    event_driven_reset = bool(
+        deep_drawdown
+        and event_context
+        and (extreme_heat or event_price_response)
+    )
+
+    allowed_intervals: list[str] = []
+    if new_contract_window:
+        eligible, reason = True, "official-new-contract-window"
+    elif explicit_main_wave:
+        eligible, reason = True, "explicit-main-wave"
+    elif new_coin:
+        eligible, reason = True, "new-listing"
+    elif recent_main_wave:
+        eligible, reason = True, "recent-main-wave"
+    elif event_driven_reset:
+        eligible, reason = True, "event-driven-market-revival"
+    elif market_regime_reset:
+        eligible, reason = True, "deep-coin-market-regime-reset"
+    elif deep_drawdown:
+        eligible, reason = False, "deep-legacy-no-new-wave"
+    else:
+        eligible, reason = True, "active-hot-coin"
+    return {
+        "eligible": eligible,
+        "reason": reason,
+        "allowedIntervals": allowed_intervals,
+        "explicitMainWave": explicit_main_wave,
+        "officialNewContractWindow": new_contract_window,
+        "newCoin": new_coin,
+        "recentMainWave": recent_main_wave,
+        "deepDrawdown": deep_drawdown,
+        "drawdownPct": round(drawdown_pct, 2),
+        "historyAgeDays": round(history_age_days, 1) if history_age_days < 999 else None,
+        "hotRank": rank or None,
+        "heat": round(heat, 1),
+        "extremeHeat": extreme_heat,
+        "repricing": repricing,
+        "marketRegimeReset": market_regime_reset,
+        "eventDrivenReset": event_driven_reset,
+        "eventContext": event_context,
+        "eventPriceResponse": event_price_response,
+        "regimeResetScore": regime_reset_score,
+        "capitalConfirmed": capital_confirmed,
+    }
+
+
+NEW_COIN_LOW_ADMISSION_SOURCES = frozenset({"binance", "okx", "gate", "htx"})
+NEW_COIN_LOW_HISTORY_SOURCES = frozenset({
+    "binance", "okx", "bitget", "gate", "htx", "aster"
+})
+NEW_COIN_LOW_STRUCTURE_INTERVALS = frozenset({"1h", "4h"})
+
+
+def merge_new_coin_low_listing_candidate(
+    candidates: dict[str, dict[str, Any]],
+    symbol_value: Any,
+    listed_at_value: Any,
+    source_value: Any,
+    pair_value: Any = "",
+    *,
+    now_ms: int | None = None,
+) -> None:
+    """Keep the earliest known cross-exchange listing before applying the one-year filter."""
+    symbol = clean_price_watch_symbol(symbol_value)
+    source = clean_feed_text(source_value, 40)
+    pair = clean_feed_text(pair_value, 80)
+    listed_at = int(safe_float(listed_at_value, 0))
+    effective_now = int(now_ms or time.time() * 1000)
+    if (
+        not symbol
+        or not source
+        or source.casefold() not in NEW_COIN_LOW_HISTORY_SOURCES
+        or listed_at <= 0
+        or listed_at > effective_now + 14 * 24 * 60 * 60 * 1000
+        or not is_price_watch_auto_crypto_candidate(symbol, symbol, pair)
+    ):
+        return
+
+    current = candidates.get(symbol) if isinstance(candidates.get(symbol), dict) else {}
+    history_by_source: dict[str, dict[str, Any]] = {}
+    for entry in current.get("newCoinListingHistory") if isinstance(current.get("newCoinListingHistory"), list) else []:
+        if not isinstance(entry, dict):
+            continue
+        entry_source = clean_feed_text(entry.get("source"), 40)
+        entry_at = int(safe_float(entry.get("listedAt"), 0))
+        if not entry_source or entry_at <= 0:
+            continue
+        history_by_source[entry_source.casefold()] = {
+            "source": entry_source,
+            "listedAt": entry_at,
+            "pair": clean_feed_text(entry.get("pair"), 80),
+        }
+    prior = history_by_source.get(source.casefold())
+    if not prior or listed_at < int(safe_float(prior.get("listedAt"), 0)):
+        history_by_source[source.casefold()] = {
+            "source": source,
+            "listedAt": listed_at,
+            "pair": pair,
+        }
+    history = sorted(
+        history_by_source.values(),
+        key=lambda entry: (int(safe_float(entry.get("listedAt"), 0)), clean_feed_text(entry.get("source"), 40).casefold()),
+    )
+    first = history[0]
+    first_source = clean_feed_text(first.get("source"), 40)
+    first_at = int(safe_float(first.get("listedAt"), 0))
+    sources = [clean_feed_text(entry.get("source"), 40) for entry in history if entry.get("source")]
+    candidates[symbol] = {
+        **current,
+        "symbol": symbol,
+        "name": symbol,
+        "icon": current.get("icon") or crypto_icon_url(symbol),
+        "monitorPool": "new-coin-low",
+        "newCoinListedAt": first_at,
+        "newCoinFirstListedAt": first_at,
+        "newCoinSource": first_source,
+        "newCoinFirstSource": first_source,
+        "newCoinSources": list(dict.fromkeys(sources)),
+        "newCoinListingHistory": history,
+        "adaptiveContext": {
+            "symbol": symbol,
+            "mode": "new-coin-low",
+            "label": "近一年新币低位",
+            "sourceKind": "new-coin-low",
+            "sourceName": first_source,
+            "observedAt": first_at,
+        },
+    }
+
+
+def new_coin_low_row_within_age(item: dict[str, Any] | None, *, now_ms: int | None = None) -> bool:
+    if not isinstance(item, dict):
+        return False
+    effective_now = int(now_ms or time.time() * 1000)
+    first_listed_at = int(safe_float(
+        item.get("newCoinFirstListedAt") or item.get("newCoinListedAt"), 0
+    ))
+    return (
+        effective_now - NEW_COIN_LOW_MAX_AGE_SECONDS * 1000 <= first_listed_at
+        <= effective_now + 10 * 60_000
+    )
+
+
+def price_structure_recent_listing_index() -> dict[str, int]:
+    global PRICE_STRUCTURE_RECENT_LISTING_INDEX_CACHE
+    now = time.time()
+    with PRICE_STRUCTURE_RECENT_LISTING_INDEX_LOCK:
+        cached = PRICE_STRUCTURE_RECENT_LISTING_INDEX_CACHE
+        if cached and now - cached[0] < PRICE_STRUCTURE_RECENT_LISTING_CACHE_SECONDS:
+            return dict(cached[1])
+
+    inventory_rows = (
+        NEW_COIN_LOW_INVENTORY_CACHE[1]
+        if NEW_COIN_LOW_INVENTORY_CACHE and isinstance(NEW_COIN_LOW_INVENTORY_CACHE[1], list)
+        else []
+    )
+    history = read_json_cache(NEW_COIN_LOW_LISTING_HISTORY_PATH)
+    history_rows = history.get("items") if isinstance(history.get("items"), list) else []
+    index: dict[str, int] = {}
+    for item in [*history_rows, *inventory_rows]:
+        if not isinstance(item, dict):
+            continue
+        symbol = clean_price_watch_symbol(item.get("symbol"))
+        listed_at = int(safe_float(
+            item.get("newCoinFirstListedAt") or item.get("newCoinListedAt"), 0
+        ))
+        if not symbol or listed_at <= 0:
+            continue
+        existing = index.get(symbol, 0)
+        if not existing or listed_at < existing:
+            index[symbol] = listed_at
+    with PRICE_STRUCTURE_RECENT_LISTING_INDEX_LOCK:
+        PRICE_STRUCTURE_RECENT_LISTING_INDEX_CACHE = (time.time(), dict(index))
+    return index
+
+
+def price_structure_recent_listing_at(symbol: Any, *, now_ms: int | None = None) -> int:
+    symbol_key = clean_price_watch_symbol(symbol)
+    listed_at = int(price_structure_recent_listing_index().get(symbol_key, 0))
+    effective_now = int(now_ms or time.time() * 1000)
+    if (
+        listed_at <= 0
+        or listed_at > effective_now + 10 * 60_000
+        or effective_now - listed_at > PRICE_STRUCTURE_SHORT_HISTORY_MAX_AGE_DAYS * 24 * 60 * 60 * 1000
+    ):
+        return 0
+    return listed_at
+
+
+def price_structure_allows_short_history(
+    row: dict[str, Any],
+    adaptive_context: dict[str, Any] | None,
+) -> bool:
+    return bool(
+        row.get("monitorPool") == "new-coin-low"
+        or (
+            isinstance(adaptive_context, dict)
+            and adaptive_context.get("mode") in {"new-contract", "new-coin-low"}
+        )
+        or price_structure_recent_listing_at(row.get("symbol"))
+    )
+
+
+def price_structure_known_asset_metadata() -> dict[str, dict[str, str]]:
+    metadata: dict[str, dict[str, str]] = {}
+    snapshot = read_json_cache(PRICE_STRUCTURE_SNAPSHOT_PATH)
+    payload = snapshot.get("payload") if isinstance(snapshot.get("payload"), dict) else {}
+    snapshot_items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    for item in [*snapshot_items, *price_watch_active_rows()]:
+        if not isinstance(item, dict):
+            continue
+        symbol = clean_price_watch_symbol(item.get("symbol"))
+        if not symbol:
+            continue
+        name = clean_feed_text(item.get("name"), 100)
+        icon = clean_feed_text(item.get("icon"), 600)
+        current = metadata.get(symbol, {})
+        metadata[symbol] = {
+            "name": name if name and name != symbol else current.get("name", ""),
+            "icon": icon or current.get("icon", ""),
+        }
+    return metadata
+
+
+def normalize_new_coin_low_structure_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Migrate old six-frame snapshots to the dedicated 1h/4h monitor contract."""
+    if not isinstance(item, dict) or item.get("monitorPool") != "new-coin-low":
+        return dict(item) if isinstance(item, dict) else {}
+    normalized = dict(item)
+    for field, interval_field in (("frames", "key"), ("signals", "interval"), ("alertHints", "interval")):
+        values = item.get(field) if isinstance(item.get(field), list) else []
+        normalized[field] = [
+            dict(value) for value in values
+            if isinstance(value, dict)
+            and clean_feed_text(value.get(interval_field), 10).lower() in NEW_COIN_LOW_STRUCTURE_INTERVALS
+        ]
+    normalized["signalCount"] = len(normalized["signals"])
+    normalized["alertHintCount"] = len(normalized["alertHints"])
+    interval_states = item.get("structureIntervalStates") if isinstance(item.get("structureIntervalStates"), dict) else {}
+    normalized["structureIntervalStates"] = {
+        key: value for key, value in interval_states.items()
+        if clean_feed_text(key, 10).lower() in NEW_COIN_LOW_STRUCTURE_INTERVALS
+    }
+    normalized["structure1mEnabled"] = False
+    normalized["structure1mMode"] = "pool-disabled"
+    normalized["structure1mLabel"] = "新币低位仅监控1小时/4小时"
+    eligibility = item.get("broadcastEligibility") if isinstance(item.get("broadcastEligibility"), dict) else {}
+    normalized["broadcastEligibility"] = {
+        **eligibility,
+        "allowedIntervals": sorted(NEW_COIN_LOW_STRUCTURE_INTERVALS),
+    }
+    return normalized
+
+
+def new_coin_low_row_admitted(item: dict[str, Any] | None) -> bool:
+    """Aster is a candle provider only and can never admit a structure symbol."""
+    if not isinstance(item, dict):
+        return False
+    sources = [
+        *(item.get("newCoinSources") if isinstance(item.get("newCoinSources"), list) else []),
+        item.get("newCoinSource"),
+    ]
+    return any(
+        clean_feed_text(source, 40).casefold() in NEW_COIN_LOW_ADMISSION_SOURCES
+        for source in sources
+        if source
+    )
+
+
+def price_structure_membership_sources(item: dict[str, Any] | None) -> list[str]:
+    if not isinstance(item, dict):
+        return []
+    if item.get("monitorPool") == "new-coin-low":
+        sources = item.get("newCoinSources") if isinstance(item.get("newCoinSources"), list) else []
+        admitted = [
+            clean_feed_text(source, 30) for source in sources
+            if clean_feed_text(source, 30).casefold() in NEW_COIN_LOW_ADMISSION_SOURCES
+        ]
+        return [f"新币池({','.join(dict.fromkeys(admitted))})"] if admitted else []
+    sources = item.get("structureMembershipSources") if isinstance(item.get("structureMembershipSources"), list) else []
+    return list(dict.fromkeys(
+        clean_feed_text(source, 30) for source in sources
+        if clean_feed_text(source, 30) in {"AiCoin", "个人X", "币安钱包4H"}
+    ))
+
+
+def price_structure_alert_source_labels(item: dict[str, Any], provider: Any = "") -> tuple[str, str]:
+    membership = price_structure_membership_sources(item)
+    membership_label = f"入池：{'/'.join(membership)}" if membership else ""
+    provider_label = clean_feed_text(provider or item.get("provider"), 40)
+    if provider_label:
+        provider_label = (
+            "K线：Aster备用"
+            if "aster" in provider_label.casefold()
+            else f"K线：{provider_label}"
+        )
+    return membership_label, provider_label
+
+
+def price_structure_broadcast_allowed(item: dict[str, Any], interval: str = "") -> bool:
+    if item.get("monitorPool") == "new-coin-low":
+        if not new_coin_low_row_admitted(item):
+            return False
+        if clean_feed_text(interval, 10).lower() not in NEW_COIN_LOW_STRUCTURE_INTERVALS:
+            return False
+    elif item.get("monitorPool") in {"aicoin-x", "aicoin-x-wallet"} and not price_structure_membership_sources(item):
+        return False
+    eligibility = (
+        item.get("broadcastEligibility")
+        if isinstance(item.get("broadcastEligibility"), dict)
+        else {}
+    )
+    if not eligibility or not eligibility.get("eligible"):
+        return False
+    allowed_intervals = eligibility.get("allowedIntervals")
+    if isinstance(allowed_intervals, list) and allowed_intervals:
+        return clean_feed_text(interval, 10).lower() in {
+            clean_feed_text(value, 10).lower() for value in allowed_intervals
+        }
+    return True
+
+
+def new_coin_low_position_context(
+    timeframes: dict[str, list[tuple[int, float, float, float, float, float]]],
+    listed_at: Any,
+    *,
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    now_value = int(now_ms or time.time() * 1000)
+    listed_value = int(safe_float(listed_at, 0))
+    daily = timeframes.get("1d") if isinstance(timeframes.get("1d"), list) else []
+    clean_daily = [row for row in daily if len(row) >= 5 and safe_float(row[4], 0) > 0]
+    age_days = (now_value - listed_value) / 86_400_000 if listed_value > 0 else 9999.0
+    if len(clean_daily) < 7:
+        return {"qualified": False, "reason": "insufficient-daily-history", "ageDays": round(age_days, 1)}
+    highs = [safe_float(row[2], 0) for row in clean_daily]
+    lows = [safe_float(row[3], 0) for row in clean_daily]
+    current = safe_float(clean_daily[-1][4], 0)
+    history_high = max(highs)
+    history_low = min(low for low in lows if low > 0)
+    drawdown_pct = (history_high - current) / history_high * 100 if history_high > 0 else 0.0
+    range_position_pct = (
+        (current - history_low) / (history_high - history_low) * 100
+        if history_high > history_low > 0
+        else 100.0
+    )
+    recent = clean_daily[-min(20, len(clean_daily)):]
+    recent_high = max(safe_float(row[2], 0) for row in recent)
+    recent_low = min(safe_float(row[3], 0) for row in recent if safe_float(row[3], 0) > 0)
+    recent_range_pct = (recent_high - recent_low) / recent_high * 100 if recent_high > 0 else 999.0
+    split = max(2, min(5, len(recent) // 2))
+    prior_lows = [safe_float(row[3], 0) for row in recent[-split * 2:-split]]
+    latest_lows = [safe_float(row[3], 0) for row in recent[-split:]]
+    rising_low = bool(prior_lows and latest_lows and min(latest_lows) >= min(prior_lows) * 0.97)
+    low_position = drawdown_pct >= 30 or range_position_pct <= 45
+    qualified = bool(0 <= age_days <= 365 and low_position)
+    return {
+        "qualified": qualified,
+        "reason": "new-coin-low-position" if qualified else "not-in-new-coin-low-zone",
+        "ageDays": round(age_days, 1),
+        "drawdownPct": round(max(0.0, drawdown_pct), 2),
+        "rangePositionPct": round(max(0.0, min(100.0, range_position_pct)), 2),
+        "recentRangePct": round(max(0.0, recent_range_pct), 2),
+        "risingLow": rising_low,
+        "listedAt": listed_value,
+    }
+
+
+def price_structure_provider_probe_batch(
+    providers: list[tuple[Any, ...]],
+    cursor: int,
+) -> list[tuple[Any, ...]]:
+    if not providers:
+        return []
+    batch_size = min(PRICE_STRUCTURE_FAST_PROVIDER_LIMIT, len(providers))
+    start = max(0, int(cursor or 0)) % len(providers)
+    return [providers[(start + offset) % len(providers)] for offset in range(batch_size)]
+
+
+def fetch_price_structure_item(
+    row: dict[str, Any],
+    *,
+    fast_provider_probe: bool = False,
+) -> dict[str, Any]:
+    symbol = price_structure_monitor_symbol(row.get("symbol"))
+    new_coin_low_pool = row.get("monitorPool") == "new-coin-low"
+    row_context = row.get("adaptiveContext") if isinstance(row.get("adaptiveContext"), dict) else None
+    adaptive_context = row_context or strategy_adaptive_context_for_symbol(symbol)
+    # History requirements belong to the asset, not to the tab displaying it.
+    # A recently listed coin such as DOS must use the same short-history rule in
+    # both the new-coin-low pool and the regular AiCoin/personal-X pool.
+    allow_short_history = price_structure_allows_short_history(row, adaptive_context)
+    one_minute_state = price_structure_1m_state({
+        "symbol": symbol,
+        "adaptiveContext": adaptive_context,
+        "structure1mOverride": row.get("structure1mOverride", row.get("structure_1m_override", -1)),
+    })
+    interval_overrides = parse_price_structure_interval_overrides(
+        row.get("structureIntervalOverrides", row.get("structure_interval_overrides_json", {}))
+    )
+    interval_states = price_structure_interval_states({
+        "symbol": symbol,
+        "adaptiveContext": adaptive_context,
+        "structure1mOverride": one_minute_state["override"],
+        "structureIntervalOverrides": interval_overrides,
+    })
+    errors: list[str] = []
+    request_timeout = 4.0 if fast_provider_probe else 8.0
+    providers = [
+        (
+            "Binance Futures",
+            lambda value, min_rows: price_structure_candles_from_binance(
+                symbol, value, limit=PRICE_STRUCTURE_CANDLE_LIMIT, min_rows=min_rows,
+                timeout=request_timeout,
+            ),
+            2,
+            False,
+        ),
+        (
+            "OKX Swap",
+            lambda value, min_rows: price_structure_candles_from_okx(
+                symbol, value, limit=min(300, PRICE_STRUCTURE_CANDLE_LIMIT), min_rows=min_rows,
+                timeout=request_timeout,
+            ),
+            3,
+            False,
+        ),
+        (
+            "Bitget Futures",
+            lambda value, min_rows: price_structure_candles_from_bitget(
+                symbol, value, limit=PRICE_STRUCTURE_CANDLE_LIMIT, min_rows=min_rows,
+                timeout=request_timeout,
+            ),
+            4,
+            False,
+        ),
+        (
+            "KuCoin Spot",
+            lambda value, min_rows: price_structure_candles_from_kucoin(
+                symbol, value, limit=PRICE_STRUCTURE_CANDLE_LIMIT, min_rows=min_rows,
+                timeout=request_timeout,
+            ),
+            2,
+            True,
+        ),
+        (
+            "Gate Futures",
+            lambda value, min_rows: price_structure_candles_from_gate(
+                symbol, value, limit=PRICE_STRUCTURE_CANDLE_LIMIT, min_rows=min_rows,
+                timeout=request_timeout,
+            ),
+            5,
+            False,
+        ),
+        (
+            "HTX Futures",
+            lambda value, min_rows: price_structure_candles_from_htx(
+                symbol, value, limit=PRICE_STRUCTURE_CANDLE_LIMIT, min_rows=min_rows,
+                timeout=request_timeout,
+            ),
+            6,
+            False,
+        ),
+        (
+            "Aster Futures",
+            lambda value, min_rows: price_structure_candles_from_aster(
+                symbol, value, limit=PRICE_STRUCTURE_CANDLE_LIMIT, min_rows=min_rows,
+                timeout=request_timeout,
+            ),
+            7,
+            False,
+        ),
+        (
+            "Hyperliquid",
+            lambda value, min_rows: price_structure_candles_from_hyperliquid(
+                symbol, value, limit=PRICE_STRUCTURE_CANDLE_LIMIT, min_rows=min_rows,
+                timeout=request_timeout,
+            ),
+            8,
+            True,
+        ),
+        (
+            "Trade.xyz",
+            lambda value, min_rows: price_structure_candles_from_hyperliquid(
+                symbol, value, limit=PRICE_STRUCTURE_CANDLE_LIMIT, min_rows=min_rows,
+                dex_prefix="xyz", timeout=request_timeout,
+            ),
+            8,
+            True,
+        ),
+        (
+            "Binance Wallet K线",
+            lambda value, min_rows: price_structure_candles_from_binance_wallet(
+                row.get("contractAddress"), row.get("chain"), value,
+                limit=PRICE_STRUCTURE_CANDLE_LIMIT, min_rows=min_rows,
+                timeout=request_timeout,
+            ),
+            9,
+            True,
+        ),
+        (
+            "链上 K线",
+            lambda value, min_rows: price_structure_candles_from_geckoterminal(
+                symbol, value, limit=PRICE_STRUCTURE_CANDLE_LIMIT, min_rows=min_rows,
+                contract_address=row.get("contractAddress"), chain=row.get("chain"),
+                timeout=request_timeout,
+            ),
+            9,
+            True,
+        ),
+    ]
+    with PRICE_STRUCTURE_PROVIDER_PREFERENCE_LOCK:
+        preferred_provider = PRICE_STRUCTURE_PROVIDER_PREFERENCE.get(symbol, "")
+        provider_probe_cursor = int(PRICE_STRUCTURE_PROVIDER_PROBE_CURSOR.get(symbol, 0) or 0)
+    if not preferred_provider and row.get("monitorPool") == "new-coin-low":
+        preferred_provider = {
+            "Binance": "Binance Futures",
+            "OKX": "OKX Swap",
+            "Gate": "Gate Futures",
+            "HTX": "HTX Futures",
+            "Aster": "Aster Futures",
+        }.get(clean_feed_text(row.get("newCoinSource"), 30), "")
+    if row.get("contractAddress"):
+        preferred_provider = "Binance Wallet K线"
+    if preferred_provider:
+        providers.sort(key=lambda provider: 0 if provider[0] == preferred_provider else 1)
+    provider_count = len(providers)
+    if fast_provider_probe:
+        # Keep every background pass bounded. Failed symbols rotate through the
+        # remaining venues on the next pass, so Gate/HTX and later on-chain
+        # sources are reached without one symbol blocking a worker for minutes.
+        providers = price_structure_provider_probe_batch(providers, provider_probe_cursor)
+    for provider_name, fetcher, mapping_index, provider_allows_short_history in providers:
+        try:
+            timeframes: dict[str, list[tuple[int, float, float, float, float, float]]] = {}
+            current_price = 0.0
+            requests_by_key: dict[str, str] = {}
+            requested_timeframes = (
+                tuple(values for values in PRICE_STRUCTURE_TIMEFRAMES if values[0] in {*NEW_COIN_LOW_STRUCTURE_INTERVALS, "1d"})
+                if new_coin_low_pool
+                else PRICE_STRUCTURE_TIMEFRAMES
+            )
+            for values in requested_timeframes:
+                requests_by_key[values[0]] = values[mapping_index]
+            with ThreadPoolExecutor(max_workers=len(requests_by_key)) as timeframe_executor:
+                timeframe_futures = {
+                    timeframe_executor.submit(
+                        fetcher,
+                        fetcher_value,
+                        2 if allow_short_history or provider_allows_short_history else 30,
+                    ): key
+                    for key, fetcher_value in requests_by_key.items()
+                }
+                fetched_by_key: dict[str, list[tuple[int, float, float, float, float, float]]] = {}
+                for future in as_completed(timeframe_futures):
+                    key = timeframe_futures[future]
+                    candles, _ = future.result()
+                    fetched_by_key[key] = candles
+            timeframes = {
+                key: fetched_by_key[key]
+                for key, _label, *_provider_values in requested_timeframes
+            }
+            for price_key in ("1m", "1h", "4h", "1d"):
+                if timeframes.get(price_key):
+                    current_price = safe_float(timeframes[price_key][-1][4], 0)
+                    break
+            strategy_timeframes = (
+                {key: candles for key, candles in timeframes.items() if key in NEW_COIN_LOW_STRUCTURE_INTERVALS}
+                if new_coin_low_pool
+                else timeframes
+            )
+            strategy = run_dragon_wave_monitor_strategy(strategy_timeframes, adaptive_context=adaptive_context)
+            frames = strategy.get("frames") if isinstance(strategy.get("frames"), list) else []
+            signals = strategy.get("signals") if isinstance(strategy.get("signals"), list) else []
+            alert_hints = strategy.get("alertHints") if isinstance(strategy.get("alertHints"), list) else []
+            if new_coin_low_pool:
+                frames = [frame for frame in frames if clean_feed_text(frame.get("key"), 10).lower() in NEW_COIN_LOW_STRUCTURE_INTERVALS]
+                signals = [signal for signal in signals if clean_feed_text(signal.get("interval"), 10).lower() in NEW_COIN_LOW_STRUCTURE_INTERVALS]
+                alert_hints = [hint for hint in alert_hints if clean_feed_text(hint.get("interval"), 10).lower() in NEW_COIN_LOW_STRUCTURE_INTERVALS]
+            broadcast_eligibility = price_structure_broadcast_eligibility(
+                row,
+                timeframes,
+                adaptive_context,
+            )
+            low_position_context = (
+                new_coin_low_position_context(timeframes, row.get("newCoinListedAt"))
+                if row.get("monitorPool") == "new-coin-low"
+                else {}
+            )
+            if low_position_context.get("qualified"):
+                broadcast_eligibility = {
+                    **broadcast_eligibility,
+                    "eligible": True,
+                    "reason": "new-coin-low-position",
+                    "allowedIntervals": sorted(NEW_COIN_LOW_STRUCTURE_INTERVALS),
+                }
+            with PRICE_STRUCTURE_PROVIDER_PREFERENCE_LOCK:
+                PRICE_STRUCTURE_PROVIDER_PREFERENCE[symbol] = provider_name
+                PRICE_STRUCTURE_PROVIDER_PROBE_CURSOR.pop(symbol, None)
+            return {
+                "symbol": symbol,
+                "name": row.get("name") or symbol,
+                "icon": row.get("icon") or crypto_icon_url(symbol),
+                "monitorPool": row.get("monitorPool") or "",
+                "structureMembershipSources": row.get("structureMembershipSources") if isinstance(row.get("structureMembershipSources"), list) else [],
+                "marketActivity": row.get("marketActivity") if isinstance(row.get("marketActivity"), dict) else {},
+                "chain": clean_feed_text(row.get("chain"), 40),
+                "chainLabel": clean_feed_text(row.get("chainLabel"), 40),
+                "contractAddress": clean_feed_text(row.get("contractAddress"), 180),
+                "wallet4hFirstSeenAt": int(safe_float(row.get("wallet4hFirstSeenAt"), 0)),
+                "wallet4hLastSeenAt": int(safe_float(row.get("wallet4hLastSeenAt"), 0)),
+                "personalXPriority": bool(row.get("personalXPriority")),
+                "personalXMentionedAt": int(safe_float(row.get("personalXMentionedAt"), 0)),
+                "newCoinListedAt": int(safe_float(row.get("newCoinListedAt"), 0)),
+                "newCoinFirstListedAt": int(safe_float(row.get("newCoinFirstListedAt") or row.get("newCoinListedAt"), 0)),
+                "newCoinSource": clean_feed_text(row.get("newCoinSource"), 60),
+                "newCoinFirstSource": clean_feed_text(row.get("newCoinFirstSource") or row.get("newCoinSource"), 60),
+                "newCoinSources": row.get("newCoinSources") if isinstance(row.get("newCoinSources"), list) else [],
+                "newCoinListingHistory": row.get("newCoinListingHistory") if isinstance(row.get("newCoinListingHistory"), list) else [],
+                "provider": provider_name,
+                "currentPrice": current_price or None,
+                "frames": frames,
+                "signals": signals,
+                "signalCount": len(signals),
+                "alertHints": alert_hints,
+                "alertHintCount": len(alert_hints),
+                "strategy": "dragon-wave-engine",
+                "strategyVersion": strategy.get("strategyVersion") or "shared-live",
+                "adaptiveContext": adaptive_context,
+                "structure1mOverride": one_minute_state["override"],
+                "structure1mEnabled": one_minute_state["enabled"] if not new_coin_low_pool else False,
+                "structure1mMode": one_minute_state["mode"] if not new_coin_low_pool else "pool-disabled",
+                "structure1mLabel": one_minute_state["label"] if not new_coin_low_pool else "新币低位仅监控1小时/4小时",
+                "structureIntervalOverrides": interval_overrides,
+                "structureIntervalStates": (
+                    {key: value for key, value in interval_states.items() if key in NEW_COIN_LOW_STRUCTURE_INTERVALS}
+                    if new_coin_low_pool
+                    else interval_states
+                ),
+                "broadcastEligibility": broadcast_eligibility,
+                "lowPositionContext": low_position_context,
+                "checkedAt": int(time.time() * 1000),
+                "error": "",
+            }
+        except Exception as exc:
+            errors.append(f"{provider_name}: {safe_error_text(str(exc))[:100]}")
+    with PRICE_STRUCTURE_PROVIDER_PREFERENCE_LOCK:
+        if preferred_provider and PRICE_STRUCTURE_PROVIDER_PREFERENCE.get(symbol) == preferred_provider:
+            PRICE_STRUCTURE_PROVIDER_PREFERENCE.pop(symbol, None)
+        if fast_provider_probe and provider_count > len(providers):
+            PRICE_STRUCTURE_PROVIDER_PROBE_CURSOR[symbol] = (
+                provider_probe_cursor + len(providers)
+            ) % provider_count
+    return {
+        "symbol": symbol,
+        "name": row.get("name") or symbol,
+        "icon": row.get("icon") or crypto_icon_url(symbol),
+        "monitorPool": row.get("monitorPool") or "",
+        "structureMembershipSources": row.get("structureMembershipSources") if isinstance(row.get("structureMembershipSources"), list) else [],
+        "marketActivity": row.get("marketActivity") if isinstance(row.get("marketActivity"), dict) else {},
+        "chain": clean_feed_text(row.get("chain"), 40),
+        "chainLabel": clean_feed_text(row.get("chainLabel"), 40),
+        "contractAddress": clean_feed_text(row.get("contractAddress"), 180),
+        "wallet4hFirstSeenAt": int(safe_float(row.get("wallet4hFirstSeenAt"), 0)),
+        "wallet4hLastSeenAt": int(safe_float(row.get("wallet4hLastSeenAt"), 0)),
+        "personalXPriority": bool(row.get("personalXPriority")),
+        "personalXMentionedAt": int(safe_float(row.get("personalXMentionedAt"), 0)),
+        "newCoinListedAt": int(safe_float(row.get("newCoinListedAt"), 0)),
+        "newCoinFirstListedAt": int(safe_float(row.get("newCoinFirstListedAt") or row.get("newCoinListedAt"), 0)),
+        "newCoinSource": clean_feed_text(row.get("newCoinSource"), 60),
+        "newCoinFirstSource": clean_feed_text(row.get("newCoinFirstSource") or row.get("newCoinSource"), 60),
+        "newCoinSources": row.get("newCoinSources") if isinstance(row.get("newCoinSources"), list) else [],
+        "newCoinListingHistory": row.get("newCoinListingHistory") if isinstance(row.get("newCoinListingHistory"), list) else [],
+        "provider": "",
+        "currentPrice": None,
+        "frames": [],
+        "signals": [],
+        "signalCount": 0,
+        "alertHints": [],
+        "alertHintCount": 0,
+        "strategy": "dragon-wave-engine",
+        "adaptiveContext": adaptive_context,
+        "structure1mOverride": one_minute_state["override"],
+        "structure1mEnabled": one_minute_state["enabled"] if not new_coin_low_pool else False,
+        "structure1mMode": one_minute_state["mode"] if not new_coin_low_pool else "pool-disabled",
+        "structure1mLabel": one_minute_state["label"] if not new_coin_low_pool else "新币低位仅监控1小时/4小时",
+        "structureIntervalOverrides": interval_overrides,
+        "structureIntervalStates": (
+            {key: value for key, value in interval_states.items() if key in NEW_COIN_LOW_STRUCTURE_INTERVALS}
+            if new_coin_low_pool
+            else interval_states
+        ),
+        "broadcastEligibility": {
+            "eligible": False,
+            "reason": "market-data-unavailable",
+            "allowedIntervals": [],
+        },
+        "lowPositionContext": {},
+        "checkedAt": int(time.time() * 1000),
+        "error": "可用行情源本轮暂不可用，后台正在切换备用源重试",
+        "providerDiagnostics": (
+            [errors[0], *errors[-4:]]
+            if len(errors) > 5 and preferred_provider and errors[0] not in errors[-5:]
+            else errors[-5:]
+        ),
+    }
+
+
+def price_structure_alert_interval_allowed(item: dict[str, Any], interval: str) -> bool:
+    interval_key = clean_feed_text(interval, 10).lower()
+    if interval_key not in PRICE_STRUCTURE_INTERVAL_LABELS:
+        return True
+    effective = dict(item)
+    symbol = price_structure_monitor_symbol(item.get("symbol"))
+    if symbol:
+        persisted = price_structure_interval_overrides_for_symbol(symbol)
+        effective["structure1mOverride"] = persisted["1m"]
+        effective["structureIntervalOverrides"] = persisted
+    return bool(price_structure_interval_states(effective)[interval_key]["enabled"])
+
+
+def price_structure_signal_actionable_now(signal: dict[str, Any], item: dict[str, Any]) -> bool:
+    """Allow a trigger fallback only during its candle or just after its close.
+
+    Historical/closed-bar signals stay visible on the page but must never be
+    replayed as a late desktop alert.
+    """
+    bars_ago = int(safe_float(signal.get("barsAgo"), -1))
+    if bars_ago > 0:
+        return False
+    decision_time = int(safe_float(signal.get("decisionTime") or signal.get("time"), 0))
+    checked_at = int(safe_float(item.get("checkedAt"), 0)) or int(time.time() * 1000)
+    if decision_time <= 0 or checked_at < decision_time:
+        return False
+    interval = clean_feed_text(signal.get("interval"), 10).lower()
+    try:
+        candle_ms = price_structure_interval_ms(interval)
+    except (KeyError, ValueError):
+        candle_ms = 0
+    freshness_ms = candle_ms + PRICE_STRUCTURE_SIGNAL_CLOSE_GRACE_MS
+    return checked_at - decision_time <= freshness_ms
+
+
+def launch_price_structure_strategy_alerts(item: dict[str, Any]) -> int:
+    """Broadcast a live trigger only as a fallback when pre-arm did not catch it."""
+
+    symbol = price_structure_monitor_symbol(item.get("symbol"))
+    signals = item.get("signals") if isinstance(item.get("signals"), list) else []
+    alert_hints = item.get("alertHints") if isinstance(item.get("alertHints"), list) else []
+    if not symbol or (not signals and not alert_hints) or price_structure_symbol_excluded(symbol):
+        return 0
+    child_ids = {
+        str(signal.get("lowerTimeframeTriggerId") or "")
+        for signal in signals
+        if signal.get("multiTimeframeConfluence") and signal.get("lowerTimeframeTriggerId")
+    }
+    alert_signals = [signal for signal in signals if str(signal.get("id") or "") not in child_ids]
+    local_port = env_value("PORT") or env_value("XINGYUN_PORT") or "8765"
+    membership_label, provider_label = price_structure_alert_source_labels(item)
+    launched = 0
+    for signal in alert_signals:
+        interval = clean_feed_text(signal.get("interval"), 10)
+        if (
+            not price_structure_signal_actionable_now(signal, item)
+            or
+            not price_structure_broadcast_allowed(item, interval)
+            or not price_structure_alert_interval_allowed(item, interval)
+        ):
+            continue
+        label = clean_feed_text(signal.get("label") or interval, 16)
+        decision_time = int(safe_float(signal.get("decisionTime") or signal.get("time"), 0))
+        if not interval or decision_time <= 0:
+            continue
+        alerted_at = int(time.time() * 1000)
+        body = " · ".join(
+            part for part in [
+                membership_label,
+                provider_label,
+            ]
+            if part
+        )
+        result = launch_desktop_alert({
+            "key": f"price-watch:dragon-wave:{symbol}:{interval}:{decision_time}",
+            "kind": "价格监控",
+            "source": "币种价格监控",
+            "sourceLabel": "B",
+            "title": f"{symbol} {label} 起爆买点",
+            "body": body,
+            "url": f"http://127.0.0.1:{local_port}/price-watch.html?mode=structure",
+            "time": alerted_at,
+            "priority": "一级·正式买点",
+            "speech": f"龙头策略买点提醒，{symbol}，{label}。",
+            "sound": "urgent",
+            "queuePriority": DESKTOP_ALERT_TRADING_SIGNAL_PRIORITY,
+        })
+        if result.get("queued"):
+            launched += 1
+    for hint in alert_hints:
+        interval = clean_feed_text(hint.get("interval"), 10)
+        if (
+            not price_structure_signal_actionable_now(hint, item)
+            or
+            not price_structure_broadcast_allowed(item, interval)
+            or not price_structure_alert_interval_allowed(item, interval)
+        ):
+            continue
+        decision_time = int(safe_float(hint.get("decisionTime") or hint.get("time"), 0))
+        if not interval or decision_time <= 0 or not hint.get("secondaryBreakoutHint") or not hint.get("alertOnly"):
+            continue
+        label = clean_feed_text(hint.get("label") or interval, 16)
+        pattern = clean_feed_text(hint.get("pattern") or "二次突破提示", 80)
+        certainty = int(safe_float(hint.get("certainty"), 0))
+        grade = clean_feed_text(hint.get("grade") or "A", 8)
+        price = safe_float(hint.get("price") or hint.get("triggerPrice"), 0)
+        price_text = price_usd(price) if price > 0 else ""
+        signal_candle_label = datetime.fromtimestamp(decision_time / 1000).strftime("%H:%M")
+        alerted_at = int(time.time() * 1000)
+        body = " · ".join(
+            part for part in [
+                pattern,
+                "防止试突破洗出后踏空",
+                f"确定性 {grade} {certainty}分" if certainty else f"确定性 {grade}",
+                f"信号K线 {signal_candle_label}",
+                price_text,
+                membership_label,
+                provider_label,
+            ]
+            if part
+        )
+        result = launch_desktop_alert({
+            "key": f"price-watch:dragon-wave-secondary:{symbol}:{interval}:{decision_time}",
+            "kind": "价格监控",
+            "source": "币种价格监控",
+            "sourceLabel": "B!",
+            "title": f"{symbol} {label} 二次突破提示",
+            "body": body,
+            "url": f"http://127.0.0.1:{local_port}/price-watch.html?mode=structure",
+            "time": alerted_at,
+            "priority": "二级·防洗提示",
+            "speech": f"防洗二次突破提示，{symbol}，{label}，防止试突破洗出后踏空。",
+            "sound": "urgent",
+            "queuePriority": DESKTOP_ALERT_TRADING_PREARM_PRIORITY,
+        })
+        if result.get("queued"):
+            launched += 1
+    return launched
+
+
+def price_structure_frame_is_observation(frame: dict[str, Any] | None) -> bool:
+    if not isinstance(frame, dict):
+        return False
+    pattern = clean_feed_text(frame.get("pattern"), 120)
+    if not pattern or "无明确结构" in pattern:
+        return False
+    return not isinstance(frame.get("signal"), dict) and not isinstance(frame.get("pending"), dict)
+
+
+def claim_price_structure_observation_alert(
+    symbol_value: Any,
+    *,
+    now_ms: int | None = None,
+) -> bool:
+    """Atomically reserve the one-per-symbol observation slot for one hour."""
+    symbol = price_structure_monitor_symbol(symbol_value)
+    if not symbol:
+        return False
+    claimed_at = int(now_ms or time.time() * 1000)
+    with AUTH_DB_LOCK, auth_db() as conn:
+        state = conn.execute(
+            "SELECT last_alert_at FROM price_structure_observation_alert_state WHERE symbol = ?",
+            (symbol,),
+        ).fetchone()
+        last_alert_at = int(state["last_alert_at"] or 0) if state else 0
+        if last_alert_at and claimed_at - last_alert_at < PRICE_STRUCTURE_OBSERVATION_COOLDOWN_MS:
+            return False
+        conn.execute(
+            """
+            INSERT INTO price_structure_observation_alert_state (symbol, last_alert_at, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                last_alert_at = excluded.last_alert_at,
+                updated_at = excluded.updated_at
+            """,
+            (symbol, claimed_at, claimed_at),
+        )
+    return True
+
+
+def launch_price_structure_first_observation_alerts(
+    item: dict[str, Any],
+    previous_item: dict[str, Any] | None,
+) -> int:
+    """Speak only the transition from no structure to the first observed setup."""
+    symbol = price_structure_monitor_symbol(item.get("symbol"))
+    if (
+        not symbol
+        or price_structure_symbol_excluded(symbol)
+        or not isinstance(previous_item, dict)
+        or not previous_item.get("checkedAt")
+    ):
+        return 0
+    previous_frames = {
+        clean_feed_text(frame.get("key"), 10): frame
+        for frame in (previous_item.get("frames") if isinstance(previous_item.get("frames"), list) else [])
+        if isinstance(frame, dict)
+    }
+    local_port = env_value("PORT") or env_value("XINGYUN_PORT") or "8765"
+    membership_label, provider_label = price_structure_alert_source_labels(item)
+    launched = 0
+    for frame in item.get("frames") if isinstance(item.get("frames"), list) else []:
+        if not isinstance(frame, dict) or not price_structure_frame_is_observation(frame):
+            continue
+        interval = clean_feed_text(frame.get("key"), 10)
+        if (
+            price_structure_frame_is_observation(previous_frames.get(interval))
+            or not price_structure_broadcast_allowed(item, interval)
+            or not price_structure_alert_interval_allowed(item, interval)
+        ):
+            continue
+        if not claim_price_structure_observation_alert(symbol):
+            continue
+        label = clean_feed_text(frame.get("label") or interval, 16)
+        pattern = clean_feed_text(frame.get("pattern"), 100)
+        stage = clean_feed_text(frame.get("stage") or "结构观察", 24)
+        confidence = int(safe_float(frame.get("confidence"), 0))
+        support = safe_float(frame.get("support"), 0)
+        resistance = safe_float(frame.get("resistance"), 0)
+        identity = hashlib.sha256(
+            f"{symbol}:{interval}:{pattern}:{item.get('checkedAt')}".encode("utf-8")
+        ).hexdigest()[:16]
+        body = " · ".join(
+            part for part in (
+                stage,
+                f"结构置信度 {confidence}%" if confidence else "",
+                f"支撑 {price_usd(support)}" if support > 0 else "",
+                f"压力 {price_usd(resistance)}" if resistance > 0 else "",
+                membership_label,
+                provider_label,
+            )
+            if part
+        )
+        result = launch_desktop_alert({
+            "key": f"price-watch:structure-first:{symbol}:{interval}:{identity}",
+            "kind": "价格监控",
+            "source": "币种价格监控",
+            "sourceLabel": "S",
+            "title": f"{symbol} {label} 首次结构观察",
+            "body": body,
+            "url": f"http://127.0.0.1:{local_port}/price-watch.html?mode=structure",
+            "time": int(time.time() * 1000),
+            "priority": "一级·首次结构",
+            "excludeEndpoint": f"http://127.0.0.1:{local_port}/api/price-structures",
+            "excludeSymbol": symbol,
+            "excludeLabel": "剔除结构",
+            "excludeAction": "exclude_structure",
+            "speech": f"结构观察提醒，{symbol}，{label}，已进入结构观察，请开始关注。",
+            "sound": "urgent",
+            "queuePriority": DESKTOP_ALERT_TRADING_PREARM_PRIORITY - 1,
+        })
+        if result.get("queued"):
+            launched += 1
+    return launched
+
+
+def price_structure_latest_snapshot_payload() -> dict[str, Any]:
+    with PRICE_STRUCTURE_CACHE_LOCK:
+        cached_entries = list(PRICE_STRUCTURE_CACHE.values())
+    if cached_entries:
+        latest = max(cached_entries, key=lambda entry: entry[0])[1]
+        if isinstance(latest, dict):
+            return latest
+    snapshot = read_json_cache(PRICE_STRUCTURE_SNAPSHOT_PATH)
+    payload = snapshot.get("payload") if isinstance(snapshot.get("payload"), dict) else {}
+    return payload
+
+
+def price_structure_prearm_candidates(now_ms: int | None = None) -> list[dict[str, Any]]:
+    now_ms = int(now_ms or time.time() * 1000)
+    payload = price_structure_latest_snapshot_payload()
+    items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    if NEW_COIN_LOW_MONITOR_ACTIVE:
+        with NEW_COIN_LOW_LOCK:
+            hydrate_new_coin_low_snapshot()
+            # New-coin-low candidates use the same A/A+ prearm path, so a quiet
+            # low-volume setup is not forced to wait for the formal buy candle.
+            items = [
+                *items,
+                *(
+                    dict(item) for item in NEW_COIN_LOW_ITEMS.values()
+                    if new_coin_low_row_admitted(item)
+                ),
+            ]
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    excluded_symbols = price_structure_excluded_symbols()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        checked_at = int(safe_float(item.get("checkedAt"), 0))
+        if checked_at <= 0 or now_ms - checked_at > PRICE_STRUCTURE_PREARM_MAX_SNAPSHOT_AGE_SECONDS * 1000:
+            continue
+        symbol = price_structure_monitor_symbol(item.get("symbol"))
+        frames = item.get("frames") if isinstance(item.get("frames"), list) else []
+        eligibility = item.get("broadcastEligibility") if isinstance(item.get("broadcastEligibility"), dict) else {}
+        if not symbol or symbol in excluded_symbols or not eligibility.get("eligible"):
+            continue
+        for frame in frames:
+            if not isinstance(frame, dict) or frame.get("signal"):
+                continue
+            pending = frame.get("pending") if isinstance(frame.get("pending"), dict) else None
+            if not pending:
+                continue
+            certainty = int(safe_float(pending.get("certainty") or frame.get("confidence"), 0))
+            grade = clean_feed_text(pending.get("grade") or "", 8).upper()
+            trigger_price = safe_float(pending.get("triggerPrice") or pending.get("price"), 0)
+            interval = clean_feed_text(pending.get("interval") or frame.get("key"), 10)
+            if (
+                not price_structure_broadcast_allowed(item, interval)
+                or not price_structure_alert_interval_allowed(item, interval)
+            ):
+                continue
+            candidate_id = clean_feed_text(
+                pending.get("id") or f"{interval}:{pending.get('decisionTime') or pending.get('time')}",
+                180,
+            )
+            identity = f"{symbol}:{candidate_id}"
+            if certainty < 90 or grade not in {"A", "A+"} or trigger_price <= 0 or not interval or identity in seen:
+                continue
+            seen.add(identity)
+            candidates.append({
+                "id": candidate_id,
+                "symbol": symbol,
+                "name": item.get("name") or symbol,
+                "provider": item.get("provider") or "",
+                "chain": clean_feed_text(item.get("chain"), 40),
+                "contractAddress": clean_feed_text(item.get("contractAddress"), 180),
+                "monitorPool": item.get("monitorPool") or "",
+                "structureMembershipSources": item.get("structureMembershipSources") if isinstance(item.get("structureMembershipSources"), list) else [],
+                "newCoinSource": item.get("newCoinSource") or "",
+                "newCoinSources": item.get("newCoinSources") if isinstance(item.get("newCoinSources"), list) else [],
+                "interval": interval,
+                "label": clean_feed_text(pending.get("label") or frame.get("label") or interval, 16),
+                "pattern": clean_feed_text(pending.get("pattern") or frame.get("pattern") or "起爆结构", 100),
+                "triggerPrice": trigger_price,
+                "stop": safe_float(pending.get("stop"), 0) or None,
+                "certainty": certainty,
+                "grade": grade,
+                "multiTimeframeConfluence": bool(pending.get("multiTimeframeConfluence")),
+                "decisionTime": int(safe_float(pending.get("decisionTime") or pending.get("time"), 0)),
+                "checkedAt": checked_at,
+                "broadcastEligibility": item.get("broadcastEligibility"),
+            })
+    return candidates
+
+
+def price_structure_short_momentum(item: dict[str, Any], current_price: float) -> dict[str, Any]:
+    symbol = price_structure_monitor_symbol(item.get("symbol"))
+    provider = clean_feed_text(item.get("provider"), 60)
+    if not symbol or current_price <= 0:
+        return {}
+    cache_key = f"{provider.lower()}:{symbol}"
+    now = time.time()
+    with PRICE_STRUCTURE_MOMENTUM_CACHE_LOCK:
+        cached_momentum = PRICE_STRUCTURE_MOMENTUM_CACHE.get(cache_key)
+    if cached_momentum and now - cached_momentum[0] < PRICE_STRUCTURE_MOMENTUM_CACHE_TTL_SECONDS:
+        return cached_momentum[1]
+
+    try:
+        provider_lower = provider.lower()
+        if "okx" in provider_lower:
+            candles, _ = price_structure_candles_from_okx(symbol, "1m", limit=30)
+        elif "bitget" in provider_lower:
+            candles, _ = price_structure_candles_from_bitget(symbol, "1m", limit=30)
+        elif "gate" in provider_lower:
+            candles, _ = price_structure_candles_from_gate(symbol, "1m", limit=30)
+        elif "kucoin" in provider_lower:
+            candles, _ = price_structure_candles_from_kucoin(symbol, "1m", limit=30)
+        elif "htx" in provider_lower:
+            candles, _ = price_structure_candles_from_htx(symbol, "1min", limit=30)
+        elif "aster" in provider_lower:
+            candles, _ = price_structure_candles_from_aster(symbol, "1m", limit=30)
+        elif "trade.xyz" in provider_lower:
+            candles, _ = price_structure_candles_from_hyperliquid(
+                symbol, "1m", limit=30, min_rows=2, dex_prefix="xyz"
+            )
+        elif "hyperliquid" in provider_lower:
+            candles, _ = price_structure_candles_from_hyperliquid(symbol, "1m", limit=30, min_rows=2)
+        elif "链上" in provider_lower:
+            candles, _ = price_structure_candles_from_geckoterminal(
+                symbol, "1m", limit=30, min_rows=2,
+                contract_address=item.get("contractAddress"), chain=item.get("chain"),
+            )
+        else:
+            candles, _ = price_structure_candles_from_binance(symbol, "1m", limit=30)
+    except Exception:
+        return cached_momentum[1] if cached_momentum else {}
+    if len(candles) < 11:
+        return {}
+
+    closes = [safe_float(row[4], 0) for row in candles if len(row) >= 5 and safe_float(row[4], 0) > 0]
+    if len(closes) < 11:
+        return {}
+    closes[-1] = current_price
+    speeds: list[float] = []
+    for minutes in (3, 5, 10):
+        if len(closes) <= minutes or closes[-1 - minutes] <= 0:
+            continue
+        speeds.append(((current_price / closes[-1 - minutes]) - 1) * 100 / minutes)
+    positive_speeds = sorted(speed for speed in speeds if speed > 0)
+    speed = positive_speeds[len(positive_speeds) // 2] if positive_speeds else 0.0
+    recent = closes[-11:]
+    up_steps = sum(1 for left, right in zip(recent, recent[1:]) if right >= left)
+    up_ratio = up_steps / max(1, len(recent) - 1)
+    momentum = {
+        "speedPctPerMinute": round(speed, 6),
+        "upRatio": round(up_ratio, 4),
+        "sampleMinutes": 10,
+    }
+    with PRICE_STRUCTURE_MOMENTUM_CACHE_LOCK:
+        PRICE_STRUCTURE_MOMENTUM_CACHE[cache_key] = (time.time(), momentum)
+    return momentum
+
+
+def price_structure_realtime_quote(item: dict[str, Any]) -> dict[str, Any]:
+    symbol = price_structure_monitor_symbol(item.get("symbol"))
+    if not symbol:
+        return {}
+    preferred = clean_feed_text(item.get("provider"), 60).lower()
+
+    def binance_quote() -> dict[str, Any]:
+        response = requests.get(
+            "https://fapi.binance.com/fapi/v1/ticker/price",
+            params={"symbol": binance_price_watch_pair(symbol)},
+            headers=HEADERS,
+            timeout=2.5,
+        )
+        response.raise_for_status()
+        response.encoding = "utf-8"
+        payload = response.json()
+        price = safe_float(payload.get("price") if isinstance(payload, dict) else 0, 0)
+        return {"price": price, "provider": "Binance Futures"} if price > 0 else {}
+
+    def okx_quote() -> dict[str, Any]:
+        response = requests.get(
+            "https://www.okx.com/api/v5/market/ticker",
+            params={"instId": f"{symbol}-USDT-SWAP"},
+            headers=HEADERS,
+            timeout=2.5,
+        )
+        response.raise_for_status()
+        response.encoding = "utf-8"
+        payload = response.json()
+        rows = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), list) else []
+        price = safe_float(rows[0].get("last") if rows and isinstance(rows[0], dict) else 0, 0)
+        return {"price": price, "provider": "OKX Swap"} if price > 0 else {}
+
+    def bitget_quote() -> dict[str, Any]:
+        response = requests.get(
+            "https://api.bitget.com/api/v2/mix/market/ticker",
+            params={"symbol": f"{symbol}USDT", "productType": "USDT-FUTURES"},
+            headers=HEADERS,
+            timeout=2.5,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data") if isinstance(payload, dict) else []
+        row = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else (data if isinstance(data, dict) else {})
+        price = safe_float(row.get("lastPr") or row.get("last"), 0)
+        return {"price": price, "provider": "Bitget Futures"} if price > 0 else {}
+
+    def candle_quote(provider_key: str) -> dict[str, Any]:
+        if provider_key == "gate":
+            candles, label = price_structure_candles_from_gate(symbol, "1m", limit=3, min_rows=2)
+        elif provider_key == "kucoin":
+            candles, label = price_structure_candles_from_kucoin(symbol, "1m", limit=3, min_rows=2)
+        elif provider_key == "htx":
+            candles, label = price_structure_candles_from_htx(symbol, "1min", limit=3, min_rows=2)
+        elif provider_key == "aster":
+            candles, label = price_structure_candles_from_aster(symbol, "1m", limit=3, min_rows=2)
+        elif provider_key == "trade.xyz":
+            candles, label = price_structure_candles_from_hyperliquid(
+                symbol, "1m", limit=3, min_rows=2, dex_prefix="xyz"
+            )
+        elif provider_key == "hyperliquid":
+            candles, label = price_structure_candles_from_hyperliquid(symbol, "1m", limit=3, min_rows=2)
+        else:
+            candles, label = price_structure_candles_from_geckoterminal(
+                symbol, "1m", limit=3, min_rows=2,
+                contract_address=item.get("contractAddress"), chain=item.get("chain"),
+            )
+        price = safe_float(candles[-1][4], 0) if candles else 0
+        return {"price": price, "provider": label} if price > 0 else {}
+
+    providers = [
+        ("binance", binance_quote),
+        ("okx", okx_quote),
+        ("bitget", bitget_quote),
+        ("kucoin", lambda: candle_quote("kucoin")),
+        ("gate", lambda: candle_quote("gate")),
+        ("htx", lambda: candle_quote("htx")),
+        ("aster", lambda: candle_quote("aster")),
+        ("hyperliquid", lambda: candle_quote("hyperliquid")),
+        ("trade.xyz", lambda: candle_quote("trade.xyz")),
+        ("链上", lambda: candle_quote("onchain")),
+    ]
+    providers.sort(key=lambda entry: 0 if entry[0] in preferred else 1)
+    for _provider_key, fetcher in providers:
+        try:
+            quote = fetcher()
+            if quote:
+                momentum = price_structure_short_momentum(
+                    {**item, "provider": quote.get("provider") or item.get("provider")},
+                    safe_float(quote.get("price"), 0),
+                )
+                return {
+                    **quote,
+                    **momentum,
+                    "symbol": symbol,
+                    "observedAt": int(time.time() * 1000),
+                }
+        except Exception:
+            continue
+    return {}
+
+
+def launch_price_structure_prearm_alert(
+    candidate: dict[str, Any],
+    quote: dict[str, Any],
+) -> dict[str, Any]:
+    symbol = price_structure_monitor_symbol(candidate.get("symbol"))
+    if not symbol or price_structure_symbol_excluded(symbol):
+        return {"ok": True, "skipped": True, "reason": "structure monitor excluded"}
+    if not price_structure_broadcast_allowed(candidate, clean_feed_text(candidate.get("interval"), 10)):
+        return {"ok": True, "skipped": True, "reason": "broadcast qualification rejected"}
+    current_price = safe_float(quote.get("price"), 0)
+    trigger_price = safe_float(candidate.get("triggerPrice"), 0)
+    if current_price <= 0 or trigger_price <= 0:
+        return {"ok": True, "skipped": True, "reason": "quote unavailable"}
+    distance_pct = (trigger_price - current_price) / trigger_price * 100
+    if distance_pct < -PRICE_STRUCTURE_PREARM_MAX_OVERSHOOT_PCT:
+        return {"ok": True, "skipped": True, "reason": "already beyond chase window", "distancePct": distance_pct}
+
+    speed_pct_per_minute = safe_float(quote.get("speedPctPerMinute"), 0)
+    up_ratio = safe_float(quote.get("upRatio"), 0)
+    eta_minutes = (
+        distance_pct / speed_pct_per_minute
+        if distance_pct > 0 and speed_pct_per_minute >= PRICE_STRUCTURE_PREARM_MIN_SPEED_PCT_PER_MINUTE
+        else None
+    )
+    near_trigger = distance_pct <= PRICE_STRUCTURE_PREARM_DISTANCE_PCT
+    forecast_window = (
+        eta_minutes is not None
+        and distance_pct <= PRICE_STRUCTURE_PREARM_MAX_FORECAST_DISTANCE_PCT
+        and eta_minutes <= PRICE_STRUCTURE_PREARM_FORECAST_MINUTES
+        and up_ratio >= PRICE_STRUCTURE_PREARM_MIN_UP_RATIO
+    )
+    if not near_trigger and not forecast_window:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "outside forecast window",
+            "distancePct": round(distance_pct, 6),
+            "etaMinutes": round(eta_minutes, 2) if eta_minutes is not None else None,
+            "upRatio": round(up_ratio, 4),
+        }
+
+    label = clean_feed_text(candidate.get("label") or candidate.get("interval"), 16)
+    pattern = clean_feed_text(candidate.get("pattern") or "起爆结构", 100)
+    certainty = int(safe_float(candidate.get("certainty"), 0))
+    grade = clean_feed_text(candidate.get("grade") or "A", 8)
+    crossed = distance_pct <= 0
+    if crossed:
+        stage = "盘中预触发"
+    elif forecast_window and eta_minutes is not None and eta_minutes >= 5:
+        stage = "5至10分钟提前预判"
+    elif forecast_window and eta_minutes is not None:
+        stage = "5分钟内加速预判"
+    else:
+        stage = "临界预判"
+    distance_text = (
+        f"盘中已触及触发价，超出 {abs(distance_pct):.2f}%"
+        if crossed
+        else f"距触发价仅 {distance_pct:.2f}%"
+    )
+    eta_text = (
+        f"按近10分钟推进速度，预计约 {max(1, round(eta_minutes))} 分钟触发"
+        if forecast_window and eta_minutes is not None
+        else "已进入临界触发区"
+    )
+    local_port = env_value("PORT") or env_value("XINGYUN_PORT") or "8765"
+    membership_label, provider_label = price_structure_alert_source_labels(
+        candidate,
+        quote.get("provider") or candidate.get("provider"),
+    )
+    return launch_desktop_alert({
+        "key": f"price-watch:dragon-wave-prearm:{symbol}:{candidate.get('id')}",
+        "kind": "价格监控",
+        "source": "币种价格监控",
+        "sourceLabel": "P",
+        "title": f"{symbol} {label} 起爆预判",
+        "body": " · ".join([
+            stage,
+            pattern,
+            distance_text,
+            eta_text,
+            f"确定性 {grade} {certainty}分",
+            f"现价 {price_usd(current_price)}",
+            f"触发 {price_usd(trigger_price)}",
+            membership_label,
+            provider_label,
+            "尚未收线",
+        ]),
+        "url": f"http://127.0.0.1:{local_port}/price-watch.html?mode=structure",
+        "time": int(time.time() * 1000),
+        "priority": "一级·提前预判",
+        "speech": (
+            f"一级优先，{symbol}，{label}起爆预判，{stage}，{distance_text}，"
+            f"{eta_text}，确定性{grade}，尚未收线，请立即关注。"
+        ),
+        "sound": "urgent",
+        "queuePriority": DESKTOP_ALERT_TRADING_PREARM_PRIORITY,
+    })
+
+
+def price_structure_prearm_monitor_once() -> dict[str, Any]:
+    candidates = price_structure_prearm_candidates()
+    if not candidates:
+        result = {"ok": True, "candidates": 0, "quotes": 0, "alerts": 0}
+        with PRICE_STRUCTURE_PREARM_STATUS_LOCK:
+            PRICE_STRUCTURE_PREARM_STATUS.update({**result, "lastRunAt": int(time.time() * 1000)})
+        return result
+    first_by_symbol: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        first_by_symbol.setdefault(str(candidate["symbol"]), candidate)
+    quotes: dict[str, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=min(4, len(first_by_symbol))) as executor:
+        futures = {
+            executor.submit(price_structure_realtime_quote, candidate): symbol
+            for symbol, candidate in first_by_symbol.items()
+        }
+        for future in as_completed(futures):
+            try:
+                quotes[futures[future]] = future.result()
+            except Exception:
+                quotes[futures[future]] = {}
+    alerts = 0
+    for candidate in candidates:
+        result = launch_price_structure_prearm_alert(candidate, quotes.get(str(candidate["symbol"]), {}))
+        if result.get("queued"):
+            alerts += 1
+    result = {
+        "ok": True,
+        "candidates": len(candidates),
+        "quotes": len([quote for quote in quotes.values() if quote]),
+        "alerts": alerts,
+    }
+    with PRICE_STRUCTURE_PREARM_STATUS_LOCK:
+        PRICE_STRUCTURE_PREARM_STATUS.update({**result, "lastRunAt": int(time.time() * 1000)})
+    return result
+
+
+def price_structure_cache_key(rows: list[dict[str, Any]]) -> str:
+    # Display priority is intentionally dynamic (personal X and hot-list rank
+    # move rows to the front). Cache identity must describe membership and
+    # settings only; otherwise concurrent workers carrying two harmless row
+    # orders continually replace one another with cold placeholder payloads.
+    members = sorted(
+        ":".join((
+            str(row["symbol"]),
+            str(int(safe_float(row.get("structure1mOverride"), -1))),
+            json.dumps(
+                parse_price_structure_interval_overrides(row.get("structureIntervalOverrides", {})),
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            str(max(
+                int(safe_float(row.get("personalXMentionedAt"), 0)),
+                int(safe_float(row.get("newContractListedAt"), 0)),
+                int(safe_float((row.get("adaptiveContext") or {}).get("observedAt"), 0))
+                if isinstance(row.get("adaptiveContext"), dict) else 0,
+            )),
+        ))
+        for row in rows
+    )
+    return f"{PRICE_STRUCTURE_STRATEGY_VERSION}:" + ",".join(members)
+
+
+def price_structure_payload(*, force_refresh: bool = False) -> dict[str, Any]:
+    global PRICE_STRUCTURE_DISK_CACHE_HYDRATED
+    rows = price_structure_watch_rows()
+    cache_key = price_structure_cache_key(rows)
+    with PRICE_STRUCTURE_CACHE_LOCK:
+        cached = PRICE_STRUCTURE_CACHE.get(cache_key)
+    if cached:
+        if force_refresh and rows:
+            threading.Thread(
+                target=refresh_price_structure_strategy_monitor_item,
+                args=(rows[0], rows),
+                name="manual-structure-refresh",
+                daemon=True,
+            ).start()
+        return cached[1]
+
+    # A pool may contain hundreds of 30-day AiCoin/X/listing symbols. A cold
+    # page request must never fan out across every symbol and six timeframes.
+    # Reuse per-symbol disk snapshots immediately and let the authoritative
+    # three-second background rotator refresh one symbol at a time.
+    with PRICE_STRUCTURE_REFRESH_LOCK:
+        with PRICE_STRUCTURE_CACHE_LOCK:
+            cached = PRICE_STRUCTURE_CACHE.get(cache_key)
+            if cached:
+                return cached[1]
+        snapshot = read_json_cache(PRICE_STRUCTURE_SNAPSHOT_PATH)
+        restored_payload = snapshot.get("payload") if isinstance(snapshot.get("payload"), dict) else {}
+        restored_items = restored_payload.get("items") if isinstance(restored_payload.get("items"), list) else []
+        restored_by_symbol = {
+            price_structure_monitor_symbol(item.get("symbol")): item
+            for item in restored_items
+            if isinstance(item, dict) and price_structure_monitor_symbol(item.get("symbol"))
+        }
+        with PRICE_STRUCTURE_PROVIDER_PREFERENCE_LOCK:
+            for symbol, item in restored_by_symbol.items():
+                provider = clean_feed_text(item.get("provider"), 60)
+                if provider:
+                    PRICE_STRUCTURE_PROVIDER_PREFERENCE.setdefault(symbol, provider)
+        items: list[dict[str, Any]] = []
+        for watched in rows:
+            symbol = price_structure_monitor_symbol(watched.get("symbol"))
+            restored = restored_by_symbol.get(symbol)
+            if restored:
+                items.append({**restored, **watched})
+            else:
+                items.append({
+                    **watched,
+                    "provider": "",
+                    "currentPrice": None,
+                    "frames": [],
+                    "signals": [],
+                    "signalCount": 0,
+                    "strategy": "dragon-wave-engine",
+                    "checkedAt": 0,
+                    "error": "等待后台轮询",
+                })
+        payload = {
+            "ok": True,
+            "updatedAt": int(time.time() * 1000),
+            "items": items,
+            "summary": {
+                "total": len(items),
+                "available": sum(1 for item in items if item.get("frames")),
+                "timeframes": len(PRICE_STRUCTURE_TIMEFRAMES),
+                "signals": sum(int(safe_float(item.get("signalCount"), 0)) for item in items),
+                "alerts": 0,
+                "strategy": "dragon-wave-engine",
+                "monitorMode": "parallel-full-pool",
+                "inactiveExcluded": int(safe_float(PRICE_MONITOR_ACTIVITY_SUMMARY.get("excluded"), 0)),
+                "activityThresholdUsd": safe_float(PRICE_MONITOR_ACTIVITY_SUMMARY.get("thresholdUsd"), 0),
+            },
+        }
+        with PRICE_STRUCTURE_CACHE_LOCK:
+            PRICE_STRUCTURE_CACHE.clear()
+            PRICE_STRUCTURE_CACHE[cache_key] = (time.time(), payload)
+            PRICE_STRUCTURE_DISK_CACHE_HYDRATED = True
+        write_json_cache(PRICE_STRUCTURE_SNAPSHOT_PATH, {
+            "cacheKey": cache_key,
+            "savedAt": int(time.time() * 1000),
+            "payload": payload,
+        })
+    if force_refresh and rows:
+        threading.Thread(
+            target=refresh_price_structure_strategy_monitor_item,
+            args=(rows[0], rows),
+            name="manual-structure-refresh",
+            daemon=True,
+        ).start()
+    return payload
+
+
+def new_coin_low_apply_monitor_preferences(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    symbols = sorted({clean_price_watch_symbol(row.get("symbol")) for row in rows} - {""})
+    if not symbols:
+        return []
+    placeholders = ",".join("?" for _ in symbols)
+    with AUTH_DB_LOCK, auth_db() as conn:
+        settings_rows = conn.execute(
+            f"""
+            SELECT symbol, structure_1m_override, structure_interval_overrides_json
+            FROM price_watch_assets WHERE symbol IN ({placeholders})
+            """,
+            tuple(symbols),
+        ).fetchall()
+        excluded_rows = conn.execute(
+            f"SELECT symbol FROM price_structure_exclusions WHERE symbol IN ({placeholders})",
+            tuple(symbols),
+        ).fetchall()
+    settings = {clean_price_watch_symbol(row["symbol"]): row_dict(row) for row in settings_rows}
+    excluded = {clean_price_watch_symbol(row["symbol"]) for row in excluded_rows}
+    enriched: list[dict[str, Any]] = []
+    for row in rows:
+        symbol = clean_price_watch_symbol(row.get("symbol"))
+        if not symbol or symbol in excluded:
+            continue
+        setting = settings.get(symbol, {})
+        raw_one_minute = setting.get("structure_1m_override", -1)
+        enriched.append({
+            **row,
+            "structure1mOverride": int(raw_one_minute if raw_one_minute is not None else -1),
+            "structureIntervalOverrides": parse_price_structure_interval_overrides(
+                setting.get("structure_interval_overrides_json")
+            ),
+        })
+    return enriched
+
+
+def fetch_new_coin_low_market_activity(*, force_refresh: bool = False) -> dict[str, dict[str, Any]]:
+    with NEW_COIN_LOW_ACTIVITY_LOCK:
+        return _fetch_new_coin_low_market_activity(force_refresh=force_refresh)
+
+
+def _fetch_new_coin_low_market_activity(*, force_refresh: bool = False) -> dict[str, dict[str, Any]]:
+    """Return the largest official 24h contract turnover seen across admission venues."""
+    global NEW_COIN_LOW_ACTIVITY_CACHE
+    now = time.time()
+    if (
+        NEW_COIN_LOW_ACTIVITY_CACHE
+        and not force_refresh
+        and now - NEW_COIN_LOW_ACTIVITY_CACHE[0] < NEW_COIN_LOW_ACTIVITY_CACHE_SECONDS
+    ):
+        return {symbol: dict(value) for symbol, value in NEW_COIN_LOW_ACTIVITY_CACHE[1].items()}
+
+    def binance_activity() -> dict[str, float]:
+        response = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", headers=HEADERS, timeout=18)
+        response.raise_for_status()
+        payload = response.json()
+        return {
+            clean_price_watch_symbol(str(item.get("symbol") or "").removesuffix("USDT")): safe_float(item.get("quoteVolume"), 0)
+            for item in payload if isinstance(item, dict) and str(item.get("symbol") or "").endswith("USDT")
+        }
+
+    def okx_activity() -> dict[str, float]:
+        response = requests.get(
+            "https://www.okx.com/api/v5/market/tickers",
+            params={"instType": "SWAP"}, headers=HEADERS, timeout=18,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        result: dict[str, float] = {}
+        for item in payload.get("data", []) if isinstance(payload, dict) else []:
+            inst_id = str(item.get("instId") or "") if isinstance(item, dict) else ""
+            match = re.fullmatch(r"(.+)-USDT-SWAP", inst_id)
+            if not match:
+                continue
+            result[clean_price_watch_symbol(match.group(1))] = (
+                safe_float(item.get("last"), 0) * safe_float(item.get("volCcy24h") or item.get("vol24h"), 0)
+            )
+        return result
+
+    def gate_activity() -> dict[str, float]:
+        response = requests.get(
+            "https://api.gateio.ws/api/v4/futures/usdt/tickers", headers=HEADERS, timeout=18
+        )
+        response.raise_for_status()
+        payload = response.json()
+        result: dict[str, float] = {}
+        for item in payload if isinstance(payload, list) else []:
+            contract = str(item.get("contract") or "") if isinstance(item, dict) else ""
+            if not contract.endswith("_USDT"):
+                continue
+            result[clean_price_watch_symbol(contract.removesuffix("_USDT"))] = safe_float(
+                item.get("volume_24h_quote") or item.get("volume_24h_settle"), 0
+            )
+        return result
+
+    def htx_activity() -> dict[str, float]:
+        response = requests.get(
+            "https://api.hbdm.com/linear-swap-ex/market/detail/batch_merged",
+            headers=HEADERS, timeout=18,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        result: dict[str, float] = {}
+        for item in payload.get("ticks", []) if isinstance(payload, dict) else []:
+            contract = str(item.get("contract_code") or "") if isinstance(item, dict) else ""
+            if not contract.endswith("-USDT"):
+                continue
+            result[clean_price_watch_symbol(contract.removesuffix("-USDT"))] = safe_float(
+                item.get("trade_turnover"), 0
+            )
+        return result
+
+    def bitget_activity() -> dict[str, float]:
+        response = requests.get(
+            "https://api.bitget.com/api/v2/mix/market/tickers",
+            params={"productType": "USDT-FUTURES"}, headers=HEADERS, timeout=18,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        result: dict[str, float] = {}
+        for item in payload.get("data", []) if isinstance(payload, dict) else []:
+            market_symbol = str(item.get("symbol") or "") if isinstance(item, dict) else ""
+            if not market_symbol.endswith("USDT"):
+                continue
+            result[clean_price_watch_symbol(market_symbol.removesuffix("USDT"))] = safe_float(
+                item.get("usdtVolume") or item.get("quoteVolume"), 0
+            )
+        return result
+
+    def aster_activity() -> dict[str, float]:
+        response = requests.get(
+            "https://fapi.asterdex.com/fapi/v1/ticker/24hr",
+            headers={**HEADERS, "Referer": ASTER_TRADE_URL}, timeout=18,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        rows = payload if isinstance(payload, list) else [payload] if isinstance(payload, dict) else []
+        result: dict[str, float] = {}
+        for item in rows:
+            market_symbol = str(item.get("symbol") or "") if isinstance(item, dict) else ""
+            if not market_symbol.endswith("USDT"):
+                continue
+            result[clean_price_watch_symbol(market_symbol.removesuffix("USDT"))] = safe_float(
+                item.get("quoteVolume"), 0
+            )
+        return result
+
+    def hyperliquid_activity(dex: str = "") -> dict[str, float]:
+        request_payload: dict[str, Any] = {"type": "metaAndAssetCtxs"}
+        if dex:
+            request_payload["dex"] = dex
+        response = requests.post(
+            "https://api.hyperliquid.xyz/info",
+            json=request_payload,
+            headers={**HEADERS, "Content-Type": "application/json"},
+            timeout=18,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, list) or len(payload) < 2:
+            return {}
+        universe = payload[0].get("universe", []) if isinstance(payload[0], dict) else []
+        contexts = payload[1] if isinstance(payload[1], list) else []
+        result: dict[str, float] = {}
+        for meta, context in zip(universe, contexts):
+            if not isinstance(meta, dict) or not isinstance(context, dict):
+                continue
+            symbol = clean_price_watch_symbol(meta.get("name"))
+            if symbol:
+                result[symbol] = safe_float(context.get("dayNtlVlm"), 0)
+        return result
+
+    merged: dict[str, dict[str, Any]] = {}
+    sources = (
+        ("Binance", binance_activity),
+        ("OKX", okx_activity),
+        ("Gate", gate_activity),
+        ("HTX", htx_activity),
+        ("Bitget", bitget_activity),
+        ("Aster", aster_activity),
+        ("Hyperliquid", hyperliquid_activity),
+        ("Trade.xyz", lambda: hyperliquid_activity("xyz")),
+    )
+    with ThreadPoolExecutor(max_workers=len(sources)) as executor:
+        futures = {executor.submit(fetcher): source for source, fetcher in sources}
+        for future in as_completed(futures):
+            source = futures[future]
+            try:
+                values = future.result()
+            except Exception as exc:
+                print(f"New-coin activity {source} failed: {safe_error_text(str(exc))[:140]}", file=sys.stderr)
+                continue
+            for symbol, turnover in values.items():
+                if not symbol or turnover < 0:
+                    continue
+                current = merged.get(symbol)
+                if current is None or turnover > safe_float(current.get("turnover24hUsd"), 0):
+                    merged[symbol] = {"turnover24hUsd": round(turnover, 2), "source": source}
+    if not merged and NEW_COIN_LOW_ACTIVITY_CACHE:
+        return {symbol: dict(value) for symbol, value in NEW_COIN_LOW_ACTIVITY_CACHE[1].items()}
+    NEW_COIN_LOW_ACTIVITY_CACHE = (now, merged)
+    return {symbol: dict(value) for symbol, value in merged.items()}
+
+
+def new_coin_low_activity_state(
+    row: dict[str, Any],
+    activity: dict[str, dict[str, Any]],
+    *,
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    symbol = clean_price_watch_symbol(row.get("symbol"))
+    effective_now = int(now_ms or time.time() * 1000)
+    first_listed_at = int(safe_float(row.get("newCoinFirstListedAt") or row.get("newCoinListedAt"), 0))
+    age_days = (effective_now - first_listed_at) / 86_400_000 if first_listed_at > 0 else 9999.0
+    market = activity.get(symbol) if symbol else None
+    if NEW_COIN_LOW_ACTIVITY_GRACE_DAYS > 0 and age_days <= NEW_COIN_LOW_ACTIVITY_GRACE_DAYS:
+        return {
+            "active": True,
+            "status": "grace",
+            "reason": "new-listing-grace",
+            "ageDays": round(age_days, 1),
+            "turnover24hUsd": safe_float((market or {}).get("turnover24hUsd"), 0) if market else None,
+            "source": clean_feed_text((market or {}).get("source"), 30),
+        }
+    if not market:
+        return {
+            "active": True,
+            "status": "unavailable",
+            "reason": "activity-data-unavailable-keep",
+            "ageDays": round(age_days, 1),
+            "turnover24hUsd": None,
+            "source": "",
+        }
+    turnover = safe_float(market.get("turnover24hUsd"), 0)
+    active = turnover >= NEW_COIN_LOW_MIN_TURNOVER_24H_USD
+    return {
+        "active": active,
+        "status": "active" if active else "inactive",
+        "reason": "turnover-active" if active else "turnover-below-threshold",
+        "ageDays": round(age_days, 1),
+        "turnover24hUsd": round(turnover, 2),
+        "source": clean_feed_text(market.get("source"), 30),
+        "thresholdUsd": NEW_COIN_LOW_MIN_TURNOVER_24H_USD,
+    }
+
+
+def price_monitor_market_activity_state(
+    symbol_value: Any,
+    activity: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    symbol = clean_price_watch_symbol(symbol_value)
+    market = activity.get(symbol) if symbol else None
+    if not market:
+        return {
+            "active": True,
+            "status": "unavailable",
+            "reason": "activity-data-unavailable-keep",
+            "turnover24hUsd": None,
+            "source": "",
+            "thresholdUsd": NEW_COIN_LOW_MIN_TURNOVER_24H_USD,
+        }
+    turnover = safe_float(market.get("turnover24hUsd"), 0)
+    active = turnover >= NEW_COIN_LOW_MIN_TURNOVER_24H_USD
+    return {
+        "active": active,
+        "status": "active" if active else "inactive",
+        "reason": "turnover-active" if active else "turnover-below-threshold",
+        "turnover24hUsd": round(turnover, 2),
+        "source": clean_feed_text(market.get("source"), 30),
+        "thresholdUsd": NEW_COIN_LOW_MIN_TURNOVER_24H_USD,
+    }
+
+
+def price_structure_onchain_activity_state(symbol_value: Any, *, timeout: float = 5) -> dict[str, Any]:
+    """Resolve aggregate DEX turnover for personal-X assets absent from CEX activity maps."""
+    symbol = clean_price_watch_symbol(symbol_value)
+    if not symbol:
+        return {
+            "active": True,
+            "status": "unavailable",
+            "reason": "onchain-symbol-unavailable-keep",
+            "turnover24hUsd": None,
+            "source": "",
+            "thresholdUsd": NEW_COIN_LOW_MIN_TURNOVER_24H_USD,
+        }
+    pool = price_structure_onchain_pool(symbol, timeout=timeout)
+    if not pool:
+        return {
+            "active": True,
+            "status": "unavailable",
+            "reason": "onchain-activity-unavailable-keep",
+            "turnover24hUsd": None,
+            "source": "",
+            "thresholdUsd": NEW_COIN_LOW_MIN_TURNOVER_24H_USD,
+        }
+    turnover = max(0.0, safe_float(pool.get("volume24hUsd"), 0))
+    active = turnover >= NEW_COIN_LOW_MIN_TURNOVER_24H_USD
+    return {
+        "active": active,
+        "status": "active" if active else "inactive",
+        "reason": "onchain-turnover-active" if active else "onchain-turnover-below-threshold",
+        "turnover24hUsd": round(turnover, 2),
+        "source": clean_feed_text(pool.get("source") or "DexScreener 链上聚合", 40),
+        "thresholdUsd": NEW_COIN_LOW_MIN_TURNOVER_24H_USD,
+        "network": clean_feed_text(pool.get("network"), 30),
+        "poolAddress": clean_feed_text(pool.get("poolAddress"), 100),
+        "contractAddress": clean_feed_text(pool.get("contractAddress"), 100),
+        "poolCount": int(safe_float(pool.get("poolCount"), 0)),
+    }
+
+
+def filter_price_monitor_rows_by_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Apply one turnover admission gate to prior-high, oversold and structure pools."""
+    global PRICE_MONITOR_ACTIVITY_SUMMARY
+    activity = fetch_new_coin_low_market_activity()
+    now_ms = int(time.time() * 1000)
+    personal_x_cutoff = now_ms - PERSONAL_X_MONITOR_RETENTION_SECONDS * 1000
+    states = {
+        clean_price_watch_symbol(row.get("symbol")): price_monitor_market_activity_state(row.get("symbol"), activity)
+        for row in rows
+        if clean_price_watch_symbol(row.get("symbol"))
+    }
+    onchain_rows = [
+        row
+        for row in rows
+        if int(safe_float(row.get("personal_x_mentioned_at"), 0)) >= personal_x_cutoff
+        and (
+            states.get(clean_price_watch_symbol(row.get("symbol")), {}).get("status") == "unavailable"
+            or not states.get(clean_price_watch_symbol(row.get("symbol")), {}).get("active", True)
+        )
+    ]
+    if onchain_rows:
+        with ThreadPoolExecutor(max_workers=min(4, len(onchain_rows))) as executor:
+            futures = {
+                executor.submit(price_structure_onchain_activity_state, row.get("symbol")): clean_price_watch_symbol(row.get("symbol"))
+                for row in onchain_rows
+            }
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    onchain_state = future.result()
+                except Exception:
+                    continue
+                current_state = states.get(symbol) or {}
+                if onchain_state.get("status") == "unavailable":
+                    continue
+                if (
+                    onchain_state.get("active")
+                    or current_state.get("status") == "unavailable"
+                    or safe_float(onchain_state.get("turnover24hUsd"), 0)
+                    > safe_float(current_state.get("turnover24hUsd"), 0)
+                ):
+                    states[symbol] = onchain_state
+    filtered: list[dict[str, Any]] = []
+    excluded = 0
+    unavailable = 0
+    for row in rows:
+        state = states.get(clean_price_watch_symbol(row.get("symbol"))) or price_monitor_market_activity_state(
+            row.get("symbol"), activity
+        )
+        if state["status"] == "unavailable":
+            unavailable += 1
+        if not state["active"]:
+            excluded += 1
+            continue
+        filtered.append({**row, "marketActivity": state})
+    PRICE_MONITOR_ACTIVITY_SUMMARY = {
+        "excluded": excluded,
+        "unavailable": unavailable,
+        "thresholdUsd": NEW_COIN_LOW_MIN_TURNOVER_24H_USD,
+        "checked": len(rows),
+    }
+    return filtered
+
+
+def new_coin_low_inventory_rows(*, force_refresh: bool = False) -> list[dict[str, Any]]:
+    global NEW_COIN_LOW_INVENTORY_CACHE, NEW_COIN_LOW_ACTIVITY_SUMMARY
+    global PRICE_STRUCTURE_RECENT_LISTING_INDEX_CACHE
+    now = time.time()
+    if (
+        NEW_COIN_LOW_INVENTORY_CACHE
+        and not force_refresh
+        and now - NEW_COIN_LOW_INVENTORY_CACHE[0] < NEW_COIN_LOW_INVENTORY_CACHE_SECONDS
+    ):
+        return new_coin_low_apply_monitor_preferences([
+            dict(row) for row in NEW_COIN_LOW_INVENTORY_CACHE[1]
+            if new_coin_low_row_admitted(row)
+        ])
+    now_ms = int(now * 1000)
+    candidates: dict[str, dict[str, Any]] = {}
+    candidates_lock = threading.Lock()
+    tradfi_assets: set[str] = set()
+
+    listing_history = read_json_cache(NEW_COIN_LOW_LISTING_HISTORY_PATH)
+    for history_row in listing_history.get("items") if isinstance(listing_history.get("items"), list) else []:
+        if not isinstance(history_row, dict):
+            continue
+        symbol = history_row.get("symbol")
+        history = history_row.get("newCoinListingHistory")
+        if not isinstance(history, list):
+            history = [{
+                "source": history_row.get("newCoinSource"),
+                "listedAt": history_row.get("newCoinListedAt"),
+                "pair": history_row.get("symbol"),
+            }]
+        for entry in history:
+            if isinstance(entry, dict):
+                merge_new_coin_low_listing_candidate(
+                    candidates,
+                    symbol,
+                    entry.get("listedAt"),
+                    entry.get("source"),
+                    entry.get("pair"),
+                    now_ms=now_ms,
+                )
+
+    def add(symbol_value: Any, listed_at_value: Any, source: str, pair: str = "") -> None:
+        with candidates_lock:
+            merge_new_coin_low_listing_candidate(
+                candidates,
+                symbol_value,
+                listed_at_value,
+                source,
+                pair,
+                now_ms=now_ms,
+            )
+
+    def binance_inventory() -> None:
+        payload = requests.get(
+            "https://fapi.binance.com/fapi/v1/exchangeInfo", headers=HEADERS, timeout=18
+        ).json()
+        for item in payload.get("symbols", []) if isinstance(payload, dict) else []:
+            if not isinstance(item, dict) or item.get("quoteAsset") != "USDT":
+                continue
+            add(item.get("baseAsset"), item.get("onboardDate"), "Binance", item.get("symbol") or "")
+
+    def okx_inventory() -> None:
+        payload = requests.get(
+            "https://www.okx.com/api/v5/public/instruments",
+            params={"instType": "SWAP"}, headers=HEADERS, timeout=18,
+        ).json()
+        for item in payload.get("data", []) if isinstance(payload, dict) else []:
+            inst_id = str(item.get("instId") or "") if isinstance(item, dict) else ""
+            if not inst_id.endswith("-USDT-SWAP") or str(item.get("instCategory") or "") == "3":
+                continue
+            add(inst_id.split("-")[0], item.get("listTime"), "OKX", inst_id)
+
+    def gate_inventory() -> None:
+        response = requests.get(
+            "https://api.gateio.ws/api/v4/futures/usdt/contracts", headers=HEADERS, timeout=18
+        )
+        response.raise_for_status()
+        payload = response.json()
+        for item in payload if isinstance(payload, list) else []:
+            if not isinstance(item, dict):
+                continue
+            contract = str(item.get("name") or "").upper()
+            asset = clean_price_watch_symbol(contract.removesuffix("_USDT"))
+            if str(item.get("contract_type") or "").lower() in {
+                "stocks", "indices", "index", "tradfi", "metals", "commodities", "forex"
+            }:
+                if asset:
+                    with candidates_lock:
+                        tradfi_assets.add(asset)
+                continue
+            add(asset, safe_float(item.get("launch_time") or item.get("create_time")) * 1000, "Gate", contract)
+
+    def htx_inventory() -> None:
+        response = requests.get(
+            "https://api.hbdm.com/linear-swap-api/v1/swap_contract_info", headers=HEADERS, timeout=18
+        )
+        response.raise_for_status()
+        payload = response.json()
+        for item in payload.get("data", []) if isinstance(payload, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            asset = clean_price_watch_symbol(item.get("symbol"))
+            if item.get("tradfi_labels"):
+                if asset:
+                    with candidates_lock:
+                        tradfi_assets.add(asset)
+                continue
+            add(asset, htx_contract_date_ms(item.get("create_date")), "HTX", item.get("contract_code") or "")
+
+    def bitget_history_inventory() -> None:
+        payload = requests.get(
+            "https://api.bitget.com/api/v2/spot/public/symbols", headers=HEADERS, timeout=18
+        ).json()
+        for item in payload.get("data", []) if isinstance(payload, dict) else []:
+            if not isinstance(item, dict) or item.get("quoteCoin") != "USDT":
+                continue
+            add(item.get("baseCoin"), item.get("openTime"), "Bitget", item.get("symbol") or "")
+
+    def aster_history_inventory() -> None:
+        for item in aster_contract_rows(5000):
+            if not isinstance(item, dict):
+                continue
+            add(item.get("baseAsset"), item.get("date"), "Aster", item.get("symbol") or "")
+
+    fetchers = (
+        binance_inventory,
+        okx_inventory,
+        gate_inventory,
+        htx_inventory,
+        bitget_history_inventory,
+        aster_history_inventory,
+    )
+    with ThreadPoolExecutor(max_workers=len(fetchers)) as executor:
+        futures = [executor.submit(fetcher) for fetcher in fetchers]
+        for future in futures:
+            try:
+                future.result()
+            except Exception as exc:
+                print(f"New-coin low inventory source failed: {safe_error_text(str(exc))[:140]}", file=sys.stderr)
+    history_rows = sorted(
+        candidates.values(),
+        key=lambda row: (clean_price_watch_symbol(row.get("symbol")), int(safe_float(row.get("newCoinListedAt"), 0))),
+    )
+    write_json_cache(NEW_COIN_LOW_LISTING_HISTORY_PATH, {
+        "updatedAt": now_ms,
+        "items": history_rows,
+    })
+    base_rows = [
+        row for symbol, row in candidates.items()
+        if (
+            symbol not in tradfi_assets
+            and new_coin_low_row_admitted(row)
+            and new_coin_low_row_within_age(row, now_ms=now_ms)
+        )
+    ]
+    activity = fetch_new_coin_low_market_activity(force_refresh=force_refresh)
+    known_metadata = price_structure_known_asset_metadata()
+    rows_with_activity: list[dict[str, Any]] = []
+    inactive_excluded = 0
+    activity_unavailable = 0
+    for row in base_rows:
+        activity_state = new_coin_low_activity_state(row, activity, now_ms=now_ms)
+        if activity_state["status"] == "unavailable":
+            activity_unavailable += 1
+        if not activity_state["active"]:
+            inactive_excluded += 1
+            continue
+        symbol = clean_price_watch_symbol(row.get("symbol"))
+        display = known_metadata.get(symbol, {})
+        rows_with_activity.append({
+            **row,
+            "name": display.get("name") or row.get("name") or symbol,
+            "icon": display.get("icon") or row.get("icon") or crypto_icon_url(symbol),
+            "marketActivity": activity_state,
+        })
+    rows = sorted(
+        rows_with_activity,
+        key=lambda row: int(safe_float(row.get("newCoinListedAt"), 0)),
+        reverse=True,
+    )
+    NEW_COIN_LOW_ACTIVITY_SUMMARY = {
+        "excluded": inactive_excluded,
+        "unavailable": activity_unavailable,
+        "thresholdUsd": NEW_COIN_LOW_MIN_TURNOVER_24H_USD,
+        "graceDays": NEW_COIN_LOW_ACTIVITY_GRACE_DAYS,
+        "checked": len(base_rows),
+    }
+    NEW_COIN_LOW_INVENTORY_CACHE = (time.time(), [dict(row) for row in rows])
+    with PRICE_STRUCTURE_RECENT_LISTING_INDEX_LOCK:
+        PRICE_STRUCTURE_RECENT_LISTING_INDEX_CACHE = None
+    return new_coin_low_apply_monitor_preferences(rows)
+
+
+def hydrate_new_coin_low_snapshot() -> None:
+    if NEW_COIN_LOW_ITEMS:
+        return
+    snapshot = read_json_cache(NEW_COIN_LOW_SNAPSHOT_PATH)
+    migrated = False
+    for item in snapshot.get("items") if isinstance(snapshot.get("items"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        symbol = clean_price_watch_symbol(item.get("symbol"))
+        if symbol and new_coin_low_row_admitted(item):
+            normalized = normalize_new_coin_low_structure_item(item)
+            NEW_COIN_LOW_ITEMS[symbol] = normalized
+            migrated = migrated or normalized != item
+        elif symbol:
+            migrated = True
+    if migrated:
+        write_json_cache(NEW_COIN_LOW_SNAPSHOT_PATH, {
+            "savedAt": int(time.time() * 1000),
+            "items": list(NEW_COIN_LOW_ITEMS.values()),
+        })
+
+
+def refresh_new_coin_low_structure_item(row: dict[str, Any]) -> dict[str, Any]:
+    symbol = clean_price_watch_symbol(row.get("symbol"))
+    if not new_coin_low_row_admitted(row):
+        return {
+            "symbol": symbol,
+            "monitorPool": "new-coin-low",
+            "skipped": True,
+            "skipReason": "Aster 仅作为K线备用源，不作为结构入池来源",
+            "alerts": 0,
+        }
+    with NEW_COIN_LOW_LOCK:
+        hydrate_new_coin_low_snapshot()
+        previous = NEW_COIN_LOW_ITEMS.get(symbol)
+    fresh = normalize_new_coin_low_structure_item(
+        fetch_price_structure_item(row, fast_provider_probe=True)
+    )
+    alert_count = (
+        launch_price_structure_first_observation_alerts(fresh, previous)
+        + launch_price_structure_strategy_alerts(fresh)
+    )
+    with NEW_COIN_LOW_LOCK:
+        if not fresh.get("frames") and previous and previous.get("frames"):
+            fresh = {
+                **previous,
+                "checkedAt": fresh.get("checkedAt"),
+                "error": fresh.get("error") or "本轮低位结构行情暂不可用，保留上一快照",
+            }
+        NEW_COIN_LOW_ITEMS[symbol] = fresh
+        write_json_cache(NEW_COIN_LOW_SNAPSHOT_PATH, {
+            "savedAt": int(time.time() * 1000),
+            "items": list(NEW_COIN_LOW_ITEMS.values()),
+        })
+        return {**fresh, "alerts": alert_count}
+
+
+def new_coin_low_structure_payload(*, force_refresh: bool = False) -> dict[str, Any]:
+    rows = new_coin_low_inventory_rows(force_refresh=force_refresh)
+    rows_by_symbol = {
+        clean_price_watch_symbol(row.get("symbol")): row
+        for row in rows
+        if clean_price_watch_symbol(row.get("symbol"))
+    }
+    with NEW_COIN_LOW_LOCK:
+        hydrate_new_coin_low_snapshot()
+        if force_refresh and rows:
+            # The background scanner still owns the full rotation; a page refresh
+            # only advances one symbol and never fans out across hundreds of coins.
+            pass
+        current_symbols = {clean_price_watch_symbol(row.get("symbol")) for row in rows}
+        stale_symbols = [symbol for symbol in NEW_COIN_LOW_ITEMS if symbol not in current_symbols]
+        for symbol in stale_symbols:
+            NEW_COIN_LOW_ITEMS.pop(symbol, None)
+        migrated_symbols = []
+        for symbol, item in list(NEW_COIN_LOW_ITEMS.items()):
+            normalized = normalize_new_coin_low_structure_item(item)
+            if normalized != item:
+                NEW_COIN_LOW_ITEMS[symbol] = normalized
+                migrated_symbols.append(symbol)
+        if stale_symbols or migrated_symbols:
+            write_json_cache(NEW_COIN_LOW_SNAPSHOT_PATH, {
+                "savedAt": int(time.time() * 1000),
+                "items": list(NEW_COIN_LOW_ITEMS.values()),
+            })
+        scanned = []
+        for item in NEW_COIN_LOW_ITEMS.values():
+            if not item.get("checkedAt"):
+                continue
+            symbol = clean_price_watch_symbol(item.get("symbol"))
+            inventory_row = rows_by_symbol.get(symbol, {})
+            scanned.append({
+                **item,
+                "name": inventory_row.get("name") or item.get("name") or symbol,
+                "icon": inventory_row.get("icon") or item.get("icon") or crypto_icon_url(symbol),
+            })
+    candidates = [
+        item for item in scanned
+        if isinstance(item.get("lowPositionContext"), dict)
+        and item["lowPositionContext"].get("qualified")
+    ]
+    candidates.sort(
+        key=lambda item: (
+            any(price_structure_frame_is_observation(frame) for frame in (item.get("frames") or [])),
+            safe_float((item.get("lowPositionContext") or {}).get("risingLow"), 0),
+            -safe_float((item.get("lowPositionContext") or {}).get("rangePositionPct"), 100),
+            int(safe_float(item.get("newCoinListedAt"), 0)),
+        ),
+        reverse=True,
+    )
+    return {
+        "ok": True,
+        "updatedAt": int(time.time() * 1000),
+        "items": candidates,
+        "summary": {
+            "inventory": len(rows),
+            "scanned": len(scanned),
+            "candidates": len(candidates),
+            "monitorMode": "parallel-new-coin-low",
+            "inactiveExcluded": int(safe_float(NEW_COIN_LOW_ACTIVITY_SUMMARY.get("excluded"), 0)),
+            "activityUnavailable": int(safe_float(NEW_COIN_LOW_ACTIVITY_SUMMARY.get("unavailable"), 0)),
+            "activityThresholdUsd": safe_float(NEW_COIN_LOW_ACTIVITY_SUMMARY.get("thresholdUsd"), 0),
+            "activityGraceDays": safe_float(NEW_COIN_LOW_ACTIVITY_SUMMARY.get("graceDays"), 0),
+        },
+    }
+
+
+def new_coin_low_structure_monitor_loop() -> None:
+    inflight: dict[Any, str] = {}
+    with ThreadPoolExecutor(
+        max_workers=NEW_COIN_LOW_MONITOR_WORKERS,
+        thread_name_prefix="new-coin-low-scan",
+    ) as executor:
+        while True:
+            try:
+                for future in [future for future in inflight if future.done()]:
+                    symbol = inflight.pop(future, "")
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        print(
+                            f"New-coin low symbol {symbol or '--'} failed: {safe_error_text(str(exc))}",
+                            file=sys.stderr,
+                        )
+                rows = new_coin_low_inventory_rows()
+                if rows:
+                    with NEW_COIN_LOW_LOCK:
+                        hydrate_new_coin_low_snapshot()
+                        active_symbols = {
+                            clean_price_watch_symbol(row.get("symbol")) for row in rows
+                        } - {""}
+                        stale_symbols = [
+                            symbol for symbol in NEW_COIN_LOW_ITEMS if symbol not in active_symbols
+                        ]
+                        for symbol in stale_symbols:
+                            NEW_COIN_LOW_ITEMS.pop(symbol, None)
+                        if stale_symbols:
+                            write_json_cache(NEW_COIN_LOW_SNAPSHOT_PATH, {
+                                "savedAt": int(time.time() * 1000),
+                                "items": list(NEW_COIN_LOW_ITEMS.values()),
+                            })
+                        snapshot_items = [dict(item) for item in NEW_COIN_LOW_ITEMS.values()]
+                    slots = max(0, NEW_COIN_LOW_MONITOR_WORKERS - len(inflight))
+                    selected_rows = price_structure_monitor_next_rows(
+                        rows,
+                        snapshot_items,
+                        set(inflight.values()),
+                        slots,
+                    )
+                    for selected_row in selected_rows:
+                        symbol = clean_price_watch_symbol(selected_row.get("symbol"))
+                        future = executor.submit(refresh_new_coin_low_structure_item, selected_row)
+                        inflight[future] = symbol
+            except Exception as exc:
+                print(f"New-coin low structure monitor failed: {safe_error_text(str(exc))}", file=sys.stderr)
+            time.sleep(NEW_COIN_LOW_MONITOR_INTERVAL_SECONDS)
+
+
+def start_new_coin_low_structure_monitor() -> None:
+    global NEW_COIN_LOW_MONITOR_ACTIVE
+    if os.getenv("XINGYUN_DISABLE_PRICE_WATCH") == "1":
+        NEW_COIN_LOW_MONITOR_ACTIVE = False
+        return
+    NEW_COIN_LOW_MONITOR_ACTIVE = True
+    threading.Thread(
+        target=new_coin_low_structure_monitor_loop,
+        name="new-coin-low-structure-monitor",
+        daemon=True,
+    ).start()
+
+
+def refresh_price_structure_strategy_monitor_item(
+    row: dict[str, Any],
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Fetch one leader concurrently, then serialize only the snapshot commit."""
+    cache_key = price_structure_cache_key(rows)
+    fresh_item = fetch_price_structure_item(row, fast_provider_probe=True)
+    with PRICE_STRUCTURE_REFRESH_LOCK:
+        with PRICE_STRUCTURE_CACHE_LOCK:
+            cached_entry = PRICE_STRUCTURE_CACHE.get(cache_key)
+            previous_payload = cached_entry[1] if cached_entry and isinstance(cached_entry[1], dict) else {}
+        if not previous_payload:
+            disk_snapshot = read_json_cache(PRICE_STRUCTURE_SNAPSHOT_PATH)
+            # Per-symbol snapshots remain reusable when the admitted pool gains,
+            # loses or reorders a member. The current `rows` list below remains
+            # authoritative, so stale symbols can never re-enter through disk.
+            if isinstance(disk_snapshot.get("payload"), dict):
+                previous_payload = disk_snapshot["payload"]
+        with PRICE_STRUCTURE_CACHE_LOCK:
+            previous_items = previous_payload.get("items") if isinstance(previous_payload.get("items"), list) else []
+
+        items_by_symbol = {
+            price_structure_monitor_symbol(item.get("symbol")): item
+            for item in previous_items
+            if isinstance(item, dict) and price_structure_monitor_symbol(item.get("symbol"))
+        }
+        symbol = price_structure_monitor_symbol(fresh_item.get("symbol"))
+        previous_item = items_by_symbol.get(symbol)
+        # The first appearance opens one observation episode. Later changes and
+        # invalidations stay display-only; prearm/formal signals remain urgent.
+        alert_count = (
+            launch_price_structure_first_observation_alerts(fresh_item, previous_item)
+            + launch_price_structure_strategy_alerts(fresh_item)
+        )
+        if not fresh_item.get("frames") and previous_item and previous_item.get("frames"):
+            items_by_symbol[symbol] = {
+                **previous_item,
+                "checkedAt": fresh_item.get("checkedAt"),
+                "error": fresh_item.get("error") or "本轮快速行情暂不可用，继续显示上一份结构快照",
+            }
+        else:
+            items_by_symbol[symbol] = fresh_item
+
+        items: list[dict[str, Any]] = []
+        for watched in rows:
+            watched_symbol = price_structure_monitor_symbol(watched.get("symbol"))
+            existing = items_by_symbol.get(watched_symbol)
+            if existing:
+                items.append(existing)
+                continue
+            items.append({
+                **watched,
+                "provider": "",
+                "currentPrice": None,
+                "frames": [],
+                "signals": [],
+                "signalCount": 0,
+                "strategy": "dragon-wave-engine",
+                "checkedAt": 0,
+                "error": "等待轮询",
+            })
+
+        payload = {
+            "ok": True,
+            "updatedAt": int(time.time() * 1000),
+            "items": items,
+            "summary": {
+                "total": len(items),
+                "available": sum(1 for item in items if item.get("frames")),
+                "timeframes": len(PRICE_STRUCTURE_TIMEFRAMES),
+                "signals": sum(int(safe_float(item.get("signalCount"), 0)) for item in items),
+                "alerts": alert_count,
+                "strategy": "dragon-wave-engine",
+                "monitorMode": "parallel-priority",
+                "inactiveExcluded": int(safe_float(PRICE_MONITOR_ACTIVITY_SUMMARY.get("excluded"), 0)),
+                "activityThresholdUsd": safe_float(PRICE_MONITOR_ACTIVITY_SUMMARY.get("thresholdUsd"), 0),
+            },
+        }
+        with PRICE_STRUCTURE_CACHE_LOCK:
+            PRICE_STRUCTURE_CACHE.clear()
+            PRICE_STRUCTURE_CACHE[cache_key] = (time.time(), payload)
+        write_json_cache(PRICE_STRUCTURE_SNAPSHOT_PATH, {
+            "cacheKey": cache_key,
+            "savedAt": int(time.time() * 1000),
+            "payload": payload,
+        })
+        return payload
+
+
+def price_watch_daily_candles_from_binance(
+    symbol: str, futures: bool = True, *, limit: int = PRICE_WATCH_FIB_DAILY_LIMIT
+) -> tuple[list[tuple[int, float, float, float, float]], str]:
+    host = "https://fapi.binance.com/fapi/v1/klines" if futures else "https://api.binance.com/api/v3/klines"
+    response = requests.get(
+        host,
+        params={"symbol": binance_price_watch_pair(symbol), "interval": "1d", "limit": limit},
+        headers=HEADERS,
+        timeout=8,
+    )
+    response.raise_for_status()
+    rows = response.json()
+    if not isinstance(rows, list) or len(rows) < 10:
+        raise RuntimeError("no Binance daily candles")
+    candles = [
+        (
+            int(row[0]),
+            safe_float(row[2]),
+            safe_float(row[3]),
+            safe_float(row[4]),
+            safe_float(row[1]),
+        )
+        for row in rows
+        if isinstance(row, list) and len(row) >= 5
+    ]
+    return candles, "Binance Futures" if futures else "Binance Spot"
+
+
+def price_watch_daily_candles_from_okx(
+    symbol: str, swap: bool = True, *, limit: int = PRICE_WATCH_FIB_DAILY_LIMIT
+) -> tuple[list[tuple[int, float, float, float, float]], str]:
+    inst_id = f"{symbol}-USDT-SWAP" if swap else f"{symbol}-USDT"
+    response = requests.get(
+        "https://www.okx.com/api/v5/market/candles",
+        params={"instId": inst_id, "bar": "1D", "limit": limit},
+        headers=HEADERS,
+        timeout=8,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload.get("data") if isinstance(payload, dict) else []
+    if not isinstance(rows, list) or len(rows) < 10:
+        raise RuntimeError("no OKX daily candles")
+    candles = [
+        (
+            int(row[0]),
+            safe_float(row[2]),
+            safe_float(row[3]),
+            safe_float(row[4]),
+            safe_float(row[1]),
+        )
+        for row in reversed(rows)
+        if isinstance(row, list) and len(row) >= 5
+    ]
+    return candles, "OKX Swap" if swap else "OKX Spot"
+
+
+def price_watch_daily_candles_from_bitget_futures(
+    symbol: str, *, limit: int = PRICE_WATCH_FIB_DAILY_LIMIT
+) -> tuple[list[tuple[int, float, float, float, float]], str]:
+    response = requests.get(
+        "https://api.bitget.com/api/v2/mix/market/candles",
+        params={
+            "symbol": f"{symbol}USDT",
+            "productType": "USDT-FUTURES",
+            "granularity": "1D",
+            "limit": limit,
+        },
+        headers=HEADERS,
+        timeout=8,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload.get("data") if isinstance(payload, dict) else []
+    if not isinstance(rows, list) or len(rows) < 10:
+        raise RuntimeError("no Bitget daily candles")
+    candles = [
+        (
+            int(row[0]),
+            safe_float(row[2]),
+            safe_float(row[3]),
+            safe_float(row[4]),
+            safe_float(row[1]),
+        )
+        for row in rows
+        if isinstance(row, list) and len(row) >= 5
+    ]
+    candles.sort(key=lambda item: item[0])
+    return candles, "Bitget Futures"
+
+
+def price_watch_candles_from_gate(symbol: str) -> tuple[list[tuple[int, float, float]], str]:
+    response = requests.get(
+        "https://api.gateio.ws/api/v4/spot/candlesticks",
+        params={"currency_pair": f"{symbol}_USDT", "interval": "1h", "limit": 169},
+        headers=HEADERS,
+        timeout=8,
+    )
+    response.raise_for_status()
+    rows = response.json()
+    if not isinstance(rows, list) or len(rows) < 24:
+        raise RuntimeError("no Gate candles")
+    candles = [(int(row[0]) * 1000, safe_float(row[3]), safe_float(row[2])) for row in rows if isinstance(row, list) and len(row) >= 6]
+    candles.sort(key=lambda item: item[0])
+    return candles, "Gate Spot"
+
+
+def price_watch_candles_from_kucoin(symbol: str) -> tuple[list[tuple[int, float, float]], str]:
+    now = int(time.time())
+    response = requests.get(
+        "https://api.kucoin.com/api/v1/market/candles",
+        params={"symbol": f"{symbol}-USDT", "type": "1hour", "startAt": now - PRICE_WATCH_WINDOW_SECONDS - 7200, "endAt": now},
+        headers=HEADERS,
+        timeout=8,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload.get("data") if isinstance(payload, dict) else []
+    if not isinstance(rows, list) or len(rows) < 24:
+        raise RuntimeError("no KuCoin candles")
+    candles = [(int(row[0]) * 1000, safe_float(row[3]), safe_float(row[2])) for row in rows if isinstance(row, list) and len(row) >= 5]
+    candles.sort(key=lambda item: item[0])
+    return candles, "KuCoin Spot"
+
+
+def price_watch_candles_from_hyperliquid(symbol: str) -> tuple[list[tuple[int, float, float]], str]:
+    now_ms = int(time.time() * 1000)
+    response = requests.post(
+        "https://api.hyperliquid.xyz/info",
+        json={"type": "candleSnapshot", "req": {"coin": symbol, "interval": "1h", "startTime": now_ms - (PRICE_WATCH_WINDOW_SECONDS + 7200) * 1000, "endTime": now_ms}},
+        headers={**HEADERS, "Content-Type": "application/json"},
+        timeout=8,
+    )
+    response.raise_for_status()
+    rows = response.json()
+    if not isinstance(rows, list) or len(rows) < 24:
+        raise RuntimeError("no Hyperliquid candles")
+    candles = [(int(row.get("t") or 0), safe_float(row.get("h")), safe_float(row.get("c"))) for row in rows if isinstance(row, dict)]
+    candles.sort(key=lambda item: item[0])
+    return candles, "Hyperliquid"
+
+
+def price_watch_structure(candles: list[tuple[int, float, float]]) -> dict[str, Any]:
+    """Confirm a genuine retest or base instead of a one-candle pause in a vertical move."""
+    clean = [item for item in candles if item[0] and item[1] > 0 and item[2] > 0]
+    if len(clean) < PRICE_WATCH_CONSOLIDATION_BARS + 2:
+        return {"qualified": False, "type": "", "reason": "insufficient-structure"}
+
+    previous = clean[:-1]
+    peak_index = max(range(len(previous)), key=lambda index: previous[index][1])
+    peak_high = previous[peak_index][1]
+    bars_since_peak = len(clean) - 1 - peak_index
+    post_peak_closes = [item[2] for item in clean[peak_index + 1 :]]
+    pullback_pct = 0.0
+    below_zone_bars = 0
+    if post_peak_closes and peak_high > 0:
+        pullback_pct = ((peak_high - min(post_peak_closes)) / peak_high) * 100
+        below_zone_bars = sum(1 for close in post_peak_closes if close <= peak_high * 0.97)
+    retest = bool(
+        bars_since_peak >= PRICE_WATCH_RETEST_MIN_BARS
+        and pullback_pct >= PRICE_WATCH_RETEST_DEPTH_PCT
+        and below_zone_bars >= PRICE_WATCH_RETEST_HOLD_BARS
+    )
+
+    base = clean[-(PRICE_WATCH_CONSOLIDATION_BARS + 1) : -1]
+    base_closes = [item[2] for item in base]
+    base_high = max(base_closes)
+    base_low = min(base_closes)
+    base_range_pct = ((base_high - base_low) / base_high) * 100 if base_high > 0 else 999.0
+    base_net_pct = abs(base_closes[-1] - base_closes[0]) / base_closes[0] * 100 if base_closes[0] > 0 else 999.0
+    # The local high must exist before the base starts. Otherwise a vertical
+    # move with one or two red candles can look artificially "flat" when only
+    # the latest closes are inspected.
+    peak_precedes_base = peak_index < len(previous) - PRICE_WATCH_CONSOLIDATION_BARS
+    consolidation = bool(
+        len(base_closes) >= PRICE_WATCH_CONSOLIDATION_BARS
+        and peak_precedes_base
+        and base_range_pct <= PRICE_WATCH_CONSOLIDATION_RANGE_PCT
+        and base_net_pct <= PRICE_WATCH_CONSOLIDATION_NET_PCT
+    )
+
+    setup_type = "retest" if retest else "consolidation" if consolidation else ""
+    return {
+        "qualified": bool(setup_type),
+        "type": setup_type,
+        "structureLow": round(base_low, 12) if base_low > 0 else None,
+        "structureHigh": round(base_high, 12) if base_high > 0 else None,
+        "barsSincePeak": bars_since_peak,
+        "pullbackPct": round(max(0.0, pullback_pct), 4),
+        "belowZoneBars": below_zone_bars,
+        "peakPrecedesBase": peak_precedes_base,
+        "baseRangePct": round(base_range_pct, 4),
+        "baseNetPct": round(base_net_pct, 4),
+    }
+
+
+def price_watch_oversold_structure(
+    candles: list[tuple[int, float, float]], current_price: float | None = None
+) -> dict[str, Any]:
+    """Find a retested stage high formed after the post-peak low."""
+    clean = [item for item in candles if item[0] and item[1] > 0 and item[2] > 0]
+    if len(clean) < 12:
+        return {
+            "candidate": False,
+            "qualified": False,
+            "near": False,
+            "status": "normal",
+            "reason": "insufficient-history",
+        }
+
+    historical = clean[:-1]
+    current = safe_float(current_price) or clean[-1][2]
+    peak_index = max(range(len(historical)), key=lambda index: historical[index][1])
+    week_high = historical[peak_index][1]
+    after_peak = historical[peak_index + 1 :]
+    if not after_peak or current <= 0 or week_high <= 0:
+        return {
+            "candidate": False,
+            "qualified": False,
+            "near": False,
+            "status": "normal",
+            "reason": "no-post-peak-low",
+        }
+
+    low_offset = min(range(len(after_peak)), key=lambda index: after_peak[index][2])
+    low_index = peak_index + 1 + low_offset
+    range_low = historical[low_index][2]
+    bars_since_low = len(clean) - 1 - low_index
+    drawdown_pct = ((week_high - current) / week_high) * 100
+    low_drawdown_pct = ((week_high - range_low) / week_high) * 100
+    candidate = drawdown_pct >= PRICE_WATCH_OVERSOLD_DRAWDOWN_PCT
+
+    stage_bars = historical[low_index + 1 :]
+    if not candidate or bars_since_low < PRICE_WATCH_OVERSOLD_MIN_BARS_SINCE_LOW or len(stage_bars) < 2:
+        return {
+            "candidate": candidate,
+            "qualified": False,
+            "near": False,
+            "status": "forming" if candidate else "normal",
+            "reason": "low-too-recent" if candidate else "drawdown-below-threshold",
+            "weekHigh": round(week_high, 12),
+            "drawdownPct": round(max(0.0, drawdown_pct), 4),
+            "lowDrawdownPct": round(max(0.0, low_drawdown_pct), 4),
+            "rangeLow": round(range_low, 12),
+            "rangeHigh": None,
+            "distancePct": None,
+            "barsSinceLow": bars_since_low,
+            "lowAt": int(historical[low_index][0]),
+        }
+
+    stage_high_offset = max(range(len(stage_bars)), key=lambda index: stage_bars[index][1])
+    stage_high = stage_bars[stage_high_offset][1]
+    bars_after_stage_high = len(stage_bars) - 1 - stage_high_offset
+    closes_after_stage_high = [item[2] for item in stage_bars[stage_high_offset + 1 :]]
+    stage_gain_pct = ((stage_high - range_low) / range_low) * 100 if range_low > 0 else 0.0
+    retest_depth_pct = (
+        ((stage_high - min(closes_after_stage_high)) / stage_high) * 100
+        if closes_after_stage_high and stage_high > 0
+        else 0.0
+    )
+    has_stage_retest = bool(
+        bars_after_stage_high >= 1
+        and stage_gain_pct >= PRICE_WATCH_OVERSOLD_MIN_STAGE_GAIN_PCT
+        and retest_depth_pct >= PRICE_WATCH_OVERSOLD_RETEST_DEPTH_PCT
+    )
+    distance_pct = ((stage_high - current) / stage_high) * 100 if stage_high > 0 else 999.0
+    qualified = bool(candidate and has_stage_retest)
+    near = bool(
+        qualified
+        and current <= stage_high
+        and 0 <= distance_pct <= PRICE_WATCH_OVERSOLD_THRESHOLD_PCT
+    )
+    if not candidate:
+        status = "normal"
+    elif not qualified:
+        status = "forming"
+    elif current > stage_high:
+        status = "breakout"
+    elif near:
+        status = "near"
+    else:
+        status = "watching"
+    return {
+        "candidate": candidate,
+        "qualified": qualified,
+        "near": near,
+        "status": status,
+        "reason": "stage-retest" if qualified else "waiting-stage-retest",
+        "weekHigh": round(week_high, 12),
+        "drawdownPct": round(max(0.0, drawdown_pct), 4),
+        "lowDrawdownPct": round(max(0.0, low_drawdown_pct), 4),
+        "rangeLow": round(range_low, 12),
+        "rangeHigh": round(stage_high, 12),
+        "distancePct": round(distance_pct, 4),
+        "barsSinceLow": bars_since_low,
+        "barsAfterStageHigh": bars_after_stage_high,
+        "stageGainPct": round(stage_gain_pct, 4),
+        "retestDepthPct": round(retest_depth_pct, 4),
+        "lowAt": int(historical[low_index][0]),
+        "stageHighAt": int(stage_bars[stage_high_offset][0]),
+    }
+
+
+def price_watch_bullish_acceleration_launch(
+    candles: list[tuple],
+    cycle_start: int,
+    peak_index: int,
+    swing_high: float,
+) -> dict[str, Any] | None:
+    """Find the low where daily bullish participation abruptly accelerates."""
+
+    def is_bullish(index: int) -> bool:
+        candle = candles[index]
+        close = float(candle[3])
+        if len(candle) >= 5 and safe_float(candle[4]) > 0:
+            reference = float(candle[4])
+        elif index > 0:
+            reference = float(candles[index - 1][3])
+        else:
+            reference = close
+        return close > reference * 1.001
+
+    candidates: list[dict[str, Any]] = []
+    last_start = peak_index - PRICE_WATCH_FIB_ACCEL_MIN_WINDOW_DAYS + 1
+    for start in range(cycle_start, last_start + 1):
+        end = min(peak_index + 1, start + PRICE_WATCH_FIB_ACCEL_WINDOW_DAYS)
+        if end - start < PRICE_WATCH_FIB_ACCEL_MIN_WINDOW_DAYS:
+            continue
+
+        baseline_start = max(0, start - PRICE_WATCH_FIB_ACCEL_WINDOW_DAYS)
+        baseline_indexes = list(range(baseline_start, start))
+        if len(baseline_indexes) < PRICE_WATCH_FIB_ACCEL_MIN_WINDOW_DAYS:
+            continue
+
+        window_indexes = list(range(start, end))
+        bull_ratio = sum(is_bullish(index) for index in window_indexes) / len(window_indexes)
+        baseline_bull_ratio = sum(is_bullish(index) for index in baseline_indexes) / len(
+            baseline_indexes
+        )
+        ratio_jump = bull_ratio - baseline_bull_ratio
+        if (
+            bull_ratio < PRICE_WATCH_FIB_ACCEL_MIN_BULL_RATIO
+            or ratio_jump < PRICE_WATCH_FIB_ACCEL_MIN_RATIO_JUMP
+        ):
+            continue
+
+        window_low_index = min(window_indexes, key=lambda index: float(candles[index][2]))
+        # The launch low belongs at the beginning of the acceleration, not at
+        # a later pullback or lower wick after the move is already underway.
+        if window_low_index > start + 1:
+            continue
+        window_low = float(candles[window_low_index][2])
+        window_closes = [float(candles[index][3]) for index in window_indexes]
+        window_high_close = max(window_closes)
+        gain_pct = (
+            (window_high_close - window_low) / window_low * 100 if window_low > 0 else 0.0
+        )
+        path = sum(
+            abs(window_closes[index] - window_closes[index - 1])
+            for index in range(1, len(window_closes))
+        )
+        efficiency = (
+            max(0.0, window_closes[-1] - window_closes[0]) / path if path > 0 else 0.0
+        )
+        impulse_gain_pct = (
+            (swing_high - window_low) / window_low * 100 if window_low > 0 else 0.0
+        )
+        if (
+            gain_pct < PRICE_WATCH_FIB_ACCEL_MIN_GAIN_PCT
+            or efficiency < PRICE_WATCH_FIB_ACCEL_MIN_EFFICIENCY
+            or impulse_gain_pct <= PRICE_WATCH_FIB_MIN_IMPULSE_GAIN_PCT
+        ):
+            continue
+
+        candidates.append(
+            {
+                "index": window_low_index,
+                "startIndex": start,
+                "low": window_low,
+                "bullRatio": bull_ratio,
+                "baselineBullRatio": baseline_bull_ratio,
+                "ratioJump": ratio_jump,
+                "gainPct": gain_pct,
+                "efficiency": efficiency,
+                "correctionPct": 0.0,
+            }
+        )
+
+    if not candidates:
+        return None
+
+    selected = candidates[0]
+    for candidate in candidates[1:]:
+        if candidate["startIndex"] <= selected["startIndex"] + 2:
+            continue
+        prior_high = max(
+            float(candles[index][1])
+            for index in range(selected["startIndex"], candidate["startIndex"])
+        )
+        correction_pct = (
+            (prior_high - candidate["low"]) / prior_high * 100 if prior_high > 0 else 0.0
+        )
+        if correction_pct < PRICE_WATCH_FIB_ACCEL_NEW_LEG_CORRECTION_PCT:
+            continue
+        selected = {**candidate, "correctionPct": correction_pct}
+    return selected
+
+
+def price_watch_fib_structure(
+    candles: list[tuple], current_price: float | None = None
+) -> dict[str, Any]:
+    """Locate the base of the latest complete >100% daily impulse and its Fib levels."""
+    clean = [
+        item
+        for item in candles
+        if len(item) >= 4 and item[0] and item[1] > 0 and item[2] > 0 and item[3] > 0
+    ]
+    if len(clean) < 10:
+        return {
+            "candidate": False,
+            "qualified": False,
+            "status": "normal",
+            "reason": "insufficient-daily-history",
+        }
+
+    # The last daily bar may still be open. Use it for retracement detection,
+    # but locate the impulse high from completed daily bars.
+    historical = clean[:-1]
+    current = safe_float(current_price) or clean[-1][3]
+    if len(historical) < PRICE_WATCH_FIB_MIN_IMPULSE_DAYS + 3 or current <= 0:
+        return {
+            "candidate": False,
+            "qualified": False,
+            "status": "normal",
+            "reason": "insufficient-completed-days",
+        }
+
+    recent_high_start = max(0, len(historical) - PRICE_WATCH_FIB_RECENT_HIGH_DAYS)
+    peak_index = max(
+        range(recent_high_start, len(historical)),
+        key=lambda index: historical[index][1],
+    )
+    swing_high = historical[peak_index][1]
+    search_start = max(0, peak_index - PRICE_WATCH_FIB_MAX_IMPULSE_DAYS)
+    eligible_end = peak_index - PRICE_WATCH_FIB_MIN_IMPULSE_DAYS
+    if eligible_end < search_start:
+        return {
+            "candidate": False,
+            "qualified": False,
+            "status": "normal",
+            "reason": "insufficient-impulse-days",
+        }
+
+    # Split independent market cycles at a confirmed deep daily reset. This
+    # prevents an old spike from inflating a new rebound while retaining the
+    # true multi-month base of a continuous move (for example US near 0.003).
+    running_high = historical[search_start][1]
+    reset_active = False
+    reset_reference_high = running_high
+    reset_low = historical[search_start][2]
+    reset_low_index = search_start
+    reset_episode_high = running_high
+    latest_reset_low_index: int | None = None
+    reset_ratio = 1 - PRICE_WATCH_FIB_CYCLE_RESET_DRAWDOWN_PCT / 100
+    reset_close_ratio = PRICE_WATCH_FIB_CYCLE_RESET_CLOSE_PCT / 100
+    recovery_ratio = PRICE_WATCH_FIB_CYCLE_RECOVERY_PCT / 100
+    for index in range(search_start + 1, eligible_end + 1):
+        high = historical[index][1]
+        low = historical[index][2]
+        close = historical[index][3]
+        if not reset_active:
+            if low <= running_high * reset_ratio and close <= running_high * reset_close_ratio:
+                reset_active = True
+                reset_reference_high = running_high
+                reset_low = low
+                reset_low_index = index
+                reset_episode_high = high
+            else:
+                running_high = max(running_high, high)
+            continue
+
+        reset_episode_high = max(reset_episode_high, high)
+        if low < reset_low:
+            reset_low = low
+            reset_low_index = index
+        if close >= reset_reference_high * recovery_ratio:
+            latest_reset_low_index = reset_low_index
+            reset_active = False
+            running_high = max(reset_episode_high, high)
+
+    if reset_active:
+        latest_reset_low_index = reset_low_index
+
+    cycle_start = latest_reset_low_index if latest_reset_low_index is not None else search_start
+
+    # Prefer the latest quiet base that price actually left before the main
+    # impulse. A plain minimum over the entire cycle can anchor a fresh move to
+    # an unrelated low months earlier (TUT used to resolve to 0.00792 instead
+    # of the July launch base near 0.00964).
+    base_candidates: list[int] = []
+    for index in range(cycle_start, eligible_end + 1):
+        base_start = max(cycle_start, index - PRICE_WATCH_FIB_BASE_LOOKBACK_DAYS + 1)
+        base_floor = min(item[2] for item in historical[base_start : index + 1])
+        low = historical[index][2]
+        if low > base_floor * (1 + PRICE_WATCH_FIB_BASE_TOLERANCE_PCT / 100):
+            continue
+        early_end = min(peak_index + 1, index + 8)
+        early_closes = [item[3] for item in historical[index + 1 : early_end]]
+        early_lift_pct = (
+            ((max(early_closes) - low) / low) * 100 if early_closes and low > 0 else 0.0
+        )
+        candidate_gain_pct = ((swing_high - low) / low) * 100 if low > 0 else 0.0
+        if (
+            early_lift_pct >= PRICE_WATCH_FIB_MIN_EARLY_LIFT_PCT
+            and candidate_gain_pct > PRICE_WATCH_FIB_MIN_IMPULSE_GAIN_PCT
+        ):
+            base_candidates.append(index)
+
+    if base_candidates:
+        latest_cluster = [base_candidates[-1]]
+        for index in reversed(base_candidates[:-1]):
+            if latest_cluster[-1] - index > 2:
+                break
+            latest_cluster.append(index)
+        launch_index = min(latest_cluster, key=lambda index: historical[index][2])
+    else:
+        launch_index = min(
+            range(cycle_start, eligible_end + 1),
+            key=lambda index: historical[index][2],
+        )
+
+    launch_candle_low = float(historical[launch_index][2])
+    launch_low = launch_candle_low
+    base_start = max(search_start, launch_index - PRICE_WATCH_FIB_BASE_LOOKBACK_DAYS + 1)
+    base_window = historical[base_start : launch_index + 1]
+    base_high = max(item[1] for item in base_window)
+    base_range_pct = (
+        ((base_high - launch_candle_low) / launch_candle_low) * 100
+        if launch_candle_low > 0
+        else 999.0
+    )
+    launch_candidate_gain_pct = (
+        ((swing_high - launch_candle_low) / launch_candle_low) * 100
+        if launch_candle_low > 0
+        else 0.0
+    )
+    if (
+        launch_candidate_gain_pct > PRICE_WATCH_FIB_MIN_IMPULSE_GAIN_PCT
+        and base_range_pct < PRICE_WATCH_FIB_BASE_CLOSE_RANGE_PCT
+    ):
+        # In a compact consolidation, the launch day's close is a more stable
+        # structural anchor than a small intraday wick. Deep capitulation bases
+        # keep their true low (for example US near 0.0034).
+        launch_low = float(historical[launch_index][3])
+    original_launch_index = launch_index
+    original_launch_low = launch_low
+    launch_method = "cycle-base"
+    original_impulse_gain_pct = (
+        ((swing_high - original_launch_low) / original_launch_low) * 100
+        if original_launch_low > 0
+        else 0.0
+    )
+
+    # A later, clean acceleration can be the actual launch of the current main
+    # leg even when the wider cycle has an older low. Detect the earliest start
+    # whose close path remains orderly into the peak, then use the low of a
+    # strong departure candle. This separates BTW's August leg (0.07854) from
+    # its unrelated June low without moving slow base launches such as TUT.
+    sustained_start: int | None = None
+    for index in range(cycle_start, eligible_end + 1):
+        candidate_low = float(historical[index][2])
+        candidate_gain_pct = (
+            ((swing_high - candidate_low) / candidate_low) * 100
+            if candidate_low > 0
+            else 0.0
+        )
+        if candidate_gain_pct <= PRICE_WATCH_FIB_MIN_IMPULSE_GAIN_PCT:
+            continue
+        path_closes = [float(item[3]) for item in historical[index : peak_index + 1]]
+        running_close = path_closes[0]
+        max_path_drawdown_pct = 0.0
+        for close in path_closes[1:]:
+            running_close = max(running_close, close)
+            if running_close > 0:
+                max_path_drawdown_pct = max(
+                    max_path_drawdown_pct,
+                    ((running_close - close) / running_close) * 100,
+                )
+        early_end = min(peak_index + 1, index + 8)
+        early_closes = [float(item[3]) for item in historical[index + 1 : early_end]]
+        early_lift_pct = (
+            ((max(early_closes) - candidate_low) / candidate_low) * 100
+            if early_closes and candidate_low > 0
+            else 0.0
+        )
+        if (
+            max_path_drawdown_pct <= PRICE_WATCH_FIB_MAX_PATH_DRAWDOWN_PCT
+            and early_lift_pct >= PRICE_WATCH_FIB_MIN_EARLY_LIFT_PCT
+        ):
+            sustained_start = index
+            break
+
+    if sustained_start is not None:
+        sustained_base_end = min(
+            peak_index,
+            sustained_start + PRICE_WATCH_FIB_SUSTAINED_BASE_DAYS,
+        )
+        sustained_base_index = min(
+            range(sustained_start, sustained_base_end + 1),
+            key=lambda index: historical[index][2],
+        )
+        sustained_base_close = float(historical[sustained_base_index][3])
+        departure_end = min(peak_index + 1, sustained_base_index + 8)
+        departure_index = next(
+            (
+                index
+                for index in range(sustained_base_index + 1, departure_end)
+                if float(historical[index][3])
+                >= sustained_base_close * (1 + PRICE_WATCH_FIB_DEPARTURE_PCT / 100)
+            ),
+            None,
+        )
+        if departure_index is not None and sustained_base_close > 0:
+            departure_gain_pct = (
+                (float(historical[departure_index][3]) - sustained_base_close)
+                / sustained_base_close
+                * 100
+            )
+            shift_pivot_index: int | None = None
+            shift_drawdown_pct = 0.0
+            pivot_search_start = max(original_launch_index + 2, cycle_start + 2)
+            pivot_search_end = departure_index - 2
+            for pivot_index in range(pivot_search_start, pivot_search_end + 1):
+                pivot_high = float(historical[pivot_index][1])
+                left_high = max(
+                    float(historical[pivot_index - 2][1]),
+                    float(historical[pivot_index - 1][1]),
+                )
+                right_high = max(
+                    float(historical[pivot_index + 1][1]),
+                    float(historical[pivot_index + 2][1]),
+                )
+                if pivot_high < left_high or pivot_high <= right_high:
+                    continue
+                correction_low = min(
+                    float(historical[index][2])
+                    for index in range(pivot_index + 1, departure_index + 1)
+                )
+                pivot_drawdown_pct = (
+                    (pivot_high - correction_low) / pivot_high * 100
+                    if pivot_high > 0
+                    else 0.0
+                )
+                if pivot_drawdown_pct < 20.0:
+                    continue
+                shift_pivot_index = pivot_index
+                shift_drawdown_pct = pivot_drawdown_pct
+            if (
+                original_impulse_gain_pct > PRICE_WATCH_FIB_MIN_IMPULSE_GAIN_PCT
+                and departure_gain_pct >= PRICE_WATCH_FIB_STRONG_DEPARTURE_PCT
+                and shift_pivot_index is not None
+                and shift_drawdown_pct >= 20.0
+            ):
+                launch_index = departure_index
+                launch_low = float(historical[departure_index][2])
+                launch_method = "sustained-leg"
+
+    acceleration = price_watch_bullish_acceleration_launch(
+        historical,
+        cycle_start,
+        peak_index,
+        swing_high,
+    )
+    if acceleration is not None:
+        launch_index = int(acceleration["index"])
+        launch_low = float(acceleration["low"])
+        launch_method = "bullish-ratio-acceleration"
+
+    # Some fresh listings leave a quiet base in one unmistakable daily candle.
+    # Use that candle's low as the launch point, but only while the preceding
+    # move is still near the base. This catches BMT at 0.01306 without moving
+    # TUT to a late acceleration candle after it had already risen severalfold.
+    breakout_index: int | None = None
+    for index in range(original_launch_index + 1, peak_index + 1):
+        previous_close = float(historical[index - 1][3])
+        close = float(historical[index][3])
+        if previous_close <= 0:
+            continue
+        candle_gain_pct = (close - previous_close) / previous_close * 100
+        if candle_gain_pct < PRICE_WATCH_FIB_BREAKOUT_CANDLE_GAIN_PCT:
+            continue
+        pre_breakout_high = max(
+            float(historical[position][1])
+            for position in range(original_launch_index, index)
+        )
+        pre_breakout_gain_pct = (
+            (pre_breakout_high - original_launch_low) / original_launch_low * 100
+            if original_launch_low > 0
+            else 999.0
+        )
+        if pre_breakout_gain_pct > PRICE_WATCH_FIB_PRE_BREAKOUT_MAX_GAIN_PCT:
+            continue
+        breakout_index = index
+        break
+    if breakout_index is not None and acceleration is None:
+        launch_index = breakout_index
+        launch_low = float(historical[breakout_index][2])
+        launch_method = "breakout-candle"
+
+    impulse_gain_pct = ((swing_high - launch_low) / launch_low) * 100 if launch_low > 0 else 0.0
+    if impulse_gain_pct <= PRICE_WATCH_FIB_MIN_IMPULSE_GAIN_PCT:
+        return {
+            "candidate": False,
+            "qualified": False,
+            "status": "normal",
+            "reason": "impulse-below-main-wave-threshold",
+            "launchLow": round(launch_low, 12),
+            "swingHigh": round(swing_high, 12),
+            "impulseGainPct": round(impulse_gain_pct, 4),
+            "launchAt": int(historical[launch_index][0]),
+            "swingHighAt": int(historical[peak_index][0]),
+            "launchMethod": launch_method,
+        }
+
+    early_end = min(peak_index + 1, launch_index + 8)
+    early_closes = [item[3] for item in historical[launch_index + 1 : early_end]]
+    early_lift_pct = (
+        ((max(early_closes) - launch_low) / launch_low) * 100 if early_closes else 0.0
+    )
+    closes = [item[3] for item in historical[launch_index : peak_index + 1]]
+    path = sum(abs(closes[pos] - closes[pos - 1]) for pos in range(1, len(closes)))
+    efficiency = min(1.0, max(0.0, (closes[-1] - closes[0]) / path)) if path > 0 else 0.0
+    positive_steps = sum(1 for pos in range(1, len(closes)) if closes[pos] >= closes[pos - 1])
+    positive_ratio = positive_steps / max(1, len(closes) - 1)
+    main_wave_qualified = price_watch_main_wave_quality(
+        impulse_gain_pct,
+        efficiency,
+        positive_ratio,
+        launch_method,
+    )
+    price_range = swing_high - launch_low
+    # Fibonacci retracement levels are measured down from the swing high.
+    # For a 20 -> 120 impulse, the 0.618 retracement is 58.2, not 81.8.
+    level_05 = swing_high - price_range * 0.5
+    level_0618 = swing_high - price_range * 0.618
+    post_peak = clean[peak_index + 1 :]
+    retracement_low = min((item[2] for item in post_peak), default=current)
+    # A pullback reaches 0.5 before the deeper 0.618 retracement.
+    candidate = bool(
+        retracement_low
+        <= level_05 * (1 + PRICE_WATCH_FIB_THRESHOLD_PCT / 100)
+    )
+    signed_distance_05 = (
+        ((level_05 - current) / level_05) * 100 if level_05 > 0 else 999.0
+    )
+    signed_distance_0618 = (
+        ((level_0618 - current) / level_0618) * 100 if level_0618 > 0 else 999.0
+    )
+    distance_05 = abs(signed_distance_05)
+    distance_0618 = abs(signed_distance_0618)
+    if not main_wave_qualified:
+        return {
+            "candidate": False,
+            "qualified": False,
+            "mainWaveQualified": False,
+            "status": "normal",
+            "reason": "impulse-lacks-main-wave-quality",
+            "launchLow": round(launch_low, 12),
+            "swingHigh": round(swing_high, 12),
+            "level05": round(level_05, 12),
+            "level0618": round(level_0618, 12),
+            "impulseGainPct": round(impulse_gain_pct, 4),
+            "trendEfficiency": round(efficiency, 4),
+            "positiveDayRatio": round(positive_ratio, 4),
+            "impulseDays": peak_index - launch_index,
+            "launchAt": int(historical[launch_index][0]),
+            "swingHighAt": int(historical[peak_index][0]),
+            "launchMethod": launch_method,
+        }
+    if not candidate:
+        status = "forming"
+    elif distance_05 <= PRICE_WATCH_FIB_THRESHOLD_PCT:
+        status = "near-0.5"
+    elif distance_0618 <= PRICE_WATCH_FIB_THRESHOLD_PCT:
+        status = "near-0.618"
+    elif current < level_0618:
+        status = "below-0.618"
+    elif current < level_05:
+        status = "between-levels"
+    else:
+        status = "above-0.5"
+    return {
+        "candidate": candidate,
+        "qualified": candidate,
+        "mainWaveQualified": True,
+        "status": status,
+        "reason": "recent-main-impulse-fib" if candidate else "waiting-retrace-to-fib-zone",
+        "launchLow": round(launch_low, 12),
+        "swingHigh": round(swing_high, 12),
+        "level05": round(level_05, 12),
+        "level0618": round(level_0618, 12),
+        "distance05Pct": round(distance_05, 4),
+        "distance0618Pct": round(distance_0618, 4),
+        "signedDistance05Pct": round(signed_distance_05, 4),
+        "signedDistance0618Pct": round(signed_distance_0618, 4),
+        "currentBarHigh": round(clean[-1][1], 12),
+        "currentBarLow": round(clean[-1][2], 12),
+        "retracementLow": round(retracement_low, 12),
+        "impulseGainPct": round(impulse_gain_pct, 4),
+        "earlyLiftPct": round(early_lift_pct, 4),
+        "trendEfficiency": round(efficiency, 4),
+        "positiveDayRatio": round(positive_ratio, 4),
+        "impulseDays": peak_index - launch_index,
+        "launchAt": int(historical[launch_index][0]),
+        "swingHighAt": int(historical[peak_index][0]),
+        "launchMethod": launch_method,
+        "acceleration": (
+            {
+                "bullRatio": round(float(acceleration["bullRatio"]), 4),
+                "baselineBullRatio": round(
+                    float(acceleration["baselineBullRatio"]), 4
+                ),
+                "ratioJump": round(float(acceleration["ratioJump"]), 4),
+                "gainPct": round(float(acceleration["gainPct"]), 4),
+                "efficiency": round(float(acceleration["efficiency"]), 4),
+                "correctionPct": round(float(acceleration["correctionPct"]), 4),
+            }
+            if acceleration is not None
+            else None
+        ),
+    }
+
+
+def price_watch_main_wave_quality(
+    impulse_gain_pct: Any,
+    trend_efficiency: Any,
+    positive_day_ratio: Any,
+    launch_method: Any = "",
+) -> bool:
+    """Reject choppy rebounds that merely doubled but never formed a real main wave."""
+    gain = safe_float(impulse_gain_pct)
+    efficiency = safe_float(trend_efficiency)
+    positive_ratio = safe_float(positive_day_ratio)
+    if str(launch_method or "") == "breakout-candle":
+        return gain > PRICE_WATCH_FIB_MIN_IMPULSE_GAIN_PCT
+    orderly_wave = bool(
+        efficiency >= PRICE_WATCH_FIB_MIN_TREND_EFFICIENCY
+        and positive_ratio >= PRICE_WATCH_FIB_MIN_POSITIVE_DAY_RATIO
+    )
+    explosive_wave = bool(
+        gain >= PRICE_WATCH_FIB_EXPLOSIVE_GAIN_PCT
+        and efficiency >= PRICE_WATCH_FIB_EXPLOSIVE_MIN_EFFICIENCY
+        and positive_ratio >= PRICE_WATCH_FIB_MIN_POSITIVE_DAY_RATIO
+    )
+    return bool(gain > PRICE_WATCH_FIB_MIN_IMPULSE_GAIN_PCT and (orderly_wave or explosive_wave))
+
+
+def price_watch_snapshot_provider_from_structure_source(
+    provider_name: str,
+    fetcher,
+    *,
+    hourly_interval: str = "1h",
+    structure_interval: str = "15m",
+    daily_interval: str = "1d",
+) -> tuple[str, Any, Any, Any]:
+    """Adapt the shared structure-candle sources to the prior-high scanner."""
+
+    def compact(interval: str, limit: int, min_rows: int, *, daily: bool = False):
+        candles, _source_name = fetcher(interval, limit, min_rows)
+        if daily:
+            rows = [
+                (int(item[0]), safe_float(item[2]), safe_float(item[3]), safe_float(item[4]))
+                for item in candles
+                if isinstance(item, (list, tuple)) and len(item) >= 5
+            ]
+        else:
+            rows = [
+                (int(item[0]), safe_float(item[2]), safe_float(item[4]))
+                for item in candles
+                if isinstance(item, (list, tuple)) and len(item) >= 5
+            ]
+        return rows, provider_name
+
+    return (
+        provider_name,
+        lambda: compact(hourly_interval, 169, 24),
+        lambda: compact(
+            structure_interval,
+            PRICE_WATCH_STRUCTURE_BARS,
+            PRICE_WATCH_CONSOLIDATION_BARS + 2,
+        ),
+        # Daily history is only needed by the optional Fib model. A newly
+        # listed personal-X asset may already have enough hourly candles for a
+        # meaningful prior-high distance while still having fewer than ten
+        # daily bars. Keep those two capabilities independent.
+        lambda: compact(daily_interval, PRICE_WATCH_FIB_DAILY_LIMIT, 2, daily=True),
+    )
+
+
+def price_watch_extended_snapshot_providers(symbol: str) -> list[tuple[str, Any, Any, Any]]:
+    """Reuse the multi-timeframe market-source rotation for prior-high prices."""
+
+    timeout = 6.0
+    provider_specs = [
+        (
+            "KuCoin Spot",
+            lambda interval, limit, min_rows: price_structure_candles_from_kucoin(
+                symbol, interval, limit=limit, min_rows=min_rows, timeout=timeout
+            ),
+            "1h", "15m", "1d",
+        ),
+        (
+            "Gate Futures",
+            lambda interval, limit, min_rows: price_structure_candles_from_gate(
+                symbol, interval, limit=limit, min_rows=min_rows, timeout=timeout
+            ),
+            "1h", "15m", "1d",
+        ),
+        (
+            "HTX Futures",
+            lambda interval, limit, min_rows: price_structure_candles_from_htx(
+                symbol, interval, limit=limit, min_rows=min_rows, timeout=timeout
+            ),
+            "60min", "15min", "1day",
+        ),
+        (
+            "Aster Futures",
+            lambda interval, limit, min_rows: price_structure_candles_from_aster(
+                symbol, interval, limit=limit, min_rows=min_rows, timeout=timeout
+            ),
+            "1h", "15m", "1d",
+        ),
+        (
+            "Hyperliquid",
+            lambda interval, limit, min_rows: price_structure_candles_from_hyperliquid(
+                symbol, interval, limit=limit, min_rows=min_rows, timeout=timeout
+            ),
+            "1h", "15m", "1d",
+        ),
+        (
+            "Trade.xyz",
+            lambda interval, limit, min_rows: price_structure_candles_from_hyperliquid(
+                symbol,
+                interval,
+                limit=limit,
+                min_rows=min_rows,
+                dex_prefix="xyz",
+                timeout=timeout,
+            ),
+            "1h", "15m", "1d",
+        ),
+        (
+            "链上 K线",
+            lambda interval, limit, min_rows: price_structure_candles_from_geckoterminal(
+                symbol, interval, limit=limit, min_rows=min_rows, timeout=timeout
+            ),
+            "1h", "15m", "1d",
+        ),
+    ]
+    return [
+        price_watch_snapshot_provider_from_structure_source(
+            provider_name,
+            fetcher,
+            hourly_interval=hourly_interval,
+            structure_interval=structure_interval,
+            daily_interval=daily_interval,
+        )
+        for provider_name, fetcher, hourly_interval, structure_interval, daily_interval in provider_specs
+    ]
+
+
+def fetch_price_watch_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+    symbol = clean_price_watch_symbol(row.get("symbol"))
+    binance_futures = (
+        "Binance Futures",
+        lambda: price_watch_candles_from_binance(symbol, True),
+        lambda: price_watch_candles_from_binance(symbol, True, interval="15m", limit=PRICE_WATCH_STRUCTURE_BARS),
+        lambda: price_watch_daily_candles_from_binance(symbol, True),
+    )
+    okx_swap = (
+        "OKX Swap",
+        lambda: price_watch_candles_from_okx(symbol, True),
+        lambda: price_watch_candles_from_okx(symbol, True, bar="15m", limit=PRICE_WATCH_STRUCTURE_BARS),
+        lambda: price_watch_daily_candles_from_okx(symbol, True),
+    )
+    bitget_futures = (
+        "Bitget Futures",
+        lambda: price_watch_candles_from_bitget_futures(symbol),
+        lambda: price_watch_candles_from_bitget_futures(symbol, granularity="15m", limit=PRICE_WATCH_STRUCTURE_BARS),
+        lambda: price_watch_daily_candles_from_bitget_futures(symbol),
+    )
+
+    providers = [binance_futures, okx_swap, bitget_futures]
+    providers.extend(price_watch_extended_snapshot_providers(symbol))
+    with PRICE_STRUCTURE_PROVIDER_PREFERENCE_LOCK:
+        preferred_provider = PRICE_STRUCTURE_PROVIDER_PREFERENCE.get(symbol, "")
+    activity = row.get("marketActivity") if isinstance(row.get("marketActivity"), dict) else {}
+    activity_text = f"{activity.get('source') or ''} {activity.get('reason') or ''}".lower()
+    onchain_priority = "dexscreener" in activity_text or "onchain" in activity_text or "链上" in activity_text
+    original_order = {provider[0]: index for index, provider in enumerate(providers)}
+    providers.sort(key=lambda provider: (
+        0 if preferred_provider and provider[0] == preferred_provider else 1,
+        0 if onchain_priority and provider[0] == "链上 K线" else 1,
+        original_order.get(provider[0], 999),
+    ))
+    errors: list[str] = []
+    for provider_label, hourly_provider, structure_provider, daily_provider in providers:
+        try:
+            hourly_candles, provider_name = hourly_provider()
+            structure_candles, _ = structure_provider()
+            try:
+                daily_candles, _ = daily_provider()
+            except Exception:
+                # Prior-high and intraday structure must remain usable when a
+                # short-history coin does not yet have enough daily candles.
+                # price_watch_fib_structure() already reports insufficient
+                # daily history without suppressing the rest of the snapshot.
+                daily_candles = []
+            hourly_candles = [item for item in hourly_candles if item[0] and item[1] > 0 and item[2] > 0]
+            structure_candles = [item for item in structure_candles if item[0] and item[1] > 0 and item[2] > 0]
+            daily_candles = [
+                item for item in daily_candles
+                if len(item) >= 4 and item[0] and item[1] > 0 and item[2] > 0 and item[3] > 0
+            ]
+            if (
+                len(hourly_candles) < 24
+                or len(structure_candles) < PRICE_WATCH_CONSOLIDATION_BARS + 2
+            ):
+                raise RuntimeError("insufficient candles")
+            hourly_candles = hourly_candles[-169:]
+            structure_candles = structure_candles[-PRICE_WATCH_STRUCTURE_BARS:]
+            daily_candles = daily_candles[-PRICE_WATCH_FIB_DAILY_LIMIT:]
+            current_price = structure_candles[-1][2]
+            historical = hourly_candles[:-1] or hourly_candles
+            week_high = max(item[1] for item in historical)
+            if current_price <= 0 or week_high <= 0:
+                raise RuntimeError("invalid price")
+            distance_pct = ((week_high - current_price) / week_high) * 100
+            is_below_high = current_price <= week_high
+            inside_warning_band = is_below_high and 0 <= distance_pct <= PRICE_WATCH_THRESHOLD_PCT
+            structure = price_watch_structure(structure_candles)
+            fib = price_watch_fib_structure(daily_candles, current_price)
+            oversold = price_watch_oversold_structure(hourly_candles, current_price)
+            prior_main_wave = bool(fib.get("mainWaveQualified"))
+            oversold = {**oversold, "priorMainWaveQualified": prior_main_wave}
+            if oversold.get("candidate") and not prior_main_wave:
+                oversold.update({
+                    "qualified": False,
+                    "near": False,
+                    "status": "forming",
+                    "reason": "no-prior-main-wave",
+                })
+            if current_price > week_high:
+                status = "breakout"
+            elif inside_warning_band and structure.get("qualified"):
+                status = "near"
+            elif inside_warning_band:
+                status = "forming"
+            else:
+                status = "normal"
+            return {
+                "symbol": symbol,
+                "currentPrice": current_price,
+                "weekHigh": week_high,
+                "distancePct": max(0.0, distance_pct),
+                "provider": provider_name,
+                "status": status,
+                "setupType": structure.get("type") or "",
+                "structure": structure,
+                "oversoldStatus": oversold.get("status") or "normal",
+                "oversold": oversold,
+                "fibStatus": fib.get("status") or "normal",
+                "fib": fib,
+                "checkedAt": int(time.time() * 1000),
+                "error": "",
+            }
+        except Exception as exc:
+            errors.append(f"{provider_label}: {safe_error_text(str(exc))[:80]}")
+    return {
+        "symbol": symbol,
+        "status": "unavailable",
+        "oversoldStatus": "unavailable",
+        "oversold": {"status": "unavailable", "candidate": False, "qualified": False, "near": False},
+        "fibStatus": "unavailable",
+        "fib": {"status": "unavailable", "candidate": False, "qualified": False},
+        "checkedAt": int(time.time() * 1000),
+        "error": errors[-1] if errors else "暂时没有可用的 7 日价格数据",
+    }
+
+
+def update_price_watch_snapshot(result: dict[str, Any]) -> list[dict[str, Any]]:
+    symbol = clean_price_watch_symbol(result.get("symbol"))
+    if not symbol:
+        return []
+    now_ms = int(result.get("checkedAt") or time.time() * 1000)
+    status = str(result.get("status") or "unavailable")
+    current_price = safe_float(result.get("currentPrice"))
+    week_high = safe_float(result.get("weekHigh"))
+    distance_pct = safe_float(result.get("distancePct"), -1)
+    oversold = result.get("oversold") if isinstance(result.get("oversold"), dict) else {}
+    oversold_status = str(result.get("oversoldStatus") or oversold.get("status") or "unavailable")
+    oversold_drawdown_pct = safe_float(oversold.get("drawdownPct"), -1)
+    oversold_range_low = safe_float(oversold.get("rangeLow"))
+    oversold_range_high = safe_float(oversold.get("rangeHigh"))
+    oversold_distance_pct = safe_float(oversold.get("distancePct"), -1)
+    fib = result.get("fib") if isinstance(result.get("fib"), dict) else {}
+    fib_status = str(result.get("fibStatus") or fib.get("status") or "unavailable")
+    alert_events: list[dict[str, Any]] = []
+    with AUTH_DB_LOCK, auth_db() as conn:
+        asset = conn.execute("SELECT * FROM price_watch_assets WHERE symbol = ?", (symbol,)).fetchone()
+        prior_high_enabled = price_watch_prior_high_source_enabled(asset, now_ms=now_ms)
+        quote_ok = status not in {"unavailable", "pending"} and current_price > 0
+        opportunity_first_seen_at = int(asset["opportunity_first_seen_at"] or 0) if asset else 0
+        opportunity_manual_removed_at = int(asset["opportunity_manual_removed_at"] or 0) if asset else 0
+        opportunity_active = int(asset["opportunity_active"] or 0) if asset else 0
+        last_quote_success_at = int(asset["last_quote_success_at"] or 0) if asset else 0
+        quote_failure_streak = int(asset["quote_failure_streak"] or 0) if asset else 0
+        dead_at = int(asset["dead_at"] or 0) if asset else 0
+        dead_reason = str(asset["dead_reason"] or "") if asset else ""
+        if quote_ok:
+            last_quote_success_at = now_ms
+            quote_failure_streak = 0
+            if opportunity_first_seen_at and not opportunity_manual_removed_at:
+                opportunity_active = 1
+                dead_at = 0
+                dead_reason = ""
+        else:
+            quote_failure_streak += 1
+            opportunity_baseline = last_quote_success_at or opportunity_first_seen_at
+            dead_window_ms = 30 * 24 * 60 * 60 * 1000
+            if (
+                opportunity_active
+                and not opportunity_manual_removed_at
+                and opportunity_baseline
+                and now_ms - opportunity_baseline >= dead_window_ms
+            ):
+                opportunity_active = 0
+                dead_at = now_ms
+                dead_reason = "连续30天在 Binance、OKX、Bitget 均无可用合约行情"
+        conn.execute(
+            """
+            UPDATE price_watch_assets SET
+                current_price = ?, week_high = ?, distance_pct = ?, provider = ?,
+                status = ?, setup_type = ?, structure_low = ?, structure_high = ?, structure_json = ?,
+                oversold_status = ?, oversold_drawdown_pct = ?, oversold_range_low = ?,
+                oversold_range_high = ?, oversold_distance_pct = ?, oversold_json = ?,
+                fib_status = ?, fib_json = ?,
+                last_checked_at = ?, last_error = ?,
+                last_quote_success_at = ?, quote_failure_streak = ?,
+                opportunity_active = ?, dead_at = ?, dead_reason = ?, updated_at = ?
+            WHERE symbol = ?
+            """,
+            (
+                current_price if current_price > 0 else None,
+                week_high if week_high > 0 else None,
+                distance_pct if distance_pct >= 0 else None,
+                result.get("provider") or "",
+                status,
+                result.get("setupType") or "",
+                safe_float((result.get("structure") or {}).get("structureLow")) or None,
+                safe_float((result.get("structure") or {}).get("structureHigh")) or None,
+                json.dumps(result.get("structure") or {}, ensure_ascii=False, separators=(",", ":")),
+                oversold_status,
+                oversold_drawdown_pct if oversold_drawdown_pct >= 0 else None,
+                oversold_range_low if oversold_range_low > 0 else None,
+                oversold_range_high if oversold_range_high > 0 else None,
+                oversold_distance_pct if oversold_distance_pct >= 0 else None,
+                json.dumps(oversold, ensure_ascii=False, separators=(",", ":")),
+                fib_status,
+                json.dumps(fib, ensure_ascii=False, separators=(",", ":")),
+                now_ms,
+                result.get("error") or "",
+                last_quote_success_at,
+                quote_failure_streak,
+                opportunity_active,
+                dead_at,
+                dead_reason,
+                now_ms,
+                symbol,
+            ),
+        )
+        state = conn.execute("SELECT * FROM price_watch_alert_state WHERE symbol = ?", (symbol,)).fetchone()
+        confirmation = conn.execute(
+            "SELECT episode FROM price_watch_first_confirmations WHERE symbol = ?",
+            (symbol,),
+        ).fetchone()
+        first_valid_episode = int(confirmation["episode"] or 0) if confirmation else 0
+        has_confirmed_first = first_valid_episode > 0
+        was_in_zone = bool(state and state["in_zone"])
+        previous_high = safe_float(state["reference_high"] if state else 0)
+        last_alert_at = int(state["last_alert_at"] or 0) if state else 0
+        left_zone_at = int(state["left_zone_at"] or 0) if state and "left_zone_at" in state.keys() else 0
+        episode = int(state["episode"] or 0) if state and "episode" in state.keys() else 0
+        cooldown_ms = PRICE_WATCH_REENTRY_COOLDOWN_SECONDS * 1000
+        cooldown_ready = not last_alert_at or now_ms - last_alert_at >= cooldown_ms
+        reference_advanced = bool(
+            previous_high > 0
+            and week_high > previous_high * (1 + PRICE_WATCH_NEW_HIGH_DELTA_PCT / 100)
+        )
+
+        should_alert = False
+        if status in {"unavailable", "pending"}:
+            in_zone = was_in_zone
+        elif status == "breakout":
+            in_zone = False
+            if was_in_zone:
+                left_zone_at = now_ms
+        elif status == "forming":
+            # Price is close, but a vertical move has not built a valid retest/base yet.
+            in_zone = False
+            if was_in_zone:
+                left_zone_at = now_ms
+        elif status == "near":
+            should_alert = prior_high_enabled and cooldown_ready and (not was_in_zone or reference_advanced)
+            # A new high formed during cooldown starts a pending episode. If price remains near,
+            # the next eligible pass will still emit the alert instead of losing that approach.
+            if reference_advanced and not cooldown_ready:
+                in_zone = False
+                left_zone_at = now_ms
+            else:
+                in_zone = was_in_zone or should_alert
+        else:
+            in_zone = was_in_zone and 0 <= distance_pct <= PRICE_WATCH_RESET_PCT
+            if was_in_zone and not in_zone:
+                left_zone_at = now_ms
+
+        if should_alert:
+            episode += 1
+        conn.execute(
+            """
+            INSERT INTO price_watch_alert_state (
+                symbol, reference_high, in_zone, last_alert_at, left_zone_at, episode, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                reference_high = excluded.reference_high,
+                in_zone = excluded.in_zone,
+                last_alert_at = CASE WHEN ? THEN excluded.last_alert_at ELSE price_watch_alert_state.last_alert_at END,
+                left_zone_at = excluded.left_zone_at,
+                episode = excluded.episode,
+                updated_at = excluded.updated_at
+            """,
+            (
+                symbol,
+                week_high if week_high > 0 else previous_high,
+                1 if in_zone else 0,
+                now_ms if should_alert else last_alert_at,
+                left_zone_at,
+                episode,
+                now_ms,
+                1 if should_alert else 0,
+            ),
+        )
+        if should_alert:
+            alert_events.append({
+                "eventType": "prior_high",
+                "symbol": symbol,
+                "name": (asset["name"] if asset else "") or symbol,
+                "currentPrice": current_price,
+                "weekHigh": week_high,
+                "distancePct": distance_pct,
+                "provider": result.get("provider") or "",
+                "setupType": result.get("setupType") or "",
+                "checkedAt": now_ms,
+                "episode": episode,
+                "firstValidEpisode": first_valid_episode,
+                "hasConfirmedFirst": has_confirmed_first,
+                "isFirstCandidate": not has_confirmed_first,
+                "isLaterEpisode": bool(has_confirmed_first and episode > first_valid_episode),
+            })
+
+        oversold_state = conn.execute(
+            "SELECT * FROM price_watch_oversold_alert_state WHERE symbol = ?",
+            (symbol,),
+        ).fetchone()
+        oversold_was_in_zone = bool(oversold_state and oversold_state["in_zone"])
+        oversold_was_armed = bool(oversold_state["armed"]) if oversold_state else True
+        previous_low = safe_float(oversold_state["reference_low"] if oversold_state else 0)
+        previous_stage_high = safe_float(oversold_state["reference_high"] if oversold_state else 0)
+        oversold_last_alert_at = int(oversold_state["last_alert_at"] or 0) if oversold_state else 0
+        oversold_left_zone_at = int(oversold_state["left_zone_at"] or 0) if oversold_state else 0
+        oversold_episode = int(oversold_state["episode"] or 0) if oversold_state else 0
+        oversold_cooldown_ready = (
+            not oversold_last_alert_at or now_ms - oversold_last_alert_at >= cooldown_ms
+        )
+        oversold_candidate = bool(oversold.get("candidate"))
+        oversold_qualified = bool(
+            oversold.get("qualified")
+            and oversold.get("priorMainWaveQualified")
+            and fib.get("mainWaveQualified")
+        )
+        materially_new_low = bool(
+            previous_low > 0
+            and oversold_range_low > 0
+            and oversold_range_low < previous_low * (1 - PRICE_WATCH_OVERSOLD_NEW_LOW_DELTA_PCT / 100)
+        )
+
+        oversold_should_alert = False
+        oversold_in_zone = oversold_was_in_zone
+        oversold_armed = oversold_was_armed
+        if oversold_status in {"unavailable", "pending"}:
+            pass
+        elif not oversold_candidate:
+            oversold_in_zone = False
+            oversold_armed = True
+        elif materially_new_low:
+            oversold_in_zone = False
+            oversold_armed = True
+            oversold_left_zone_at = now_ms
+        elif oversold_status == "near":
+            oversold_should_alert = bool(
+                oversold_qualified
+                and oversold_armed
+                and not oversold_was_in_zone
+                and oversold_cooldown_ready
+            )
+            if oversold_should_alert:
+                oversold_in_zone = True
+                oversold_armed = False
+            elif not oversold_cooldown_ready:
+                oversold_in_zone = False
+        elif oversold_status == "breakout":
+            if oversold_was_in_zone:
+                oversold_left_zone_at = now_ms
+            oversold_in_zone = False
+        else:
+            if oversold_was_in_zone:
+                oversold_left_zone_at = now_ms
+            oversold_in_zone = False
+            if oversold_distance_pct >= PRICE_WATCH_OVERSOLD_REARM_PCT and oversold_cooldown_ready:
+                oversold_armed = True
+
+        if oversold_should_alert:
+            oversold_episode += 1
+        conn.execute(
+            """
+            INSERT INTO price_watch_oversold_alert_state (
+                symbol, reference_low, reference_high, in_zone, armed,
+                last_alert_at, left_zone_at, episode, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                reference_low = excluded.reference_low,
+                reference_high = excluded.reference_high,
+                in_zone = excluded.in_zone,
+                armed = excluded.armed,
+                last_alert_at = CASE WHEN ? THEN excluded.last_alert_at
+                    ELSE price_watch_oversold_alert_state.last_alert_at END,
+                left_zone_at = excluded.left_zone_at,
+                episode = excluded.episode,
+                updated_at = excluded.updated_at
+            """,
+            (
+                symbol,
+                oversold_range_low if oversold_range_low > 0 else previous_low,
+                oversold_range_high if oversold_range_high > 0 else previous_stage_high,
+                1 if oversold_in_zone else 0,
+                1 if oversold_armed else 0,
+                now_ms if oversold_should_alert else oversold_last_alert_at,
+                oversold_left_zone_at,
+                oversold_episode,
+                now_ms,
+                1 if oversold_should_alert else 0,
+            ),
+        )
+        if oversold_should_alert:
+            alert_events.append(
+                {
+                    "eventType": "oversold_rebound",
+                    "symbol": symbol,
+                    "name": (asset["name"] if asset else "") or symbol,
+                    "currentPrice": current_price,
+                    "weekHigh": week_high,
+                    "drawdownPct": oversold_drawdown_pct,
+                    "rangeLow": oversold_range_low,
+                    "rangeHigh": oversold_range_high,
+                    "distancePct": oversold_distance_pct,
+                    "provider": result.get("provider") or "",
+                    "checkedAt": now_ms,
+                    "episode": oversold_episode,
+                }
+            )
+
+        fib_candidate = bool(fib.get("candidate"))
+        fib_launch_low = safe_float(fib.get("launchLow"))
+        fib_swing_high = safe_float(fib.get("swingHigh"))
+        fib_current_bar_high = safe_float(fib.get("currentBarHigh"))
+        fib_current_bar_low = safe_float(fib.get("currentBarLow"))
+        fib_alert_emitted = False
+        if fib_status not in {"unavailable", "pending"}:
+            # A pullback reaches 0.5 before 0.618. Process that order and emit
+            # at most one Fib alert per monitor round; a candle spanning both
+            # levels will emit the second level on the next round.
+            for level_name, target_key in (("0.5", "level05"), ("0.618", "level0618")):
+                target_price = safe_float(fib.get(target_key))
+                fib_state = conn.execute(
+                    "SELECT * FROM price_watch_fib_alert_state WHERE symbol = ? AND level = ?",
+                    (symbol, level_name),
+                ).fetchone()
+                previous_fib_low = safe_float(fib_state["reference_low"] if fib_state else 0)
+                previous_fib_high = safe_float(fib_state["reference_high"] if fib_state else 0)
+                previous_fib_target = safe_float(fib_state["target_price"] if fib_state else 0)
+                previous_fib_price = safe_float(fib_state["last_price"] if fib_state else 0)
+                fib_was_in_zone = bool(fib_state and fib_state["in_zone"])
+                fib_armed = bool(fib_state["armed"]) if fib_state else True
+                fib_last_alert_at = int(fib_state["last_alert_at"] or 0) if fib_state else 0
+                fib_episode = int(fib_state["episode"] or 0) if fib_state else 0
+                fib_cooldown_ready = (
+                    not fib_last_alert_at or now_ms - fib_last_alert_at >= cooldown_ms
+                )
+                materially_new_wave = bool(
+                    fib_state
+                    and (
+                        (
+                            previous_fib_low > 0
+                            and fib_launch_low > 0
+                            and abs(fib_launch_low - previous_fib_low) / previous_fib_low * 100
+                            >= PRICE_WATCH_FIB_REFERENCE_DELTA_PCT
+                        )
+                        or (
+                            previous_fib_high > 0
+                            and fib_swing_high > 0
+                            and abs(fib_swing_high - previous_fib_high) / previous_fib_high * 100
+                            >= PRICE_WATCH_FIB_REFERENCE_DELTA_PCT
+                        )
+                        or (
+                            previous_fib_target > 0
+                            and target_price > 0
+                            and abs(target_price - previous_fib_target) / previous_fib_target * 100
+                            >= PRICE_WATCH_FIB_REFERENCE_DELTA_PCT
+                        )
+                    )
+                )
+                if materially_new_wave:
+                    fib_was_in_zone = False
+                    fib_armed = True
+                    previous_fib_price = 0
+                    fib_last_alert_at = 0
+                    fib_episode = 0
+                    fib_cooldown_ready = True
+
+                fib_signed_distance_pct = (
+                    ((target_price - current_price) / target_price) * 100
+                    if target_price > 0 and current_price > 0
+                    else 999.0
+                )
+                fib_distance_pct = abs(fib_signed_distance_pct)
+                near_level = bool(
+                    fib_candidate
+                    and target_price > 0
+                    and fib_distance_pct <= PRICE_WATCH_FIB_THRESHOLD_PCT
+                )
+                crossed_up = bool(
+                    fib_candidate
+                    and target_price > 0
+                    and previous_fib_price > 0
+                    and previous_fib_price < target_price <= current_price
+                )
+                crossed_down = bool(
+                    fib_candidate
+                    and target_price > 0
+                    and previous_fib_price > target_price >= current_price
+                )
+                crossed_in_current_bar = bool(
+                    fib_candidate
+                    and not fib_last_alert_at
+                    and target_price > 0
+                    and fib_current_bar_low > 0
+                    and fib_current_bar_high >= fib_current_bar_low
+                    and fib_current_bar_low <= target_price <= fib_current_bar_high
+                )
+                fib_direction = "rebound"
+                if crossed_down or (crossed_in_current_bar and current_price <= target_price):
+                    fib_direction = "pullback"
+                elif near_level and current_price > target_price and not crossed_up:
+                    fib_direction = "pullback"
+                fib_signal = bool(
+                    near_level
+                    or crossed_up
+                    or crossed_down
+                    or crossed_in_current_bar
+                )
+                fib_should_alert = bool(
+                    fib_armed
+                    and fib_cooldown_ready
+                    and not fib_was_in_zone
+                    and fib_candidate
+                    and target_price > 0
+                    and fib_signal
+                    and not fib_alert_emitted
+                )
+
+                fib_in_zone = fib_was_in_zone
+                if not fib_candidate or target_price <= 0:
+                    fib_in_zone = False
+                    fib_armed = True
+                elif fib_should_alert:
+                    fib_in_zone = True
+                    fib_armed = False
+                elif fib_distance_pct >= PRICE_WATCH_FIB_REARM_PCT:
+                    fib_in_zone = False
+                    if fib_cooldown_ready:
+                        fib_armed = True
+                elif not fib_signal:
+                    fib_in_zone = False
+
+                if fib_should_alert:
+                    fib_episode += 1
+                    fib_alert_emitted = True
+                conn.execute(
+                    """
+                    INSERT INTO price_watch_fib_alert_state (
+                        symbol, level, reference_low, reference_high, target_price,
+                        last_price, in_zone, armed, last_alert_at, episode, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(symbol, level) DO UPDATE SET
+                        reference_low = excluded.reference_low,
+                        reference_high = excluded.reference_high,
+                        target_price = excluded.target_price,
+                        last_price = excluded.last_price,
+                        in_zone = excluded.in_zone,
+                        armed = excluded.armed,
+                        last_alert_at = CASE WHEN ? THEN excluded.last_alert_at
+                            ELSE price_watch_fib_alert_state.last_alert_at END,
+                        episode = excluded.episode,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        symbol,
+                        level_name,
+                        fib_launch_low if fib_launch_low > 0 else previous_fib_low,
+                        fib_swing_high if fib_swing_high > 0 else previous_fib_high,
+                        target_price,
+                        current_price,
+                        1 if fib_in_zone else 0,
+                        1 if fib_armed else 0,
+                        now_ms if fib_should_alert else fib_last_alert_at,
+                        fib_episode,
+                        now_ms,
+                        1 if fib_should_alert else 0,
+                    ),
+                )
+                if fib_should_alert:
+                    alert_events.append(
+                        {
+                            "eventType": "oversold_fib_rebound",
+                            "symbol": symbol,
+                            "name": (asset["name"] if asset else "") or symbol,
+                            "currentPrice": current_price,
+                            "fibLevel": level_name,
+                            "fibTarget": target_price,
+                            "launchLow": fib_launch_low,
+                            "swingHigh": fib_swing_high,
+                            "impulseGainPct": safe_float(fib.get("impulseGainPct")),
+                            "distancePct": fib_distance_pct,
+                            "direction": fib_direction,
+                            "provider": result.get("provider") or "",
+                            "checkedAt": now_ms,
+                            "episode": fib_episode,
+                        }
+                    )
+    return alert_events
+
+
+def launch_price_watch_alert(event: dict[str, Any]) -> dict[str, Any]:
+    symbol = event.get("symbol") or "--"
+    distance = safe_float(event.get("distancePct"))
+    current_price = safe_float(event.get("currentPrice"))
+    week_high = safe_float(event.get("weekHigh"))
+    provider = event.get("provider") or ""
+    if event.get("eventType") == "oversold_fib_rebound":
+        fib_level = str(event.get("fibLevel") or "0.5")
+        fib_target = safe_float(event.get("fibTarget"))
+        launch_low = safe_float(event.get("launchLow"))
+        swing_high = safe_float(event.get("swingHigh"))
+        direction = str(event.get("direction") or "rebound")
+        reached = current_price >= fib_target > 0
+        if direction == "pullback":
+            title = (
+                f"{symbol} 回撤至主升浪 Fib {fib_level}"
+                if current_price <= fib_target
+                else f"{symbol} 距主升浪 Fib {fib_level} 仅 {distance:.2f}%"
+            )
+            speech = f"超跌反弹预警，{symbol} 正在回撤至主升浪斐波那契 {fib_level} 位置。"
+        else:
+            title = (
+                f"{symbol} 已收复主升浪 Fib {fib_level}"
+                if reached
+                else f"{symbol} 距主升浪 Fib {fib_level} 仅 {distance:.2f}%"
+            )
+            speech = (
+                f"超跌反弹预警，{symbol} "
+                f"{'已经收复' if reached else '正在接近'}主升浪斐波那契 {fib_level} 位置。"
+            )
+        return launch_desktop_alert(
+            {
+                "key": f"price-watch:fib:{symbol}:{fib_level}:episode:{int(event.get('episode') or 1)}",
+                "kind": "超跌反弹 · 日线主升浪",
+                "source": "币种价格监控",
+                "sourceLabel": "PW",
+                "title": title,
+                "body": (
+                    f"现价 {price_usd(current_price)} / Fib {fib_level} {price_usd(fib_target)} / "
+                    f"主升浪启动点 {price_usd(launch_low)} / 波段高点 {price_usd(swing_high)} / "
+                    f"{event.get('provider') or '市场行情'}"
+                ),
+                "url": price_watch_trade_url(symbol, provider, "./price-watch.html?mode=oversold"),
+                "time": event.get("checkedAt") or int(time.time() * 1000),
+                "priority": f"主升浪 Fib {fib_level}",
+                "speech": speech,
+            }
+        )
+    if event.get("eventType") == "oversold_rebound":
+        drawdown = safe_float(event.get("drawdownPct"))
+        range_low = safe_float(event.get("rangeLow"))
+        range_high = safe_float(event.get("rangeHigh"))
+        return launch_desktop_alert(
+            {
+                "key": f"price-watch:oversold:{symbol}:episode:{int(event.get('episode') or 1)}",
+                "kind": "超跌反弹",
+                "source": "币种价格监控",
+                "sourceLabel": "PW",
+                "title": f"{symbol} 距低位阶段高点仅 {distance:.2f}%",
+                "body": (
+                    f"7 日高点回撤 {drawdown:.2f}% / 现价 {price_usd(current_price)} / "
+                    f"低位阶段高点 {price_usd(range_high)} / 下跌低点 {price_usd(range_low)} / "
+                    f"{event.get('provider') or '市场行情'}"
+                ),
+                "url": price_watch_trade_url(symbol, provider, "./price-watch.html?mode=oversold"),
+                "time": event.get("checkedAt") or int(time.time() * 1000),
+                "priority": "接近低位区间高点",
+                "speech": f"超跌反弹预警，{symbol} 已接近低位阶段高点，距离 {distance:.1f}%。",
+            }
+        )
+    setup_label = "回撤后再接近" if event.get("setupType") == "retest" else "盘整后再接近"
+    is_first_candidate = bool(event.get("isFirstCandidate"))
+    signal_label = "首次有效突破待确认" if is_first_candidate else "非首次突破"
+    local_api = f"http://127.0.0.1:{env_value('PORT') or env_value('XINGYUN_PORT') or '8765'}"
+    return launch_desktop_alert(
+        {
+            "key": f"price-watch:{symbol}:episode:{int(event.get('episode') or 1)}",
+            "kind": "价格监控",
+            "source": "币种价格监控",
+            "sourceLabel": "PW",
+            "title": f"{symbol} 距 7 日前高仅 {distance:.2f}%",
+            "body": f"{signal_label} / {setup_label} / 现价 {price_usd(current_price)} / 最近 7 日前高 {price_usd(week_high)} / {event.get('provider') or '市场行情'}",
+            "url": price_watch_trade_url(symbol, provider),
+            "time": event.get("checkedAt") or int(time.time() * 1000),
+            "priority": "接近前高",
+            "confirmEndpoint": f"{local_api}/api/price-watch" if is_first_candidate else "",
+            "confirmSymbol": symbol if is_first_candidate else "",
+            "confirmEpisode": int(event.get("episode") or 0) if is_first_candidate else 0,
+            "confirmLabel": "确认有效",
+            "excludeEndpoint": f"{local_api}/api/price-watch",
+            "excludeSymbol": symbol,
+            "excludeLabel": "剔除前高",
+            "speech": f"前高预警，{symbol} 已接近最近七日前高，距离 {distance:.1f}%。",
+        }
+    )
+
+
+def send_price_watch_discord_alerts(events: list[dict[str, Any]]) -> dict[str, Any]:
+    bot_token = env_value("PRICE_WATCH_DISCORD_BOT_TOKEN") or env_value("DISCORD_BOT_TOKEN")
+    channel_id = env_value("PRICE_WATCH_DISCORD_CHANNEL_ID") or env_value("DISCORD_ALERT_CHANNEL_ID")
+    webhook = env_value("PRICE_WATCH_DISCORD_WEBHOOK_URL")
+    use_bot = bool(bot_token and channel_id)
+    if (not use_bot and not webhook) or not events:
+        return {"ok": False, "disabled": not bool(use_bot or webhook), "sent": 0}
+
+    sent = 0
+    for start in range(0, len(events), 10):
+        batch = events[start : start + 10]
+        embeds = []
+        for event in batch:
+            symbol = clean_price_watch_symbol(event.get("symbol")) or "--"
+            distance = safe_float(event.get("distancePct"))
+            current_price = safe_float(event.get("currentPrice"))
+            week_high = safe_float(event.get("weekHigh"))
+            if event.get("eventType") == "oversold_fib_rebound":
+                fib_level = str(event.get("fibLevel") or "0.5")
+                fib_target = safe_float(event.get("fibTarget"))
+                launch_low = safe_float(event.get("launchLow"))
+                swing_high = safe_float(event.get("swingHigh"))
+                direction = str(event.get("direction") or "rebound")
+                reached = current_price >= fib_target > 0
+                if direction == "pullback":
+                    discord_title = f"{symbol} 回撤至主升浪 Fib {fib_level}"
+                    discord_description = (
+                        "从近期日线主升浪启动点到波段高点计算；"
+                        f"价格正在回撤至 **{fib_level}** 位置。"
+                    )
+                else:
+                    discord_title = (
+                        f"{symbol} 已收复主升浪 Fib {fib_level}"
+                        if reached
+                        else f"{symbol} 接近主升浪 Fib {fib_level}"
+                    )
+                    discord_description = (
+                        "从近期日线主升浪启动点到波段高点计算；"
+                        f"价格{'已经重新站上' if reached else '正在重新接近'} **{fib_level}** 位置。"
+                    )
+                embeds.append(
+                    {
+                        "title": discord_title,
+                        "description": discord_description,
+                        "color": 0xF6BB48,
+                        "fields": [
+                            {"name": "当前价格", "value": price_usd(current_price), "inline": True},
+                            {"name": f"Fib {fib_level}", "value": price_usd(fib_target), "inline": True},
+                            {"name": "主升浪启动点", "value": price_usd(launch_low), "inline": True},
+                            {"name": "波段高点", "value": price_usd(swing_high), "inline": True},
+                            {"name": "行情来源", "value": clean_feed_text(event.get("provider") or "市场行情", 80), "inline": True},
+                        ],
+                        "footer": {"text": "星云社 · 日线主升浪 Fib 反弹监控"},
+                        "timestamp": datetime.fromtimestamp(
+                            int(event.get("checkedAt") or time.time() * 1000) / 1000
+                        ).astimezone().isoformat(),
+                    }
+                )
+                continue
+            if event.get("eventType") == "oversold_rebound":
+                drawdown = safe_float(event.get("drawdownPct"))
+                range_low = safe_float(event.get("rangeLow"))
+                range_high = safe_float(event.get("rangeHigh"))
+                embeds.append(
+                    {
+                        "title": f"{symbol} 超跌反弹接近低位阶段高点",
+                        "description": (
+                            f"自 7 日高点回撤 **{drawdown:.2f}%**，当前距离下跌低点后形成的"
+                            f"阶段高点仅 **{distance:.2f}%**。"
+                        ),
+                        "color": 0xF6BB48,
+                        "fields": [
+                            {"name": "当前价格", "value": price_usd(current_price), "inline": True},
+                            {"name": "低位阶段高点", "value": price_usd(range_high), "inline": True},
+                            {"name": "下跌低点", "value": price_usd(range_low), "inline": True},
+                            {"name": "最近 7 日高点", "value": price_usd(week_high), "inline": True},
+                            {"name": "行情来源", "value": clean_feed_text(event.get("provider") or "市场行情", 80), "inline": True},
+                        ],
+                        "footer": {"text": "星云社 · 超跌反弹监控"},
+                        "timestamp": datetime.fromtimestamp(
+                            int(event.get("checkedAt") or time.time() * 1000) / 1000
+                        ).astimezone().isoformat(),
+                    }
+                )
+                continue
+            setup_label = "回撤后再接近" if event.get("setupType") == "retest" else "盘整后再接近"
+            signal_label = "首次有效突破待确认" if event.get("isFirstCandidate") else "非首次突破"
+            embeds.append(
+                {
+                    "title": f"{symbol} 接近最近 7 日前高 · {signal_label}",
+                    "description": f"{setup_label}，现价仍低于前高，距离仅 **{distance:.2f}%**。",
+                    "color": 0xFF695D,
+                    "fields": [
+                        {"name": "当前价格", "value": price_usd(current_price), "inline": True},
+                        {"name": "最近 7 日前高", "value": price_usd(week_high), "inline": True},
+                        {"name": "行情来源", "value": clean_feed_text(event.get("provider") or "市场行情", 80), "inline": True},
+                    ],
+                    "footer": {"text": "星云社 · 币种价格监控"},
+                    "timestamp": datetime.fromtimestamp(
+                        int(event.get("checkedAt") or time.time() * 1000) / 1000
+                    ).astimezone().isoformat(),
+                }
+            )
+        try:
+            oversold_types = {"oversold_rebound", "oversold_fib_rebound"}
+            has_oversold = any(event.get("eventType") in oversold_types for event in batch)
+            has_fib = any(event.get("eventType") == "oversold_fib_rebound" for event in batch)
+            has_low_range = any(event.get("eventType") == "oversold_rebound" for event in batch)
+            has_prior_high = any(event.get("eventType") not in oversold_types for event in batch)
+            if has_oversold and has_prior_high:
+                content = "币种价格监控出现新信号"
+            elif has_fib and has_low_range:
+                content = "超跌反弹出现新的结构预警"
+            elif has_fib:
+                content = "超跌币接近近期日线主升浪 Fib 0.5 / 0.618 预警位"
+            elif has_low_range:
+                content = "超跌币接近低位阶段高点 3% 预警区间"
+            else:
+                content = "币种进入最近 7 日前高 3% 预警区间"
+            message = {
+                "content": content,
+                "embeds": embeds,
+                "allowed_mentions": {"parse": []},
+            }
+            if use_bot:
+                response = requests.post(
+                    f"https://discord.com/api/v10/channels/{channel_id}/messages",
+                    json=message,
+                    headers={
+                        "Authorization": f"Bot {bot_token}",
+                        "Content-Type": "application/json",
+                        "User-Agent": "XingyunSociety/price-watch",
+                    },
+                    timeout=10,
+                )
+            else:
+                response = requests.post(
+                    webhook,
+                    params={"wait": "true"},
+                    json={"username": "星云社价格监控", **message},
+                    headers={"User-Agent": "XingyunSociety/price-watch"},
+                    timeout=10,
+                )
+            response.raise_for_status()
+            sent += len(batch)
+        except Exception as exc:
+            print(f"Price watch Discord push failed: {safe_error_text(str(exc))[:180]}", file=sys.stderr)
+    return {"ok": sent == len(events), "sent": sent, "mode": "bot" if use_bot else "webhook"}
+
+
+def sync_price_watch_monitor(*, symbols: list[str] | None = None) -> dict[str, Any]:
+    if not PRICE_WATCH_LOCK.acquire(blocking=False):
+        return price_watch_payload(sync_candidates=False)
+    try:
+        sync_price_watch_new_contract_candidates()
+        sync_price_watch_aicoin_candidates()
+        rows = filter_price_monitor_rows_by_activity(price_watch_active_rows())
+        wanted = {clean_price_watch_symbol(symbol) for symbol in symbols or [] if clean_price_watch_symbol(symbol)}
+        if wanted:
+            rows = [row for row in rows if row.get("symbol") in wanted]
+        candidates: list[dict[str, Any]] = []
+        if rows:
+            with ThreadPoolExecutor(max_workers=min(8, len(rows))) as executor:
+                futures = {executor.submit(fetch_price_watch_snapshot, row): row for row in rows}
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        result = {
+                            "symbol": futures[future].get("symbol"),
+                            "status": "unavailable",
+                            "checkedAt": int(time.time() * 1000),
+                            "error": str(exc),
+                        }
+                    # Persist and alert each completed symbol immediately. A slow
+                    # market source must never hold back a fast actionable signal.
+                    fresh_events = update_price_watch_snapshot(result)
+                    fresh_events.sort(key=lambda item: safe_float(item.get("distancePct"), 999))
+                    candidates.extend(fresh_events)
+                    for event in fresh_events:
+                        launch_price_watch_alert(event)
+        if candidates:
+            candidates.sort(key=lambda item: safe_float(item.get("distancePct"), 999))
+            send_price_watch_discord_alerts(candidates)
+        return price_watch_payload(sync_candidates=False)
+    finally:
+        PRICE_WATCH_LOCK.release()
+
+
+def price_watch_monitor_loop() -> None:
+    while True:
+        try:
+            sync_price_watch_monitor()
+        except Exception as exc:
+            print(f"Price watch monitor failed: {safe_error_text(str(exc))}", file=sys.stderr)
+        time.sleep(PRICE_WATCH_INTERVAL_SECONDS)
+
+
+def start_price_watch_monitor() -> None:
+    global PRICE_WATCH_MONITOR_ACTIVE
+    if os.getenv("XINGYUN_DISABLE_PRICE_WATCH") == "1":
+        PRICE_WATCH_MONITOR_ACTIVE = False
+        return
+    PRICE_WATCH_MONITOR_ACTIVE = True
+    threading.Thread(target=price_watch_monitor_loop, daemon=True).start()
+
+
+def price_structure_monitor_next_rows(
+    rows: list[dict[str, Any]],
+    snapshot_items: list[dict[str, Any]],
+    inflight_symbols: set[str],
+    slots: int,
+    *,
+    now_ms: int | None = None,
+) -> list[dict[str, Any]]:
+    """Reserve half the workers for urgent rows and half for the stalest rows."""
+    if slots <= 0:
+        return []
+    effective_now = int(now_ms or time.time() * 1000)
+    snapshots = {
+        price_structure_monitor_symbol(item.get("symbol")): item
+        for item in snapshot_items
+        if isinstance(item, dict) and price_structure_monitor_symbol(item.get("symbol"))
+    }
+    pending_symbols = {
+        symbol
+        for symbol, item in snapshots.items()
+        if any(
+            isinstance(frame, dict) and isinstance(frame.get("pending"), dict)
+            for frame in (item.get("frames") if isinstance(item.get("frames"), list) else [])
+        )
+    }
+
+    def checked_at(row: dict[str, Any]) -> int:
+        symbol = price_structure_monitor_symbol(row.get("symbol"))
+        return int(safe_float((snapshots.get(symbol) or {}).get("checkedAt"), 0))
+
+    def eligible(row: dict[str, Any], refresh_seconds: float) -> bool:
+        symbol = price_structure_monitor_symbol(row.get("symbol"))
+        last_checked = checked_at(row)
+        return bool(
+            symbol
+            and symbol not in inflight_symbols
+            and (last_checked <= 0 or effective_now - last_checked >= refresh_seconds * 1000)
+        )
+
+    priority_rows = [
+        row for row in rows
+        if (
+            price_structure_monitor_symbol(row.get("symbol")) in pending_symbols
+            or bool(row.get("personalXPriority"))
+        )
+        and eligible(row, PRICE_STRUCTURE_PRIORITY_REFRESH_SECONDS)
+    ]
+    priority_rows.sort(key=lambda row: (checked_at(row), price_structure_monitor_symbol(row.get("symbol"))))
+    priority_symbols = {price_structure_monitor_symbol(row.get("symbol")) for row in priority_rows}
+    regular_rows = [
+        row for row in rows
+        if price_structure_monitor_symbol(row.get("symbol")) not in priority_symbols
+        and eligible(row, PRICE_STRUCTURE_REGULAR_REFRESH_SECONDS)
+    ]
+    regular_rows.sort(key=lambda row: (checked_at(row), price_structure_monitor_symbol(row.get("symbol"))))
+
+    priority_quota = min(len(priority_rows), max(1, slots // 2)) if priority_rows else 0
+    selected = priority_rows[:priority_quota]
+    selected.extend(regular_rows[:max(0, slots - len(selected))])
+    if len(selected) < slots:
+        selected.extend(priority_rows[priority_quota:priority_quota + slots - len(selected)])
+    return selected
+
+
+def price_structure_strategy_monitor_loop() -> None:
+    inflight: dict[Any, str] = {}
+    with ThreadPoolExecutor(
+        max_workers=PRICE_STRUCTURE_MONITOR_WORKERS,
+        thread_name_prefix="dragon-wave-scan",
+    ) as executor:
+        while True:
+            try:
+                for future in [future for future in inflight if future.done()]:
+                    symbol = inflight.pop(future, "")
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        print(
+                            f"Dragon-wave symbol {symbol or '--'} failed: {safe_error_text(str(exc))}",
+                            file=sys.stderr,
+                        )
+                rows = price_structure_watch_rows()
+                if rows:
+                    payload = price_structure_payload(force_refresh=False)
+                    payload_items = payload.get("items") if isinstance(payload.get("items"), list) else []
+                    slots = max(0, PRICE_STRUCTURE_MONITOR_WORKERS - len(inflight))
+                    selected_rows = price_structure_monitor_next_rows(
+                        rows,
+                        payload_items,
+                        set(inflight.values()),
+                        slots,
+                    )
+                    for selected_row in selected_rows:
+                        symbol = price_structure_monitor_symbol(selected_row.get("symbol"))
+                        future = executor.submit(
+                            refresh_price_structure_strategy_monitor_item,
+                            selected_row,
+                            rows,
+                        )
+                        inflight[future] = symbol
+            except Exception as exc:
+                print(f"Dragon-wave structure monitor failed: {safe_error_text(str(exc))}", file=sys.stderr)
+            time.sleep(PRICE_STRUCTURE_MONITOR_INTERVAL_SECONDS)
+
+
+def price_structure_prearm_monitor_loop() -> None:
+    while True:
+        try:
+            price_structure_prearm_monitor_once()
+        except Exception as exc:
+            print(f"Dragon-wave prearm monitor failed: {safe_error_text(str(exc))}", file=sys.stderr)
+        time.sleep(PRICE_STRUCTURE_PREARM_INTERVAL_SECONDS)
+
+
+def start_price_structure_strategy_monitor() -> None:
+    global PRICE_STRUCTURE_MONITOR_ACTIVE, PRICE_STRUCTURE_PREARM_MONITOR_ACTIVE
+    if os.getenv("XINGYUN_DISABLE_PRICE_WATCH") == "1":
+        PRICE_STRUCTURE_MONITOR_ACTIVE = False
+        PRICE_STRUCTURE_PREARM_MONITOR_ACTIVE = False
+        return
+    PRICE_STRUCTURE_MONITOR_ACTIVE = True
+    PRICE_STRUCTURE_PREARM_MONITOR_ACTIVE = True
+    threading.Thread(
+        target=price_structure_strategy_monitor_loop,
+        name="dragon-wave-structure-monitor",
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=price_structure_prearm_monitor_loop,
+        name="dragon-wave-prearm-monitor",
+        daemon=True,
+    ).start()
+
+
+def wechat_group_monitor_user_id(user: dict[str, Any] | None) -> int:
+    return int(safe_float((user or {}).get("id"), 0))
+
+
+def wechat_group_monitor_status_label(status: str) -> str:
+    return {
+        "connected": "正常监听",
+        "baseline_ready": "基线已建立",
+        "baseline_pending": "正在建立基线",
+        "wechat_not_running": "微信未打开",
+        "qq_not_running": "QQ 未打开",
+        "group_not_open": "目标群未打开",
+        "wechat_window_hidden": "微信窗口不可读",
+        "qq_window_hidden": "QQ 窗口不可读",
+        "collector_unavailable": "采集组件不可用",
+        "collector_error": "读取失败",
+        "stopped": "已停止",
+    }.get(str(status or ""), "等待连接")
+
+
+def wechat_opportunity_content_key(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip().lower()
+    text = re.sub(r"(?:^|\s)\d{1,2}:\d{2}(?:\s|$)", " ", text)
+    for boilerplate in (
+        "微信群聊机会", "星云社快讯", "市场事件", "待确认线索",
+        "核对公告行情与成交数据后再判断", "核对公告、行情与成交数据后再判断",
+        "信息来自群聊需要核对原始来源", "信息来自群聊，需要核对原始来源",
+    ):
+        text = text.replace(boilerplate, " ")
+    return re.sub(r"[^0-9a-z\u3400-\u9fff]", "", text)
+
+
+def wechat_opportunity_identity_symbols(item: dict[str, Any]) -> set[str]:
+    raw_symbols = item.get("symbols_json")
+    if raw_symbols is None:
+        raw_symbols = item.get("symbols")
+    symbols = {
+        clean_price_watch_symbol(symbol)
+        for symbol in parse_json_list(raw_symbols)
+        if clean_price_watch_symbol(symbol)
+    }
+    content = str(item.get("content") or "").upper()
+    for token in re.findall(r"[A-Z][A-Z0-9]{1,28}", content):
+        quote_positions = [position for quote in ("USDT", "USDC") if (position := token.find(quote)) >= 2]
+        candidate = token[:min(quote_positions)] if quote_positions else token
+        cleaned = clean_price_watch_symbol(candidate)
+        if cleaned and cleaned not in {"BITGET", "BINANCE", "ASTER", "OKX", "COIN", "LISTINGS"}:
+            symbols.add(cleaned)
+    return symbols
+
+
+def wechat_opportunity_display_symbols(item: dict[str, Any]) -> list[str]:
+    raw_symbols = item.get("symbols_json")
+    if raw_symbols is None:
+        raw_symbols = item.get("symbols")
+    result: list[str] = []
+    for symbol in parse_json_list(raw_symbols):
+        value = str(symbol or "").upper().strip()
+        if value and value not in result:
+            result.append(value)
+    return result[:8]
+
+
+def wechat_opportunity_exchanges(value: Any) -> set[str]:
+    text = str(value or "").lower()
+    exchanges: set[str] = set()
+    for exchange, aliases in {
+        "bitget": ("bitget",),
+        "binance": ("binance", "币安"),
+        "okx": ("okx", "欧易"),
+        "aster": ("aster",),
+        "bybit": ("bybit",),
+        "gate": ("gate.io", "gateio"),
+    }.items():
+        if any(alias in text for alias in aliases):
+            exchanges.add(exchange)
+    return exchanges
+
+
+def wechat_opportunity_event_kind(value: Any, category: Any = "") -> str:
+    text = f"{value or ''} {category or ''}".lower()
+    if any(term in text for term in ("下架", "退市", "delist")):
+        return "delisting"
+    if any(term in text for term in ("取消上线", "取消上新", "取消挂牌", "cancel listing")):
+        return "listing_cancel"
+    if any(term in text for term in ("推迟上线", "延迟上线", "延期上线", "postpone", "delayed listing")):
+        return "listing_delay"
+    if any(term in text for term in ("调整上线", "变更上线", "修改上线时间", "listing update")):
+        return "listing_update"
+    listing = any(term in text for term in (
+        "上线", "上新", "上币", "上市", "挂牌", "listing", "coin_listings", "永续合约",
+    ))
+    if listing and any(term in text for term in ("永续", "合约", "perpetual", "futures")):
+        return "listing_perpetual"
+    if listing and any(term in text for term in ("现货", "spot")):
+        return "listing_spot"
+    if listing:
+        return "listing"
+    for kind, terms in (
+        ("unlock", ("解锁", "unlock")),
+        ("buyback", ("回购", "销毁", "buyback", "burn")),
+        ("security", ("黑客", "攻击", "被盗", "hack", "exploit")),
+        ("funding", ("融资", "投资", "funding", "raise")),
+        ("regulation", ("监管", "诉讼", "sec", "政策")),
+        ("chain", ("主网", "测试网", "链上", "空投", "tge")),
+    ):
+        if any(term in text for term in terms):
+            return kind
+    return ""
+
+
+def wechat_opportunity_text_similarity(left: str, right: str) -> float:
+    if not left or not right:
+        return 0.0
+    if left in right or right in left:
+        return min(len(left), len(right)) / max(1, min(len(left), len(right)))
+    left_pairs = {left[index:index + 2] for index in range(max(1, len(left) - 1))}
+    right_pairs = {right[index:index + 2] for index in range(max(1, len(right) - 1))}
+    return len(left_pairs & right_pairs) / max(1, min(len(left_pairs), len(right_pairs)))
+
+
+def wechat_opportunity_near_symbol_match(left: set[str], right: set[str]) -> bool:
+    for left_symbol in left:
+        for right_symbol in right:
+            if len(left_symbol) != len(right_symbol) or len(left_symbol) < 3:
+                continue
+            if sum(a != b for a, b in zip(left_symbol, right_symbol)) == 1:
+                return True
+    return False
+
+
+def wechat_opportunities_match(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    window_seconds: int = WECHAT_GROUP_OPPORTUNITY_DEDUP_SECONDS,
+) -> bool:
+    if normalize_group_name(left.get("group_name") or left.get("groupName")) != normalize_group_name(
+        right.get("group_name") or right.get("groupName")
+    ):
+        return False
+    left_at = int(safe_float(left.get("captured_at") or left.get("capturedAt"), 0))
+    right_at = int(safe_float(right.get("captured_at") or right.get("capturedAt"), 0))
+    if left_at and right_at and abs(left_at - right_at) > max(60, int(window_seconds)):
+        return False
+    left_key = wechat_opportunity_content_key(left.get("content"))
+    right_key = wechat_opportunity_content_key(right.get("content"))
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+    left_kind = wechat_opportunity_event_kind(left.get("content"), left.get("category"))
+    right_kind = wechat_opportunity_event_kind(right.get("content"), right.get("category"))
+    if left_kind and right_kind and left_kind != right_kind:
+        listing_kinds = {"listing", "listing_perpetual", "listing_spot"}
+        if not ({left_kind, right_kind} <= listing_kinds and "listing" in {left_kind, right_kind}):
+            return False
+    left_exchanges = wechat_opportunity_exchanges(left.get("content"))
+    right_exchanges = wechat_opportunity_exchanges(right.get("content"))
+    if left_exchanges and right_exchanges and left_exchanges.isdisjoint(right_exchanges):
+        return False
+    left_symbols = wechat_opportunity_identity_symbols(left)
+    right_symbols = wechat_opportunity_identity_symbols(right)
+    similarity = wechat_opportunity_text_similarity(left_key, right_key)
+    if left_symbols and right_symbols:
+        if left_symbols & right_symbols:
+            return bool(left_kind or right_kind or similarity >= 0.72)
+        near_symbol = wechat_opportunity_near_symbol_match(left_symbols, right_symbols)
+        near_in_time = not left_at or not right_at or abs(left_at - right_at) <= 5 * 60
+        return bool(near_symbol and near_in_time and left_exchanges and right_exchanges and similarity >= 0.72)
+    if (left_key in right_key or right_key in left_key) and min(len(left_key), len(right_key)) >= 8:
+        return bool(left_kind or right_kind or left_exchanges or right_exchanges)
+    return bool((left_kind or right_kind) and similarity >= 0.84)
+
+
+def ensure_default_qq_group_monitor(user_id: int | None = None) -> int:
+    """Keep the requested QQ speaker monitor present without overwriting user pause state."""
+    now = int(time.time())
+    group_name = normalize_group_name(DEFAULT_QQ_GROUP_NAME)
+    inserted = 0
+    with AUTH_DB_LOCK, auth_db() as conn:
+        if user_id:
+            user_ids = [int(user_id)]
+        else:
+            user_ids = [int(row["id"]) for row in conn.execute("SELECT id FROM users").fetchall()]
+        for target_user_id in user_ids:
+            existing = conn.execute(
+                "SELECT 1 FROM wechat_group_monitors WHERE user_id = ? AND group_name = ?",
+                (target_user_id, group_name),
+            ).fetchone()
+            if existing:
+                continue
+            conn.execute(
+                """
+                INSERT INTO wechat_group_monitors
+                    (user_id, group_name, platform, sender_filter, forward_to_wechat, forward_target,
+                     enabled, baseline_ready,
+                     last_status, last_error, last_seen_at, created_at, updated_at)
+                VALUES (?, ?, 'qq', ?, 1, ?, 1, 0, 'baseline_pending', '', 0, ?, ?)
+                """,
+                (
+                    target_user_id,
+                    group_name,
+                    DEFAULT_QQ_SENDER_FILTER,
+                    DEFAULT_QQ_WECHAT_FORWARD_TARGET,
+                    now,
+                    now,
+                ),
+            )
+            inserted += 1
+    return inserted
+
+
+def format_chat_forward_message(group_name: Any, sender: Any, content: Any, symbols: list[str] | None = None) -> str:
+    del group_name, sender, symbols
+    return str(content or "").strip()[:1800]
+
+
+CHAT_FORWARD_CRYPTO_RE = re.compile(
+    r"(?:"
+    r"土狗|链上|项目方?|代币|发币|上币|上线|开盘|预售|公募|私募|空投|打新|"
+    r"合约地址|币安|欧易|交易所|钱包|跨链|主网|测试网|流动性|池子|市值|FDV|"
+    r"持仓|聪明钱|庄家|叙事|赛道|白皮书|官网|社区|生态|铭文|NFT|"
+    r"meme|token|coin|crypto|blockchain|on[ -]?chain|airdrop|launch|presale|"
+    r"TGE|IDO|IEO|DEX|CEX|swap|liquidity|contract|BSC|BNB|ETH|Ethereum|"
+    r"Solana|SOL|Base|Arbitrum|ARB|Avalanche|AVAX|TON|SUI|TRON"
+    r")",
+    re.IGNORECASE,
+)
+CHAT_FORWARD_CONTRACT_RE = re.compile(r"(?:0x[a-fA-F0-9]{40}|\b[1-9A-HJ-NP-Za-km-z]{32,44}\b)")
+CHAT_FORWARD_TICKER_RE = re.compile(r"(?:\$[A-Za-z][A-Za-z0-9]{1,14}\b|\b[A-Z][A-Z0-9]{1,14}(?:USDT|USD|PERP)?\b)")
+
+
+def chat_message_is_forwardable(content: Any, symbols: list[str] | None = None) -> bool:
+    """Keep only token, on-chain, or crypto-project discussion for WeChat forwarding."""
+    text = re.sub(r"\s+", " ", str(content or "")).strip()
+    if not text:
+        return False
+    if CHAT_FORWARD_CRYPTO_RE.search(text) or CHAT_FORWARD_CONTRACT_RE.search(text):
+        return True
+    extracted = [str(symbol).upper() for symbol in (symbols or extract_candidate_symbols(text)) if str(symbol).strip()]
+    return bool(extracted and CHAT_FORWARD_TICKER_RE.search(text))
+
+
+def enqueue_chat_message_forward(user_id: int, monitor: dict[str, Any], message: dict[str, Any]) -> bool:
+    if normalize_chat_platform(monitor.get("platform")) != "qq" or not bool(monitor.get("forward_to_wechat")):
+        return False
+    message_hash = str(message.get("hash") or "").strip()
+    content = str(message.get("content") or "").strip()
+    if not message_hash or not content:
+        return False
+    group_name = normalize_group_name(monitor.get("group_name"))
+    sender = str(message.get("sender") or monitor.get("sender_filter") or "群成员").strip()
+    symbols = extract_candidate_symbols(content)
+    if not chat_message_is_forwardable(content, symbols):
+        return False
+    target = str(monitor.get("forward_target") or DEFAULT_QQ_WECHAT_FORWARD_TARGET).strip()
+    now = int(time.time())
+    with AUTH_DB_LOCK, auth_db() as conn:
+        existing = conn.execute(
+            """
+            SELECT 1 FROM chat_message_forwards
+            WHERE message_hash = ? AND source_platform = 'qq' AND source_name = ? AND target = ?
+            LIMIT 1
+            """,
+            (message_hash, group_name, target),
+        ).fetchone()
+        if existing:
+            return False
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO chat_message_forwards
+                (user_id, message_hash, source_platform, source_name, sender, target, content,
+                 symbols_json, status, attempts, last_error, next_attempt_at, created_at, sent_at)
+            VALUES (?, ?, 'qq', ?, ?, ?, ?, ?, 'pending', 0, '', ?, ?, 0)
+            """,
+            (
+                int(user_id),
+                message_hash,
+                group_name,
+                sender,
+                target,
+                content,
+                json.dumps(symbols, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+    return cursor.rowcount == 1
+
+
+def process_chat_message_forward_outbox(limit: int = 2) -> dict[str, Any]:
+    now = int(time.time())
+    sent = 0
+    failed = 0
+    with CHAT_FORWARD_LOCK:
+        with AUTH_DB_LOCK, auth_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM chat_message_forwards
+                WHERE status IN ('pending', 'retry') AND next_attempt_at <= ?
+                ORDER BY created_at ASC, id ASC
+                LIMIT ?
+                """,
+                (now, max(1, int(limit))),
+            ).fetchall()
+        for raw_row in rows:
+            row = row_dict(raw_row)
+            forward_id = int(row.get("id") or 0)
+            attempts = int(row.get("attempts") or 0) + 1
+            symbols = [str(symbol).upper() for symbol in parse_json_list(row.get("symbols_json"))]
+            text = format_chat_forward_message(
+                row.get("source_name"),
+                row.get("sender"),
+                row.get("content"),
+                symbols,
+            )
+            if not chat_message_is_forwardable(text, symbols):
+                with AUTH_DB_LOCK, auth_db() as conn:
+                    conn.execute(
+                        """
+                        UPDATE chat_message_forwards
+                        SET status = 'filtered', attempts = ?, last_error = '非链上或项目内容，已过滤', next_attempt_at = 0
+                        WHERE id = ?
+                        """,
+                        (attempts, forward_id),
+                    )
+                continue
+            try:
+                result = send_text_to_wechat(str(row.get("target") or DEFAULT_QQ_WECHAT_FORWARD_TARGET), text)
+                sent_at = int(result.get("sentAt") or time.time())
+                with AUTH_DB_LOCK, auth_db() as conn:
+                    conn.execute(
+                        "UPDATE chat_message_forwards SET status = 'sent', attempts = ?, last_error = '', sent_at = ? WHERE id = ?",
+                        (attempts, sent_at, forward_id),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE wechat_group_monitors
+                        SET last_forward_at = ?, last_forward_error = '', updated_at = ?
+                        WHERE user_id = ? AND group_name = ? AND platform = 'qq'
+                        """,
+                        (sent_at, sent_at, int(row.get("user_id") or 0), normalize_group_name(row.get("source_name"))),
+                    )
+                sent += 1
+            except WechatDeliveryUncertainError as exc:
+                error = str(exc)[:320]
+                with AUTH_DB_LOCK, auth_db() as conn:
+                    conn.execute(
+                        """
+                        UPDATE chat_message_forwards
+                        SET status = 'uncertain', attempts = ?, last_error = ?, next_attempt_at = 0
+                        WHERE id = ?
+                        """,
+                        (attempts, error, forward_id),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE wechat_group_monitors
+                        SET last_forward_error = ?, updated_at = ?
+                        WHERE user_id = ? AND group_name = ? AND platform = 'qq'
+                        """,
+                        (error, now, int(row.get("user_id") or 0), normalize_group_name(row.get("source_name"))),
+                    )
+                failed += 1
+            except Exception as exc:
+                error = str(exc)[:320]
+                delay = CHAT_FORWARD_RETRY_SECONDS[min(attempts - 1, len(CHAT_FORWARD_RETRY_SECONDS) - 1)]
+                next_attempt_at = now + delay
+                with AUTH_DB_LOCK, auth_db() as conn:
+                    conn.execute(
+                        """
+                        UPDATE chat_message_forwards
+                        SET status = 'retry', attempts = ?, last_error = ?, next_attempt_at = ?
+                        WHERE id = ?
+                        """,
+                        (attempts, error, next_attempt_at, forward_id),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE wechat_group_monitors
+                        SET last_forward_error = ?, updated_at = ?
+                        WHERE user_id = ? AND group_name = ? AND platform = 'qq'
+                        """,
+                        (error, now, int(row.get("user_id") or 0), normalize_group_name(row.get("source_name"))),
+                    )
+                failed += 1
+    return {"ok": failed == 0, "processed": sent + failed, "sent": sent, "failed": failed}
+
+
+def wechat_opportunity_content_quality(item: dict[str, Any]) -> int:
+    content = str(item.get("content") or "")
+    key = wechat_opportunity_content_key(content)
+    score = min(180, len(key))
+    score += 16 * len(wechat_opportunity_identity_symbols(item))
+    score += 10 * len(wechat_opportunity_exchanges(content))
+    score += 12 if wechat_opportunity_event_kind(content, item.get("category")) else 0
+    score -= 30 if "微信群聊机会" in content else 0
+    score -= 18 if "后再判断" in content else 0
+    return score
+
+
+def merge_wechat_opportunity_records(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(left)
+    left_quality = wechat_opportunity_content_quality(left)
+    right_quality = wechat_opportunity_content_quality(right)
+    preferred = right if right_quality > left_quality else left
+    for field in ("sender", "content", "category", "thesis", "action_hint", "analysis_source"):
+        if preferred.get(field):
+            merged[field] = preferred[field]
+    left_symbols = wechat_opportunity_display_symbols(left)
+    right_symbols = wechat_opportunity_display_symbols(right)
+    left_identity = wechat_opportunity_identity_symbols(left)
+    right_identity = wechat_opportunity_identity_symbols(right)
+    if left_symbols and right_symbols and left_identity.isdisjoint(right_identity):
+        display_symbols = right_symbols if right_quality > left_quality else left_symbols
+    else:
+        display_symbols = list(dict.fromkeys([*left_symbols, *right_symbols]))[:8]
+    merged["symbols_json"] = json.dumps(display_symbols, ensure_ascii=False)
+    for field in ("catalysts_json", "risks_json"):
+        values = list(dict.fromkeys([
+            *[str(value) for value in parse_json_list(left.get(field)) if str(value).strip()],
+            *[str(value) for value in parse_json_list(right.get(field)) if str(value).strip()],
+        ]))
+        merged[field] = json.dumps(values[:5], ensure_ascii=False)
+    for field in ("candidate_score", "is_opportunity", "opportunity_score", "analyzed_at"):
+        merged[field] = max(int(safe_float(left.get(field), 0)), int(safe_float(right.get(field), 0)))
+    captured_values = [
+        int(safe_float(item.get("captured_at"), 0))
+        for item in (left, right)
+        if int(safe_float(item.get("captured_at"), 0)) > 0
+    ]
+    if captured_values:
+        merged["captured_at"] = min(captured_values)
+    created_values = [
+        int(safe_float(item.get("created_at"), 0))
+        for item in (left, right)
+        if int(safe_float(item.get("created_at"), 0)) > 0
+    ]
+    if created_values:
+        merged["created_at"] = min(created_values)
+    urgencies = {str(left.get("urgency") or "normal"), str(right.get("urgency") or "normal")}
+    merged["urgency"] = "high" if "high" in urgencies else ("normal" if "normal" in urgencies else "low")
+    return merged
+
+
+def dedupe_wechat_opportunity_records(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    clusters: list[dict[str, Any]] = []
+    ordered = sorted(rows, key=lambda item: (
+        int(safe_float(item.get("captured_at"), 0)),
+        int(safe_float(item.get("id"), 0)),
+    ))
+    for item in ordered:
+        duplicate_index = next(
+            (index for index in range(len(clusters) - 1, -1, -1) if wechat_opportunities_match(clusters[index], item)),
+            None,
+        )
+        if duplicate_index is None:
+            clusters.append(dict(item))
+        else:
+            clusters[duplicate_index] = merge_wechat_opportunity_records(clusters[duplicate_index], item)
+            merged_again = True
+            while merged_again:
+                merged_again = False
+                for index in range(len(clusters) - 1, -1, -1):
+                    if index == duplicate_index or not wechat_opportunities_match(
+                        clusters[duplicate_index], clusters[index]
+                    ):
+                        continue
+                    keep_index = min(index, duplicate_index)
+                    drop_index = max(index, duplicate_index)
+                    clusters[keep_index] = merge_wechat_opportunity_records(
+                        clusters[keep_index], clusters[drop_index]
+                    )
+                    clusters.pop(drop_index)
+                    duplicate_index = keep_index
+                    merged_again = True
+                    break
+    return sorted(clusters, key=lambda item: (
+        int(safe_float(item.get("captured_at"), 0)),
+        int(safe_float(item.get("id"), 0)),
+    ), reverse=True)
+
+
+def wechat_group_monitor_rows(user_id: int | None = None, enabled_only: bool = False) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if user_id:
+        clauses.append("user_id = ?")
+        params.append(int(user_id))
+    if enabled_only:
+        clauses.append("enabled = 1")
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    with AUTH_DB_LOCK, auth_db() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM wechat_group_monitors{where} ORDER BY updated_at DESC",
+            tuple(params),
+        ).fetchall()
+    return [row_dict(row) for row in rows]
+
+
+def wechat_group_monitor_payload(user: dict[str, Any] | None) -> dict[str, Any]:
+    user_id = wechat_group_monitor_user_id(user)
+    if not user_id:
+        raise PermissionError("unauthorized")
+    ensure_default_qq_group_monitor(user_id)
+    monitors = wechat_group_monitor_rows(user_id=user_id)
+    with AUTH_DB_LOCK, auth_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM wechat_group_messages
+            WHERE user_id = ? AND is_opportunity = 1
+            ORDER BY captured_at DESC, id DESC
+            LIMIT 500
+            """,
+            (user_id,),
+        ).fetchall()
+        watch_rows = conn.execute(
+            """
+            SELECT symbol, opportunity_active, opportunity_manual_removed_at, dead_at,
+                   dead_reason, status, current_price, last_quote_success_at
+            FROM price_watch_assets
+            WHERE opportunity_first_seen_at > 0
+            """
+        ).fetchall()
+        forward_rows = conn.execute(
+            """
+            SELECT status, COUNT(*) AS count
+            FROM chat_message_forwards
+            WHERE user_id = ?
+            GROUP BY status
+            """,
+            (user_id,),
+        ).fetchall()
+    forward_counts = {str(row["status"] or ""): int(row["count"] or 0) for row in forward_rows}
+    watch_states = {
+        str(row["symbol"] or "").upper(): {
+            "symbol": str(row["symbol"] or "").upper(),
+            "active": bool(row["opportunity_active"]),
+            "manuallyRemoved": bool(row["opportunity_manual_removed_at"]),
+            "dead": bool(row["dead_at"]),
+            "deadReason": row["dead_reason"] or "",
+            "quoteStatus": row["status"] or "pending",
+            "currentPrice": safe_float(row["current_price"]) or None,
+            "lastQuoteSuccessAt": int(row["last_quote_success_at"] or 0),
+        }
+        for row in watch_rows
+        if row["symbol"]
+    }
+    opportunity_rows = dedupe_wechat_opportunity_records([row_dict(row) for row in rows])[:120]
+    opportunities: list[dict[str, Any]] = []
+    for item in opportunity_rows:
+        symbols = [str(symbol).upper() for symbol in parse_json_list(item.get("symbols_json"))]
+        opportunities.append({
+            "id": int(item.get("id") or 0),
+            "groupName": item.get("group_name") or "",
+            "platform": normalize_chat_platform(item.get("platform")),
+            "sender": item.get("sender") or "群成员",
+            "content": item.get("content") or "",
+            "capturedAt": int(item.get("captured_at") or 0),
+            "confidence": int(item.get("opportunity_score") or 0),
+            "category": item.get("category") or "市场线索",
+            "symbols": symbols,
+            "symbolStates": [
+                watch_states.get(symbol, {
+                    "symbol": symbol,
+                    "active": False,
+                    "manuallyRemoved": False,
+                    "dead": False,
+                    "deadReason": "",
+                    "quoteStatus": "pending",
+                    "currentPrice": None,
+                    "lastQuoteSuccessAt": 0,
+                })
+                for symbol in symbols
+            ],
+            "thesis": item.get("thesis") or "",
+            "catalysts": parse_json_list(item.get("catalysts_json")),
+            "risks": parse_json_list(item.get("risks_json")),
+            "actionHint": item.get("action_hint") or "等待更多确认",
+            "urgency": item.get("urgency") or "normal",
+            "analysisSource": item.get("analysis_source") or "rules",
+        })
+    public_monitors = []
+    for row in monitors:
+        status = str(row.get("last_status") or "stopped")
+        fixed_monitor = (
+            normalize_chat_platform(row.get("platform")) == "qq"
+            and normalize_group_name(row.get("group_name")) == normalize_group_name(DEFAULT_QQ_GROUP_NAME)
+            and str(row.get("sender_filter") or "").strip() == DEFAULT_QQ_SENDER_FILTER
+        )
+        public_monitors.append({
+            "groupName": row.get("group_name") or "",
+            "platform": normalize_chat_platform(row.get("platform")),
+            "senderFilter": row.get("sender_filter") or "",
+            "forwardToWechat": bool(row.get("forward_to_wechat")),
+            "forwardTarget": row.get("forward_target") or "",
+            "lastForwardAt": int(row.get("last_forward_at") or 0),
+            "lastForwardError": str(row.get("last_forward_error") or "")[:220],
+            "fixed": fixed_monitor,
+            "enabled": bool(row.get("enabled")),
+            "baselineReady": bool(row.get("baseline_ready")),
+            "status": status,
+            "statusLabel": wechat_group_monitor_status_label(status),
+            "error": str(row.get("last_error") or "")[:220],
+            "lastSeenAt": int(row.get("last_seen_at") or 0),
+            "updatedAt": int(row.get("updated_at") or 0),
+        })
+    return {
+        "ok": True,
+        "collector": {
+            "supported": os.name == "nt",
+            "mode": "local-window-ocr",
+            "privacy": "只在本机内存识别已打开的微信或 QQ 窗口，截图不保存、不上传",
+        },
+        "monitors": public_monitors,
+        "opportunities": opportunities,
+        "summary": {
+            "groups": len(public_monitors),
+            "active": sum(1 for row in public_monitors if row["enabled"]),
+            "connected": sum(1 for row in public_monitors if row["status"] == "connected"),
+            "opportunities": len(opportunities),
+            "watchingSymbols": sum(1 for state in watch_states.values() if state["active"]),
+            "removedSymbols": sum(1 for state in watch_states.values() if state["manuallyRemoved"]),
+            "deadSymbols": sum(1 for state in watch_states.values() if state["dead"]),
+            "forwardPending": int(forward_counts.get("pending", 0)) + int(forward_counts.get("retry", 0)),
+            "forwardSent": int(forward_counts.get("sent", 0)),
+        },
+        "updatedAt": int(time.time()),
+    }
+
+
+def save_wechat_group_monitor(
+    user: dict[str, Any] | None,
+    group_name: Any,
+    enabled: Any = True,
+    platform: Any = "wechat",
+    sender_filter: Any = "",
+    forward_to_wechat: Any = False,
+    forward_target: Any = "",
+) -> dict[str, Any]:
+    user_id = wechat_group_monitor_user_id(user)
+    if not user_id:
+        raise PermissionError("unauthorized")
+    normalized = normalize_group_name(group_name)
+    if not normalized or len(normalized) > 80:
+        raise ValueError("请输入正确的群聊名称")
+    normalized_platform = normalize_chat_platform(platform)
+    normalized_sender = re.sub(r"\s+", " ", str(sender_filter or "")).strip()[:80]
+    if normalized_platform == "qq" and not normalized_sender:
+        raise ValueError("Q 群监控需要填写发言 ID")
+    now = int(time.time())
+    enabled_value = 1 if bool_value(enabled, True) else 0
+    forward_value = 1 if normalized_platform == "qq" and bool_value(forward_to_wechat, False) else 0
+    target = re.sub(r"\s+", " ", str(forward_target or "")).strip()[:80]
+    if forward_value and not target:
+        target = DEFAULT_QQ_WECHAT_FORWARD_TARGET
+    with AUTH_DB_LOCK, auth_db() as conn:
+        existing = conn.execute(
+            "SELECT * FROM wechat_group_monitors WHERE user_id = ? AND group_name = ?",
+            (user_id, normalized),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE wechat_group_monitors
+                SET platform = ?, sender_filter = ?, forward_to_wechat = ?, forward_target = ?,
+                    enabled = ?, last_status = ?, last_error = '', updated_at = ?
+                WHERE user_id = ? AND group_name = ?
+                """,
+                (
+                    normalized_platform,
+                    normalized_sender,
+                    forward_value,
+                    target,
+                    enabled_value,
+                    "baseline_pending" if enabled_value else "stopped",
+                    now,
+                    user_id,
+                    normalized,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO wechat_group_monitors
+                    (user_id, group_name, platform, sender_filter, forward_to_wechat, forward_target,
+                     enabled, baseline_ready, last_status, last_error, last_seen_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, '', 0, ?, ?)
+                """,
+                (
+                    user_id,
+                    normalized,
+                    normalized_platform,
+                    normalized_sender,
+                    forward_value,
+                    target,
+                    enabled_value,
+                    "baseline_pending" if enabled_value else "stopped",
+                    now,
+                    now,
+                ),
+            )
+    return wechat_group_monitor_payload(user)
+
+
+def remove_wechat_group_monitor(user: dict[str, Any] | None, group_name: Any) -> dict[str, Any]:
+    user_id = wechat_group_monitor_user_id(user)
+    if not user_id:
+        raise PermissionError("unauthorized")
+    normalized = normalize_group_name(group_name)
+    with AUTH_DB_LOCK, auth_db() as conn:
+        conn.execute(
+            "DELETE FROM wechat_group_monitors WHERE user_id = ? AND group_name = ?",
+            (user_id, normalized),
+        )
+    return wechat_group_monitor_payload(user)
+
+
+def wechat_group_analysis_result(user_id: int, group_name: str, message: dict[str, Any], local_score: int) -> dict[str, Any]:
+    content = re.sub(r"\s+", " ", str(message.get("content") or "")).strip()
+    symbols = extract_candidate_symbols(content)
+    platform = normalize_chat_platform(message.get("platform"))
+    targeted_qq_mention = platform == "qq" and bool(message.get("senderFilter")) and bool(symbols)
+    source_label = "Q群" if platform == "qq" else "微信群聊"
+    settings = llm_settings_for_user(user_id)
+    fallback = {
+        "isOpportunity": targeted_qq_mention or local_score >= 72,
+        "confidence": 82 if targeted_qq_mention else min(88, max(45, local_score)),
+        "category": "指定ID提及" if targeted_qq_mention else ("市场事件" if local_score >= 72 else "待确认线索"),
+        "symbols": symbols,
+        "thesis": content[:48],
+        "catalysts": [],
+        "risks": [f"信息来自{source_label}，需要核对原始来源"],
+        "actionHint": "核对公告、行情与成交数据后再判断",
+        "urgency": "high" if local_score >= 85 else "normal",
+        "analysisSource": "rules",
+    }
+    if not clean_api_key(settings.get("apiKey")):
+        return fallback
+    prompt = {
+        "task": f"判断{source_label}新消息里是否存在值得继续核验的金融市场机会线索。",
+        "group": group_name,
+        "message": content,
+        "localRuleScore": local_score,
+        "candidateSymbols": symbols,
+        "rules": [
+            "普通闲聊、情绪表达、无来源喊单、复读旧闻、与市场无关内容必须判定为 false。",
+            "只有上新、上市、监管、产品、融资、回购、解锁、链上异动、流动性变化、重大公告或可核验催化才可判定为机会线索。",
+            "不得把群聊内容当成事实；必须提示核验原始来源，不给出自动下单指令。",
+            "指定监控 ID 提及的币种必须原样保留在 symbols 中，结构监控入池不以机会评分为前提。",
+            "thesis 最多 36 个中文字符，actionHint 最多 42 个中文字符。",
+            "confidence 为 0 到 100；低于 70 不应判定为机会。",
+            "只输出 JSON 对象。",
+        ],
+        "schema": {
+            "isOpportunity": False,
+            "confidence": 0,
+            "category": "上新/政策/项目/链上/宏观/风险/其他",
+            "symbols": [],
+            "thesis": "",
+            "catalysts": [],
+            "risks": [],
+            "actionHint": "",
+            "urgency": "high/normal/low",
+        },
+    }
+    try:
+        response = deepseek_chat([
+            {"role": "system", "content": "你是审慎的市场线索分析助手。你只做线索筛选和风险核验提示，不执行交易。"},
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ], settings)
+        choices = response.get("choices") if isinstance(response, dict) else []
+        message_payload = choices[0].get("message") if isinstance(choices, list) and choices else {}
+        parsed = deepseek_extract_json(str((message_payload or {}).get("content") or ""))
+        confidence = max(0, min(100, int(safe_float(parsed.get("confidence"), 0))))
+        is_opportunity = bool(parsed.get("isOpportunity")) and confidence >= 70
+        return {
+            "isOpportunity": is_opportunity,
+            "confidence": confidence,
+            "category": deepseek_flat_text(parsed.get("category"), 32) or "市场线索",
+            "symbols": [str(item).upper() for item in parse_json_list(parsed.get("symbols"))[:8]] or symbols,
+            "thesis": deepseek_flat_text(parsed.get("thesis"), 80) or content[:48],
+            "catalysts": [deepseek_flat_text(item, 80) for item in parse_json_list(parsed.get("catalysts"))[:5]],
+            "risks": [deepseek_flat_text(item, 90) for item in parse_json_list(parsed.get("risks"))[:5]],
+            "actionHint": deepseek_flat_text(parsed.get("actionHint"), 100) or fallback["actionHint"],
+            "urgency": str(parsed.get("urgency") or "normal").lower(),
+            "analysisSource": str(settings.get("providerName") or settings.get("provider") or "llm"),
+        }
+    except Exception as exc:
+        fallback["risks"] = [f"模型分析暂不可用：{str(exc)[:90]}", *fallback["risks"]]
+        return fallback
+
+
+def upsert_group_opportunity_price_watch_symbol(
+    symbol_value: Any,
+    group_name: str,
+    message_hash: str,
+    now_seconds: int,
+    platform: str = "wechat",
+    sender_filter: str = "",
+) -> bool:
+    symbol = clean_price_watch_symbol(symbol_value)
+    if not symbol or not is_price_watch_auto_crypto_candidate(symbol):
+        return False
+    now_ms = max(1, int(now_seconds)) * 1000
+    normalized_platform = normalize_chat_platform(platform)
+    source_label = f"{'Q群' if normalized_platform == 'qq' else '微信群聊'} · {group_name}"
+    if normalized_platform == "qq" and str(sender_filter or "").strip():
+        source_label = f"{source_label} · {str(sender_filter).strip()}"
+    with AUTH_DB_LOCK, auth_db() as conn:
+        existing = conn.execute(
+            "SELECT * FROM price_watch_assets WHERE symbol = ?",
+            (symbol,),
+        ).fetchone()
+        if existing and int(existing["opportunity_manual_removed_at"] or 0) > 0:
+            return False
+        sources = parse_json_list(existing["opportunity_sources_json"] if existing else "[]")
+        source_key = (source_label, message_hash)
+        merged_sources = [
+            item for item in sources
+            if isinstance(item, dict)
+            and (str(item.get("source") or ""), str(item.get("messageHash") or "")) != source_key
+        ]
+        merged_sources.insert(0, {
+            "source": source_label,
+            "messageHash": message_hash,
+            "seenAt": now_ms,
+        })
+        merged_sources = merged_sources[:30]
+        first_seen_at = int(existing["opportunity_first_seen_at"] or 0) if existing else 0
+        if not first_seen_at:
+            first_seen_at = now_ms
+        conn.execute(
+            """
+            INSERT INTO price_watch_assets
+                (symbol, manual_pinned, aicoin_first_seen_at, aicoin_last_seen_at,
+                 opportunity_active, opportunity_first_seen_at, opportunity_last_seen_at,
+                 opportunity_source, opportunity_sources_json, opportunity_manual_removed_at,
+                 dead_at, dead_reason, dismissed_until, created_at, updated_at)
+            VALUES (?, 0, 0, 0, 1, ?, ?, ?, ?, 0, 0, '', 0, ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                opportunity_active = 1,
+                opportunity_first_seen_at = CASE
+                    WHEN price_watch_assets.opportunity_first_seen_at > 0
+                    THEN price_watch_assets.opportunity_first_seen_at
+                    ELSE excluded.opportunity_first_seen_at
+                END,
+                opportunity_last_seen_at = excluded.opportunity_last_seen_at,
+                opportunity_source = excluded.opportunity_source,
+                opportunity_sources_json = excluded.opportunity_sources_json,
+                dead_at = 0,
+                dead_reason = '',
+                dismissed_until = 0,
+                updated_at = excluded.updated_at
+            """,
+            (
+                symbol,
+                first_seen_at,
+                now_ms,
+                source_label,
+                json.dumps(merged_sources, ensure_ascii=False, separators=(",", ":")),
+                now_ms,
+                now_ms,
+            ),
+        )
+    return True
+
+
+def backfill_wechat_group_opportunity_watch_pool() -> list[str]:
+    """Restore historical opportunities without reviving manually removed or dead assets."""
+    with AUTH_DB_LOCK, auth_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT group_name, platform, sender_filter, message_hash, symbols_json, captured_at
+            FROM wechat_group_messages
+            WHERE is_opportunity = 1 AND opportunity_score >= 75
+            ORDER BY captured_at ASC, id ASC
+            """
+        ).fetchall()
+        blocked_rows = conn.execute(
+            """
+            SELECT symbol
+            FROM price_watch_assets
+            WHERE opportunity_manual_removed_at > 0 OR dead_at > 0
+            """
+        ).fetchall()
+    blocked = {str(row["symbol"] or "").upper() for row in blocked_rows}
+    restored: set[str] = set()
+    for row in rows:
+        group_name = str(row["group_name"] or "微信群聊")
+        platform = normalize_chat_platform(row["platform"])
+        sender_filter = str(row["sender_filter"] or "")
+        message_hash = str(row["message_hash"] or "")
+        captured_at = max(1, int(row["captured_at"] or time.time()))
+        for symbol_value in parse_json_list(row["symbols_json"]):
+            symbol = clean_price_watch_symbol(symbol_value)
+            if not symbol or symbol in blocked:
+                continue
+            if upsert_group_opportunity_price_watch_symbol(
+                symbol,
+                group_name,
+                message_hash,
+                captured_at,
+                platform=platform,
+                sender_filter=sender_filter,
+            ):
+                restored.add(symbol)
+    return sorted(restored)
+
+
+def persist_wechat_group_analysis(user_id: int, group_name: str, message: dict[str, Any], local_score: int) -> None:
+    content = re.sub(r"\s+", " ", str(message.get("content") or "")).strip()
+    message_hash = str(message.get("hash") or message_fingerprint(group_name, str(message.get("sender") or "群成员"), content))
+    platform = normalize_chat_platform(message.get("platform"))
+    sender_filter = str(message.get("senderFilter") or "").strip()
+    analysis = wechat_group_analysis_result(user_id, group_name, message, local_score)
+    now = int(time.time())
+    symbols = [str(item).upper() for item in parse_json_list(analysis.get("symbols"))[:8]]
+    captured_at = int(message.get("capturedAt") or now)
+    incoming = {
+        "user_id": user_id,
+        "group_name": group_name,
+        "platform": platform,
+        "sender_filter": sender_filter,
+        "message_hash": message_hash,
+        "sender": str(message.get("sender") or "群成员"),
+        "content": content,
+        "captured_at": captured_at,
+        "candidate_score": local_score,
+        "is_opportunity": 1 if analysis.get("isOpportunity") else 0,
+        "opportunity_score": int(analysis.get("confidence") or 0),
+        "category": str(analysis.get("category") or ""),
+        "symbols_json": json.dumps(symbols, ensure_ascii=False),
+        "thesis": str(analysis.get("thesis") or ""),
+        "catalysts_json": json.dumps(parse_json_list(analysis.get("catalysts")), ensure_ascii=False),
+        "risks_json": json.dumps(parse_json_list(analysis.get("risks")), ensure_ascii=False),
+        "action_hint": str(analysis.get("actionHint") or ""),
+        "urgency": str(analysis.get("urgency") or "normal"),
+        "analysis_source": str(analysis.get("analysisSource") or "rules"),
+        "analyzed_at": now,
+        "created_at": now,
+    }
+    duplicate_id = 0
+    effective_message_hash = message_hash
+    with AUTH_DB_LOCK, auth_db() as conn:
+        duplicate = conn.execute(
+            "SELECT * FROM wechat_group_messages WHERE user_id = ? AND message_hash = ? LIMIT 1",
+            (user_id, message_hash),
+        ).fetchone()
+        if duplicate is None and incoming["is_opportunity"]:
+            recent_rows = conn.execute(
+                """
+                SELECT * FROM wechat_group_messages
+                WHERE user_id = ? AND group_name = ? AND is_opportunity = 1
+                  AND captured_at BETWEEN ? AND ?
+                ORDER BY captured_at DESC, id DESC
+                LIMIT 240
+                """,
+                (
+                    user_id,
+                    group_name,
+                    captured_at - WECHAT_GROUP_OPPORTUNITY_DEDUP_SECONDS,
+                    captured_at + WECHAT_GROUP_OPPORTUNITY_DEDUP_SECONDS,
+                ),
+            ).fetchall()
+            duplicate = next(
+                (row for row in recent_rows if wechat_opportunities_match(row_dict(row), incoming)),
+                None,
+            )
+        if duplicate is not None:
+            duplicate_item = row_dict(duplicate)
+            duplicate_id = int(duplicate_item.get("id") or 0)
+            effective_message_hash = str(duplicate_item.get("message_hash") or message_hash)
+            merged = merge_wechat_opportunity_records(duplicate_item, incoming)
+            symbols = wechat_opportunity_display_symbols(merged)
+            conn.execute(
+                """
+                UPDATE wechat_group_messages
+                SET platform = ?, sender_filter = ?, sender = ?, content = ?, captured_at = ?, candidate_score = ?,
+                    is_opportunity = ?, opportunity_score = ?, category = ?, symbols_json = ?,
+                    thesis = ?, catalysts_json = ?, risks_json = ?, action_hint = ?, urgency = ?,
+                    analysis_source = ?, analyzed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    platform, sender_filter, merged.get("sender") or "群成员", merged.get("content") or content,
+                    int(merged.get("captured_at") or captured_at), int(merged.get("candidate_score") or local_score),
+                    int(merged.get("is_opportunity") or 0), int(merged.get("opportunity_score") or 0),
+                    merged.get("category") or "", merged.get("symbols_json") or "[]",
+                    merged.get("thesis") or "", merged.get("catalysts_json") or "[]",
+                    merged.get("risks_json") or "[]", merged.get("action_hint") or "",
+                    merged.get("urgency") or "normal", merged.get("analysis_source") or "rules",
+                    int(merged.get("analyzed_at") or now), duplicate_id,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO wechat_group_messages
+                    (user_id, group_name, platform, sender_filter, message_hash, sender, content, captured_at, candidate_score,
+                     is_opportunity, opportunity_score, category, symbols_json, thesis, catalysts_json,
+                     risks_json, action_hint, urgency, analysis_source, analyzed_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    incoming["user_id"], incoming["group_name"], incoming["platform"], incoming["sender_filter"],
+                    incoming["message_hash"], incoming["sender"],
+                    incoming["content"], incoming["captured_at"], incoming["candidate_score"],
+                    incoming["is_opportunity"], incoming["opportunity_score"], incoming["category"],
+                    incoming["symbols_json"], incoming["thesis"], incoming["catalysts_json"],
+                    incoming["risks_json"], incoming["action_hint"], incoming["urgency"],
+                    incoming["analysis_source"], incoming["analyzed_at"], incoming["created_at"],
+                ),
+            )
+    if not analysis.get("isOpportunity") or int(analysis.get("confidence") or 0) < 75:
+        return
+    monitored_symbols = [
+        symbol for symbol in symbols
+        if upsert_group_opportunity_price_watch_symbol(
+            symbol,
+            group_name,
+            effective_message_hash,
+            now,
+            platform=platform,
+            sender_filter=sender_filter,
+        )
+    ]
+    if monitored_symbols:
+        threading.Thread(
+            target=sync_price_watch_monitor,
+            kwargs={"symbols": monitored_symbols},
+            name="wechat-opportunity-quotes",
+            daemon=True,
+        ).start()
+    symbols_text = "、".join(symbols[:4])
+    thesis = str(analysis.get("thesis") or "群聊中出现新的市场机会线索")
+    action_hint = str(analysis.get("actionHint") or "请先核验原始来源")
+    local_port = env_value("PORT") or env_value("XINGYUN_PORT") or "8765"
+    if duplicate_id:
+        return
+    launch_desktop_alert({
+        "key": f"wechat-group:{user_id}:{message_hash}",
+        "kind": "Q群机会" if platform == "qq" else "微信群聊机会",
+        "source": group_name,
+        "sourceLabel": "Q" if platform == "qq" else "微",
+        "title": thesis,
+        "body": " · ".join(part for part in [str(analysis.get("category") or "市场线索"), symbols_text, action_hint] if part),
+        "url": f"http://127.0.0.1:{local_port}/price-watch.html?mode=wechat",
+        "time": now * 1000,
+        "priority": "机会识别",
+        "speech": f"群聊机会提醒，{group_name}，{thesis}",
+        "sound": "urgent",
+        "queuePriority": 108,
+    })
+
+
+def poll_wechat_group_monitors_once(user_id: int | None = None) -> dict[str, Any]:
+    monitors = wechat_group_monitor_rows(user_id=user_id, enabled_only=True)
+    if not monitors:
+        return {"ok": True, "groups": 0, "newMessages": 0, "queued": 0}
+    now = int(time.time())
+    collected: dict[str, dict[str, Any]] = {}
+    new_messages = 0
+    queued = 0
+    directly_monitored_symbols: set[str] = set()
+    for monitor in monitors:
+        group_name = str(monitor.get("group_name") or "")
+        platform = normalize_chat_platform(monitor.get("platform"))
+        sender_filter = str(monitor.get("sender_filter") or "").strip()
+        collection_key = "|".join((platform, group_name, sender_filter))
+        if collection_key not in collected:
+            collected[collection_key] = collect_visible_group_messages(
+                group_name,
+                platform=platform,
+                sender_filter=sender_filter,
+            )
+        result = collected[collection_key]
+        status = str(result.get("status") or "collector_error")
+        if not result.get("ok"):
+            with AUTH_DB_LOCK, auth_db() as conn:
+                conn.execute(
+                    """
+                    UPDATE wechat_group_monitors
+                    SET last_status = ?, last_error = ?, updated_at = ?
+                    WHERE user_id = ? AND group_name = ?
+                    """,
+                    (status, str(result.get("error") or "")[:320], now, int(monitor.get("user_id") or 0), group_name),
+                )
+            continue
+        messages = result.get("messages") if isinstance(result.get("messages"), list) else []
+        monitor_user_id = int(monitor.get("user_id") or 0)
+        last_status = str(monitor.get("last_status") or "")
+        stale_reconnect = last_status != "connected" and now - int(monitor.get("last_seen_at") or 0) > 120
+        establish_baseline = not bool(monitor.get("baseline_ready")) or stale_reconnect
+        adaptive_messages: list[dict[str, Any]] = []
+        direct_qq_messages: list[dict[str, Any]] = []
+        with AUTH_DB_LOCK, auth_db() as conn:
+            if establish_baseline:
+                for message in messages:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO wechat_group_seen(user_id, group_name, message_hash, seen_at) VALUES (?, ?, ?, ?)",
+                        (monitor_user_id, group_name, str(message.get("hash") or ""), now),
+                    )
+                conn.execute(
+                    """
+                    UPDATE wechat_group_monitors
+                    SET baseline_ready = 1, last_status = 'connected', last_error = '', last_seen_at = ?, updated_at = ?
+                    WHERE user_id = ? AND group_name = ?
+                    """,
+                    (now, now, monitor_user_id, group_name),
+                )
+                continue
+            accepted: list[tuple[dict[str, Any], int]] = []
+            for message in messages:
+                message["platform"] = platform
+                message["senderFilter"] = sender_filter
+                if sender_filter:
+                    message["sender"] = sender_filter
+                message_hash = str(message.get("hash") or "")
+                if not message_hash:
+                    continue
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO wechat_group_seen(user_id, group_name, message_hash, seen_at) VALUES (?, ?, ?, ?)",
+                    (monitor_user_id, group_name, message_hash, now),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                new_messages += 1
+                adaptive_messages.append(message)
+                if platform == "qq" and sender_filter:
+                    direct_qq_messages.append(message)
+                score = candidate_rule_score(message.get("content"))
+                if score >= 35 or (platform == "qq" and sender_filter and extract_candidate_symbols(message.get("content"))):
+                    accepted.append((message, score))
+            conn.execute(
+                """
+                UPDATE wechat_group_monitors
+                SET last_status = 'connected', last_error = '', last_seen_at = ?, updated_at = ?
+                WHERE user_id = ? AND group_name = ?
+                """,
+                (now, now, monitor_user_id, group_name),
+            )
+        for message in direct_qq_messages:
+            message_hash = str(message.get("hash") or "")
+            for symbol in extract_candidate_symbols(message.get("content")):
+                if upsert_group_opportunity_price_watch_symbol(
+                    symbol,
+                    group_name,
+                    message_hash,
+                    int(safe_float(message.get("capturedAt"), 0)) or now,
+                    platform=platform,
+                    sender_filter=sender_filter,
+                ):
+                    directly_monitored_symbols.add(symbol)
+            enqueue_chat_message_forward(monitor_user_id, monitor, message)
+        for message in adaptive_messages:
+            update_strategy_adaptive_context_from_text(
+                message.get("content"),
+                source_kind="qq" if platform == "qq" else "wechat",
+                source_name=group_name,
+                observed_at=int(safe_float(message.get("capturedAt"), 0)) or now * 1000,
+            )
+        for message, score in accepted:
+            WECHAT_GROUP_ANALYSIS_POOL.submit(persist_wechat_group_analysis, monitor_user_id, group_name, message, score)
+            queued += 1
+    if directly_monitored_symbols:
+        threading.Thread(
+            target=sync_price_watch_monitor,
+            kwargs={"symbols": sorted(directly_monitored_symbols)},
+            name="qq-speaker-mentions-quotes",
+            daemon=True,
+        ).start()
+    forward_result = process_chat_message_forward_outbox(limit=2)
+    if now % 3600 < 8:
+        with AUTH_DB_LOCK, auth_db() as conn:
+            conn.execute("DELETE FROM wechat_group_seen WHERE seen_at < ?", (now - 31 * 86400,))
+    return {
+        "ok": True,
+        "groups": len(monitors),
+        "newMessages": new_messages,
+        "queued": queued,
+        "directlyMonitoredSymbols": sorted(directly_monitored_symbols),
+        "forwarded": int(forward_result.get("sent") or 0),
+        "forwardPendingFailed": int(forward_result.get("failed") or 0),
+    }
+
+
+def wechat_group_monitor_loop() -> None:
+    interval = max(2.5, safe_float(env_value("WECHAT_GROUP_MONITOR_INTERVAL_SECONDS", "4"), 4.0))
+    while WECHAT_GROUP_MONITOR_STARTED:
+        try:
+            poll_wechat_group_monitors_once()
+        except Exception:
+            pass
+        time.sleep(interval)
+
+
+def start_wechat_group_monitor() -> None:
+    global WECHAT_GROUP_MONITOR_STARTED
+    if os.name != "nt" or os.getenv("XINGYUN_DISABLE_WECHAT_GROUP_MONITOR") == "1":
+        WECHAT_GROUP_MONITOR_STARTED = False
+        return
+    with WECHAT_GROUP_MONITOR_LOCK:
+        if WECHAT_GROUP_MONITOR_STARTED:
+            return
+        WECHAT_GROUP_MONITOR_STARTED = True
+    ensure_default_qq_group_monitor()
+    restored_symbols = backfill_wechat_group_opportunity_watch_pool()
+    if restored_symbols:
+        threading.Thread(
+            target=sync_price_watch_monitor,
+            kwargs={"symbols": restored_symbols},
+            name="wechat-opportunity-backfill-quotes",
+            daemon=True,
+        ).start()
+    threading.Thread(target=wechat_group_monitor_loop, name="wechat-group-monitor", daemon=True).start()
+
+
+def strategy_live_enabled() -> bool:
+    return str(env_value("STRATEGY_LIVE_TRADING_ENABLED", "0")).strip().lower() in TRUTHY_ENV_VALUES
+
+
+def strategy_max_notional() -> float:
+    return max(100.0, safe_float(env_value("STRATEGY_MAX_ORDER_NOTIONAL_USDT", "25000"), 25000.0))
+
+
+def strategy_risk_tier(account_equity: Any) -> dict[str, Any]:
+    equity = max(0.0, safe_float(account_equity))
+    if equity < 10_000:
+        values = ("< 1万 U", 0.5, 0.8, 50.0, 120.0, 1.0, 3.0, 2.0)
+    elif equity < 100_000:
+        values = ("1万 - 10万 U", 0.4, 0.6, 40.0, 100.0, 2.0, 3.0, 1.5)
+    elif equity < 1_000_000:
+        values = ("10万 - 100万 U", 0.25, 0.4, 30.0, 80.0, 1.5, 2.0, 1.0)
+    elif equity < 5_000_000:
+        values = ("100万 - 500万 U", 0.15, 0.3, 20.0, 60.0, 1.0, 2.0, 0.8)
+    else:
+        values = ("> 500万 U", 0.1, 0.2, 10.0, 40.0, 1.0, 1.5, 0.5)
+    label, risk_min, risk_max, exposure_min, exposure_max, lev_min, lev_max, daily_loss = values
+    return {
+        "label": label,
+        "riskMinPct": risk_min,
+        "riskMaxPct": risk_max,
+        "riskDefaultPct": round((risk_min + risk_max) / 2, 3),
+        "exposureMinPct": exposure_min,
+        "exposureMaxPct": exposure_max,
+        "exposureDefaultPct": exposure_max,
+        "leverageMin": lev_min,
+        "leverageMax": lev_max,
+        "leverageDefault": 3.0,
+        "dailyLossLimitPct": daily_loss,
+    }
+
+
+def strategy_clamp(value: Any, low: float, high: float, fallback: float) -> float:
+    number = safe_float(value, fallback)
+    return min(high, max(low, number))
+
+
+def strategy_dragon_wave_signal_candidates(item: dict[str, Any], field: str) -> list[dict[str, Any]]:
+    """Read the shared engine's compact signals without duplicating strategy rules."""
+    candidates: list[dict[str, Any]] = []
+    direct_field = "signals" if field == "signal" else "pending"
+    for row in (item.get(direct_field) if isinstance(item.get(direct_field), list) else []):
+        if isinstance(row, dict):
+            candidates.append(dict(row))
+    for frame in item.get("frames") if isinstance(item.get("frames"), list) else []:
+        if not isinstance(frame, dict) or not isinstance(frame.get(field), dict):
+            continue
+        candidates.append(dict(frame[field]))
+    deduped: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        identity = clean_feed_text(
+            candidate.get("id")
+            or f"{candidate.get('interval')}:{candidate.get('decisionTime') or candidate.get('time')}",
+            180,
+        )
+        if identity:
+            deduped[identity] = candidate
+    return sorted(
+        deduped.values(),
+        key=lambda candidate: (
+            1 if clean_feed_text(candidate.get("grade"), 8).upper() == "A+" else 0,
+            safe_float(candidate.get("certainty"), 0),
+            safe_float(candidate.get("score"), 0),
+            int(safe_float(candidate.get("decisionTime") or candidate.get("time"), 0)),
+        ),
+        reverse=True,
+    )
+
+
+def strategy_dragon_wave_context(item: dict[str, Any]) -> dict[str, Any]:
+    signals = strategy_dragon_wave_signal_candidates(item, "signal")
+    pending = strategy_dragon_wave_signal_candidates(item, "pending")
+    meaningful_frames = [
+        dict(frame)
+        for frame in (item.get("frames") if isinstance(item.get("frames"), list) else [])
+        if isinstance(frame, dict)
+        if str(frame.get("stage") or "") not in {"", "等待", "观察"}
+        and str(frame.get("pattern") or "") not in {"", "无明确结构", "数据不足"}
+    ]
+    meaningful_frames.sort(
+        key=lambda frame: (
+            safe_float(frame.get("confidence"), 0),
+            1 if frame.get("signal") else 0,
+            1 if frame.get("pending") else 0,
+        ),
+        reverse=True,
+    )
+    return {
+        "signal": signals[0] if signals else None,
+        "pending": pending[0] if pending else None,
+        "frame": meaningful_frames[0] if meaningful_frames else None,
+    }
+
+
+def strategy_dragon_wave_items() -> dict[str, dict[str, Any]]:
+    """Return the latest shared-engine rows from main and independent new-coin pools."""
+    payload = price_structure_latest_snapshot_payload()
+    rows = [
+        dict(row)
+        for row in (payload.get("items") if isinstance(payload.get("items"), list) else [])
+        if isinstance(row, dict)
+    ]
+    if NEW_COIN_LOW_MONITOR_ACTIVE:
+        with NEW_COIN_LOW_LOCK:
+            hydrate_new_coin_low_snapshot()
+            rows.extend(
+                dict(row) for row in NEW_COIN_LOW_ITEMS.values()
+                if isinstance(row, dict) and new_coin_low_row_admitted(row)
+            )
+    selected: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        symbol = clean_price_watch_symbol(row.get("symbol"))
+        if not symbol:
+            continue
+        current = selected.get(symbol)
+        current_context = strategy_dragon_wave_context(current) if current else {}
+        row_context = strategy_dragon_wave_context(row)
+        current_rank = (
+            1 if current_context.get("signal") else 0,
+            1 if current_context.get("pending") else 0,
+            int(safe_float((current or {}).get("checkedAt"), 0)),
+        )
+        row_rank = (
+            1 if row_context.get("signal") else 0,
+            1 if row_context.get("pending") else 0,
+            int(safe_float(row.get("checkedAt"), 0)),
+        )
+        if current is None or row_rank >= current_rank:
+            selected[symbol] = row
+    return selected
+
+
+def strategy_stop_loss_plan(entry_price: Any, breakout_candle_low: Any = 0) -> dict[str, Any]:
+    """Use the breakout candle low, widening sub-3% noise to a 3% default stop."""
+    entry = safe_float(entry_price, 0)
+    if entry <= 0:
+        raise ValueError("入场价格无效")
+    candle_low = safe_float(breakout_candle_low, 0)
+    default_stop = entry * (1 - STRATEGY_DEFAULT_STOP_PCT / 100)
+    candle_distance_pct = (
+        max(0.0, (entry - candle_low) / entry * 100)
+        if 0 < candle_low < entry
+        else 0.0
+    )
+    use_candle_low = bool(
+        0 < candle_low < entry
+        and candle_distance_pct >= STRATEGY_DEFAULT_STOP_PCT
+    )
+    stop_price = candle_low if use_candle_low else default_stop
+    return {
+        "stopLossPrice": stop_price,
+        "stopDistancePct": max(0.0, (entry - stop_price) / entry * 100),
+        "breakoutCandleLow": candle_low or None,
+        "breakoutCandleDistancePct": round(candle_distance_pct, 4),
+        "stopLossSource": "breakout-candle-low" if use_candle_low else "default-3pct",
+        "stopLossSourceLabel": "突破K低点" if use_candle_low else "入场价下方3%",
+        "stopLossReason": (
+            "突破K低点距离入场价不少于3%，按真实结构低点止损"
+            if use_candle_low
+            else (
+                "突破K低点距离入场价不足3%，按入场价下方3%防止正常波动扫损"
+                if candle_low > 0
+                else "尚无可用突破K低点，按入场价下方3%止损"
+            )
+        ),
+    }
+
+
+def strategy_asset_row(symbol: Any) -> dict[str, Any]:
+    clean_symbol = clean_price_watch_symbol(symbol)
+    if not clean_symbol:
+        raise ValueError("币种代码无效")
+    rows = price_watch_active_rows()
+    row = next((item for item in rows if item.get("symbol") == clean_symbol), None)
+    structure_item = strategy_dragon_wave_items().get(clean_symbol)
+    if not row and not structure_item:
+        raise ValueError("该币种已不在热门币价格监控中")
+    result = dict(row or {
+        "symbol": clean_symbol,
+        "name": (structure_item or {}).get("name") or clean_symbol,
+        "icon": (structure_item or {}).get("icon") or crypto_icon_url(clean_symbol),
+    })
+    if structure_item:
+        context = strategy_dragon_wave_context(structure_item)
+        structure_price = safe_float(structure_item.get("currentPrice"), 0)
+        if structure_price > 0:
+            result["current_price"] = structure_price
+        result.update({
+            "strategy_structure_item": structure_item,
+            "strategy_signal": context.get("signal"),
+            "strategy_pending": context.get("pending"),
+            "strategy_frame": context.get("frame"),
+            "strategy_engine": structure_item.get("strategy") or "dragon-wave-engine",
+            "strategy_version": structure_item.get("strategyVersion") or "shared-live",
+        })
+    return result
+
+
+STRATEGY_EXCHANGE_DEFINITIONS = {
+    "binance": {"label": "Binance"},
+    "okx": {"label": "OKX"},
+    "bitget": {"label": "Bitget"},
+}
+
+
+def clean_strategy_exchange(exchange: Any) -> str:
+    name = str(exchange or "").strip().lower()
+    if name not in STRATEGY_EXCHANGE_DEFINITIONS:
+        raise ValueError("不支持该交易所")
+    return name
+
+
+def clean_exchange_credential(value: Any, limit: int = 800) -> str:
+    return str(value or "").strip()[:limit]
+
+
+def strategy_user_exchange_credentials(user_id: int | None, exchange: str) -> dict[str, str]:
+    if not user_id:
+        return {}
+    name = clean_strategy_exchange(exchange)
+    with AUTH_DB_LOCK, auth_db() as conn:
+        row = conn.execute(
+            "SELECT api_key, api_secret, passphrase, updated_at FROM user_exchange_credentials WHERE user_id = ? AND exchange = ?",
+            (int(user_id), name),
+        ).fetchone()
+    if not row:
+        return {}
+    return {
+        "key": clean_exchange_credential(decrypt_field(row["api_key"])),
+        "secret": clean_exchange_credential(decrypt_field(row["api_secret"])),
+        "passphrase": clean_exchange_credential(decrypt_field(row["passphrase"])),
+        "updatedAt": int(row["updated_at"] or 0),
+        "source": "user",
+    }
+
+
+def strategy_environment_exchange_credentials(exchange: str) -> dict[str, str]:
+    name = clean_strategy_exchange(exchange)
+    prefix = "BINANCE" if name == "binance" else "OKX" if name == "okx" else "BITGET"
+    return {
+        "key": clean_exchange_credential(env_value(f"{prefix}_API_KEY")),
+        "secret": clean_exchange_credential(env_value(f"{prefix}_API_SECRET")),
+        "passphrase": clean_exchange_credential(
+            env_value(f"{prefix}_API_PASSPHRASE") or env_value(f"{prefix}_API_PASSWORD")
+        ),
+        "source": "server",
+    }
+
+
+def strategy_exchange_credentials(exchange: str, user_id: int | None = None) -> dict[str, str]:
+    name = clean_strategy_exchange(exchange)
+    personal = strategy_user_exchange_credentials(user_id, name)
+    if strategy_credentials_complete(name, personal):
+        return personal
+    return strategy_environment_exchange_credentials(name)
+
+
+def strategy_credentials_complete(exchange: str, credentials: dict[str, Any]) -> bool:
+    name = clean_strategy_exchange(exchange)
+    required = ("key", "secret", "passphrase") if name == "okx" else ("key", "secret")
+    return all(clean_exchange_credential(credentials.get(key)) for key in required)
+
+
+def strategy_exchange_configured(exchange: str, user_id: int | None = None) -> bool:
+    name = clean_strategy_exchange(exchange)
+    return strategy_credentials_complete(name, strategy_exchange_credentials(name, user_id))
+
+
+def strategy_exchange_cache_get(key: str) -> Any | None:
+    with STRATEGY_EXCHANGE_CACHE_LOCK:
+        cached = STRATEGY_EXCHANGE_CACHE.get(key)
+        if not cached:
+            return None
+        cached_at, value = cached
+        if time.time() - cached_at > STRATEGY_POSITION_CACHE_SECONDS:
+            STRATEGY_EXCHANGE_CACHE.pop(key, None)
+            return None
+        return value
+
+
+def strategy_exchange_cache_set(key: str, value: Any) -> Any:
+    with STRATEGY_EXCHANGE_CACHE_LOCK:
+        STRATEGY_EXCHANGE_CACHE[key] = (time.time(), value)
+    return value
+
+
+def strategy_clear_exchange_cache(user_id: int | None = None, exchange: str = "") -> None:
+    user_marker = f":{int(user_id)}:" if user_id else ""
+    exchange_marker = f":{clean_strategy_exchange(exchange)}:" if exchange else ""
+    with STRATEGY_EXCHANGE_CACHE_LOCK:
+        for key in list(STRATEGY_EXCHANGE_CACHE):
+            if user_marker and user_marker not in key:
+                continue
+            if exchange_marker and exchange_marker not in key:
+                continue
+            STRATEGY_EXCHANGE_CACHE.pop(key, None)
+
+
+def binance_futures_error_message(code: Any, message: Any, status_code: int = 0) -> str:
+    clean_code = int(safe_float(code)) if str(code or "").strip() else 0
+    clean_message = re.sub(r"\s+", " ", str(message or "")).strip()
+    if clean_code == -2015:
+        return (
+            "API Key 无效、未开放合约读取权限，或当前服务出口 IP 不在币安白名单中。"
+            "请确认币安 API 的“允许读取、允许合约”已开启，并将运行本站的出口 IP 加入白名单。"
+        )
+    if clean_code == -1022:
+        return "币安签名校验失败，请重新保存正确的 API Secret。"
+    if clean_code == -1021:
+        return "本站时间与币安服务器时间偏差过大，请同步电脑系统时间后重试。"
+    if clean_code == -1003:
+        return "币安接口访问频率受限，请稍后再试。"
+    if status_code in {401, 403}:
+        return "币安拒绝了账户读取请求，请检查 API 权限和 IP 白名单。"
+    if status_code == 451:
+        return "当前网络区域无法访问币安合约接口。"
+    detail = clean_message or (f"HTTP {status_code}" if status_code else "未知错误")
+    return f"币安合约接口返回：{detail}"[:420]
+
+
+def binance_futures_signed_get(
+    path: str,
+    credentials: dict[str, str],
+    params: dict[str, Any] | None = None,
+) -> Any:
+    api_key = clean_exchange_credential(credentials.get("key"))
+    api_secret = clean_exchange_credential(credentials.get("secret"))
+    if not api_key or not api_secret:
+        raise RuntimeError("币安 API Key 或 Secret 尚未配置完整。")
+
+    timestamp = int(time.time() * 1000)
+    try:
+        time_response = requests.get(
+            "https://fapi.binance.com/fapi/v1/time",
+            headers=HEADERS,
+            timeout=6,
+        )
+        if time_response.ok:
+            timestamp = int(time_response.json().get("serverTime") or timestamp)
+    except (requests.RequestException, TypeError, ValueError, json.JSONDecodeError):
+        pass
+
+    query_params = dict(params or {})
+    query_params["recvWindow"] = 10_000
+    query_params["timestamp"] = timestamp
+    query = urlencode(query_params)
+    signature = hmac.new(api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
+    url = f"https://fapi.binance.com{path}?{query}&signature={signature}"
+    try:
+        response = requests.get(
+            url,
+            headers={**HEADERS, "Accept": "application/json", "X-MBX-APIKEY": api_key},
+            timeout=12,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"无法连接币安合约接口：{safe_error_text(str(exc))}") from exc
+
+    try:
+        payload = response.json()
+    except (ValueError, json.JSONDecodeError):
+        payload = None
+    if not response.ok:
+        error_payload = payload if isinstance(payload, dict) else {}
+        raise RuntimeError(
+            binance_futures_error_message(
+                error_payload.get("code"),
+                error_payload.get("msg") or response.text[:240],
+                response.status_code,
+            )
+        )
+    if isinstance(payload, dict) and safe_float(payload.get("code")) < 0:
+        raise RuntimeError(binance_futures_error_message(payload.get("code"), payload.get("msg"), response.status_code))
+    return payload
+
+
+def binance_futures_positions(user_id: int) -> list[dict[str, Any]]:
+    credentials = strategy_exchange_credentials("binance", user_id)
+    if not strategy_credentials_complete("binance", credentials):
+        return []
+    key_fingerprint = hashlib.sha256(credentials["key"].encode("utf-8")).hexdigest()[:12]
+    cache_key = f"positions:{int(user_id)}:binance:{key_fingerprint}"
+    cached = strategy_exchange_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    payload = binance_futures_signed_get("/fapi/v3/positionRisk", credentials)
+    if not isinstance(payload, list):
+        raise RuntimeError("币安合约持仓接口没有返回有效列表。")
+
+    positions: list[dict[str, Any]] = []
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        signed_quantity = safe_float(row.get("positionAmt"))
+        if abs(signed_quantity) <= 0:
+            continue
+        symbol = normalize_asset_symbol(row.get("symbol"))
+        if not symbol:
+            continue
+        position_side = str(row.get("positionSide") or "BOTH").strip().upper()
+        side = "short" if position_side == "SHORT" or (position_side == "BOTH" and signed_quantity < 0) else "long"
+        quantity = abs(signed_quantity)
+        entry_price = safe_float(row.get("entryPrice"))
+        mark_price = safe_float(row.get("markPrice")) or entry_price
+        notional = abs(safe_float(row.get("notional"))) or mark_price * quantity
+        initial_margin = (
+            safe_float(row.get("positionInitialMargin"))
+            or safe_float(row.get("initialMargin"))
+            or safe_float(row.get("isolatedMargin"))
+        )
+        leverage = safe_float(row.get("leverage"))
+        if leverage <= 0 and initial_margin > 0:
+            leverage = max(1.0, round(notional / initial_margin, 2))
+        if leverage <= 0:
+            leverage = 1.0
+        margin = initial_margin or (notional / leverage if leverage > 0 else notional)
+        unrealized_pnl = safe_float(row.get("unRealizedProfit"))
+        pnl_pct = unrealized_pnl / margin * 100 if margin > 0 else 0.0
+        asset_symbol = re.sub(r"(?:USDT|USDC|BUSD)$", "", symbol)
+        positions.append(
+            {
+                "key": f"exchange:binance:{symbol}:{side}",
+                "id": f"binance:{symbol}:{side}",
+                "symbol": symbol,
+                "name": asset_symbol or symbol,
+                "icon": crypto_icon_url(asset_symbol or symbol),
+                "exchange": "binance",
+                "mode": "live",
+                "source": "exchange",
+                "side": side,
+                "positionSide": position_side,
+                "entryPrice": entry_price,
+                "breakEvenPrice": safe_float(row.get("breakEvenPrice")),
+                "markPrice": mark_price,
+                "liquidationPrice": safe_float(row.get("liquidationPrice")),
+                "quantity": quantity,
+                "notional": notional,
+                "margin": margin,
+                "marginType": str(row.get("marginType") or "").strip().lower(),
+                "leverage": leverage,
+                "stopLossPrice": 0,
+                "unrealizedPnl": round(unrealized_pnl, 6),
+                "unrealizedPnlPct": round(pnl_pct, 4),
+                "breakEvenAt": 0,
+                "canBreakEven": False,
+                "createdAt": int(row.get("updateTime") or 0),
+            }
+        )
+    positions.sort(key=lambda item: safe_float(item.get("notional")), reverse=True)
+    return strategy_exchange_cache_set(cache_key, positions)
+
+
+def parse_binance_futures_account(payload: dict[str, Any]) -> dict[str, Any]:
+    assets = payload.get("assets") if isinstance(payload.get("assets"), list) else []
+    usdt_asset = next(
+        (
+            item
+            for item in assets
+            if isinstance(item, dict) and str(item.get("asset") or "").strip().upper() == "USDT"
+        ),
+        {},
+    )
+    available_balance = safe_float(payload.get("availableBalance"))
+    if not str(payload.get("availableBalance") or "").strip():
+        available_balance = safe_float(usdt_asset.get("availableBalance"))
+    wallet_balance = safe_float(payload.get("totalWalletBalance"))
+    if not str(payload.get("totalWalletBalance") or "").strip():
+        wallet_balance = safe_float(usdt_asset.get("walletBalance"))
+    margin_balance = safe_float(payload.get("totalMarginBalance"))
+    if not str(payload.get("totalMarginBalance") or "").strip():
+        margin_balance = safe_float(usdt_asset.get("marginBalance"))
+    initial_margin = safe_float(payload.get("totalInitialMargin"))
+    if not str(payload.get("totalInitialMargin") or "").strip():
+        initial_margin = safe_float(usdt_asset.get("initialMargin"))
+    return {
+        "exchange": "binance",
+        "label": "Binance U 本位",
+        "currency": "USDT",
+        "availableBalance": round(max(0.0, available_balance), 8),
+        "walletBalance": round(max(0.0, wallet_balance), 8),
+        "marginBalance": round(max(0.0, margin_balance), 8),
+        "initialMargin": round(max(0.0, initial_margin), 8),
+        "updatedAt": int(time.time() * 1000),
+    }
+
+
+def x_kol_realtime_key(user: dict[str, Any] | None = None) -> int:
+    return int(safe_float((user or {}).get("id")) or 0)
+
+
+def x_kol_realtime_snapshot_path(user: dict[str, Any] | None = None) -> Path:
+    return PERSIST_CACHE_DIR / f"x_kol_realtime_{x_kol_realtime_key(user)}.json"
+
+
+def persist_x_kol_realtime_payload(user: dict[str, Any] | None, payload: dict[str, Any]) -> None:
+    if not isinstance(payload, dict) or not payload.get("items"):
+        return
+    write_json_cache(x_kol_realtime_snapshot_path(user), {
+        "savedAt": int(time.time() * 1000),
+        "payload": payload,
+    })
+
+
+def x_kol_payload_signature(payload: dict[str, Any]) -> str:
+    rows = payload.get("items") if isinstance(payload.get("items"), list) else []
+    sources = payload.get("sources") if isinstance(payload.get("sources"), list) else []
+    signature_payload = {
+        "items": [
+            (
+                x_kol_realtime_item_identity(row),
+                int(safe_float(row.get("publishedAt")) or 0),
+                clean_feed_text(row.get("text") or row.get("title"), 200),
+            )
+            for row in rows[:240]
+            if isinstance(row, dict)
+        ],
+        "sources": [
+            (
+                str(row.get("id") or ""),
+                str(row.get("status") or ""),
+                str(row.get("provider") or ""),
+                int(safe_float(row.get("itemsReturned")) or 0),
+            )
+            for row in sources
+            if isinstance(row, dict)
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(signature_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def x_kol_realtime_item_identity(row: dict[str, Any]) -> str:
+    """Return one identity for the same tweet across X API and RSS providers."""
+    candidates = (row.get("tweetId"), row.get("url"))
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if not value:
+            continue
+        if value.isdigit():
+            return f"tweet:{value}"
+        match = re.search(r"/(?:status|statuses)/(\d+)(?:\D|$)", value, flags=re.IGNORECASE)
+        if match:
+            return f"tweet:{match.group(1)}"
+    return str(row.get("id") or row.get("url") or row.get("publishedAt") or "")
+
+
+def x_kol_realtime_item_priority(row: dict[str, Any]) -> int:
+    return {
+        "x-stream": 3,
+        "x-api": 2,
+        "rss": 1,
+    }.get(str(row.get("provider") or "").lower(), 0)
+
+
+def x_kol_merge_realtime_payload(
+    previous_payload: dict[str, Any] | None,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    previous = previous_payload if isinstance(previous_payload, dict) else {}
+    cutoff = int(time.time() * 1000) - X_KOL_RETENTION_MS
+    merged_items: dict[str, dict[str, Any]] = {}
+    for row in [
+        *(payload.get("items") if isinstance(payload.get("items"), list) else []),
+        *(previous.get("items") if isinstance(previous.get("items"), list) else []),
+    ]:
+        if not isinstance(row, dict):
+            continue
+        published_at = int(safe_float(row.get("publishedAt")) or 0)
+        if published_at and published_at < cutoff:
+            continue
+        item_key = x_kol_realtime_item_identity(row)
+        existing = merged_items.get(item_key)
+        if item_key and (
+            existing is None
+            or x_kol_realtime_item_priority(row) > x_kol_realtime_item_priority(existing)
+        ):
+            merged_items[item_key] = row
+
+    incoming_sources = {
+        str(row.get("id") or row.get("handle") or ""): row
+        for row in (payload.get("sources") if isinstance(payload.get("sources"), list) else [])
+        if isinstance(row, dict) and (row.get("id") or row.get("handle"))
+    }
+    previous_sources = {
+        str(row.get("id") or row.get("handle") or ""): row
+        for row in (previous.get("sources") if isinstance(previous.get("sources"), list) else [])
+        if isinstance(row, dict) and (row.get("id") or row.get("handle"))
+    }
+    item_counts: dict[str, int] = {}
+    for row in merged_items.values():
+        source_id = str(row.get("sourceId") or "")
+        if source_id:
+            item_counts[source_id] = item_counts.get(source_id, 0) + 1
+
+    source_order = list(dict.fromkeys([*incoming_sources, *previous_sources]))
+    merged_sources: dict[str, dict[str, Any]] = {}
+    for source_key in source_order:
+        incoming = incoming_sources.get(source_key)
+        prior = previous_sources.get(source_key)
+        if incoming and incoming.get("status") == "error" and prior and item_counts.get(source_key, 0) > 0:
+            merged_sources[source_key] = {
+                **prior,
+                **incoming,
+                "status": "recovering",
+                "provider": prior.get("provider") or incoming.get("provider") or "rss",
+                "itemsReturned": item_counts[source_key],
+                "lastOkAt": prior.get("lastOkAt") or previous.get("updatedAt") or 0,
+                "stale": True,
+                "error": "上游换源重连中 · 已保留最近成功数据",
+            }
+        elif incoming:
+            merged_sources[source_key] = incoming
+        elif prior:
+            merged_sources[source_key] = prior
+
+    return {
+        **payload,
+        "items": sorted(
+            merged_items.values(),
+            key=lambda row: int(safe_float(row.get("publishedAt")) or 0),
+            reverse=True,
+        )[:240],
+        "sources": list(merged_sources.values()),
+    }
+
+
+def hydrate_x_kol_realtime_history(user: dict[str, Any] | None) -> None:
+    """Merge the last successful disk history before any empty startup poll can mask it."""
+    key = x_kol_realtime_key(user)
+    with X_KOL_REALTIME_CONDITION:
+        if key in X_KOL_REALTIME_DISK_HYDRATED:
+            return
+    cached = read_json_cache(x_kol_realtime_snapshot_path(user))
+    cached_payload = cached.get("payload") if isinstance(cached.get("payload"), dict) else None
+    if cached_payload and cached_payload.get("items"):
+        # Retained posts must restore their monitoring side effects too. Previously
+        # they were rendered after restart but never re-entered the watch pools.
+        update_strategy_contexts_from_personal_x_payload(
+            cached_payload,
+            monitor_max_age_seconds=personal_x_monitor_backfill_seconds(),
+        )
+    with X_KOL_REALTIME_CONDITION:
+        if key in X_KOL_REALTIME_DISK_HYDRATED:
+            return
+        X_KOL_REALTIME_DISK_HYDRATED.add(key)
+        if not cached_payload or not (cached_payload.get("items") or cached_payload.get("sources")):
+            return
+        previous = X_KOL_REALTIME_SNAPSHOTS.get(key) or {}
+        current_payload = previous.get("payload") if isinstance(previous.get("payload"), dict) else {}
+        merged = x_kol_merge_realtime_payload(cached_payload, current_payload)
+        restored_items = merged.get("items") if isinstance(merged.get("items"), list) else []
+        if not restored_items and not merged.get("sources"):
+            return
+        restored = {
+            **merged,
+            "cached": not bool(current_payload.get("items")),
+            "stale": not bool(current_payload.get("items")),
+            "historyRestored": True,
+            "message": current_payload.get("message")
+            or ("已恢复保留动态，后台正在重连上游" if not current_payload.get("items") else ""),
+        }
+        signature = x_kol_payload_signature(restored)
+        X_KOL_REALTIME_SNAPSHOTS[key] = {
+            "payload": restored,
+            "signature": signature,
+            "publishedAt": max(
+                int(safe_float(previous.get("publishedAt"), 0)),
+                int(safe_float(cached.get("savedAt"), 0)),
+            ),
+        }
+        if signature != previous.get("signature"):
+            X_KOL_REALTIME_CONDITION.notify_all()
+
+
+def publish_x_kol_realtime_payload(
+    user: dict[str, Any] | None,
+    payload: dict[str, Any],
+    *,
+    monitor_max_age_seconds: int | None = None,
+) -> dict[str, Any]:
+    key = x_kol_realtime_key(user)
+    hydrate_x_kol_realtime_history(user)
+    with X_KOL_REALTIME_CONDITION:
+        previous = X_KOL_REALTIME_SNAPSHOTS.get(key) or {}
+        previous_payload = previous.get("payload") if isinstance(previous.get("payload"), dict) else {}
+        merged = x_kol_merge_realtime_payload(previous_payload, payload)
+        incoming_items = payload.get("items") if isinstance(payload.get("items"), list) else []
+        retained_history = bool(previous_payload.get("historyRestored"))
+        published = {
+            **merged,
+            "realtime": True,
+            "transport": "sse",
+            "historyRestored": retained_history,
+            "cached": bool(retained_history and not incoming_items),
+            "stale": bool(retained_history and not incoming_items),
+            "message": payload.get("message")
+            or previous_payload.get("message")
+            or ("已恢复保留动态，后台正在重连上游" if retained_history and not incoming_items else ""),
+            "upstreamMode": payload.get("upstreamMode")
+            or ("official-api" if payload.get("provider") == "x-api" else "rss-resilient"),
+        }
+        signature = x_kol_payload_signature(published)
+        X_KOL_REALTIME_SNAPSHOTS[key] = {
+            "payload": published,
+            "signature": signature,
+            "publishedAt": int(time.time() * 1000),
+        }
+        if signature != previous.get("signature"):
+            X_KOL_REALTIME_CONDITION.notify_all()
+    update_strategy_contexts_from_personal_x_payload(
+        published,
+        monitor_max_age_seconds=monitor_max_age_seconds,
+    )
+    return published
+
+
+def x_kol_official_stream_available() -> bool:
+    return x_kol_official_stream_enabled()
+
+
+def x_kol_official_stream_targets() -> dict[str, list[tuple[dict[str, Any], dict[str, Any]]]]:
+    with X_KOL_OFFICIAL_STREAM_LOCK:
+        users = [(key, dict(user)) for key, user in X_KOL_OFFICIAL_STREAM_USERS.items()]
+    targets: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    for key, user in users:
+        if key != 0 and not x_kol_stream_all_tracked_accounts_enabled():
+            continue
+        sources = x_kol_priority_sources() if key == 0 else load_x_kol_sources(user)
+        for source in sources:
+            if source.get("enabled") is False:
+                continue
+            handle = normalize_x_handle(source.get("handle")).lower()
+            if handle:
+                targets.setdefault(handle, []).append((user, source))
+    return targets
+
+
+def x_kol_official_rule_value(handle: str) -> str:
+    filters = [f"from:{handle}"]
+    if not x_kol_include_retweets():
+        filters.append("-is:retweet")
+    if not x_kol_include_replies():
+        filters.append("-is:reply")
+    return " ".join(filters)
+
+
+def x_kol_reconcile_official_stream_rules(token: str, handles: set[str]) -> None:
+    endpoint = "https://api.x.com/2/tweets/search/stream/rules"
+    headers = {**HEADERS, "Authorization": f"Bearer {token}", "Accept": "application/json"}
+    response = requests.get(endpoint, headers=headers, timeout=(5, 15))
+    response.raise_for_status()
+    body = response.json() if response.content else {}
+    rules = body.get("data") if isinstance(body, dict) and isinstance(body.get("data"), list) else []
+    foreign_rules = [
+        rule
+        for rule in rules
+        if isinstance(rule, dict) and not str(rule.get("tag") or "").startswith("xingyun:")
+    ]
+    if foreign_rules and not x_kol_allow_shared_stream_rules():
+        raise RuntimeError(
+            "X App already contains non-Xingyun filtered-stream rules; use a dedicated X App or explicitly allow shared rules"
+        )
+    managed: dict[str, list[dict[str, Any]]] = {}
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        tag = str(rule.get("tag") or "")
+        if not tag.startswith("xingyun:"):
+            continue
+        handle = normalize_x_handle(tag.split(":", 1)[1]).lower()
+        if handle:
+            managed.setdefault(handle, []).append(rule)
+
+    delete_ids: list[str] = []
+    for handle, rows in managed.items():
+        expected = x_kol_official_rule_value(handle)
+        for index, rule in enumerate(rows):
+            if handle not in handles or index > 0 or str(rule.get("value") or "") != expected:
+                if rule.get("id"):
+                    delete_ids.append(str(rule["id"]))
+    if delete_ids:
+        delete_response = requests.post(
+            endpoint,
+            headers={**headers, "Content-Type": "application/json"},
+            json={"delete": {"ids": delete_ids}},
+            timeout=(5, 15),
+        )
+        delete_response.raise_for_status()
+
+    add_rules = []
+    for handle in sorted(handles):
+        rows = managed.get(handle) or []
+        expected = x_kol_official_rule_value(handle)
+        if not any(str(row.get("value") or "") == expected and str(row.get("id") or "") not in delete_ids for row in rows):
+            add_rules.append({"value": expected, "tag": f"xingyun:{handle}"})
+    if add_rules:
+        add_response = requests.post(
+            endpoint,
+            headers={**headers, "Content-Type": "application/json"},
+            json={"add": add_rules},
+            timeout=(5, 15),
+        )
+        add_response.raise_for_status()
+
+
+def x_kol_build_official_stream_item(source: dict[str, Any], event: dict[str, Any]) -> dict[str, Any] | None:
+    tweet = event.get("data") if isinstance(event.get("data"), dict) else {}
+    if not tweet:
+        return None
+    includes = event.get("includes") if isinstance(event.get("includes"), dict) else {}
+    user_map = {
+        str(row.get("id")): row
+        for row in includes.get("users") or []
+        if isinstance(row, dict) and row.get("id")
+    }
+    tweet_map = {
+        str(row.get("id")): row
+        for row in includes.get("tweets") or []
+        if isinstance(row, dict) and row.get("id")
+    }
+    author = user_map.get(str(tweet.get("author_id") or "")) or {}
+    handle = normalize_x_handle(author.get("username") or source.get("handle"))
+    text = clean_feed_text(tweet.get("text"), 1200)
+    if not text or not x_kol_item_matches(source, text):
+        return None
+
+    quote_card: dict[str, Any] = {}
+    ref_types: list[str] = []
+    for reference in tweet.get("referenced_tweets") or []:
+        if not isinstance(reference, dict):
+            continue
+        ref_type = str(reference.get("type") or "")
+        ref_types.append(ref_type)
+        ref_tweet = tweet_map.get(str(reference.get("id") or "")) or {}
+        ref_text = clean_feed_text(ref_tweet.get("text"), 1200)
+        if quote_card or not ref_text:
+            continue
+        ref_author = user_map.get(str(ref_tweet.get("author_id") or "")) or {}
+        ref_handle = normalize_x_handle(ref_author.get("username"))
+        quote_card = {
+            "kind": {"quoted": "引用", "retweeted": "转推", "replied_to": "回复"}.get(ref_type, "引用"),
+            "authorName": ref_author.get("name") or (f"@{ref_handle}" if ref_handle else ""),
+            "handle": ref_handle,
+            "text": ref_text,
+            "url": x_kol_tweet_url(ref_handle or handle, ref_tweet.get("id")),
+            "avatar": x_kol_avatar_url(ref_handle, ref_author.get("profile_image_url")),
+            "publishedAt": parse_feed_datetime(ref_tweet.get("created_at")),
+        }
+
+    main_text = x_kol_strip_quote_url(text)
+    if ref_types and ref_types[0] == "retweeted" and quote_card:
+        main_text = f"转推了 {x_kol_quote_display(quote_card, '原作者')} 的动态"
+    published_at = parse_feed_datetime(tweet.get("created_at")) or int(time.time() * 1000)
+    metrics = tweet.get("public_metrics") if isinstance(tweet.get("public_metrics"), dict) else {}
+    tweet_id = str(tweet.get("id") or "")
+    return {
+        "id": x_kol_item_key(source, tweet_id, text, published_at),
+        "tweetId": tweet_id,
+        "text": main_text,
+        "fullText": text,
+        "quote": quote_card,
+        "title": clean_feed_text(main_text, 120),
+        "url": x_kol_tweet_url(handle, tweet_id),
+        "publishedAt": published_at,
+        "sourceId": source["id"],
+        "sourceName": author.get("name") or source.get("displayName") or handle,
+        "handle": handle,
+        "avatar": x_kol_avatar_url(handle, author.get("profile_image_url") or source.get("avatar")),
+        "metrics": {
+            "reply": int(safe_float(metrics.get("reply_count"))),
+            "repost": int(safe_float(metrics.get("retweet_count"))),
+            "like": int(safe_float(metrics.get("like_count"))),
+            "quote": int(safe_float(metrics.get("quote_count"))),
+            "view": int(safe_float(metrics.get("impression_count"))),
+        },
+        "matchedKeywords": x_kol_keyword_hits(source, text),
+        "entryType": ref_types[0] if ref_types else "tweet",
+        "provider": "x-stream",
+    }
+
+
+def x_kol_publish_official_stream_event(
+    user: dict[str, Any] | None,
+    source: dict[str, Any],
+    event: dict[str, Any],
+) -> None:
+    item = x_kol_build_official_stream_item(source, event)
+    if not item:
+        return
+    source_state = {
+        **source,
+        "displayName": item.get("sourceName") or source.get("displayName"),
+        "avatar": item.get("avatar") or source.get("avatar") or "",
+        "status": "ok",
+        "provider": "x-stream",
+        "itemsReturned": 1,
+    }
+    targets = [user] if user else x_kol_priority_publish_targets()
+    unique_targets: dict[int, dict[str, Any] | None] = {}
+    for target in targets:
+        unique_targets[x_kol_realtime_key(target)] = target
+
+    for target in unique_targets.values():
+        key = x_kol_realtime_key(target)
+        with X_KOL_REALTIME_CONDITION:
+            snapshot = X_KOL_REALTIME_SNAPSHOTS.get(key) or {}
+            previous_payload = snapshot.get("payload") if isinstance(snapshot.get("payload"), dict) else {}
+        publish_x_kol_realtime_payload(
+            target,
+            {
+                "ok": True,
+                "sources": [source_state],
+                "items": [item],
+                "sourceCount": max(
+                    len(x_kol_priority_sources()) if not target else len(load_x_kol_sources(target)),
+                    int(safe_float(previous_payload.get("sourceCount")) or 0),
+                ),
+                "enabledCount": max(1, int(safe_float(previous_payload.get("enabledCount")) or 0)),
+                "provider": "x-stream",
+                "hasToken": True,
+                "upstreamMode": "official-stream",
+                "updatedAt": int(time.time() * 1000),
+            },
+        )
+
+
+def wake_x_kol_official_stream() -> None:
+    global X_KOL_OFFICIAL_STREAM_RESPONSE
+    X_KOL_OFFICIAL_STREAM_WAKE.set()
+    with X_KOL_OFFICIAL_STREAM_LOCK:
+        response = X_KOL_OFFICIAL_STREAM_RESPONSE
+    if response is not None:
+        try:
+            response.close()
+        except Exception:
+            pass
+
+
+def register_x_kol_official_stream_user(user: dict[str, Any] | None) -> None:
+    global X_KOL_OFFICIAL_STREAM_STARTED
+    if not x_kol_official_stream_available():
+        return
+    if user and not x_kol_stream_all_tracked_accounts_enabled():
+        return
+    key = x_kol_realtime_key(user)
+    should_wake = False
+    with X_KOL_OFFICIAL_STREAM_LOCK:
+        if key not in X_KOL_OFFICIAL_STREAM_USERS:
+            X_KOL_OFFICIAL_STREAM_USERS[key] = dict(user) if user else {}
+            should_wake = True
+        if not X_KOL_OFFICIAL_STREAM_STARTED:
+            X_KOL_OFFICIAL_STREAM_STARTED = True
+            threading.Thread(
+                target=x_kol_official_stream_worker,
+                name="x-kol-official-stream",
+                daemon=True,
+            ).start()
+    if should_wake:
+        wake_x_kol_official_stream()
+
+
+def x_kol_official_stream_worker() -> None:
+    global X_KOL_OFFICIAL_STREAM_RESPONSE
+    while True:
+        token = x_kol_token()
+        targets = x_kol_official_stream_targets() if token else {}
+        if not x_kol_official_stream_enabled() or not token or not targets:
+            X_KOL_OFFICIAL_STREAM_WAKE.wait(15)
+            X_KOL_OFFICIAL_STREAM_WAKE.clear()
+            continue
+        response = None
+        retry_seconds = 5.0
+        try:
+            X_KOL_OFFICIAL_STREAM_WAKE.clear()
+            x_kol_reconcile_official_stream_rules(token, set(targets))
+            response = requests.get(
+                "https://api.x.com/2/tweets/search/stream",
+                headers={**HEADERS, "Authorization": f"Bearer {token}", "Accept": "application/json"},
+                params={
+                    "tweet.fields": "author_id,created_at,public_metrics,entities,lang,referenced_tweets",
+                    "expansions": "author_id,referenced_tweets.id,referenced_tweets.id.author_id",
+                    "user.fields": "username,name,profile_image_url,verified",
+                },
+                stream=True,
+                timeout=(10, 90),
+            )
+            if response.status_code == 429:
+                retry_seconds = 60.0
+            response.raise_for_status()
+            with X_KOL_OFFICIAL_STREAM_LOCK:
+                X_KOL_OFFICIAL_STREAM_RESPONSE = response
+            for raw_line in response.iter_lines(chunk_size=1):
+                if X_KOL_OFFICIAL_STREAM_WAKE.is_set():
+                    break
+                if not raw_line:
+                    continue
+                try:
+                    event = json.loads(raw_line.decode("utf-8"))
+                except Exception:
+                    continue
+                matched_handles = set()
+                for match in event.get("matching_rules") or []:
+                    if not isinstance(match, dict):
+                        continue
+                    tag = str(match.get("tag") or "")
+                    if tag.startswith("xingyun:"):
+                        handle = normalize_x_handle(tag.split(":", 1)[1]).lower()
+                        if handle:
+                            matched_handles.add(handle)
+                if not matched_handles:
+                    includes = event.get("includes") if isinstance(event.get("includes"), dict) else {}
+                    author_id = str((event.get("data") or {}).get("author_id") or "")
+                    for author in includes.get("users") or []:
+                        if isinstance(author, dict) and str(author.get("id") or "") == author_id:
+                            handle = normalize_x_handle(author.get("username")).lower()
+                            if handle:
+                                matched_handles.add(handle)
+                for handle in matched_handles:
+                    for user, source in targets.get(handle, []):
+                        x_kol_publish_official_stream_event(user, source, event)
+        except Exception:
+            pass
+        finally:
+            with X_KOL_OFFICIAL_STREAM_LOCK:
+                if X_KOL_OFFICIAL_STREAM_RESPONSE is response:
+                    X_KOL_OFFICIAL_STREAM_RESPONSE = None
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+        if X_KOL_OFFICIAL_STREAM_WAKE.is_set():
+            X_KOL_OFFICIAL_STREAM_WAKE.clear()
+            continue
+        X_KOL_OFFICIAL_STREAM_WAKE.wait(retry_seconds)
+        X_KOL_OFFICIAL_STREAM_WAKE.clear()
+
+
+def x_kol_realtime_worker(user: dict[str, Any] | None) -> None:
+    key = x_kol_realtime_key(user)
+    wake_event = X_KOL_REALTIME_WAKE_EVENTS.setdefault(key, threading.Event())
+    while True:
+        try:
+            published = publish_x_kol_realtime_payload(user, x_kol_feed_payload(user))
+            persist_x_kol_realtime_payload(user, published)
+        except Exception as exc:
+            with X_KOL_REALTIME_CONDITION:
+                previous = X_KOL_REALTIME_SNAPSHOTS.get(key) or {}
+                if not previous.get("payload"):
+                    payload = {
+                        "ok": False,
+                        "sources": [],
+                        "items": [],
+                        "provider": "x-api" if x_kol_official_rest_poll_enabled() else "rss",
+                        "hasToken": bool(x_kol_token()),
+                        "paidApiEnabled": x_kol_official_api_enabled(),
+                        "paidRestPollingEnabled": x_kol_official_rest_poll_enabled(),
+                        "error": clean_feed_text(exc, 180),
+                        "updatedAt": int(time.time() * 1000),
+                    }
+                    X_KOL_REALTIME_SNAPSHOTS[key] = {
+                        "payload": payload,
+                        "signature": x_kol_payload_signature(payload),
+                        "publishedAt": int(time.time() * 1000),
+                    }
+                    X_KOL_REALTIME_CONDITION.notify_all()
+        interval = (
+            X_KOL_REALTIME_API_INTERVAL_SECONDS
+            if x_kol_official_rest_poll_enabled()
+            else X_KOL_REALTIME_RSS_INTERVAL_SECONDS
+        )
+        wake_event.wait(interval)
+        wake_event.clear()
+
+
+def x_kol_priority_payload(*, history_recovery: bool = False) -> dict[str, Any]:
+    results: list[dict[str, Any]] = []
+    token = x_kol_token()
+    token_available = bool(token)
+    paid_api_enabled = x_kol_official_api_enabled()
+    paid_rest_poll_enabled = x_kol_official_rest_poll_enabled()
+    use_startup_history = bool(history_recovery and x_kol_startup_history_recovery_enabled())
+    for source in x_kol_priority_sources():
+        try:
+            result = (
+                x_kol_fetch_api_source(source, token)
+                if paid_rest_poll_enabled or use_startup_history
+                else x_kol_fetch_priority_rss_source(source)
+            )
+        except Exception:
+            result = x_kol_fetch_priority_rss_source(source)
+        results.append(result)
+
+    sources = [result.get("source") for result in results if isinstance(result.get("source"), dict)]
+    items = [item for result in results for item in result.get("items") or [] if isinstance(item, dict)]
+    deduped_items = {str(item.get("id") or item.get("url") or index): item for index, item in enumerate(items)}
+    ordered_items = sorted(
+        deduped_items.values(),
+        key=lambda item: int(safe_float(item.get("publishedAt"))),
+        reverse=True,
+    )[: x_kol_fetch_limit()]
+    providers = {str(source.get("provider") or "") for source in sources}
+    provider = "x-api" if "x-api" in providers else "rss"
+    return {
+        "ok": bool(ordered_items),
+        "sources": sources,
+        "items": ordered_items,
+        "sourceCount": len(sources),
+        "enabledCount": len(sources),
+        "provider": provider,
+        "hasToken": token_available,
+        "paidApiEnabled": paid_api_enabled,
+        "paidRestPollingEnabled": paid_rest_poll_enabled,
+        "startupHistoryRecovery": use_startup_history,
+        "upstreamMode": (
+            "official-api-startup-recovery"
+            if provider == "x-api" and use_startup_history
+            else "official-api-recovery"
+            if provider == "x-api"
+            else "priority-rss-race"
+        ),
+        "priorityHandles": list(x_kol_priority_handles()),
+        "updatedAt": int(time.time() * 1000),
+    }
+
+
+def x_kol_priority_publish_targets() -> list[dict[str, Any] | None]:
+    targets: list[dict[str, Any] | None] = [None]
+    administrator = admin_user()
+    if administrator:
+        targets.append(administrator)
+    return targets
+
+
+def x_kol_priority_poll_once(*, history_recovery: bool = False) -> dict[str, Any]:
+    payload = x_kol_priority_payload(history_recovery=history_recovery)
+    backfill_seconds = personal_x_monitor_backfill_seconds()
+    for target in x_kol_priority_publish_targets():
+        published = publish_x_kol_realtime_payload(
+            target,
+            payload,
+            monitor_max_age_seconds=backfill_seconds,
+        )
+        if isinstance(published, dict):
+            persist_x_kol_realtime_payload(target, published)
+    return payload
+
+
+def x_kol_priority_worker() -> None:
+    recover_history = x_kol_startup_history_recovery_enabled()
+    while True:
+        if x_kol_official_stream_available():
+            register_x_kol_official_stream_user(None)
+        try:
+            x_kol_priority_poll_once(history_recovery=recover_history)
+        except Exception:
+            pass
+        recover_history = False
+        interval = (
+            x_kol_priority_api_interval_seconds()
+            if x_kol_official_rest_poll_enabled()
+            else x_kol_priority_rss_interval_seconds()
+        )
+        X_KOL_PRIORITY_WAKE.wait(interval)
+        X_KOL_PRIORITY_WAKE.clear()
+
+
+def start_x_kol_priority_monitor() -> None:
+    global X_KOL_PRIORITY_STARTED
+    with X_KOL_PRIORITY_LOCK:
+        if X_KOL_PRIORITY_STARTED:
+            return
+        X_KOL_PRIORITY_STARTED = True
+    register_x_kol_official_stream_user(None)
+    threading.Thread(
+        target=x_kol_priority_worker,
+        name="x-kol-priority-whitestar224",
+        daemon=True,
+    ).start()
+
+
+def ensure_x_kol_realtime_worker(user: dict[str, Any] | None = None) -> None:
+    register_x_kol_official_stream_user(user)
+    key = x_kol_realtime_key(user)
+    with X_KOL_REALTIME_CONDITION:
+        if key in X_KOL_REALTIME_WORKERS:
+            return
+        X_KOL_REALTIME_WORKERS.add(key)
+        X_KOL_REALTIME_WAKE_EVENTS.setdefault(key, threading.Event())
+    threading.Thread(
+        target=x_kol_realtime_worker,
+        args=(dict(user) if user else None,),
+        name=f"x-kol-realtime-{key}",
+        daemon=True,
+    ).start()
+
+
+def wake_x_kol_realtime_worker(user: dict[str, Any] | None = None) -> None:
+    ensure_x_kol_realtime_worker(user)
+    event = X_KOL_REALTIME_WAKE_EVENTS.get(x_kol_realtime_key(user))
+    if event:
+        event.set()
+    X_KOL_PRIORITY_WAKE.set()
+    wake_x_kol_official_stream()
+
+
+def x_kol_realtime_snapshot(
+    user: dict[str, Any] | None = None,
+    *,
+    wait_seconds: float = 0.0,
+) -> tuple[dict[str, Any], str]:
+    key = x_kol_realtime_key(user)
+    hydrate_x_kol_realtime_history(user)
+    ensure_x_kol_realtime_worker(user)
+    deadline = time.monotonic() + max(0.0, wait_seconds)
+    with X_KOL_REALTIME_CONDITION:
+        while key not in X_KOL_REALTIME_SNAPSHOTS and time.monotonic() < deadline:
+            X_KOL_REALTIME_CONDITION.wait(timeout=min(1.0, max(0.0, deadline - time.monotonic())))
+        snapshot = X_KOL_REALTIME_SNAPSHOTS.get(key) or {}
+    payload = snapshot.get("payload") if isinstance(snapshot.get("payload"), dict) else {
+        "ok": True,
+        "pending": True,
+        "sources": [],
+        "items": [],
+        "message": "实时追踪服务正在连接上游",
+        "updatedAt": int(time.time() * 1000),
+    }
+    return payload, str(snapshot.get("signature") or x_kol_payload_signature(payload))
+
+
+def binance_futures_account(user_id: int) -> dict[str, Any]:
+    credentials = strategy_exchange_credentials("binance", user_id)
+    if not strategy_credentials_complete("binance", credentials):
+        raise RuntimeError("Binance API Key 或 Secret 尚未配置完整")
+    key_fingerprint = hashlib.sha256(credentials["key"].encode("utf-8")).hexdigest()[:12]
+    cache_key = f"account:{int(user_id)}:binance:{key_fingerprint}"
+    cached = strategy_exchange_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    errors: list[str] = []
+    account_payload: dict[str, Any] | None = None
+    for path in ("/fapi/v3/account", "/fapi/v2/account"):
+        try:
+            candidate = binance_futures_signed_get(path, credentials)
+            if isinstance(candidate, dict):
+                account_payload = candidate
+                break
+            errors.append(f"{path} 未返回账户对象")
+        except Exception as exc:
+            errors.append(safe_error_text(str(exc)))
+    if account_payload is None:
+        detail = next((item for item in errors if item), "Binance 合约账户余额读取失败")
+        raise RuntimeError(detail)
+    return strategy_exchange_cache_set(cache_key, parse_binance_futures_account(account_payload))
+
+
+def okx_private_error_message(code: Any, message: Any, status_code: int = 0) -> str:
+    clean_code = str(code or "").strip()
+    clean_message = re.sub(r"\s+", " ", str(message or "")).strip()
+    if clean_code in {"50111", "50119"}:
+        return "OKX API Key 无效或已被删除，请重新创建并保存。"
+    if clean_code == "50113":
+        return "OKX 签名校验失败，请检查 API Secret 和 API 密码（Passphrase）。"
+    if clean_code in {"50110", "50011"}:
+        return "OKX 拒绝了当前出口 IP，请检查 API 的 IP 白名单。"
+    if clean_code in {"50105", "50120"}:
+        return "OKX API 未开放账户读取权限，请在 OKX API 管理中启用读取权限。"
+    if clean_code in {"50112", "50114"}:
+        return "OKX 请求时间已失效，请同步电脑系统时间后重试。"
+    if status_code in {401, 403}:
+        return "OKX 拒绝了账户读取请求，请检查 API Key、Secret、API 密码和 IP 白名单。"
+    detail = clean_message or (f"HTTP {status_code}" if status_code else "未知错误")
+    prefix = f"OKX 接口 {clean_code}" if clean_code else "OKX 合约接口"
+    return f"{prefix}：{detail}"[:420]
+
+
+def okx_private_signed_get(
+    path: str,
+    credentials: dict[str, str],
+    params: dict[str, Any] | None = None,
+) -> Any:
+    api_key = clean_exchange_credential(credentials.get("key"))
+    api_secret = clean_exchange_credential(credentials.get("secret"))
+    passphrase = clean_exchange_credential(credentials.get("passphrase"))
+    if not api_key or not api_secret or not passphrase:
+        raise RuntimeError("OKX 私有账户读取需要 API Key、Secret 和创建 API 时设置的 API 密码。")
+
+    query = urlencode({key: value for key, value in (params or {}).items() if value is not None})
+    request_path = f"{path}?{query}" if query else path
+    timestamp = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+    prehash = f"{timestamp}GET{request_path}"
+    signature = base64.b64encode(
+        hmac.new(api_secret.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).digest()
+    ).decode("ascii")
+    try:
+        response = requests.get(
+            f"https://www.okx.com{request_path}",
+            headers={
+                **HEADERS,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "OK-ACCESS-KEY": api_key,
+                "OK-ACCESS-SIGN": signature,
+                "OK-ACCESS-TIMESTAMP": timestamp,
+                "OK-ACCESS-PASSPHRASE": passphrase,
+            },
+            timeout=12,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"无法连接 OKX 合约接口：{safe_error_text(str(exc))}") from exc
+
+    try:
+        payload = response.json()
+    except (ValueError, json.JSONDecodeError):
+        payload = None
+    error_payload = payload if isinstance(payload, dict) else {}
+    code = str(error_payload.get("code") or "").strip()
+    if not response.ok or (code and code != "0"):
+        raise RuntimeError(
+            okx_private_error_message(
+                code,
+                error_payload.get("msg") or response.text[:240],
+                response.status_code,
+            )
+        )
+    return payload
+
+
+def parse_okx_futures_account(payload: dict[str, Any]) -> dict[str, Any]:
+    data = payload.get("data") if isinstance(payload.get("data"), list) else []
+    account = data[0] if data and isinstance(data[0], dict) else {}
+    details = account.get("details") if isinstance(account.get("details"), list) else []
+    usdt = next(
+        (
+            item
+            for item in details
+            if isinstance(item, dict) and str(item.get("ccy") or "").strip().upper() == "USDT"
+        ),
+        {},
+    )
+    available = safe_float(usdt.get("availBal"))
+    if not str(usdt.get("availBal") or "").strip():
+        available = safe_float(usdt.get("availEq"))
+    wallet = safe_float(usdt.get("cashBal"))
+    if not str(usdt.get("cashBal") or "").strip():
+        wallet = safe_float(usdt.get("eq"))
+    margin_balance = safe_float(usdt.get("eq"))
+    if not str(usdt.get("eq") or "").strip():
+        margin_balance = safe_float(account.get("totalEq"))
+    initial_margin = safe_float(usdt.get("imr"))
+    if not str(usdt.get("imr") or "").strip():
+        initial_margin = safe_float(account.get("imr"))
+    return {
+        "exchange": "okx",
+        "label": "OKX USDT 合约",
+        "currency": "USDT",
+        "availableBalance": round(max(0.0, available), 8),
+        "walletBalance": round(max(0.0, wallet), 8),
+        "marginBalance": round(max(0.0, margin_balance), 8),
+        "initialMargin": round(max(0.0, initial_margin), 8),
+        "updatedAt": int(time.time() * 1000),
+    }
+
+
+def okx_futures_account(user_id: int) -> dict[str, Any]:
+    credentials = strategy_exchange_credentials("okx", user_id)
+    if not strategy_credentials_complete("okx", credentials):
+        raise RuntimeError("OKX API 配置不完整，请补填创建 API 时设置的 API 密码。")
+    fingerprint_source = f"{credentials['key']}:{credentials.get('passphrase', '')}"
+    key_fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:12]
+    cache_key = f"account:{int(user_id)}:okx:{key_fingerprint}"
+    cached = strategy_exchange_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    payload = okx_private_signed_get("/api/v5/account/balance", credentials, {"ccy": "USDT"})
+    if not isinstance(payload, dict):
+        raise RuntimeError("OKX 合约账户接口没有返回有效账户对象。")
+    return strategy_exchange_cache_set(cache_key, parse_okx_futures_account(payload))
+
+
+def okx_futures_positions(user_id: int) -> list[dict[str, Any]]:
+    credentials = strategy_exchange_credentials("okx", user_id)
+    if not strategy_credentials_complete("okx", credentials):
+        return []
+    fingerprint_source = f"{credentials['key']}:{credentials.get('passphrase', '')}"
+    key_fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:12]
+    cache_key = f"positions:{int(user_id)}:okx:{key_fingerprint}"
+    cached = strategy_exchange_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    payload = okx_private_signed_get("/api/v5/account/positions", credentials, {"instType": "SWAP"})
+    rows = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), list) else None
+    if rows is None:
+        raise RuntimeError("OKX 合约持仓接口没有返回有效列表。")
+
+    positions: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        signed_quantity = safe_float(row.get("pos"))
+        if abs(signed_quantity) <= 0:
+            continue
+        inst_id = str(row.get("instId") or "").strip().upper()
+        symbol = normalize_asset_symbol(inst_id.replace("-SWAP", "").replace("-", ""))
+        if not symbol:
+            continue
+        position_side = str(row.get("posSide") or "net").strip().lower()
+        side = "short" if position_side == "short" or (position_side == "net" and signed_quantity < 0) else "long"
+        quantity = abs(signed_quantity)
+        entry_price = safe_float(row.get("avgPx"))
+        mark_price = safe_float(row.get("markPx")) or entry_price
+        notional = abs(safe_float(row.get("notionalUsd")))
+        leverage = max(1.0, safe_float(row.get("lever"), 1.0))
+        margin = safe_float(row.get("margin")) or safe_float(row.get("imr"))
+        if notional <= 0:
+            contract_value = safe_float(row.get("ctVal"), 1.0)
+            contract_multiplier = safe_float(row.get("ctMult"), 1.0)
+            notional = abs(quantity * mark_price * contract_value * contract_multiplier)
+        if margin <= 0:
+            margin = notional / leverage if leverage > 0 else notional
+        unrealized_pnl = safe_float(row.get("upl"))
+        pnl_pct = safe_float(row.get("uplRatio")) * 100
+        if not str(row.get("uplRatio") or "").strip() and margin > 0:
+            pnl_pct = unrealized_pnl / margin * 100
+        asset_symbol = re.sub(r"(?:USDT|USDC)$", "", symbol)
+        positions.append(
+            {
+                "key": f"exchange:okx:{symbol}:{side}",
+                "id": f"okx:{symbol}:{side}",
+                "symbol": symbol,
+                "name": asset_symbol or symbol,
+                "icon": crypto_icon_url(asset_symbol or symbol),
+                "exchange": "okx",
+                "mode": "live",
+                "source": "exchange",
+                "side": side,
+                "positionSide": position_side.upper(),
+                "entryPrice": entry_price,
+                "breakEvenPrice": 0,
+                "markPrice": mark_price,
+                "liquidationPrice": safe_float(row.get("liqPx")),
+                "quantity": quantity,
+                "notional": notional,
+                "margin": margin,
+                "marginType": str(row.get("mgnMode") or "").strip().lower(),
+                "leverage": leverage,
+                "stopLossPrice": 0,
+                "unrealizedPnl": round(unrealized_pnl, 6),
+                "unrealizedPnlPct": round(pnl_pct, 4),
+                "breakEvenAt": 0,
+                "canBreakEven": False,
+                "createdAt": int(safe_float(row.get("uTime") or row.get("cTime"))),
+            }
+        )
+    positions.sort(key=lambda item: safe_float(item.get("notional")), reverse=True)
+    return strategy_exchange_cache_set(cache_key, positions)
+
+
+def strategy_exchange_account(exchange: str, user_id: int) -> dict[str, Any]:
+    name = clean_strategy_exchange(exchange)
+    if name == "binance":
+        return binance_futures_account(user_id)
+    if name == "okx":
+        return okx_futures_account(user_id)
+    raise RuntimeError(f"{STRATEGY_EXCHANGE_DEFINITIONS[name]['label']} 账户读取尚未接入")
+
+
+def strategy_exchange_accounts(user_id: int) -> list[dict[str, Any]]:
+    accounts: list[dict[str, Any]] = []
+    for exchange, definition in STRATEGY_EXCHANGE_DEFINITIONS.items():
+        personal = strategy_user_exchange_credentials(user_id, exchange)
+        credentials_stored = any(
+            clean_exchange_credential(personal.get(key)) for key in ("key", "secret", "passphrase")
+        )
+        configured = strategy_exchange_configured(exchange, user_id)
+        base = {
+            "exchange": exchange,
+            "label": definition["label"],
+            "configured": configured,
+            "credentialsStored": credentials_stored,
+            "ok": False,
+            "currency": "USDT",
+            "availableBalance": None,
+            "updatedAt": int(time.time() * 1000),
+        }
+        if not configured:
+            error = (
+                "OKX API 配置不完整，请补填创建 API 时设置的 API 密码"
+                if exchange == "okx" and credentials_stored
+                else "尚未配置交易 API"
+            )
+            accounts.append({**base, "error": error})
+            continue
+        try:
+            accounts.append({**base, **strategy_exchange_account(exchange, user_id), "configured": True, "ok": True})
+        except Exception as exc:
+            accounts.append({**base, "error": safe_error_text(str(exc))})
+    return accounts
+
+
+def strategy_exchange_settings_payload(user_id: int) -> dict[str, Any]:
+    exchanges = []
+    for name, definition in STRATEGY_EXCHANGE_DEFINITIONS.items():
+        personal = strategy_user_exchange_credentials(user_id, name)
+        effective = strategy_exchange_credentials(name, user_id)
+        available = strategy_credentials_complete(name, effective)
+        personal_stored = any(
+            clean_exchange_credential(personal.get(key)) for key in ("key", "secret", "passphrase")
+        )
+        missing_fields = []
+        if not clean_exchange_credential(effective.get("key")):
+            missing_fields.append("API Key")
+        if not clean_exchange_credential(effective.get("secret")):
+            missing_fields.append("API Secret")
+        if name == "okx" and not clean_exchange_credential(effective.get("passphrase")):
+            missing_fields.append("API 密码")
+        exchanges.append(
+            {
+                "id": name,
+                "label": definition["label"],
+                "configured": personal_stored,
+                "available": available,
+                "source": "user" if personal_stored else "server" if available else "none",
+                "keyHint": mask_api_key(personal.get("key") or effective.get("key")),
+                "requiresPassphrase": name == "okx",
+                "passphraseConfigured": bool(clean_exchange_credential(effective.get("passphrase"))),
+                "missingFields": missing_fields,
+                "updatedAt": int(personal.get("updatedAt") or 0),
+            }
+        )
+    return {"ok": True, "liveTradingEnabled": strategy_live_enabled(), "exchanges": exchanges}
+
+
+def save_strategy_exchange_settings(user: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    action = str(payload.get("action") or "save").strip().lower()
+    exchange = clean_strategy_exchange(payload.get("exchange"))
+    user_id = int(user["id"])
+    if action == "remove":
+        with AUTH_DB_LOCK, auth_db() as conn:
+            conn.execute(
+                "DELETE FROM user_exchange_credentials WHERE user_id = ? AND exchange = ?",
+                (user_id, exchange),
+            )
+        strategy_clear_exchange_cache(user_id, exchange)
+        write_audit_log(
+            "strategy_exchange_credentials_removed",
+            actor=user,
+            object_type="exchange_credentials",
+            object_id=exchange,
+        )
+        return strategy_exchange_settings_payload(user_id)
+    if action != "save":
+        raise ValueError("不支持该操作")
+
+    existing = strategy_user_exchange_credentials(user_id, exchange)
+    api_key = clean_exchange_credential(payload.get("apiKey") or payload.get("api_key")) or existing.get("key", "")
+    api_secret = clean_exchange_credential(payload.get("apiSecret") or payload.get("api_secret")) or existing.get("secret", "")
+    passphrase = clean_exchange_credential(payload.get("passphrase") or payload.get("apiPassphrase")) or existing.get("passphrase", "")
+    candidate = {"key": api_key, "secret": api_secret, "passphrase": passphrase}
+    if not strategy_credentials_complete(exchange, candidate):
+        if exchange == "okx":
+            raise ValueError("OKX 账户读取需要完整填写 API Key、Secret 和创建 API 时设置的 API 密码")
+        raise ValueError("请完整填写 API Key 和 Secret")
+    now = int(time.time())
+    with AUTH_DB_LOCK, auth_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_exchange_credentials (user_id, exchange, api_key, api_secret, passphrase, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, exchange) DO UPDATE SET
+                api_key = excluded.api_key,
+                api_secret = excluded.api_secret,
+                passphrase = excluded.passphrase,
+                updated_at = excluded.updated_at
+            """,
+            (
+                user_id,
+                exchange,
+                encrypt_field(api_key),
+                encrypt_field(api_secret),
+                encrypt_field(passphrase) if passphrase else "",
+                now,
+            ),
+        )
+    strategy_clear_exchange_cache(user_id, exchange)
+    write_audit_log(
+        "strategy_exchange_credentials_saved",
+        actor=user,
+        object_type="exchange_credentials",
+        object_id=exchange,
+        metadata={"exchange": exchange, "key_hint": mask_api_key(api_key)},
+    )
+    return strategy_exchange_settings_payload(user_id)
+
+
+def strategy_exchange_availability(symbol: str, provider: str = "", user_id: int | None = None) -> list[dict[str, Any]]:
+    order = ["binance", "okx", "bitget"]
+    exchanges = [
+        {
+            "id": name,
+            "label": STRATEGY_EXCHANGE_DEFINITIONS[name]["label"],
+            "priority": index + 1,
+            "recommended": False,
+            "marketKnown": True,
+            "liveConfigured": strategy_exchange_configured(name, user_id),
+        }
+        for index, name in enumerate(order)
+    ]
+    preferred = next((item for item in exchanges if item["liveConfigured"]), exchanges[0])
+    preferred["recommended"] = True
+    return exchanges
+
+
+def strategy_order_preview(payload: dict[str, Any], user: dict[str, Any] | None = None) -> dict[str, Any]:
+    asset = strategy_asset_row(payload.get("symbol"))
+    symbol = asset.get("symbol") or ""
+    entry_price = safe_float(asset.get("current_price"))
+    if entry_price <= 0:
+        raise ValueError("当前价格尚未就绪，暂时不能计算仓位")
+    account_equity = max(0.0, safe_float(payload.get("totalCapital") or payload.get("accountEquity")))
+    if account_equity <= 0:
+        raise ValueError("请输入有效的账户权益")
+    current_exposure = max(0.0, safe_float(payload.get("currentGrossExposure")))
+    daily_loss = max(0.0, safe_float(payload.get("dailyLoss")))
+    tier = strategy_risk_tier(account_equity)
+    leverage = strategy_clamp(payload.get("leverage"), 1.0, 3.0, 3.0)
+    strategy_signal = asset.get("strategy_signal") if isinstance(asset.get("strategy_signal"), dict) else None
+    strategy_pending = asset.get("strategy_pending") if isinstance(asset.get("strategy_pending"), dict) else None
+    effective_strategy_signal = strategy_signal or strategy_pending or {}
+    breakout_price = safe_float(
+        effective_strategy_signal.get("triggerPrice")
+        or effective_strategy_signal.get("price")
+        or asset.get("week_high")
+    )
+    if breakout_price <= 0:
+        raise ValueError("策略突破位尚未就绪，暂时不能计算突破仓位")
+    stop_plan = strategy_stop_loss_plan(
+        entry_price,
+        effective_strategy_signal.get("breakoutLow"),
+    )
+    stop_loss_price = safe_float(stop_plan.get("stopLossPrice"), 0)
+    effective_stop_distance_pct = safe_float(stop_plan.get("stopDistancePct"), 0)
+    requested_risk_pct = strategy_clamp(
+        payload.get("riskExposurePct"),
+        0.01,
+        100.0,
+        tier["riskDefaultPct"],
+    )
+    recommended_risk_budget = account_equity * requested_risk_pct / 100
+    daily_loss_limit = account_equity * tier["dailyLossLimitPct"] / 100
+    risk_based_notional = recommended_risk_budget / ((effective_stop_distance_pct + STRATEGY_FEE_BUFFER_PCT) / 100)
+    requested_exposure = max(0.0, safe_float(payload.get("orderExposure")))
+    requested_margin = max(0.0, safe_float(payload.get("orderMargin")))
+    sizing_mode = str(payload.get("sizingMode") or "risk").strip().lower()
+    if sizing_mode not in {"risk", "notional", "margin"}:
+        sizing_mode = "risk"
+    if sizing_mode == "margin":
+        requested_exposure = requested_margin * leverage
+    elif sizing_mode == "notional":
+        requested_exposure = max(0.0, requested_exposure)
+    else:
+        sizing_mode = "risk"
+        requested_exposure = risk_based_notional
+    exchange = str(payload.get("exchange") or "").strip().lower()
+    user_id = int(user["id"]) if user else None
+    exchanges = strategy_exchange_availability(symbol, asset.get("provider") or "", user_id)
+    if exchange not in {item["id"] for item in exchanges}:
+        exchange = exchanges[0]["id"]
+    mode = str(payload.get("mode") or "paper").strip().lower()
+    if mode not in {"paper", "live"}:
+        mode = "paper"
+    exchange_account: dict[str, Any] | None = None
+    exchange_account_error = ""
+    if user_id and strategy_exchange_configured(exchange, user_id):
+        try:
+            exchange_account = strategy_exchange_account(exchange, user_id)
+        except Exception as exc:
+            exchange_account_error = safe_error_text(str(exc))
+    notional = min(requested_exposure, strategy_max_notional())
+    projected_margin = notional / leverage if leverage > 0 else notional
+    blocked_reason = ""
+    available_balance = (
+        safe_float(exchange_account.get("availableBalance"))
+        if isinstance(exchange_account, dict)
+        else None
+    )
+    breakout_candle_low = safe_float(effective_strategy_signal.get("breakoutLow"), 0)
+    structure_invalidated = bool(
+        strategy_signal
+        and breakout_candle_low > 0
+        and entry_price <= breakout_candle_low
+    )
+    if structure_invalidated:
+        blocked_reason = "现价已跌破突破K低点，该买点只保留复盘，不能继续开仓"
+        notional = 0.0
+    elif mode == "live" and exchange_account is None:
+        blocked_reason = exchange_account_error or f"无法核验 {exchange.upper()} 合约账户可用余额"
+        notional = 0.0
+    elif (
+        mode == "live"
+        and available_balance is not None
+        and projected_margin > available_balance + 1e-8
+    ):
+        blocked_reason = (
+            f"试算保证金 {projected_margin:.4f} USDT 超过 {exchange.upper()} 合约账户可用余额 "
+            f"{available_balance:.4f} USDT"
+        )
+        notional = 0.0
+    elif daily_loss >= daily_loss_limit:
+        blocked_reason = "已触及当日最大亏损，禁止新增仓位"
+        notional = 0.0
+    elif entry_price <= stop_loss_price or effective_stop_distance_pct <= 0:
+        blocked_reason = "当前价格已经进入止损区间，不应按该突破信号开仓"
+        notional = 0.0
+    elif notional < 5:
+        blocked_reason = "可用风险预算不足以形成最小仓位"
+        notional = 0.0
+    quantity = notional / entry_price if entry_price > 0 else 0.0
+    margin_required = notional / leverage if leverage > 0 else notional
+    risk_budget = notional * (effective_stop_distance_pct + STRATEGY_FEE_BUFFER_PCT) / 100
+    risk_pct = risk_budget / account_equity * 100 if account_equity > 0 else 0.0
+    warning = ""
+    if risk_pct > tier["riskMaxPct"]:
+        warning = f"当前敞口对应单笔风险 {risk_pct:.2f}%，高于该资金档建议上限 {tier['riskMaxPct']:.2f}%"
+    strategy_episode = int(safe_float(
+        effective_strategy_signal.get("decisionTime") or effective_strategy_signal.get("time"),
+        0,
+    ))
+    legacy_signal_confirmed = bool(asset.get("first_valid_episode") and asset.get("first_valid_confirmed_at"))
+    signal_confirmed = bool(strategy_signal or legacy_signal_confirmed)
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "name": asset.get("name") or symbol,
+        "icon": asset.get("icon") or crypto_icon_url(symbol),
+        "signalEpisode": strategy_episode or int(asset.get("first_valid_episode") or asset.get("latest_alert_episode") or 0),
+        "signalConfirmed": signal_confirmed,
+        "setupType": effective_strategy_signal.get("pattern") or asset.get("setup_type") or asset.get("first_valid_setup_type") or "",
+        "strategyEngine": asset.get("strategy_engine") or ("dragon-wave-engine" if strategy_signal or strategy_pending else "prior-high-monitor"),
+        "strategyVersion": asset.get("strategy_version") or "",
+        "strategySignalId": clean_feed_text(effective_strategy_signal.get("id"), 180),
+        "strategySignalInterval": clean_feed_text(effective_strategy_signal.get("interval"), 10),
+        "strategySignalGrade": clean_feed_text(effective_strategy_signal.get("grade"), 8),
+        "strategySignalPattern": clean_feed_text(effective_strategy_signal.get("pattern"), 100),
+        "strategySignalPending": bool(strategy_pending and not strategy_signal),
+        "provider": asset.get("provider") or "",
+        "exchange": exchange,
+        "exchanges": exchanges,
+        "exchangeAccount": (
+            {**exchange_account, "ok": True, "configured": True}
+            if exchange_account
+            else {
+                "exchange": exchange,
+                "ok": False,
+                "configured": bool(user_id and strategy_exchange_configured(exchange, user_id)),
+                "availableBalance": None,
+                "currency": "USDT",
+                "error": exchange_account_error,
+            }
+        ),
+        "tier": tier,
+        "accountEquity": round(account_equity, 4),
+        "currentGrossExposure": round(current_exposure, 4),
+        "dailyLoss": round(daily_loss, 4),
+        "riskPct": risk_pct,
+        "requestedRiskPct": requested_risk_pct,
+        "dailyLossLimitPct": tier["dailyLossLimitPct"],
+        "exposureCapPct": 0.0,
+        "leverage": leverage,
+        "entryPrice": entry_price,
+        "breakoutPrice": breakout_price,
+        "suggestedStopPrice": stop_loss_price,
+        "stopLossPrice": stop_loss_price,
+        "stopDistancePct": round(effective_stop_distance_pct, 4),
+        "breakoutCandleLow": stop_plan.get("breakoutCandleLow"),
+        "breakoutCandleDistancePct": stop_plan.get("breakoutCandleDistancePct"),
+        "stopLossSource": stop_plan.get("stopLossSource"),
+        "stopLossSourceLabel": stop_plan.get("stopLossSourceLabel"),
+        "stopLossReason": stop_plan.get("stopLossReason"),
+        "defaultStopPct": STRATEGY_DEFAULT_STOP_PCT,
+        "riskBudget": round(risk_budget, 4),
+        "recommendedRiskBudget": round(recommended_risk_budget, 4),
+        "dailyLossLimit": round(daily_loss_limit, 4),
+        "exposureCap": 0.0,
+        "remainingExposure": 0.0,
+        "riskBasedNotional": round(risk_based_notional, 4),
+        "recommendedNotional": round(risk_based_notional, 4),
+        "requestedExposure": round(requested_exposure, 4),
+        "requestedMargin": round(requested_margin, 4),
+        "sizingMode": sizing_mode,
+        "notional": round(notional, 4),
+        "marginRequired": round(margin_required, 4),
+        "quantity": round(quantity, 10),
+        "feeBufferPct": STRATEGY_FEE_BUFFER_PCT,
+        "blocked": bool(blocked_reason),
+        "blockedReason": blocked_reason,
+        "warning": warning,
+    }
+
+
+def strategy_board_signals(user_id: int | None = None) -> list[dict[str, Any]]:
+    items_by_symbol = {
+        item["symbol"]: item
+        for item in (price_watch_public_item(row) for row in price_watch_active_rows())
+        if item.get("symbol") and item.get("priorHighEnabled")
+    }
+    structure_items = strategy_dragon_wave_items()
+    for symbol, structure_item in structure_items.items():
+        context = strategy_dragon_wave_context(structure_item)
+        strategy_signal = context.get("signal")
+        strategy_pending = context.get("pending")
+        strategy_frame = context.get("frame")
+        has_engine_context = bool(strategy_signal or strategy_pending or strategy_frame)
+        item = items_by_symbol.get(symbol)
+        # The independent recent-new-coin pool joins Strategy Board only once
+        # the shared engine has a prediction or buy signal; it never floods the
+        # board with every low-position observation.
+        if item is None and not (strategy_signal or strategy_pending):
+            continue
+        if item is None:
+            item = {
+                "symbol": symbol,
+                "name": structure_item.get("name") or symbol,
+                "icon": structure_item.get("icon") or crypto_icon_url(symbol),
+                "currentPrice": safe_float(structure_item.get("currentPrice"), 0) or None,
+                "weekHigh": None,
+                "distancePct": 999,
+                "setupType": "",
+                "provider": structure_item.get("provider") or "",
+                "isFirstCandidate": False,
+                "hasConfirmedFirst": False,
+            }
+            items_by_symbol[symbol] = item
+        structure_price = safe_float(structure_item.get("currentPrice"), 0)
+        effective = strategy_signal or strategy_pending or {}
+        trigger_price = safe_float(effective.get("triggerPrice") or effective.get("price"), 0)
+        if structure_price > 0:
+            item["currentPrice"] = structure_price
+        if trigger_price > 0:
+            item["weekHigh"] = trigger_price
+            if structure_price > 0:
+                item["distancePct"] = round((trigger_price - structure_price) / structure_price * 100, 4)
+        stop_plan = (
+            strategy_stop_loss_plan(structure_price, effective.get("breakoutLow"))
+            if structure_price > 0 and effective
+            else {}
+        )
+        breakout_low = safe_float(effective.get("breakoutLow"), 0)
+        signal_actionable = bool(
+            strategy_signal
+            and structure_price > 0
+            and (breakout_low <= 0 or structure_price > breakout_low)
+        )
+        item.update({
+            "strategyEngine": (
+                structure_item.get("strategy") or "dragon-wave-engine"
+                if has_engine_context
+                else item.get("strategyEngine") or "prior-high-monitor"
+            ),
+            "strategyVersion": (
+                structure_item.get("strategyVersion") or "shared-live"
+                if has_engine_context
+                else item.get("strategyVersion") or ""
+            ),
+            "strategyMonitorPool": (
+                structure_item.get("monitorPool") or "aicoin-personal-x"
+                if has_engine_context
+                else item.get("strategyMonitorPool") or ""
+            ),
+            "strategySignal": strategy_signal,
+            "strategyPending": strategy_pending,
+            "strategyFrame": strategy_frame,
+            "strategyInterval": clean_feed_text(effective.get("interval") or (strategy_frame or {}).get("key"), 10),
+            "strategyGrade": clean_feed_text(effective.get("grade"), 8),
+            "strategyPattern": clean_feed_text(effective.get("pattern") or (strategy_frame or {}).get("pattern"), 100),
+            "strategyBreakoutLow": safe_float(effective.get("breakoutLow"), 0) or None,
+            "strategyStopLossPrice": safe_float(stop_plan.get("stopLossPrice"), 0) or None,
+            "strategyStopDistancePct": safe_float(stop_plan.get("stopDistancePct"), 0) or None,
+            "strategyStopLossSource": stop_plan.get("stopLossSource") or "",
+            "strategyStopLossSourceLabel": stop_plan.get("stopLossSourceLabel") or "",
+            "strategyStopLossReason": stop_plan.get("stopLossReason") or "",
+            "strategySignalActionable": signal_actionable,
+            "strategySignalInvalidReason": (
+                "现价已跌破突破K低点，信号只保留复盘"
+                if strategy_signal and breakout_low > 0 and structure_price <= breakout_low
+                else ""
+            ),
+            "provider": structure_item.get("provider") or item.get("provider") or "",
+        })
+
+    signals: list[dict[str, Any]] = []
+    for item in items_by_symbol.values():
+        phase = 1
+        if item.get("strategyFrame") or item.get("setupType"):
+            phase = 2
+        if item.get("strategyPending") or item.get("isFirstCandidate"):
+            phase = 3
+        if item.get("strategySignal") or item.get("hasConfirmedFirst"):
+            phase = 4
+        item["phase"] = phase
+        item["strategyReady"] = bool(
+            item.get("strategySignalActionable")
+            or (not item.get("strategySignal") and item.get("hasConfirmedFirst"))
+        )
+        item["strategyPredicted"] = bool(item.get("strategyPending") and not item.get("strategySignal"))
+        item["exchanges"] = strategy_exchange_availability(
+            item.get("symbol") or "",
+            item.get("provider") or "",
+            user_id,
+        )
+        signals.append(item)
+    signals.sort(
+        key=lambda item: (
+            not bool(item.get("strategyReady")),
+            not bool(item.get("strategyPredicted") or item.get("isFirstCandidate")),
+            -safe_float((item.get("strategySignal") or item.get("strategyPending") or {}).get("certainty"), 0),
+            safe_float(item.get("distancePct"), 999),
+            -int(item.get("lastSeenAt") or 0),
+        )
+    )
+    return signals
+
+
+def strategy_paper_positions(user_id: int) -> list[dict[str, Any]]:
+    with AUTH_DB_LOCK, auth_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT orders.*, assets.current_price AS live_mark_price, assets.icon, assets.name
+            FROM strategy_orders AS orders
+            LEFT JOIN price_watch_assets AS assets ON assets.symbol = orders.symbol
+            WHERE orders.user_id = ? AND orders.status IN ('paper_open', 'live_submitted')
+            ORDER BY orders.created_at DESC
+            """,
+            (user_id,),
+        ).fetchall()
+    positions = []
+    for row in rows:
+        item = dict(row)
+        mark_price = safe_float(item.get("live_mark_price")) or safe_float(item.get("mark_price")) or safe_float(item.get("entry_price"))
+        entry = safe_float(item.get("entry_price"))
+        quantity = safe_float(item.get("quantity"))
+        pnl = (mark_price - entry) * quantity
+        positions.append(
+            {
+                "key": f"paper:{item['id']}",
+                "id": int(item["id"]),
+                "symbol": item.get("symbol") or "",
+                "name": item.get("name") or item.get("symbol") or "",
+                "icon": item.get("icon") or crypto_icon_url(item.get("symbol")),
+                "exchange": item.get("exchange") or "",
+                "mode": item.get("mode") or "paper",
+                "side": item.get("side") or "long",
+                "entryPrice": entry,
+                "markPrice": mark_price,
+                "quantity": quantity,
+                "notional": mark_price * quantity,
+                "margin": safe_float(item.get("margin_required")),
+                "leverage": safe_float(item.get("leverage")),
+                "stopLossPrice": safe_float(item.get("stop_loss_price")),
+                "unrealizedPnl": round(pnl, 4),
+                "unrealizedPnlPct": round(pnl / safe_float(item.get("margin_required")) * 100, 3) if safe_float(item.get("margin_required")) > 0 else 0,
+                "breakEvenAt": int(item.get("break_even_at") or 0),
+                "canBreakEven": bool(pnl > 0 and not int(item.get("break_even_at") or 0)),
+                "createdAt": int(item.get("created_at") or 0),
+            }
+        )
+    return positions
+
+
+def strategy_live_positions(user_id: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    positions: list[dict[str, Any]] = []
+    sync_state: list[dict[str, Any]] = []
+    readers = {
+        "binance": ("Binance 合约", "币安 U 本位合约", binance_futures_positions),
+        "okx": ("OKX 合约", "OKX USDT 永续合约", okx_futures_positions),
+    }
+    for exchange, (label, market_label, reader) in readers.items():
+        configured = strategy_exchange_configured(exchange, user_id)
+        if not configured:
+            credential_hint = (
+                "尚未完整配置 OKX API Key、Secret 与 API 密码"
+                if exchange == "okx"
+                else "尚未配置 Binance API Key 与 Secret"
+            )
+            sync_state.append(
+                {
+                    "exchange": exchange,
+                    "label": label,
+                    "configured": False,
+                    "ok": False,
+                    "count": 0,
+                    "message": credential_hint,
+                    "updatedAt": int(time.time() * 1000),
+                }
+            )
+            continue
+        try:
+            exchange_positions = reader(user_id)
+            positions.extend(exchange_positions)
+            sync_state.append(
+                {
+                    "exchange": exchange,
+                    "label": label,
+                    "configured": True,
+                    "ok": True,
+                    "count": len(exchange_positions),
+                    "message": f"已读取{market_label}持仓",
+                    "updatedAt": int(time.time() * 1000),
+                }
+            )
+        except Exception as exc:
+            sync_state.append(
+                {
+                    "exchange": exchange,
+                    "label": label,
+                    "configured": True,
+                    "ok": False,
+                    "count": 0,
+                    "message": safe_error_text(str(exc)),
+                    "updatedAt": int(time.time() * 1000),
+                }
+            )
+    return positions, sync_state
+
+
+def merge_strategy_positions(
+    exchange_positions: list[dict[str, Any]],
+    local_positions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged = list(exchange_positions)
+    live_keys = {
+        (
+            str(item.get("exchange") or "").lower(),
+            normalize_asset_symbol(item.get("symbol")),
+            str(item.get("side") or "long").lower(),
+        )
+        for item in exchange_positions
+    }
+    for item in local_positions:
+        item_key = (
+            str(item.get("exchange") or "").lower(),
+            normalize_asset_symbol(item.get("symbol")),
+            str(item.get("side") or "long").lower(),
+        )
+        if str(item.get("mode") or "").lower() == "live" and item_key in live_keys:
+            continue
+        merged.append(item)
+    return merged
+
+
+def strategy_orders_payload(user: dict[str, Any] | None) -> dict[str, Any]:
+    user_id = int(user["id"]) if user else None
+    signals = strategy_board_signals(user_id)
+    local_positions = strategy_paper_positions(user_id) if user_id else []
+    exchange_positions, position_sync = strategy_live_positions(user_id) if user_id else ([], [])
+    exchange_accounts = strategy_exchange_accounts(user_id) if user_id else []
+    positions = merge_strategy_positions(exchange_positions, local_positions)
+    return {
+        "ok": True,
+        "updatedAt": int(time.time() * 1000),
+        "authenticated": bool(user),
+        "liveTradingEnabled": strategy_live_enabled(),
+        "signals": signals,
+        "positions": positions,
+        "positionSync": position_sync,
+        "exchangeAccounts": exchange_accounts,
+        "summary": {
+            "watching": len(signals),
+            "structured": sum(1 for item in signals if int(item.get("phase") or 0) >= 2),
+            "awaitingConfirmation": sum(
+                1 for item in signals if item.get("strategyPredicted") or item.get("isFirstCandidate")
+            ),
+            "ready": sum(1 for item in signals if item.get("strategyReady")),
+            "openPositions": len(positions),
+        },
+    }
+
+
+def strategy_submit_order(payload: dict[str, Any], user: dict[str, Any]) -> dict[str, Any]:
+    if str(payload.get("acknowledgement") or "").strip() != "确认下单":
+        raise ValueError("请完成二次确认后再下单")
+    preview = strategy_order_preview(payload, user)
+    if preview.get("blocked"):
+        raise ValueError(preview.get("blockedReason") or "风控阻止下单")
+    if not preview.get("signalConfirmed"):
+        raise ValueError("该信号尚未被人工标记为首次有效突破")
+    mode = str(payload.get("mode") or "paper").strip().lower()
+    if mode not in {"paper", "live"}:
+        raise ValueError("下单模式无效")
+    if mode == "live":
+        if not strategy_live_enabled():
+            raise ValueError("真实交易尚未在服务端启用；请先使用模拟确认")
+        if not strategy_exchange_configured(preview["exchange"], int(user["id"])):
+            raise ValueError(f"{preview['exchange']} 的交易 API 尚未配置")
+        raise ValueError("真实下单适配器处于保护状态；完成交易所 API 权限核验后才能启用")
+    now_ms = int(time.time() * 1000)
+    with AUTH_DB_LOCK, auth_db() as conn:
+        existing = conn.execute(
+            "SELECT id, status FROM strategy_orders WHERE user_id = ? AND symbol = ? AND signal_episode = ?",
+            (int(user["id"]), preview["symbol"], int(preview["signalEpisode"])),
+        ).fetchone()
+        if existing:
+            raise ValueError("该首次信号已经确认过订单，不能重复下单")
+        cursor = conn.execute(
+            """
+            INSERT INTO strategy_orders (
+                user_id, symbol, signal_episode, exchange, mode, side, order_type, status,
+                account_equity, current_gross_exposure, daily_loss, risk_pct,
+                daily_loss_limit_pct, exposure_cap_pct, leverage, entry_price, mark_price,
+                stop_loss_price, stop_distance_pct, risk_budget, notional, margin_required,
+                quantity, created_at, confirmed_at, submitted_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'long', 'market', 'paper_open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(user["id"]), preview["symbol"], int(preview["signalEpisode"]), preview["exchange"], mode,
+                preview["accountEquity"], preview["currentGrossExposure"], preview["dailyLoss"], preview["riskPct"],
+                preview["dailyLossLimitPct"], preview["exposureCapPct"], preview["leverage"], preview["entryPrice"],
+                preview["entryPrice"], preview["stopLossPrice"], preview["stopDistancePct"], preview["riskBudget"],
+                preview["notional"], preview["marginRequired"], preview["quantity"], now_ms, now_ms, now_ms, now_ms,
+            ),
+        )
+        order_id = int(cursor.lastrowid)
+    write_audit_log(
+        "strategy_order_confirmed",
+        actor=user,
+        object_type="strategy_order",
+        object_id=order_id,
+        metadata={"symbol": preview["symbol"], "exchange": preview["exchange"], "mode": mode, "notional": preview["notional"]},
+    )
+    return {**strategy_orders_payload(user), "order": {"id": order_id, "status": "paper_open", "preview": preview}}
+
+
+def strategy_break_even(payload: dict[str, Any], user: dict[str, Any]) -> dict[str, Any]:
+    if str(payload.get("acknowledgement") or "").strip() != "确认保本":
+        raise ValueError("请完成二次确认后再调整止损")
+    key = str(payload.get("positionKey") or "")
+    match = re.fullmatch(r"paper:(\d+)", key)
+    if not match:
+        raise ValueError("当前版本只允许对模拟仓位执行保本演练")
+    order_id = int(match.group(1))
+    now_ms = int(time.time() * 1000)
+    with AUTH_DB_LOCK, auth_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM strategy_orders WHERE id = ? AND user_id = ? AND status = 'paper_open'",
+            (order_id, int(user["id"])),
+        ).fetchone()
+        if not row:
+            raise ValueError("仓位不存在或已经关闭")
+        asset = conn.execute("SELECT current_price FROM price_watch_assets WHERE symbol = ?", (row["symbol"],)).fetchone()
+        entry_price = safe_float(row["entry_price"])
+        mark_price = safe_float(asset["current_price"] if asset else row["mark_price"])
+        quantity = safe_float(row["quantity"])
+        if mark_price <= entry_price or (mark_price - entry_price) * quantity <= 0:
+            raise ValueError("仓位尚无浮盈，不能设置保本止损")
+        break_even_price = entry_price * (1 + STRATEGY_FEE_BUFFER_PCT / 100)
+        if break_even_price >= mark_price:
+            raise ValueError("当前浮盈不足以覆盖手续费缓冲")
+        conn.execute(
+            "UPDATE strategy_orders SET stop_loss_price = ?, break_even_at = ?, updated_at = ? WHERE id = ?",
+            (break_even_price, now_ms, now_ms, order_id),
+        )
+    write_audit_log(
+        "strategy_break_even_set",
+        actor=user,
+        object_type="strategy_order",
+        object_id=order_id,
+        metadata={"break_even_price": break_even_price},
+    )
+    return {**strategy_orders_payload(user), "breakEven": {"id": order_id, "stopLossPrice": break_even_price}}
 
 
 def load_site_alert_state() -> dict[str, Any]:
@@ -10339,7 +25227,8 @@ def load_site_alert_state() -> dict[str, Any]:
         payload = read_json_cache(SITE_ALERT_STATE_PATH)
         seen = payload.get("seen") if isinstance(payload.get("seen"), dict) else {}
         ready = payload.get("ready") if isinstance(payload.get("ready"), list) else []
-        SITE_ALERT_STATE = {"seen": seen, "ready": ready}
+        ready_scopes = payload.get("newboardReadyScopes") if isinstance(payload.get("newboardReadyScopes"), list) else []
+        SITE_ALERT_STATE = {"seen": seen, "ready": ready, "newboardReadyScopes": ready_scopes}
         SITE_ALERT_STATE_LOADED = True
         return SITE_ALERT_STATE
 
@@ -10351,7 +25240,11 @@ def save_site_alert_state() -> None:
         SITE_ALERT_STATE["seen"] = recent_seen
         write_json_cache(
             SITE_ALERT_STATE_PATH,
-            {"seen": recent_seen, "ready": list(dict.fromkeys(SITE_ALERT_STATE.get("ready") or []))},
+            {
+                "seen": recent_seen,
+                "ready": list(dict.fromkeys(SITE_ALERT_STATE.get("ready") or [])),
+                "newboardReadyScopes": list(dict.fromkeys(SITE_ALERT_STATE.get("newboardReadyScopes") or [])),
+            },
         )
 
 
@@ -10373,11 +25266,19 @@ def parse_site_listing_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
     sections = payload.get("sections") if isinstance(payload.get("sections"), list) else []
     events: list[dict[str, Any]] = []
     for section in sections:
+        # Aster already has a dedicated official-announcement feed with stronger
+        # identity and timing. Keep its new-board card, but avoid a second popup.
+        if section.get("id") == "aster-new":
+            continue
         rows = section.get("rows") if isinstance(section.get("rows"), list) else []
         for index, row in enumerate(rows):
+            # Aster has a dedicated symbol-based feed so its listing rows do not alert twice.
+            if str(row.get("source") or "").strip().casefold() == "aster":
+                continue
             heat = site_heat_info(row, int(safe_float(row.get("rank"), index + 1) or index + 1))
             base_kind = "IPO / 上市" if row.get("group") == "ipo" else "A股上市" if row.get("group") == "cn" else "港美股上市" if row.get("group") in {"hk", "us"} else "交易所上新"
             title = row.get("title") or row.get("symbol") or "新的上新事件"
+            speech_prefix = "交易所上新提醒" if row.get("group") == "crypto" else "上市信息提醒"
             body_parts = [
                 row.get("symbol"),
                 row.get("metric"),
@@ -10396,8 +25297,57 @@ def parse_site_listing_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
                     "url": row.get("url") or "./listings.html",
                     "time": row.get("date") or payload.get("updatedAt") or int(time.time() * 1000),
                     "priority": "高热重点" if heat.get("high") else "交易所上新" if row.get("group") == "crypto" else "上市信息",
+                    "speech": f"{speech_prefix}，{title}。",
                 }
             )
+    return events
+
+
+def parse_site_aster_contract_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    events: list[dict[str, Any]] = []
+    for row in items:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        official = bool(row.get("officialAnnouncement"))
+        assets = [
+            str(asset).strip().upper()
+            for asset in (row.get("symbols") if isinstance(row.get("symbols"), list) else [])
+            if str(asset).strip()
+        ]
+        base_asset = str(row.get("baseAsset") or symbol).strip().upper()
+        quote_asset = str(row.get("quoteAsset") or "USDT").strip().upper()
+        pending = str(row.get("contractStatus") or "").strip().upper() == "PENDING_TRADING"
+        asset_text = "、".join(assets) if assets else base_asset
+        title = f"Aster {'官方' if official else ''}合约上新公告：{asset_text} 永续合约"
+        onboard_ms = int(safe_float(row.get("date"), 0))
+        discovered_ms = int(safe_float(row.get("firstDiscoveredAt"), 0))
+        onboard_text = ""
+        if onboard_ms > 0:
+            try:
+                onboard_text = datetime.fromtimestamp(onboard_ms / 1000).strftime("%m/%d %H:%M")
+            except (OverflowError, OSError, ValueError):
+                onboard_text = ""
+        events.append(
+            {
+                "key": f"aster-contract:{symbol}" if len(assets) <= 1 else f"aster-contract:{row.get('id') or symbol}",
+                "kind": "交易所上新",
+                "source": "Aster",
+                "sourceLabel": "AS",
+                "title": title,
+                "body": alert_body_join(asset_text, "官方公告" if official else "待上线" if pending else "已上线", onboard_text),
+                "url": row.get("url") or ASTER_TRADE_URL,
+                "time": discovered_ms or row.get("announcementAt") or payload.get("updatedAt") or int(time.time() * 1000),
+                "priority": "上新公告",
+                "speech": (
+                    f"Aster 官方合约上新公告，{asset_text} 新永续合约已发布。"
+                    if official
+                    else f"Aster 合约上新公告，{base_asset} 永续合约{'即将上线' if pending else '已上线'}。"
+                ),
+                "queuePriority": 80,
+            }
+        )
     return events
 
 
@@ -10410,6 +25360,10 @@ def parse_site_newboard_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
             rank = int(safe_float(row.get("rank"), index + 1) or index + 1)
             heat = site_heat_info(row, rank)
             symbol = row.get("symbol") or row.get("asset") or row.get("title") or row.get("name") or "新标的"
+            section_title = section.get("title") or "新币新股"
+            section_text = f"{section.get('id') or ''} {section_title} {section.get('group') or ''}".lower()
+            is_stock = any(keyword in section_text for keyword in ("stock", "ipo", "新股", "港股", "美股", "a股"))
+            speech_subject = "新股上市" if is_stock else "新币上新"
             body_parts = [
                 f"价格 {row.get('price')}" if row.get("price") else "",
                 f"涨跌 {row.get('change')}" if row.get("change") else "",
@@ -10419,14 +25373,17 @@ def parse_site_newboard_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
             events.append(
                 {
                     "key": js_stable_key("newboard", section.get("id"), row.get("id"), symbol, row.get("date"), row.get("url")),
-                    "kind": "新币新股高热" if heat.get("high") else "新币新股",
+                    "sourceScope": clean_feed_text(section.get("id"), 60),
+                    "kind": "新币新股高热" if heat.get("high") else ("新股上市" if is_stock else "新币上新"),
                     "source": row.get("source") or section.get("sourceName") or section.get("title") or "新币新股榜",
                     "sourceLabel": row.get("sourceLabel") or section.get("sourceLabel") or "NEW",
                     "title": f"高热提醒：{section.get('title') or '新币新股'} {symbol}" if heat.get("high") else f"{section.get('title') or '新币新股'} {symbol}",
                     "body": alert_body_join(*body_parts),
                     "url": row.get("url") or "./newboards.html",
                     "time": row.get("date") or payload.get("updatedAt") or int(time.time() * 1000),
-                    "priority": "高热重点" if heat.get("high") else "新币新股",
+                    "priority": "高热重点" if heat.get("high") else ("新股上市" if is_stock else "新币上新"),
+                    "speech": f"{speech_subject}提醒，{symbol}。{section_title}。",
+                    "queuePriority": 90 if heat.get("high") else 80,
                 }
             )
     return events
@@ -10506,6 +25463,7 @@ def parse_site_gainers_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "url": "./gainers.html",
                 "time": source.get("updatedAt") or payload.get("updatedAt") or int(time.time() * 1000),
                 "priority": "催化重定价" if change >= 15 else "榜首换手",
+                "speech": f"涨幅榜榜首异动，{display} 成为{source.get('title') or '涨幅榜'}榜首。",
             }
         )
     return events
@@ -10572,6 +25530,7 @@ def rank_monitor_snapshot(source: dict[str, Any], row: dict[str, Any], index: in
         "heat": heat,
         "turnover": row.get("turnover") or "",
         "note": row.get("note") or "",
+        "icon": row.get("icon") or "",
         "url": row.get("url") or ("./turnover.html" if board == "turnover" else "./index.html"),
     }
 
@@ -10605,6 +25564,71 @@ def rank_monitor_gainers_assets(payload: dict[str, Any]) -> dict[str, dict[str, 
             if asset_key and asset_key not in assets:
                 assets[asset_key] = snapshot
     return assets
+
+
+def rank_monitor_update_gainer_leader_history(
+    state: dict[str, Any],
+    payload: dict[str, Any],
+    now: float,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    history = [
+        dict(item)
+        for item in (state.get("gainerLeaderHistory") or [])
+        if isinstance(item, dict)
+    ]
+    previous_leaders = state.get("gainerCurrentLeaders")
+    if not isinstance(previous_leaders, dict):
+        previous_leaders = {}
+    current_leaders = {
+        str(source_id): dict(item)
+        for source_id, item in previous_leaders.items()
+        if isinstance(item, dict)
+    }
+    for source in payload.get("sources") if isinstance(payload.get("sources"), list) else []:
+        source_id = str(source.get("id") or "").strip()
+        if (
+            not source_id
+            or str(source.get("group") or "").lower() != "crypto"
+            or source.get("status") == "unavailable"
+            or source_id in RANK_MONITOR_SKIP_UPDATE_SOURCES
+        ):
+            continue
+        rows = source.get("rows") if isinstance(source.get("rows"), list) else []
+        leader_row = next(
+            (
+                row
+                for index, row in enumerate(rows)
+                if isinstance(row, dict) and rank_monitor_rank(row, index + 1) == 1
+            ),
+            None,
+        )
+        if not leader_row:
+            continue
+        snapshot = rank_monitor_snapshot(source, leader_row, 0, "gainers")
+        asset_key = str(snapshot.get("assetKey") or "")
+        if not asset_key:
+            continue
+        leader = {
+            "sourceId": source_id,
+            "sourceTitle": snapshot.get("sourceTitle") or source_id,
+            "assetKey": asset_key,
+            "symbol": asset_key.split(":", 1)[-1],
+            "name": snapshot.get("name") or snapshot.get("symbol") or asset_key.split(":", 1)[-1],
+            "icon": snapshot.get("icon") or "",
+            "observedAt": int(now * 1000),
+            "price": snapshot.get("price") or "",
+            "change": snapshot.get("change") or 0,
+            "amount": snapshot.get("amount") or 0,
+            "url": snapshot.get("url") or "./gainers.html",
+        }
+        previous = current_leaders.get(source_id)
+        if previous and str(previous.get("assetKey") or "") != asset_key:
+            history.append(leader)
+        current_leaders[source_id] = leader
+
+    cutoff_ms = int((now - ROTATION_GAINER_HISTORY_SECONDS) * 1000)
+    history = [item for item in history if int(item.get("observedAt") or 0) >= cutoff_ms]
+    return history[-1000:], current_leaders
 
 
 def rank_monitor_watch_rows(board: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -10681,7 +25705,7 @@ def rank_monitor_event(board: str, current: dict[str, Any], reason: str) -> dict
         round(safe_float(current.get("change")), 2),
         round(safe_float(current.get("heat"))),
     )
-    return {
+    event = {
         "key": signal,
         "kind": f"{board_label}{reason_label}",
         "source": current.get("sourceTitle") or board_label,
@@ -10693,6 +25717,9 @@ def rank_monitor_event(board: str, current: dict[str, Any], reason: str) -> dict
         "priority": reason_label,
         "_assetKey": current.get("assetKey"),
     }
+    if reason == "new":
+        event["speech"] = f"榜单新进，{symbol} 新进入{board_label}前十。"
+    return event
 
 
 def rank_monitor_cross_events(
@@ -10751,6 +25778,10 @@ def rank_monitor_cross_events(
 
 def sync_rank_monitor_feed() -> None:
     try:
+        sync_binance_wallet_4h_structure_history()
+    except Exception as exc:
+        print(f"Binance Wallet 4h structure history sync failed: {safe_error_text(str(exc))}", file=sys.stderr)
+    try:
         market = market_payload()
         turnover = turnover_rankings_payload()
         gainers = gainers_rankings_payload()
@@ -10770,6 +25801,12 @@ def sync_rank_monitor_feed() -> None:
 
     with RANK_MONITOR_LOCK:
         state = read_json_cache(RANK_MONITOR_STATE_PATH)
+        market_priority_history = market_priority_update_history(state, market, now)
+        gainer_leader_history, gainer_current_leaders = rank_monitor_update_gainer_leader_history(
+            state,
+            gainers,
+            now,
+        )
         ready = bool(state.get("ready")) and int(safe_float(state.get("version"))) == RANK_MONITOR_STATE_VERSION
         snapshots = state.get("snapshots") if isinstance(state.get("snapshots"), dict) else {}
         last_alerts = state.get("lastAlerts") if isinstance(state.get("lastAlerts"), dict) else {}
@@ -10845,6 +25882,9 @@ def sync_rank_monitor_feed() -> None:
                 "knownRows": current_known,
                 "lastAlerts": last_alerts,
                 "crossSeen": cross_seen,
+                "marketPriorityHistory": market_priority_history,
+                "gainerLeaderHistory": gainer_leader_history,
+                "gainerCurrentLeaders": gainer_current_leaders,
             },
         )
 
@@ -10896,6 +25936,11 @@ def parse_site_x_kol_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 metric_parts.append(f"{label} {value}")
         handle = item.get("handle") or item.get("sourceName") or "KOL"
         display_name = clean_feed_text(item.get("sourceName") or handle, 80)
+        quote = item.get("quote") if isinstance(item.get("quote"), dict) else {}
+        translation_text = clean_feed_text(
+            " ".join(part for part in (item.get("text"), quote.get("text")) if part),
+            1800,
+        )
         title = clean_feed_text(item.get("text") or item.get("title") or "新的 X 动态", 86)
         events.append(
             {
@@ -10907,7 +25952,4576 @@ def parse_site_x_kol_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "body": alert_body_join(item.get("text"), " / ".join(metric_parts)),
                 "url": x_kol_normalize_url(item.get("url"), handle) or "./xwatch.html",
                 "time": published_at or payload.get("updatedAt") or int(time.time() * 1000),
+                "translationText": translation_text if x_kol_text_looks_english(translation_text) else "",
                 "priority": "KOL更新",
+            }
+        )
+    return events
+
+
+def news_trade_env_number(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+NEWS_TRADE_CONFIG = {
+    "eventWeights": {
+        "velocity": 20.0,
+        "crossPlatform": 12.0,
+        "noveltyContrast": 12.0,
+        "participation": 12.0,
+        "symbolizability": 12.0,
+        "followupStory": 12.0,
+        "bigGossip": 20.0,
+    },
+    "onchainWeights": {
+        "consensusUniqueness": 15.0,
+        "liquidity": 20.0,
+        "volumeGrowth": 20.0,
+        "holderGrowth": 15.0,
+        "distributionHealth": 15.0,
+        "contractSafety": 15.0,
+    },
+    "thresholds": {
+        "cultureStaticMin": news_trade_env_number("NEWS_TRADE_CULTURE_STATIC_MIN", 42),
+        "eventObservation": news_trade_env_number("NEWS_TRADE_EVENT_OBSERVATION_MIN", 45),
+        "eventTrade": news_trade_env_number("NEWS_TRADE_EVENT_TRADE_MIN", 62),
+        "onchainTrade": news_trade_env_number("NEWS_TRADE_ONCHAIN_TRADE_MIN", 62),
+        "highVelocity": news_trade_env_number("NEWS_TRADE_HIGH_VELOCITY_MIN", 68),
+        "highRank": news_trade_env_number("NEWS_TRADE_HIGH_RANK_MIN", 68),
+        "minLiquidityUsd": news_trade_env_number("NEWS_TRADE_MIN_LIQUIDITY_USD", 100_000),
+    },
+    "alert": {
+        "cooldownSeconds": news_trade_env_number("NEWS_TRADE_ALERT_COOLDOWN_SECONDS", 30 * 60),
+        "stateRetentionSeconds": news_trade_env_number("NEWS_TRADE_ALERT_STATE_RETENTION_SECONDS", 14 * 24 * 60 * 60),
+    },
+    "candidateBlend": {
+        "event": 0.45,
+        "onchain": 0.55,
+    },
+}
+
+
+EVENT_MONITOR_TEMPLATES = (
+    {
+        "id": "counter-consensus-culture",
+        "name": "反常识文化事件 / 负面共识破圈",
+        "description": "低基数文化主题因荒诞、争议、反差或参与式负面共识破圈，并可能完成链上映射。",
+        "base": 44,
+        "keywords": (
+            "反常", "反差", "猎奇", "离谱", "荒诞", "奇葩", "抽象", "争议", "吐槽",
+            "下架", "封禁", "刷屏", "打卡", "二创", "围观", "玩梗", "笑死", "逆袭",
+            "爆红", "出圈", "热搜", "加场", "售罄", "表情包", "meme", "小作文",
+            "万字长文", "大瓜", "吃瓜", "恋情", "绯闻", "爆料", "本人下场", "叫我", "前女友", "前男友",
+        ),
+    },
+    {
+        "id": "meme-catalyst",
+        "name": "热点叙事 MEME 映射",
+        "description": "新奇、反常或争议性现实事件正在映射为尚未充分发酵的链上 MEME 机会。",
+        "base": 42,
+        "keywords": (
+            "meme", "市值", "交易量", "流动性", "出圈", "票房", "电影", "动画", "热点",
+            "反常", "反差", "猎奇", "离谱", "荒诞", "奇葩", "争议", "热议", "讨论",
+            "gmgn", "聪明钱", "回报率", "小作文", "万字长文", "大瓜", "吃瓜", "恋情", "绯闻", "爆料",
+            "本人下场", "叫我", "热搜词条",
+        ),
+    },
+    {
+        "id": "kol-latency",
+        "name": "信息延迟套利",
+        "description": "名人、项目方或核心 KOL 首发信息尚未被市场充分消化。",
+        "base": 28,
+        "keywords": ("推文", "发文", "转推", "tweet", "retweeted", "elon", "musk", "kol", "创始人", "ceo"),
+    },
+    {
+        "id": "anchor-policy",
+        "name": "价值锚与政策确认",
+        "description": "稳定币、储备、监管或政策变化正在改变资产价值锚。",
+        "base": 34,
+        "keywords": ("脱锚", "锚定", "储备", "监管", "政策", "救助", "美联储", "法院", "sec", "depeg", "peg", "reserve", "regulation", "bailout"),
+    },
+    {
+        "id": "instant-repricing",
+        "name": "重大事件瞬时重定价",
+        "description": "裁决、获批、胜诉或制度变化可能触发即时重定价。",
+        "base": 36,
+        "keywords": ("胜诉", "败诉", "裁决", "获批", "批准", "诉讼", "判决", "ruling", "approved", "approval", "lawsuit", "victory"),
+    },
+    {
+        "id": "listing-latency",
+        "name": "交易所公告延迟套利",
+        "description": "交易所上新、合约或交易安排已确认，市场仍在传播。",
+        "base": 16,
+        "keywords": ("上新", "上币", "上线", "新增", "永续", "合约", "launchpool", "listing", "listed", "perpetual"),
+    },
+    {
+        "id": "market-dislocation",
+        "name": "市场失灵与错价",
+        "description": "闪崩、宕机、异常清算或流动性故障造成短期错价。",
+        "base": 32,
+        "keywords": ("闪崩", "插针", "宕机", "错价", "市场失灵", "异常清算", "爆仓", "流动性枯竭", "flash crash", "outage", "mispricing", "liquidation"),
+    },
+    {
+        "id": "orderbook-risk",
+        "name": "盘口异常与基差",
+        "description": "盘口、基差、持仓量或资金费率异常，需要结合风控确认。",
+        "base": 30,
+        "keywords": ("盘口", "基差", "深度", "资金费率", "持仓量", "未平仓", "订单簿", "异常成交", "orderbook", "basis", "funding", "open interest", "spread", "depth"),
+    },
+)
+
+EVENT_MONITOR_ASSET_ALIASES = {
+    "比特币": "BTC",
+    "以太坊": "ETH",
+    "狗狗币": "DOGE",
+    "柴犬币": "SHIB",
+    "币安币": "BNB",
+    "瑞波币": "XRP",
+    "稳定币": "USDC",
+    "灰度": "BTC",
+    "hyperliquid": "HYPE",
+}
+
+EVENT_MONITOR_SYMBOL_STOPWORDS = {
+    "AI", "APP", "API", "CEO", "CEX", "DEX", "ETF", "FED", "KOL", "NEWS", "NFT", "SEC",
+    "USD", "USDT", "THE", "AND", "FOR", "FROM", "WITH", "THIS", "THAT", "NEW", "TRADE",
+    "BINANCE", "BITGET", "OKX", "ASTER", "BLOCKBEATS", "IPO", "HTTP", "HTTPS", "URL",
+}
+
+
+def event_monitor_known_assets() -> set[str]:
+    """Build a conservative symbol universe from the latest local ranking cache."""
+    known = set(EVENT_MONITOR_ASSET_ALIASES.values())
+    known.update({"BTC", "ETH", "BNB", "SOL", "DOGE", "SHIB", "XRP", "ADA", "AVAX", "TRX", "TON", "SUI", "HYPE", "USDC", "USDT"})
+    payload = read_json_cache(api_cache_path("market-hot"))
+    sources = payload.get("sources") if isinstance(payload.get("sources"), list) else []
+    for source in sources:
+        rows = source.get("rows") if isinstance(source, dict) and isinstance(source.get("rows"), list) else []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for key in ("symbol", "baseAsset"):
+                value = re.sub(r"[^A-Z0-9]", "", str(row.get(key) or "").upper())
+                value = re.sub(r"(?:USDT|USDC|USD)(?:SWAP|PERP)?$", "", value)
+                if 1 < len(value) <= 12 and value not in EVENT_MONITOR_SYMBOL_STOPWORDS:
+                    known.add(value)
+    return known
+
+
+def event_monitor_assets(*values: Any) -> list[str]:
+    text = " ".join(str(value or "") for value in values)
+    upper_text = text.upper()
+    assets: list[str] = []
+    known_assets = event_monitor_known_assets()
+
+    def add(symbol: Any) -> None:
+        value = re.sub(r"[^A-Z0-9]", "", str(symbol or "").upper())
+        pair_match = re.fullmatch(r"(.+?)(?:USDT|USDC|USD)(?:SWAP|PERP)?", value)
+        if pair_match:
+            value = pair_match.group(1)
+        if not value or value in EVENT_MONITOR_SYMBOL_STOPWORDS or len(value) > 12:
+            return
+        if value not in assets:
+            assets.append(value)
+
+    for alias, symbol in EVENT_MONITOR_ASSET_ALIASES.items():
+        if alias.casefold() in text.casefold():
+            add(symbol)
+    for match in re.finditer(r"(?<![A-Z0-9])\$([A-Z][A-Z0-9]{1,11})(?![A-Z0-9])", upper_text):
+        add(match.group(1))
+    for match in re.finditer(r"(?<![A-Z0-9])([A-Z0-9]{2,12})[-/]?(?:USDT|USDC|USD)(?:[-/]?(?:SWAP|PERP))?(?![A-Z0-9])", upper_text):
+        add(match.group(1))
+    for match in re.finditer(r"(?<![A-Z0-9])([A-Z][A-Z0-9]{1,11})(?![A-Z0-9])", upper_text):
+        if match.group(1) in known_assets:
+            add(match.group(1))
+    return assets[:8]
+
+
+EVENT_MONITOR_CHAIN_META = {
+    "bsc": {"chain": "bsc", "chainId": "56", "chainLabel": "BNB Chain"},
+    "bnb-chain": {"chain": "bsc", "chainId": "56", "chainLabel": "BNB Chain"},
+    "sol": {"chain": "sol", "chainId": "501", "chainLabel": "Solana"},
+    "solana": {"chain": "sol", "chainId": "501", "chainLabel": "Solana"},
+    "base": {"chain": "base", "chainId": "8453", "chainLabel": "Base"},
+    "eth": {"chain": "ethereum", "chainId": "1", "chainLabel": "Ethereum"},
+    "ethereum": {"chain": "ethereum", "chainId": "1", "chainLabel": "Ethereum"},
+    "arb": {"chain": "arbitrum", "chainId": "42161", "chainLabel": "Arbitrum"},
+    "arbitrum": {"chain": "arbitrum", "chainId": "42161", "chainLabel": "Arbitrum"},
+    "robinhood": {"chain": "robinhood", "chainId": "4663", "chainLabel": "Robinhood Chain"},
+    "robinhood-chain": {"chain": "robinhood", "chainId": "4663", "chainLabel": "Robinhood Chain"},
+}
+
+
+def event_monitor_money_value(text: str, labels: tuple[str, ...]) -> float | None:
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    match = re.search(
+        rf"(?:{label_pattern})[^\d$￥]{{0,16}}[$￥]?\s*([\d,.]+)\s*(亿|万)?\s*(?:美?元|美元|USDT)?",
+        str(text or ""),
+        flags=re.I,
+    )
+    if not match:
+        return None
+    value = safe_float(match.group(1).replace(",", ""), 0)
+    if match.group(2) == "亿":
+        value *= 100_000_000
+    elif match.group(2) == "万":
+        value *= 10_000
+    return round(value, 4) if value > 0 else None
+
+
+def event_monitor_scaled_number(value: Any) -> float:
+    text = clean_feed_text(value, 80).replace(",", "")
+    match = re.search(r"(-?[\d.]+)\s*(亿|万|千|[kmb])?", text, flags=re.I)
+    if not match:
+        return 0.0
+    number = safe_float(match.group(1), 0)
+    suffix = str(match.group(2) or "").lower()
+    multiplier = {
+        "亿": 100_000_000,
+        "万": 10_000,
+        "千": 1_000,
+        "k": 1_000,
+        "m": 1_000_000,
+        "b": 1_000_000_000,
+    }.get(suffix, 1)
+    return number * multiplier
+
+
+def event_monitor_hot_entities(title: str, body: str = "") -> list[str]:
+    """Extract stable topic entities without inventing a narrative."""
+    text = clean_feed_text(f"{title} {body}", 1200)
+    entities: list[str] = []
+
+    def add(value: Any) -> None:
+        entity = clean_feed_text(value, 48).strip(" ·:：,，。!?！？-—_")
+        if len(entity) < 2 or entity.casefold() in {item.casefold() for item in entities}:
+            return
+        entities.append(entity)
+
+    for match in re.finditer(r"[《「『“\"]([^》」』”\"]{2,40})[》」』”\"]", text):
+        add(match.group(1))
+    for match in re.finditer(
+        r"(?:叫我|称我为|改叫|称为|喊我)[：:\s]*[《「『“\"]?([\u3400-\u9fff]{2,8}?)(?:吧|了|[，。！？；、\s]|[》」』”\"]|$)",
+        text,
+    ):
+        add(match.group(1))
+    for match in re.finditer(r"[#＃]([A-Za-z0-9_\u3400-\u9fff]{2,32})", text):
+        add(match.group(1))
+    for match in re.finditer(r"(?<![A-Za-z0-9])\$?([A-Z][A-Za-z0-9]{2,23})(?![A-Za-z0-9])", text):
+        token = match.group(1)
+        if token.upper() not in EVENT_MONITOR_SYMBOL_STOPWORDS:
+            add(token)
+    for match in re.finditer(
+        r"([\u3400-\u9fff]{2,14})(?=(?:突然|因|被|将|宣布|爆红|出圈|下架|封禁|刷屏|上线|上新|获批|引发|成为|登上热搜))",
+        clean_feed_text(title, 300),
+    ):
+        subject = re.sub(r"^(?:据悉|消息称|网传|近日|今日|刚刚|原本|一部|一个)", "", match.group(1))
+        add(subject)
+    return entities[:12]
+
+
+NEWS_TRADE_KEYWORD_STOPWORDS = {
+    "消息", "快讯", "市场", "今日", "昨日", "刚刚", "最新", "表示", "宣布", "相关", "事件",
+    "加密", "交易", "上线", "上新", "合约", "永续", "热点", "新闻", "meme", "usdt",
+}
+
+
+def event_monitor_news_keywords(title: str, body: str = "") -> list[str]:
+    """Extract auditable news keywords for clustering, search and asset matching."""
+    text = clean_feed_text(f"{title} {body}", 1600)
+    keywords: list[str] = []
+
+    def add(value: Any) -> None:
+        keyword = clean_feed_text(value, 48).strip(" ·:：,，。!?！？-—_#＃$《》「」『』“”\"")
+        if (
+            len(keyword) < 2
+            or keyword.casefold() in NEWS_TRADE_KEYWORD_STOPWORDS
+            or keyword.casefold() in {item.casefold() for item in keywords}
+        ):
+            return
+        keywords.append(keyword)
+
+    for entity in event_monitor_hot_entities(title, body):
+        add(entity)
+    for asset in event_monitor_assets("", title, body):
+        add(asset)
+    for template in EVENT_MONITOR_TEMPLATES:
+        for keyword in template.get("keywords") or ():
+            if str(keyword).casefold() in text.casefold():
+                add(keyword)
+    for match in re.finditer(r"[#＃]([A-Za-z0-9_\u3400-\u9fff]{2,32})", text):
+        add(match.group(1))
+    for match in re.finditer(r"[《「『“\"]([^》」』”\"]{2,40})[》」』”\"]", text):
+        add(match.group(1))
+    return keywords[:18]
+
+
+def event_monitor_contract_from_url(value: Any) -> str:
+    raw_url = str(value or "").strip()
+    if not raw_url:
+        return ""
+    path_parts = [part for part in urlparse(raw_url).path.split("/") if part]
+    candidate = path_parts[-1] if path_parts else ""
+    candidate = re.sub(r"^(?:i_hot_|token_)", "", candidate, flags=re.I)
+    evm_match = re.search(r"0x[0-9a-fA-F]{40}", candidate or raw_url)
+    if evm_match:
+        return evm_match.group(0).lower()
+    if re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,64}", candidate):
+        return candidate
+    return ""
+
+
+def event_monitor_chain_meta(value: Any) -> dict[str, str]:
+    key = clean_feed_text(value, 40).casefold().replace("_", "-")
+    aliases = {
+        "bnb": "bsc",
+        "bnb chain": "bsc",
+        "bnb-chain": "bsc",
+        "sol": "solana",
+        "eth": "ethereum",
+        "arb": "arbitrum",
+    }
+    return dict(EVENT_MONITOR_CHAIN_META.get(aliases.get(key, key), {}))
+
+
+def event_monitor_note_metric(text: str, label: str) -> float:
+    match = re.search(rf"{re.escape(label)}\s*\$?([\d,.]+\s*(?:亿|万|千|[kmb])?)", str(text or ""), flags=re.I)
+    return event_monitor_scaled_number(match.group(1)) if match else 0.0
+
+
+def event_monitor_metric_score(value: float, *, floor: float, ceiling: float) -> float:
+    if value <= 0 or floor <= 0 or ceiling <= floor:
+        return 0.0
+    if value <= floor:
+        return max(0.0, 35.0 * value / floor)
+    logarithmic = math.log10(value / floor) / math.log10(ceiling / floor)
+    return min(100.0, 35.0 + 65.0 * max(0.0, logarithmic))
+
+
+def news_trade_candidate_trade_urls(row: dict[str, Any], chain: str, contract: str) -> dict[str, str]:
+    """Build auditable, user-confirmed swap destinations without signing a transaction."""
+    urls: dict[str, str] = {}
+    venue = clean_feed_text(row.get("venue"), 32)
+    original = clean_feed_text(row.get("tradeUrl") or row.get("url"), 800)
+    if venue and original:
+        urls[venue] = original
+    normalized_chain = clean_feed_text(chain, 40).casefold()
+    normalized_contract = clean_feed_text(contract, 96)
+    if not normalized_contract:
+        return urls
+    okx_chain = {
+        "bsc": "bsc",
+        "sol": "solana",
+        "solana": "solana",
+        "base": "base",
+        "ethereum": "eth",
+        "arbitrum": "arbitrum",
+    }.get(normalized_chain)
+    if okx_chain:
+        urls["OKX DEX"] = f"https://web3.okx.com/zh-hans/token/{okx_chain}/{quote(normalized_contract, safe='')}"
+    if normalized_chain == "bsc":
+        urls["PancakeSwap"] = (
+            "https://pancakeswap.finance/swap?chain=bsc&outputCurrency="
+            f"{quote(normalized_contract, safe='')}"
+        )
+        urls["Bitget Wallet"] = (
+            "https://web3.bitget.com/zh-CN/swap/bnb/"
+            f"{quote(normalized_contract, safe='')}"
+        )
+    return urls
+
+
+def event_monitor_onchain_candidate(row: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(row, dict):
+        return None
+    symbol = clean_feed_text(row.get("symbol") or row.get("name"), 40)
+    if not symbol:
+        return None
+    note = clean_feed_text(row.get("note"), 800)
+    chain_meta = event_monitor_chain_meta(row.get("chain") or row.get("chainLabel"))
+    raw_contract = clean_feed_text(row.get("contractAddress"), 96)
+    if re.fullmatch(r"0x[0-9a-fA-F]{40}|[1-9A-HJ-NP-Za-km-z]{32,64}", raw_contract):
+        contract = raw_contract.lower() if raw_contract.startswith("0x") else raw_contract
+    else:
+        contract = event_monitor_contract_from_url(row.get("url"))
+    liquidity = event_monitor_money_value(note, ("流动性", "liquidity")) or safe_float(row.get("liquidityUsd"), 0)
+    volume = safe_float(row.get("amount"), 0) or event_monitor_money_value(note, ("交易量", "成交量", "24小时成交")) or safe_float(row.get("volume24hUsd"), 0)
+    market_cap = event_monitor_money_value(note, ("市值", "market cap")) or safe_float(row.get("marketCapUsd"), 0)
+    transactions = event_monitor_note_metric(note, "交易") or safe_float(row.get("transactions24h"), 0)
+    holders = event_monitor_note_metric(note, "持币") or safe_float(row.get("holderCount"), 0)
+    holder_growth = row.get("holderGrowth24hPercent")
+    volume_growth = row.get("volumeGrowth1hPercent")
+    top10_holder_percent = safe_float(row.get("top10HolderPercent"), 0) or None
+    buy_sell_ratio = row.get("buySellRatio")
+    heat = max(0.0, min(100.0, safe_float(row.get("heat"), 0)))
+    price = safe_float(re.sub(r"[^\d.eE+-]", "", str(row.get("price") or "")), 0) or safe_float(row.get("priceUsd"), 0)
+    change = safe_float(re.sub(r"[^\d.eE+-]", "", str(row.get("change") or "")), 0) or safe_float(row.get("change24hPercent"), 0)
+    risk_flags: list[str] = []
+    if not contract:
+        risk_flags.append("合约地址待确认")
+    if liquidity and liquidity < 100_000:
+        risk_flags.append("流动性偏低")
+    if abs(change) >= 500:
+        risk_flags.append("短时涨幅极端")
+    if "非貔貅盘" not in note:
+        risk_flags.append("卖出能力需复核")
+    if top10_holder_percent and top10_holder_percent >= 70:
+        risk_flags.append("持仓高度集中")
+    if str(row.get("honeypot") or "").strip().lower() in {"1", "true", "yes"}:
+        risk_flags.append("疑似貔貅盘")
+    trade_urls = news_trade_candidate_trade_urls(row, chain_meta.get("chain") or "", contract)
+    return {
+        "name": clean_feed_text(row.get("name") or symbol, 80),
+        "symbol": symbol,
+        **dict(chain_meta or {"chain": "", "chainId": "", "chainLabel": clean_feed_text(row.get("chainLabel") or "链待确认", 40)}),
+        "contractAddress": contract,
+        "priceUsd": price or None,
+        "change24hPercent": change if change else None,
+        "marketCapUsd": market_cap or None,
+        "volume24hUsd": volume or None,
+        "liquidityUsd": liquidity or None,
+        "transactions24h": transactions or None,
+        "holderCount": holders or None,
+        "holderGrowth24hPercent": safe_float(holder_growth, 0) if holder_growth not in (None, "") else None,
+        "volumeGrowth1hPercent": safe_float(volume_growth, 0) if volume_growth not in (None, "") else None,
+        "top10HolderPercent": top10_holder_percent,
+        "buySellRatio": safe_float(buy_sell_ratio, 0) if buy_sell_ratio not in (None, "") else None,
+        "heatScore": round(heat, 2),
+        "riskFlags": risk_flags,
+        "tradeReady": bool(
+            chain_meta
+            and contract
+            and liquidity >= NEWS_TRADE_CONFIG["thresholds"]["minLiquidityUsd"]
+            and "疑似貔貅盘" not in risk_flags
+        ),
+        "venues": list(trade_urls),
+        "tradeUrls": trade_urls,
+        "sourceUrl": str(row.get("url") or ""),
+    }
+
+
+def news_trade_security_bool(value: Any) -> bool | None:
+    if value in (None, ""):
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y"}:
+        return True
+    if normalized in {"0", "false", "no", "n"}:
+        return False
+    return None
+
+
+def news_trade_security_percent(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    number = safe_float(value, -1)
+    if number < 0:
+        return None
+    # GoPlus returns token taxes as fractions while simulation providers return
+    # percentages. Normalize both to a user-facing percentage.
+    if 0 < number <= 1:
+        number *= 100
+    return round(min(100.0, number), 4)
+
+
+def news_trade_security_unknown(reason: str = "安全服务正在核验") -> dict[str, Any]:
+    return {
+        "verified": False,
+        "status": "pending",
+        "label": "安全待核验",
+        "score": None,
+        "provider": "GoPlus / Honeypot.is",
+        "checkedAt": 0,
+        "hardBlocked": False,
+        "hardBlockReasons": [],
+        "warnings": [reason] if reason else [],
+        "isHoneypot": None,
+        "canSell": None,
+        "openSource": None,
+        "isProxy": None,
+        "mintable": None,
+        "buyTaxPct": None,
+        "sellTaxPct": None,
+        "transferTaxPct": None,
+        "poolFeePct": None,
+        "top10HolderPercent": None,
+        "holderCount": None,
+        "liquidityLockedPercent": None,
+    }
+
+
+def news_trade_finalize_security(details: dict[str, Any]) -> dict[str, Any]:
+    verified = bool(details.get("verified"))
+    if not verified:
+        return {**news_trade_security_unknown(clean_feed_text(details.get("error"), 160) or "安全服务暂未返回结果"), **{
+            key: value for key, value in details.items() if key in {"provider", "checkedAt"} and value
+        }}
+    buy_tax = news_trade_security_percent(details.get("buyTaxPct"))
+    sell_tax = news_trade_security_percent(details.get("sellTaxPct"))
+    transfer_tax = news_trade_security_percent(details.get("transferTaxPct"))
+    pool_fee = news_trade_security_percent(details.get("poolFeePct"))
+    top10 = news_trade_security_percent(details.get("top10HolderPercent"))
+    hard_reasons = list(dict.fromkeys(clean_feed_text(item, 120) for item in details.get("hardBlockReasons", []) if clean_feed_text(item, 120)))
+    warnings = list(dict.fromkeys(clean_feed_text(item, 120) for item in details.get("warnings", []) if clean_feed_text(item, 120)))
+    is_honeypot = details.get("isHoneypot") is True
+    can_sell = details.get("canSell")
+    open_source = details.get("openSource")
+    high_tax_limit = max(5.0, safe_float(env_value("NEWS_TRADE_HARD_BLOCK_TAX_PCT", "20"), 20))
+    if is_honeypot:
+        hard_reasons.append("蜜罐/貔貅盘模拟命中")
+    if can_sell is False:
+        hard_reasons.append("卖出模拟失败")
+    for label, value in (("买入税", buy_tax), ("卖出税", sell_tax), ("转账税", transfer_tax)):
+        if value is not None and value >= high_tax_limit:
+            hard_reasons.append(f"{label}{value:g}%过高")
+        elif value is not None and value >= 5:
+            warnings.append(f"{label}{value:g}%偏高")
+    if details.get("blacklistRisk") is True:
+        hard_reasons.append("合约可设置交易黑名单")
+    if details.get("transferPausable") is True:
+        hard_reasons.append("合约可暂停转账")
+    if details.get("ownerChangeBalance") is True:
+        hard_reasons.append("所有者可修改持币余额")
+    if details.get("selfDestruct") is True:
+        hard_reasons.append("合约包含自毁能力")
+    if top10 is not None and top10 >= 90:
+        hard_reasons.append(f"前10持仓占比{top10:g}%极高")
+    elif top10 is not None and top10 >= 70:
+        warnings.append(f"前10持仓占比{top10:g}%偏高")
+    if open_source is False:
+        warnings.append("合约未开源或调用链未完全开源")
+    if details.get("mintable") is True:
+        warnings.append("合约仍可增发")
+    if details.get("hiddenOwner") is True or details.get("canTakeBackOwnership") is True:
+        warnings.append("所有权控制风险")
+    if details.get("slippageModifiable") is True:
+        warnings.append("合约可修改交易税/滑点")
+    if details.get("tradingCooldown") is True:
+        warnings.append("存在交易冷却限制")
+    if details.get("isProxy") is True:
+        warnings.append("代理合约逻辑可升级")
+    hard_reasons = list(dict.fromkeys(hard_reasons))
+    warnings = list(dict.fromkeys(warnings))
+    score = 100.0
+    if hard_reasons:
+        score = min(score, 20.0)
+    if open_source is False:
+        score -= 24
+    if details.get("mintable") is True:
+        score -= 10
+    if details.get("hiddenOwner") is True or details.get("canTakeBackOwnership") is True:
+        score -= 16
+    if details.get("slippageModifiable") is True:
+        score -= 12
+    if details.get("isProxy") is True:
+        score -= 7
+    if top10 is not None and top10 > 50:
+        score -= min(25.0, (top10 - 50) * 0.55)
+    score -= min(25.0, max(0.0, buy_tax or 0) + max(0.0, sell_tax or 0))
+    score = round(max(0.0, min(100.0, score)))
+    status = "danger" if hard_reasons else ("warning" if warnings or score < 75 else "safe")
+    label = "禁止买入" if hard_reasons else ("风险提醒" if status == "warning" else "安全已核验")
+    return {
+        **news_trade_security_unknown(""),
+        **details,
+        "verified": True,
+        "status": status,
+        "label": label,
+        "score": score,
+        "checkedAt": int(safe_float(details.get("checkedAt"), 0) or time.time() * 1000),
+        "hardBlocked": bool(hard_reasons),
+        "hardBlockReasons": hard_reasons,
+        "warnings": warnings,
+        "buyTaxPct": buy_tax,
+        "sellTaxPct": sell_tax,
+        "transferTaxPct": transfer_tax,
+        "poolFeePct": pool_fee,
+        "top10HolderPercent": top10,
+    }
+
+
+def news_trade_goplus_security(candidate: dict[str, Any]) -> dict[str, Any]:
+    contract = clean_feed_text(candidate.get("contractAddress"), 96)
+    chain_id = clean_feed_text(candidate.get("chainId"), 24)
+    chain = clean_feed_text(candidate.get("chain"), 24).lower()
+    if not contract or not chain_id:
+        return news_trade_security_unknown("缺少链或合约地址")
+    url = (
+        "https://api.gopluslabs.io/api/v1/solana/token_security"
+        if chain == "sol" or chain_id == "501"
+        else f"https://api.gopluslabs.io/api/v1/token_security/{quote(chain_id, safe='')}"
+    )
+    try:
+        response = requests.get(
+            url,
+            params={"contract_addresses": contract},
+            headers={**HEADERS, "Accept": "application/json"},
+            timeout=5,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        result = payload.get("result") if isinstance(payload, dict) else {}
+        data = {}
+        if isinstance(result, dict):
+            data = result.get(contract) or result.get(contract.lower()) or result.get(contract.upper()) or {}
+            if not data and len(result) == 1:
+                data = next(iter(result.values()))
+        if not isinstance(data, dict) or not data:
+            return news_trade_security_unknown("GoPlus 暂无该合约结果")
+        holders = data.get("holders") if isinstance(data.get("holders"), list) else []
+        top10 = sum(safe_float(item.get("percent"), 0) for item in holders[:10] if isinstance(item, dict))
+        lp_holders = data.get("lp_holders") if isinstance(data.get("lp_holders"), list) else []
+        locked_lp = sum(
+            safe_float(item.get("percent"), 0)
+            for item in lp_holders
+            if isinstance(item, dict) and news_trade_security_bool(item.get("is_locked")) is True
+        )
+        cannot_sell_all = news_trade_security_bool(data.get("cannot_sell_all"))
+        return news_trade_finalize_security({
+            "verified": True,
+            "provider": "GoPlus",
+            "checkedAt": int(time.time() * 1000),
+            "isHoneypot": news_trade_security_bool(data.get("is_honeypot")),
+            "canSell": False if cannot_sell_all is True else (True if cannot_sell_all is False else None),
+            "openSource": news_trade_security_bool(data.get("is_open_source")),
+            "isProxy": news_trade_security_bool(data.get("is_proxy")),
+            "mintable": news_trade_security_bool(data.get("is_mintable")),
+            "buyTaxPct": data.get("buy_tax"),
+            "sellTaxPct": data.get("sell_tax"),
+            "transferTaxPct": data.get("transfer_tax"),
+            "poolFeePct": data.get("pool_fee"),
+            "top10HolderPercent": top10 * 100 if 0 < top10 <= 1 else top10 or None,
+            "holderCount": int(safe_float(data.get("holder_count"), 0)) or None,
+            "liquidityLockedPercent": locked_lp * 100 if 0 < locked_lp <= 1 else locked_lp or None,
+            "blacklistRisk": news_trade_security_bool(data.get("is_blacklisted")),
+            "transferPausable": news_trade_security_bool(data.get("transfer_pausable")),
+            "ownerChangeBalance": news_trade_security_bool(data.get("owner_change_balance")),
+            "selfDestruct": news_trade_security_bool(data.get("selfdestruct")),
+            "hiddenOwner": news_trade_security_bool(data.get("hidden_owner")),
+            "canTakeBackOwnership": news_trade_security_bool(data.get("can_take_back_ownership")),
+            "slippageModifiable": news_trade_security_bool(data.get("slippage_modifiable")),
+            "tradingCooldown": news_trade_security_bool(data.get("trading_cooldown")),
+        })
+    except Exception as exc:
+        return news_trade_security_unknown(f"GoPlus 核验失败：{safe_error_text(str(exc))}")
+
+
+def news_trade_honeypot_security(candidate: dict[str, Any]) -> dict[str, Any]:
+    contract = clean_feed_text(candidate.get("contractAddress"), 96)
+    chain_id = int(safe_float(candidate.get("chainId"), 0))
+    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", contract) or chain_id not in {1, 56, 8453}:
+        return news_trade_security_unknown("Honeypot.is 暂不支持该链")
+    try:
+        response = requests.get(
+            "https://api.honeypot.is/v2/IsHoneypot",
+            params={"address": contract, "chainID": chain_id},
+            headers={**HEADERS, "Accept": "application/json"},
+            timeout=6,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        simulation = payload.get("simulationResult") if isinstance(payload.get("simulationResult"), dict) else {}
+        honeypot = payload.get("honeypotResult") if isinstance(payload.get("honeypotResult"), dict) else {}
+        contract_code = payload.get("contractCode") if isinstance(payload.get("contractCode"), dict) else {}
+        token = payload.get("token") if isinstance(payload.get("token"), dict) else {}
+        flags = [clean_feed_text(item, 80) for item in payload.get("flags", []) if clean_feed_text(item, 80)]
+        simulation_success = payload.get("simulationSuccess") is True
+        is_honeypot = honeypot.get("isHoneypot") if "isHoneypot" in honeypot else None
+        warnings = [f"Honeypot 标记：{item}" for item in flags[:5]]
+        hard = []
+        if any(flag in {"TRANSFER_BLOCKED", "EXTREMELY_HIGH_TAXES"} for flag in flags):
+            hard.append("交易模拟命中高危标记")
+        return news_trade_finalize_security({
+            "verified": bool(simulation_success or is_honeypot is not None),
+            "provider": "Honeypot.is",
+            "checkedAt": int(time.time() * 1000),
+            "isHoneypot": is_honeypot,
+            "canSell": True if simulation_success and is_honeypot is False else (False if is_honeypot is True else None),
+            "openSource": contract_code.get("openSource") if "openSource" in contract_code else None,
+            "isProxy": contract_code.get("isProxy") if "isProxy" in contract_code else None,
+            "buyTaxPct": simulation.get("buyTax"),
+            "sellTaxPct": simulation.get("sellTax"),
+            "transferTaxPct": simulation.get("transferTax"),
+            "holderCount": int(safe_float(token.get("totalHolders"), 0)) or None,
+            "warnings": warnings,
+            "hardBlockReasons": hard,
+        })
+    except Exception as exc:
+        return news_trade_security_unknown(f"Honeypot.is 核验失败：{safe_error_text(str(exc))}")
+
+
+def news_trade_merge_security(results: list[dict[str, Any]]) -> dict[str, Any]:
+    verified = [item for item in results if isinstance(item, dict) and item.get("verified")]
+    if not verified:
+        reasons = [
+            clean_feed_text(warning, 140)
+            for item in results if isinstance(item, dict)
+            for warning in item.get("warnings", [])[:1]
+            if clean_feed_text(warning, 140)
+        ]
+        return news_trade_security_unknown("；".join(reasons[:2]) or "安全服务暂未返回结果")
+    providers = list(dict.fromkeys(clean_feed_text(item.get("provider"), 40) for item in verified if clean_feed_text(item.get("provider"), 40)))
+    hard = list(dict.fromkeys(reason for item in verified for reason in item.get("hardBlockReasons", [])))
+    warnings = list(dict.fromkeys(warning for item in verified for warning in item.get("warnings", [])))
+    scores = [safe_float(item.get("score"), 0) for item in verified if item.get("score") is not None]
+    def strongest(field: str) -> Any:
+        values = [item.get(field) for item in verified if item.get(field) is not None]
+        if not values:
+            return None
+        if any(value is True for value in values):
+            return True
+        if all(value is False for value in values):
+            return False
+        return values[0]
+    merged = {
+        **verified[0],
+        "provider": " + ".join(providers),
+        "score": round(min(scores)) if scores else None,
+        "hardBlockReasons": hard,
+        "warnings": warnings,
+        "isHoneypot": strongest("isHoneypot"),
+        "canSell": False if any(item.get("canSell") is False for item in verified) else strongest("canSell"),
+        "openSource": False if any(item.get("openSource") is False for item in verified) else strongest("openSource"),
+        "isProxy": strongest("isProxy"),
+        "buyTaxPct": max((safe_float(item.get("buyTaxPct"), 0) for item in verified if item.get("buyTaxPct") is not None), default=None),
+        "sellTaxPct": max((safe_float(item.get("sellTaxPct"), 0) for item in verified if item.get("sellTaxPct") is not None), default=None),
+        "transferTaxPct": max((safe_float(item.get("transferTaxPct"), 0) for item in verified if item.get("transferTaxPct") is not None), default=None),
+        "checkedAt": max(int(safe_float(item.get("checkedAt"), 0)) for item in verified),
+    }
+    if hard:
+        merged.update({"status": "danger", "label": "禁止买入", "hardBlocked": True, "score": min(20, int(safe_float(merged.get("score"), 0)))})
+    return merged
+
+
+def news_trade_security_cache_key(candidate: dict[str, Any]) -> str:
+    return js_stable_key(candidate.get("chainId") or candidate.get("chain"), str(candidate.get("contractAddress") or "").casefold())
+
+
+def news_trade_fetch_security(candidate: dict[str, Any]) -> dict[str, Any]:
+    goplus = news_trade_goplus_security(candidate)
+    results = [goplus]
+    if int(safe_float(candidate.get("chainId"), 0)) in {1, 56, 8453}:
+        results.append(news_trade_honeypot_security(candidate))
+    return news_trade_merge_security(results)
+
+
+def news_trade_security_snapshot(candidate: dict[str, Any], *, synchronous: bool = False) -> dict[str, Any]:
+    key = news_trade_security_cache_key(candidate)
+    if not clean_feed_text(candidate.get("contractAddress"), 96) or not key:
+        return news_trade_security_unknown("缺少可核验的合约地址")
+    now = time.time()
+    with NEWS_TRADE_SECURITY_CACHE_LOCK:
+        cached = NEWS_TRADE_SECURITY_CACHE.get(key)
+        if cached:
+            ttl = NEWS_TRADE_SECURITY_CACHE_TTL_SECONDS if cached[1].get("verified") else NEWS_TRADE_SECURITY_NEGATIVE_TTL_SECONDS
+            if now - cached[0] < ttl:
+                return dict(cached[1])
+        if not synchronous:
+            if key not in NEWS_TRADE_SECURITY_INFLIGHT:
+                NEWS_TRADE_SECURITY_INFLIGHT.add(key)
+                def worker() -> None:
+                    try:
+                        result = news_trade_fetch_security(dict(candidate))
+                        with NEWS_TRADE_SECURITY_CACHE_LOCK:
+                            NEWS_TRADE_SECURITY_CACHE[key] = (time.time(), result)
+                    finally:
+                        with NEWS_TRADE_SECURITY_CACHE_LOCK:
+                            NEWS_TRADE_SECURITY_INFLIGHT.discard(key)
+                NEWS_TRADE_SECURITY_POOL.submit(worker)
+            return news_trade_security_unknown()
+    result = news_trade_fetch_security(dict(candidate))
+    with NEWS_TRADE_SECURITY_CACHE_LOCK:
+        NEWS_TRADE_SECURITY_CACHE[key] = (time.time(), result)
+    return dict(result)
+
+
+def news_trade_attach_security(topics: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for topic in topics:
+        candidates = topic.get("memeCandidates") if isinstance(topic.get("memeCandidates"), list) else []
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            security = news_trade_security_snapshot(candidate)
+            candidate["security"] = security
+            candidate["securityScore"] = security.get("score")
+            candidate["securityStatus"] = security.get("status")
+            candidate["securityLabel"] = security.get("label")
+            candidate["securityBuyAllowed"] = bool(security.get("verified") and not security.get("hardBlocked"))
+            if security.get("hardBlocked"):
+                candidate["tradeReady"] = False
+                candidate["riskFlags"] = list(dict.fromkeys([
+                    *(candidate.get("riskFlags") or []),
+                    *security.get("hardBlockReasons", []),
+                ]))
+        primary = candidates[0] if candidates else None
+        if isinstance(primary, dict):
+            topic["memeOpportunity"] = primary
+            topic["securityStatus"] = primary.get("securityStatus")
+            topic["securityScore"] = primary.get("securityScore")
+    return topics
+
+
+def event_monitor_term_matches(term: str, text: str) -> bool:
+    value = clean_feed_text(term, 80).strip()
+    if len(value) < 2:
+        return False
+    if re.search(r"[\u3400-\u9fff]", value):
+        return value.casefold() in text.casefold()
+    return bool(
+        re.search(
+            rf"(?<![A-Za-z0-9]){re.escape(value)}(?=(?:USDT|USDC|USD)?(?![A-Za-z0-9]))",
+            text,
+            flags=re.I,
+        )
+    )
+
+
+def event_monitor_candidate_relevance(
+    candidate: dict[str, Any],
+    combined: str,
+    entities: list[str],
+    listing_assets: list[str],
+) -> float:
+    contract = str(candidate.get("contractAddress") or "")
+    symbol = clean_feed_text(candidate.get("symbol"), 40)
+    name = clean_feed_text(candidate.get("name"), 80)
+    if contract and contract.casefold() in combined.casefold():
+        return 100.0
+    normalized_listing = {clean_price_watch_symbol(asset) for asset in listing_assets}
+    if clean_price_watch_symbol(symbol) in normalized_listing:
+        return 100.0
+    for entity in entities:
+        if entity.casefold() in {symbol.casefold(), name.casefold()} or event_monitor_term_matches(entity, f"{symbol} {name}"):
+            return 98.0
+    if event_monitor_term_matches(symbol, combined):
+        return 94.0
+    if name and event_monitor_term_matches(name.split()[0], combined):
+        return 90.0
+    shared = [entity for entity in entities if event_monitor_term_matches(entity, f"{symbol} {name}")]
+    return min(88.0, 60.0 + len(shared) * 10.0) if shared else 0.0
+
+
+def event_monitor_merge_candidate(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(current)
+    for key in ("name", "symbol", "priceUsd", "sourceUrl", "associationStatus", "associationLabel"):
+        if incoming.get(key) not in (None, "") and merged.get(key) in (None, ""):
+            merged[key] = incoming.get(key)
+    for key in (
+        "marketCapUsd", "volume24hUsd", "liquidityUsd", "transactions24h", "holderCount", "heatScore",
+        "holderGrowth24hPercent", "volumeGrowth1hPercent", "buySellRatio",
+        "candidateScore", "narrativeRelevance", "onchainTradeScore", "combinedWeight",
+    ):
+        if safe_float(incoming.get(key), 0) > safe_float(merged.get(key), 0):
+            merged[key] = incoming.get(key)
+    current_association = current.get("association") if isinstance(current.get("association"), dict) else {}
+    incoming_association = incoming.get("association") if isinstance(incoming.get("association"), dict) else {}
+    if safe_float(incoming_association.get("confidence"), 0) >= safe_float(current_association.get("confidence"), 0):
+        for key in ("association", "associationStatus", "associationLabel", "onchainScoreBreakdown"):
+            if incoming.get(key) not in (None, ""):
+                merged[key] = incoming.get(key)
+    for key in ("directMatch",):
+        merged[key] = bool(current.get(key) or incoming.get(key))
+    for key in ("scoreBreakdown",):
+        if not isinstance(merged.get(key), dict) and isinstance(incoming.get(key), dict):
+            merged[key] = dict(incoming[key])
+    if merged.get("top10HolderPercent") in (None, "") and incoming.get("top10HolderPercent") not in (None, ""):
+        merged["top10HolderPercent"] = incoming.get("top10HolderPercent")
+    if not merged.get("contractAddress") and incoming.get("contractAddress"):
+        merged["contractAddress"] = incoming["contractAddress"]
+    if not merged.get("chain") and incoming.get("chain"):
+        for key in ("chain", "chainId", "chainLabel"):
+            merged[key] = incoming.get(key)
+    merged["riskFlags"] = list(dict.fromkeys([*(current.get("riskFlags") or []), *(incoming.get("riskFlags") or [])]))
+    trade_urls = {**(current.get("tradeUrls") or {}), **(incoming.get("tradeUrls") or {})}
+    merged["tradeUrls"] = trade_urls
+    merged["venues"] = list(trade_urls)
+    merged["tradeReady"] = bool(
+        merged.get("chain")
+        and merged.get("contractAddress")
+        and safe_float(merged.get("liquidityUsd"), 0) >= NEWS_TRADE_CONFIG["thresholds"]["minLiquidityUsd"]
+        and "疑似貔貅盘" not in merged["riskFlags"]
+    )
+    return merged
+
+
+def event_monitor_rank_meme_candidates(
+    row: dict[str, Any],
+    title: str,
+    body: str,
+    *,
+    source_rows: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    combined = clean_feed_text(f"{title} {body} {row.get('url') or ''}", 2400)
+    direct_contract = event_monitor_contract_from_url(row.get("url"))
+    if not direct_contract:
+        direct_match = re.search(r"0x[0-9a-fA-F]{40}", combined)
+        direct_contract = direct_match.group(0).lower() if direct_match else ""
+    entities = event_monitor_hot_entities(title, body)
+    listing_assets = event_monitor_assets(row.get("symbol"), title, body)
+    candidates: list[dict[str, Any]] = []
+    for market_row in source_rows if isinstance(source_rows, list) else event_monitor_onchain_source_rows():
+        candidate = event_monitor_onchain_candidate(market_row)
+        if not candidate:
+            continue
+        relevance = event_monitor_candidate_relevance(candidate, combined, entities, listing_assets)
+        if relevance < 55:
+            continue
+        liquidity_score = event_monitor_metric_score(safe_float(candidate.get("liquidityUsd"), 0), floor=50_000, ceiling=10_000_000)
+        volume_score = event_monitor_metric_score(safe_float(candidate.get("volume24hUsd"), 0), floor=100_000, ceiling=100_000_000)
+        transaction_score = event_monitor_metric_score(safe_float(candidate.get("transactions24h"), 0), floor=500, ceiling=100_000)
+        holder_score = event_monitor_metric_score(safe_float(candidate.get("holderCount"), 0), floor=500, ceiling=100_000)
+        heat_score = safe_float(candidate.get("heatScore"), 0)
+        direct_contract_match = bool(
+            direct_contract
+            and str(candidate.get("contractAddress") or "").casefold() == direct_contract.casefold()
+        )
+        candidate_score = (
+            relevance * 0.35
+            + heat_score * 0.25
+            + liquidity_score * 0.20
+            + volume_score * 0.12
+            + transaction_score * 0.05
+            + holder_score * 0.03
+            + (12.0 if direct_contract_match else 0.0)
+        )
+        relation = event_monitor_asset_relation(row, candidate, combined, entities)
+        onchain_trade = event_monitor_onchain_trade_score(candidate, relation)
+        candidate.update(
+            {
+                "narrativeRelevance": round(relevance, 2),
+                "candidateScore": round(min(100.0, candidate_score), 2),
+                "directMatch": direct_contract_match,
+                "association": relation,
+                "associationStatus": relation["code"],
+                "associationLabel": relation["label"],
+                "onchainTradeScore": onchain_trade["score"],
+                "onchainScoreBreakdown": onchain_trade,
+                "scoreBreakdown": {
+                    "relevance": round(relevance, 2),
+                    "heat": round(heat_score, 2),
+                    "liquidity": round(liquidity_score, 2),
+                    "volume": round(volume_score, 2),
+                    "transactions": round(transaction_score, 2),
+                    "holders": round(holder_score, 2),
+                },
+            }
+        )
+        candidates.append(candidate)
+
+    by_identity: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        identity = str(candidate.get("contractAddress") or "").casefold() or js_stable_key(
+            candidate.get("chain"), candidate.get("symbol")
+        )
+        existing = by_identity.get(identity)
+        if existing:
+            merged = event_monitor_merge_candidate(existing, candidate)
+            merged["candidateScore"] = max(safe_float(existing.get("candidateScore"), 0), safe_float(candidate.get("candidateScore"), 0))
+            merged["narrativeRelevance"] = max(safe_float(existing.get("narrativeRelevance"), 0), safe_float(candidate.get("narrativeRelevance"), 0))
+            if safe_float(candidate.get("onchainTradeScore"), 0) >= safe_float(existing.get("onchainTradeScore"), 0):
+                for key in ("onchainTradeScore", "onchainScoreBreakdown", "association", "associationStatus", "associationLabel"):
+                    merged[key] = candidate.get(key)
+            by_identity[identity] = merged
+        else:
+            by_identity[identity] = candidate
+    ranked = sorted(
+        by_identity.values(),
+        key=lambda item: (
+            1 if item.get("directMatch") else 0,
+            safe_float(item.get("onchainTradeScore"), 0),
+            safe_float(item.get("candidateScore"), 0),
+            safe_float(item.get("liquidityUsd"), 0),
+            safe_float(item.get("volume24hUsd"), 0),
+        ),
+        reverse=True,
+    )
+    selected: list[dict[str, Any]] = []
+    if ranked:
+        selected.append(ranked[0])
+        primary_chain = clean_feed_text(ranked[0].get("chain"), 40).casefold()
+        primary_symbol = event_monitor_normalized_entity(ranked[0].get("symbol"))
+        semantic_backup = next(
+            (
+                candidate
+                for candidate in ranked[1:]
+                if clean_feed_text(candidate.get("chain"), 40).casefold() == primary_chain
+                and event_monitor_normalized_entity(candidate.get("symbol"))
+                and event_monitor_normalized_entity(candidate.get("symbol")) != primary_symbol
+            ),
+            None,
+        )
+        if semantic_backup:
+            selected.append(semantic_backup)
+        for candidate in ranked[1:]:
+            if candidate in selected:
+                continue
+            selected.append(candidate)
+            if len(selected) >= 3:
+                break
+    for index, candidate in enumerate(selected, start=1):
+        candidate["rank"] = index
+        candidate["role"] = "primary" if index == 1 else "backup"
+    return selected
+
+
+def event_monitor_onchain_source_rows() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    paths = (
+        PERSIST_CACHE_DIR / "okx_dex_source.json",
+        PERSIST_CACHE_DIR / "source-cache" / "market-hot_okx-dex.json",
+        PERSIST_CACHE_DIR / "source-cache" / "gainers-rankings_okx-dex-gainers.json",
+    )
+    for path in paths:
+        payload = read_json_cache(path)
+        source_rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+        for row in source_rows:
+            if not isinstance(row, dict):
+                continue
+            identity = js_stable_key(row.get("chain"), row.get("symbol"), row.get("url"))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            rows.append(row)
+    return rows
+
+
+def market_priority_update_history(
+    state: dict[str, Any],
+    payload: dict[str, Any],
+    now: float,
+) -> list[dict[str, Any]]:
+    """Keep a bounded five-minute rank history for the smart hot-list view."""
+    cutoff_ms = int((now - MARKET_PRIORITY_HISTORY_SECONDS) * 1000)
+    history = [
+        dict(item)
+        for item in (state.get("marketPriorityHistory") or [])
+        if isinstance(item, dict) and int(safe_float(item.get("observedAt"), 0)) >= cutoff_ms
+    ]
+    snapshot = {
+        "observedAt": int(now * 1000),
+        "rows": rank_monitor_market_rows(payload),
+    }
+    if history and snapshot["observedAt"] - int(safe_float(history[-1].get("observedAt"), 0)) < MARKET_PRIORITY_SNAPSHOT_INTERVAL_SECONDS * 1000:
+        history[-1] = snapshot
+    else:
+        history.append(snapshot)
+    return history[-310:]
+
+
+def market_priority_record_snapshot(sources: list[dict[str, Any]], *, now_ms: int) -> None:
+    """Persist a successful market refresh immediately, not after the alert loop."""
+    with RANK_MONITOR_LOCK:
+        state = read_json_cache(RANK_MONITOR_STATE_PATH)
+        state["marketPriorityHistory"] = market_priority_update_history(
+            state,
+            {"sources": sources},
+            now_ms / 1000,
+        )
+        write_json_cache(RANK_MONITOR_STATE_PATH, state)
+
+
+def market_priority_external_boosts(
+    now_ms: int,
+    *,
+    window_seconds: int | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Reuse recent personal-X and News Trade context as narrative evidence."""
+    boosts: dict[str, dict[str, Any]] = {}
+    evidence_window_seconds = max(
+        60 * 60,
+        min(
+            PERSONAL_X_MONITOR_RETENTION_SECONDS,
+            int(window_seconds or 24 * 60 * 60),
+        ),
+    )
+
+    def add(symbol: Any, field: str, score: float, reason: str) -> None:
+        normalized = clean_price_watch_symbol(symbol)
+        if not normalized:
+            return
+        key = f"CRYPTO:{normalized}"
+        item = boosts.setdefault(key, {"personalX": 0.0, "newsTrade": 0.0, "reasons": []})
+        item[field] = max(safe_float(item.get(field), 0), max(0.0, score))
+        if reason and reason not in item["reasons"]:
+            item["reasons"].append(reason)
+
+    try:
+        cutoff_ms = now_ms - evidence_window_seconds * 1000
+        with auth_db() as conn:
+            rows = conn.execute(
+                "SELECT symbol, personal_x_mentioned_at FROM price_watch_assets WHERE personal_x_mentioned_at >= ?",
+                (cutoff_ms,),
+            ).fetchall()
+        for row in rows:
+            add(row["symbol"], "personalX", 8.0, "个人 X 近期提及")
+    except Exception:
+        pass
+
+    try:
+        topic_payload = read_json_cache(PERSIST_CACHE_DIR / "news_trade_topic_pool.json")
+        topics = topic_payload.get("topics") if isinstance(topic_payload.get("topics"), list) else []
+        for topic in topics:
+            if not isinstance(topic, dict) or str(topic.get("newsTradePhase") or "") in {"climax", "decline"}:
+                continue
+            last_seen_at = int(safe_float(topic.get("lastSeenAt") or topic.get("updatedAt"), 0))
+            if last_seen_at and now_ms - last_seen_at > evidence_window_seconds * 1000:
+                continue
+            topic_score = safe_float(topic.get("topicScore") or topic.get("eventHeatScore") or topic.get("score"), 0)
+            bonus = min(16.0, max(4.0, topic_score / 6.0))
+            candidates = topic.get("memeCandidates") if isinstance(topic.get("memeCandidates"), list) else []
+            for candidate in candidates:
+                if isinstance(candidate, dict):
+                    add(candidate.get("symbol") or candidate.get("name"), "newsTrade", bonus, "News Trade 主题映射")
+    except Exception:
+        pass
+    return boosts
+
+
+def market_priority_narrative_profile(
+    asset: dict[str, Any],
+    boost: dict[str, Any],
+) -> dict[str, Any]:
+    source_rows = asset.get("sourceRows") if isinstance(asset.get("sourceRows"), list) else []
+    text = " ".join(
+        str(value or "")
+        for entry in source_rows
+        for value in (
+            entry.get("symbol"), entry.get("name"), entry.get("note"),
+            " ".join(entry.get("tags") or []), entry.get("sourceTitle"),
+        )
+    )
+    patterns = [
+        (r"\bAI\b|agent|人工智能|算力|机器人", "AI / Agent", 7),
+        (r"meme|表情包|玩梗|社区|文化|名人|动物|猫|狗|鸭|蛙|女友|妈妈|景甜|离谱|争议", "Meme / 文化事件", 8),
+        (r"rwa|代币化|美债|收益|预言机", "RWA / 链上收益", 7),
+        (r"dex|perp|交易平台|链上交易所|链上收入|生态扩张", "链上生态 / 交易平台", 6),
+        (r"隐私|privacy|btc|bitcoin|比特币|黄金|避险", "稀缺资产 / 宏观", 6),
+        (r"上新|上线|listing|alpha|airdrop|空投|etf|主网|升级|发布", "新催化 / 重新定价", 8),
+        (r"打卡|二创|刷屏|破圈|围观|必须看看|逆袭|封禁|下架", "参与式传播", 7),
+    ]
+    labels: list[str] = []
+    pattern_score = 0.0
+    for matcher, label, score in patterns:
+        if re.search(matcher, text, re.I):
+            labels.append(label)
+            pattern_score += score
+    source_count = len(set(asset.get("sourceIds") or []))
+    consensus_score = min(7.0, max(0, source_count - 1) * 3.5)
+    personal_x_score = min(8.0, safe_float(boost.get("personalX"), 0))
+    news_trade_score = min(16.0, safe_float(boost.get("newsTrade"), 0))
+    score = min(35.0, 4.0 + min(14.0, pattern_score) + consensus_score + personal_x_score + news_trade_score)
+    level = "强叙事" if score >= 27 else "中强叙事" if score >= 20 else "中等叙事" if score >= 13 else "弱叙事"
+    if not labels:
+        labels = ["叙事待验证"]
+    return {
+        "score": round(score, 1),
+        "level": level,
+        "label": labels[0],
+        "labels": labels[:3],
+    }
+
+
+def market_priority_trade_score(asset: dict[str, Any]) -> float:
+    amount = max((safe_float(row.get("amount"), 0) for row in asset.get("sourceRows") or []), default=0.0)
+    score = 2.0 if amount <= 0 else min(10.0, max(2.0, 2.0 + max(0.0, math.log10(amount) - 4.0) * 1.8))
+    liquidities = [safe_float(row.get("liquidity"), 0) for row in asset.get("sourceRows") or []]
+    known_liquidity = max(liquidities, default=0.0)
+    if 0 < known_liquidity < 100_000:
+        score = min(score, 3.0)
+    return round(score, 1)
+
+
+def market_priority_current_assets(sources: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    assets: dict[str, dict[str, Any]] = {}
+    for source in sources:
+        if not isinstance(source, dict) or source.get("status") == "unavailable":
+            continue
+        for index, row in enumerate(source.get("rows") if isinstance(source.get("rows"), list) else []):
+            if not isinstance(row, dict):
+                continue
+            asset_key = rank_monitor_asset_key(source, row)
+            if not asset_key:
+                continue
+            source_id = str(source.get("id") or source.get("sourceLabel") or source.get("title") or "")
+            entry = {
+                **row,
+                "sourceId": source_id,
+                "sourceTitle": source.get("title") or source_id,
+                "sourceLabel": source.get("sourceLabel") or "",
+                "sourceGroup": source.get("group") or "",
+                "sourceAccent": source.get("accent") or "",
+                "observedRank": rank_monitor_rank(row, index + 1),
+                "amount": rank_monitor_amount(row),
+                "heat": safe_float(row.get("heat"), 0),
+                "changeNumber": rank_monitor_change(row),
+            }
+            asset = assets.setdefault(asset_key, {"assetKey": asset_key, "sourceRows": [], "sourceIds": []})
+            asset["sourceRows"].append(entry)
+            if source_id and source_id not in asset["sourceIds"]:
+                asset["sourceIds"].append(source_id)
+    return assets
+
+
+def market_narrative_decorate_source(
+    source: dict[str, Any],
+    *,
+    period: str = "24h",
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    """Attach narrative fields so period-specific boards can sort without stale global rows."""
+    current_ms = int(now_ms or time.time() * 1000)
+    window_seconds = MARKET_PRIORITY_WINDOWS.get(str(period or "24h"), MARKET_PRIORITY_WINDOWS["24h"])
+    assets = market_priority_current_assets([source])
+    boosts = market_priority_external_boosts(current_ms, window_seconds=window_seconds)
+    profiles = {
+        asset_key: market_priority_narrative_profile(asset, boosts.get(asset_key, {}))
+        for asset_key, asset in assets.items()
+    }
+    rows: list[dict[str, Any]] = []
+    for raw in source.get("rows") if isinstance(source.get("rows"), list) else []:
+        if not isinstance(raw, dict):
+            continue
+        asset_key = rank_monitor_asset_key(source, raw)
+        narrative = profiles.get(asset_key)
+        rows.append({
+            **raw,
+            **({
+                "narrativeScore": narrative["score"],
+                "narrativeLevel": narrative["level"],
+                "narrativeLabel": narrative["label"],
+                "narrativeLabels": narrative["labels"],
+            } if narrative else {}),
+        })
+    return {**source, "rows": rows}
+
+
+def market_priority_window_rows(
+    assets: dict[str, dict[str, Any]],
+    history: list[dict[str, Any]],
+    period: str,
+    now_ms: int,
+    boosts: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    window_seconds = MARKET_PRIORITY_WINDOWS[period]
+    cutoff_ms = now_ms - window_seconds * 1000
+    snapshots = [
+        item for item in history
+        if isinstance(item, dict) and int(safe_float(item.get("observedAt"), 0)) >= cutoff_ms
+    ]
+    history_by_asset: dict[str, dict[str, Any]] = {}
+    for snapshot in snapshots:
+        seen_in_snapshot: set[str] = set()
+        for row in snapshot.get("rows") if isinstance(snapshot.get("rows"), list) else []:
+            if not isinstance(row, dict) or not row.get("assetKey"):
+                continue
+            asset_key = str(row["assetKey"])
+            item = history_by_asset.setdefault(asset_key, {"firstBySource": {}, "occurrences": 0, "firstSeenAt": 0})
+            source_id = str(row.get("sourceId") or "")
+            if source_id and source_id not in item["firstBySource"]:
+                item["firstBySource"][source_id] = row
+            observed_at = int(safe_float(snapshot.get("observedAt"), 0))
+            if not item["firstSeenAt"] or observed_at < item["firstSeenAt"]:
+                item["firstSeenAt"] = observed_at
+            if asset_key not in seen_in_snapshot:
+                item["occurrences"] += 1
+                seen_in_snapshot.add(asset_key)
+
+    result: list[dict[str, Any]] = []
+    for asset_key, asset in assets.items():
+        source_rows = asset.get("sourceRows") or []
+        if not source_rows:
+            continue
+        best = max(
+            source_rows,
+            key=lambda row: (safe_float(row.get("heat"), 0), -rank_monitor_rank(row), safe_float(row.get("amount"), 0)),
+        )
+        best_rank = min(rank_monitor_rank(row) for row in source_rows)
+        current_heat = max(safe_float(row.get("heat"), 0) for row in source_rows)
+        history_item = history_by_asset.get(asset_key, {})
+        first_by_source = history_item.get("firstBySource") if isinstance(history_item.get("firstBySource"), dict) else {}
+        rank_changes = [
+            rank_monitor_rank(first_by_source[source_id]) - rank_monitor_rank(row)
+            for row in source_rows
+            for source_id in [str(row.get("sourceId") or "")]
+            if source_id and source_id in first_by_source
+        ]
+        rank_change = max(rank_changes, default=0)
+        baseline_heat = max((safe_float(row.get("heat"), 0) for row in first_by_source.values()), default=current_heat)
+        heat_change = current_heat - baseline_heat
+        new_in_window = bool(snapshots and not history_item)
+        source_count = len(set(asset.get("sourceIds") or []))
+        rank_score = max(0.0, 18.0 * (1.0 - (max(1, best_rank) - 1) / 19.0))
+        momentum_score = 8.0 if new_in_window else min(12.0, max(0.0, rank_change) * 2.0)
+        cross_score = min(12.0, 2.0 + max(0, source_count - 1) * 5.0)
+        heat_acceleration_score = min(8.0, current_heat / 100.0 * 5.0 + max(0.0, heat_change) / 20.0 * 3.0)
+        persistence_ratio = (
+            safe_float(history_item.get("occurrences"), 0) / len(snapshots)
+            if snapshots else 0.0
+        )
+        persistence_score = min(5.0, persistence_ratio * 5.0)
+        recent_heat_score = round(min(55.0, rank_score + momentum_score + cross_score + heat_acceleration_score + persistence_score), 1)
+        boost = boosts.get(asset_key, {})
+        narrative = market_priority_narrative_profile(asset, boost)
+        trade_score = market_priority_trade_score(asset)
+        # The user-facing ordering is deliberately pure narrative strength.
+        # Heat and tradability remain diagnostic fields, but never change order.
+        priority_score = safe_float(narrative.get("score"), 0)
+        tier = "S" if priority_score >= 30 else "A" if priority_score >= 24 else "B" if priority_score >= 17 else "C"
+        reasons: list[str] = list(narrative.get("labels") or [])
+        if source_count >= 2:
+            reasons.append(f"{source_count} 个榜单叙事共振")
+        reasons.extend(str(reason) for reason in boost.get("reasons") or [])
+        if not reasons:
+            reasons.append("叙事待验证")
+        original_source = {
+            "id": best.get("sourceId") or "",
+            "title": best.get("sourceTitle") or "",
+            "sourceLabel": best.get("sourceLabel") or "",
+            "group": best.get("sourceGroup") or "",
+            "accent": best.get("sourceAccent") or "",
+        }
+        result.append({
+            **{key: value for key, value in best.items() if key not in {"rank", "observedRank"}},
+            "group": best.get("sourceGroup") or "",
+            "originalRank": rank_monitor_rank(best),
+            "originalBoard": best.get("sourceTitle") or "",
+            "originalSource": original_source,
+            "sourceCount": source_count,
+            "sourceIds": list(asset.get("sourceIds") or []),
+            "sourceLabels": [
+                str(row.get("sourceLabel") or row.get("sourceTitle") or "")
+                for row in source_rows
+                if row.get("sourceLabel") or row.get("sourceTitle")
+            ],
+            "priorityScore": priority_score,
+            "recentHeatScore": recent_heat_score,
+            "narrativeScore": narrative["score"],
+            "narrativeLevel": narrative["level"],
+            "narrativeLabel": narrative["label"],
+            "narrativeLabels": narrative["labels"],
+            "tradeScore": trade_score,
+            "priorityTier": tier,
+            "rankChange": rank_change,
+            "heatChange": round(heat_change, 1),
+            "newInWindow": new_in_window,
+            "persistencePct": round(persistence_ratio * 100),
+            "priorityReasons": list(dict.fromkeys(reasons))[:4],
+            "period": period,
+        })
+    result.sort(key=lambda row: (
+        -safe_float(row.get("narrativeScore"), 0),
+        -safe_float(row.get("sourceCount"), 0),
+        rank_monitor_rank(row),
+        str(row.get("symbol") or row.get("name") or ""),
+    ))
+    for index, row in enumerate(result, 1):
+        row["rank"] = index
+    return {
+        "period": period,
+        "windowSeconds": window_seconds,
+        "historySamples": len(snapshots),
+        "historyStatus": "ready" if len(snapshots) >= 2 else "accumulating",
+        "rows": result[:60],
+    }
+
+
+def market_priority_payload(sources: list[dict[str, Any]], *, now_ms: int | None = None) -> dict[str, Any]:
+    current_ms = int(now_ms or time.time() * 1000)
+    with RANK_MONITOR_LOCK:
+        state = read_json_cache(RANK_MONITOR_STATE_PATH)
+        history = [dict(item) for item in (state.get("marketPriorityHistory") or []) if isinstance(item, dict)]
+    assets = market_priority_current_assets(sources)
+    periods = {
+        period: market_priority_window_rows(
+            assets,
+            history,
+            period,
+            current_ms,
+            market_priority_external_boosts(
+                current_ms,
+                window_seconds=MARKET_PRIORITY_WINDOWS[period],
+            ),
+        )
+        for period in MARKET_PRIORITY_WINDOWS
+    }
+    return {
+        "defaultPeriod": "24h",
+        "mode": "narrative-strength",
+        "formula": {"narrative": 35},
+        "sort": "narrativeScore-desc",
+        "periods": periods,
+        "updatedAt": current_ms,
+    }
+
+
+def news_trade_geckoterminal_rows_from_payload(
+    payload: dict[str, Any],
+    network: str,
+    *,
+    now_ms: int | None = None,
+) -> list[dict[str, Any]]:
+    """Normalize GeckoTerminal trend pools into the existing on-chain candidate schema."""
+    captured_at = int(now_ms or time.time() * 1000)
+    included = payload.get("included") if isinstance(payload.get("included"), list) else []
+    tokens = {
+        clean_feed_text(item.get("id"), 180): item.get("attributes")
+        for item in included
+        if isinstance(item, dict) and isinstance(item.get("attributes"), dict)
+    }
+    rows: list[dict[str, Any]] = []
+    data = payload.get("data") if isinstance(payload.get("data"), list) else []
+    for pool in data:
+        if not isinstance(pool, dict):
+            continue
+        attributes = pool.get("attributes") if isinstance(pool.get("attributes"), dict) else {}
+        relationships = pool.get("relationships") if isinstance(pool.get("relationships"), dict) else {}
+        base_relation = relationships.get("base_token") if isinstance(relationships.get("base_token"), dict) else {}
+        base_data = base_relation.get("data") if isinstance(base_relation.get("data"), dict) else {}
+        token = tokens.get(clean_feed_text(base_data.get("id"), 180), {})
+        if not isinstance(token, dict):
+            token = {}
+        contract = clean_feed_text(token.get("address"), 96)
+        symbol = clean_feed_text(token.get("symbol"), 40)
+        name = clean_feed_text(token.get("name") or symbol, 100)
+        if not contract or not symbol:
+            continue
+        volume_payload = attributes.get("volume_usd") if isinstance(attributes.get("volume_usd"), dict) else {}
+        price_changes = attributes.get("price_change_percentage") if isinstance(attributes.get("price_change_percentage"), dict) else {}
+        transaction_payload = attributes.get("transactions") if isinstance(attributes.get("transactions"), dict) else {}
+        h24_transactions = transaction_payload.get("h24") if isinstance(transaction_payload.get("h24"), dict) else {}
+        liquidity = safe_float(attributes.get("reserve_in_usd"), 0)
+        volume_24h = safe_float(volume_payload.get("h24"), 0)
+        volume_1h = safe_float(volume_payload.get("h1"), 0)
+        transactions = safe_float(h24_transactions.get("buys"), 0) + safe_float(h24_transactions.get("sells"), 0)
+        volume_acceleration = max(0.0, min(500.0, ((volume_1h * 24 / volume_24h) - 1) * 100)) if volume_24h > 0 else 0.0
+        pair_created_at = 0
+        try:
+            created = str(attributes.get("pool_created_at") or "").replace("Z", "+00:00")
+            pair_created_at = int(datetime.fromisoformat(created).timestamp() * 1000) if created else 0
+        except (TypeError, ValueError, OverflowError):
+            pair_created_at = 0
+        chain_meta = event_monitor_chain_meta(network)
+        normalized_chain = chain_meta.get("chain") or clean_feed_text(network, 40).casefold()
+        pool_address = clean_feed_text(attributes.get("address"), 96)
+        pool_url = (
+            f"https://www.geckoterminal.com/{quote(clean_feed_text(network, 40), safe='')}/pools/"
+            f"{quote(pool_address, safe='')}"
+            if pool_address
+            else ""
+        )
+        heat = min(
+            100.0,
+            event_monitor_metric_score(liquidity, floor=50_000, ceiling=10_000_000) * 0.35
+            + event_monitor_metric_score(volume_24h, floor=100_000, ceiling=100_000_000) * 0.40
+            + event_monitor_metric_score(transactions, floor=500, ceiling=100_000) * 0.15
+            + min(100.0, volume_acceleration) * 0.10,
+        )
+        rows.append({
+            "symbol": symbol,
+            "name": name,
+            "chain": normalized_chain,
+            "chainLabel": chain_meta.get("chainLabel") or network,
+            "contractAddress": contract,
+            "heat": round(heat, 2),
+            "amount": volume_24h,
+            "volume24hUsd": volume_24h,
+            "volumeGrowth1hPercent": round(volume_acceleration, 2),
+            "liquidityUsd": liquidity,
+            "marketCapUsd": safe_float(attributes.get("market_cap_usd"), 0) or safe_float(attributes.get("fdv_usd"), 0),
+            "transactions24h": transactions,
+            "priceUsd": safe_float(attributes.get("base_token_price_usd"), 0),
+            "change24hPercent": safe_float(price_changes.get("h24"), 0),
+            "pairCreatedAt": pair_created_at,
+            "capturedAt": captured_at,
+            "note": f"流动性 ${liquidity:g} · 24小时成交 ${volume_24h:g} · 交易 {transactions:g}",
+            "url": pool_url,
+            "tradeUrl": pool_url,
+            "venue": "GeckoTerminal",
+            "source": "GeckoTerminal 链上趋势",
+        })
+    return rows
+
+
+def news_trade_trending_onchain_rows() -> list[dict[str, Any]]:
+    """Read broad on-chain trends so News Trade can start from price/volume anomalies."""
+    networks = tuple(
+        value.strip()
+        for value in str(os.getenv("NEWS_TRADE_TRENDING_NETWORKS", "bsc,solana,base,eth")).split(",")
+        if value.strip()
+    )[:6]
+
+    def fetch(network: str) -> list[dict[str, Any]]:
+        cache_key = f"geckoterminal:{network}"
+        with NEWS_TRADE_DISCOVERY_CACHE_LOCK:
+            cached = NEWS_TRADE_DISCOVERY_CACHE.get(cache_key)
+        if cached and time.time() - cached[0] < NEWS_TRADE_DISCOVERY_CACHE_TTL_SECONDS:
+            return [dict(row) for row in cached[1] if isinstance(row, dict)]
+        try:
+            response = requests.get(
+                f"https://api.geckoterminal.com/api/v2/networks/{quote(network, safe='')}/trending_pools",
+                params={"include": "base_token", "page": 1},
+                headers={**HEADERS, "Accept": "application/json"},
+                timeout=8,
+            )
+            response.raise_for_status()
+            response.encoding = "utf-8"
+            rows = news_trade_geckoterminal_rows_from_payload(response.json(), network)
+            with NEWS_TRADE_DISCOVERY_CACHE_LOCK:
+                NEWS_TRADE_DISCOVERY_CACHE[cache_key] = (time.time(), rows)
+            return rows
+        except Exception:
+            return [dict(row) for row in cached[1] if isinstance(row, dict)] if cached else []
+
+    gathered: list[dict[str, Any]] = []
+    if not networks:
+        return gathered
+    with ThreadPoolExecutor(max_workers=min(4, len(networks))) as pool:
+        futures = [pool.submit(fetch, network) for network in networks]
+        for future in as_completed(futures):
+            try:
+                gathered.extend(future.result())
+            except Exception:
+                continue
+    by_contract: dict[str, dict[str, Any]] = {}
+    for row in gathered:
+        identity = js_stable_key(row.get("chain"), str(row.get("contractAddress") or "").casefold())
+        current = by_contract.get(identity)
+        if not current or (
+            safe_float(row.get("liquidityUsd"), 0), safe_float(row.get("volume24hUsd"), 0)
+        ) > (
+            safe_float(current.get("liquidityUsd"), 0), safe_float(current.get("volume24hUsd"), 0)
+        ):
+            by_contract[identity] = row
+    return sorted(
+        by_contract.values(),
+        key=lambda row: (
+            safe_float(row.get("heat"), 0),
+            safe_float(row.get("volume24hUsd"), 0),
+            safe_float(row.get("liquidityUsd"), 0),
+        ),
+        reverse=True,
+    )[:80]
+
+
+def event_monitor_dex_pair(contract_address: str, chain: str) -> dict[str, Any]:
+    contract = str(contract_address or "").lower()
+    if not re.fullmatch(r"0x[0-9a-f]{40}", contract):
+        return {}
+
+    cache_key = f"{str(chain or '').lower()}:{contract}"
+    now = time.time()
+    with EVENT_MONITOR_DEX_CACHE_LOCK:
+        cached_pair = EVENT_MONITOR_DEX_CACHE.get(cache_key)
+    if cached_pair and now - cached_pair[0] < EVENT_MONITOR_DEX_CACHE_TTL_SECONDS:
+        return cached_pair[1]
+
+    def fetch() -> dict[str, Any]:
+        response = requests.get(
+            "https://api.dexscreener.com/latest/dex/search",
+            params={"q": contract},
+            headers={**HEADERS, "Accept": "application/json"},
+            timeout=8,
+        )
+        response.raise_for_status()
+        response.encoding = "utf-8"
+        payload = response.json()
+        pairs = payload.get("pairs") if isinstance(payload, dict) and isinstance(payload.get("pairs"), list) else []
+        expected_chain = str(chain or "").lower()
+        matched = []
+        for pair in pairs:
+            if not isinstance(pair, dict):
+                continue
+            base = pair.get("baseToken") if isinstance(pair.get("baseToken"), dict) else {}
+            if str(base.get("address") or "").lower() != contract:
+                continue
+            if expected_chain and str(pair.get("chainId") or "").lower() != expected_chain:
+                continue
+            matched.append(pair)
+        return max(
+            matched,
+            key=lambda item: safe_float((item.get("liquidity") or {}).get("usd"), 0),
+            default={},
+        )
+
+    try:
+        pair = fetch()
+        with EVENT_MONITOR_DEX_CACHE_LOCK:
+            EVENT_MONITOR_DEX_CACHE[cache_key] = (time.time(), pair)
+        return pair
+    except Exception:
+        return cached_pair[1] if cached_pair else {}
+
+
+def event_monitor_meme_opportunity(row: dict[str, Any], title: str, body: str) -> dict[str, Any] | None:
+    source_url = str(row.get("url") or "")
+    combined = f"{title} {body} {source_url}"
+    lower = combined.casefold()
+    meme_context = "meme" in lower and any(
+        term in lower
+        for term in ("市值", "成交", "交易量", "流动性", "涨", "跌", "回报率", "出圈", "热点", "gmgn", "聪明钱")
+    )
+    if not meme_context:
+        return None
+
+    name_match = re.search(r"(?:meme\s*币|代币)[「“\"]([^」”\"]{1,32})[」”\"]", combined, flags=re.I)
+    name = clean_feed_text(name_match.group(1) if name_match else "", 32)
+    contract_match = re.search(r"0x[0-9a-fA-F]{40}", combined)
+    contract_address = contract_match.group(0).lower() if contract_match else ""
+    url_chain_match = re.search(r"gmgn\.ai/([^/]+)/token/", source_url, flags=re.I)
+    url_chain = url_chain_match.group(1).lower() if url_chain_match else ""
+    chain_meta = EVENT_MONITOR_CHAIN_META.get(url_chain)
+    if not chain_meta:
+        if re.search(r"\b(?:bsc|bnb\s*chain)\b", lower):
+            chain_meta = EVENT_MONITOR_CHAIN_META["bsc"]
+        elif re.search(r"\bsolana\b", lower):
+            chain_meta = EVENT_MONITOR_CHAIN_META["sol"]
+        elif re.search(r"\bbase\b", lower):
+            chain_meta = EVENT_MONITOR_CHAIN_META["base"]
+        elif re.search(r"\b(?:ethereum|eth)\b", lower):
+            chain_meta = EVENT_MONITOR_CHAIN_META["ethereum"]
+
+    matched_market: dict[str, Any] = {}
+    for market_row in event_monitor_onchain_source_rows():
+        market_text = " ".join(str(market_row.get(key) or "") for key in ("symbol", "name", "url", "note")).casefold()
+        row_contract_match = re.search(r"0x[0-9a-fA-F]{40}", market_text)
+        row_contract = row_contract_match.group(0).lower() if row_contract_match else ""
+        symbol = clean_feed_text(market_row.get("symbol"), 32)
+        if (contract_address and row_contract == contract_address) or (name and symbol and symbol.casefold() == name.casefold()):
+            matched_market = market_row
+            if not contract_address:
+                contract_address = row_contract
+            if not name:
+                name = symbol
+            market_chain = str(market_row.get("chain") or "").lower()
+            chain_meta = EVENT_MONITOR_CHAIN_META.get(market_chain, chain_meta)
+            break
+
+    dex_pair = event_monitor_dex_pair(contract_address, (chain_meta or {}).get("chain", "")) if contract_address else {}
+    dex_base = dex_pair.get("baseToken") if isinstance(dex_pair.get("baseToken"), dict) else {}
+    if not name:
+        name = clean_feed_text(dex_base.get("symbol") or dex_base.get("name"), 32)
+    if not name:
+        return None
+    note = str(matched_market.get("note") or "")
+    price = safe_float(re.sub(r"[^\d.eE+-]", "", str(matched_market.get("price") or "")), 0) or safe_float(dex_pair.get("priceUsd"), 0) or None
+    change_percent = safe_float(re.sub(r"[^\d.eE+-]", "", str(matched_market.get("change") or "")), 0) or safe_float((dex_pair.get("priceChange") or {}).get("h24"), 0) or None
+    market_cap = event_monitor_money_value(combined, ("市值", "market cap")) or event_monitor_money_value(note, ("市值",)) or safe_float(dex_pair.get("marketCap") or dex_pair.get("fdv"), 0) or None
+    volume_24h = event_monitor_money_value(combined, ("交易量", "成交量", "24小时成交"))
+    if volume_24h is None:
+        volume_24h = safe_float(matched_market.get("amount"), 0) or safe_float((dex_pair.get("volume") or {}).get("h24"), 0) or None
+    liquidity = event_monitor_money_value(note, ("流动性",)) or safe_float((dex_pair.get("liquidity") or {}).get("usd"), 0) or None
+
+    risk_flags: list[str] = []
+    if not contract_address:
+        risk_flags.append("合约地址待确认")
+    if liquidity is not None and liquidity < 100_000:
+        risk_flags.append("流动性偏低")
+    if change_percent is not None and abs(change_percent) >= 500:
+        risk_flags.append("短时涨幅极端")
+    drawdown = re.search(r"(?:较高点)?跌(?:幅)?(?:超|破)?\s*([\d.]+)%", combined)
+    if drawdown and safe_float(drawdown.group(1), 0) >= 40:
+        risk_flags.append("高位回撤显著")
+    if any(term in lower for term in ("同名代币", "接连发行", "同名「")):
+        risk_flags.append("存在同名合约混淆")
+    if "非貔貅盘" not in note and (matched_market or dex_pair):
+        risk_flags.append("卖出能力需复核")
+
+    trade_urls: dict[str, str] = {}
+    if "gmgn.ai/" in source_url:
+        trade_urls["GMGN"] = source_url
+    okx_url = str(matched_market.get("url") or "")
+    if not okx_url and chain_meta and contract_address:
+        okx_url = f"https://web3.okx.com/zh-hans/token/{chain_meta['chain']}/{contract_address}"
+    if okx_url:
+        trade_urls["OKX DEX"] = okx_url
+    if dex_pair.get("url"):
+        trade_urls["DEX Screener"] = str(dex_pair["url"])
+    return {
+        "name": name,
+        "symbol": clean_feed_text(matched_market.get("symbol") or name, 32),
+        **dict(chain_meta or {"chain": "", "chainId": "", "chainLabel": "链待确认"}),
+        "contractAddress": contract_address,
+        "priceUsd": price,
+        "change24hPercent": change_percent,
+        "marketCapUsd": market_cap,
+        "volume24hUsd": volume_24h,
+        "liquidityUsd": liquidity,
+        "riskFlags": risk_flags,
+        "tradeReady": bool(chain_meta and contract_address),
+        "venues": list(trade_urls),
+        "tradeUrls": trade_urls,
+        "sourceUrl": source_url,
+    }
+
+
+def news_trade_execution_readiness(user_id: int | None = None, *, wallet_authorized: bool = False) -> dict[str, Any]:
+    checks = {
+        "交易所划转权限": strategy_exchange_configured("okx", user_id),
+        "链上聚合交易权限": all(env_value(name) for name in ("OKX_DEX_API_KEY", "OKX_DEX_SECRET_KEY", "OKX_DEX_PASSPHRASE")),
+        "签名钱包": wallet_authorized or all(env_value(name) for name in ("NEWS_TRADE_WALLET_ADDRESS", "NEWS_TRADE_SIGNER_URL")),
+    }
+    missing = [label for label, ready in checks.items() if not ready]
+    configured = not missing
+    return {
+        "configured": configured,
+        "liveEnabled": configured and env_flag("NEWS_TRADE_LIVE_EXECUTION_ENABLED", default=False),
+        "requiresConfirmation": True,
+        "missingConfiguration": missing,
+        "maxOrderUsdt": max(1.0, safe_float(env_value("NEWS_TRADE_MAX_ORDER_USDT", "200"), 200)),
+    }
+
+
+def news_trade_wallet_authorization(payload: dict[str, Any], opportunity: dict[str, Any]) -> dict[str, Any]:
+    provider = clean_feed_text(payload.get("walletProvider"), 20).lower()
+    namespace = clean_feed_text(payload.get("walletNamespace"), 20).lower()
+    address = clean_feed_text(payload.get("walletAddress"), 180)
+    raw_chain_id = clean_feed_text(payload.get("walletChainId"), 40).lower()
+    target_chain_id = clean_feed_text(opportunity.get("chainId"), 40)
+    target_namespace = "solana" if str(opportunity.get("chain") or "").lower() == "sol" else "evm"
+    if namespace not in {"evm", "solana"}:
+        namespace = target_namespace
+    address_valid = bool(
+        re.fullmatch(r"0x[0-9a-fA-F]{40}", address)
+        if namespace == "evm"
+        else re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,64}", address)
+    )
+    normalized_chain_id = raw_chain_id
+    if namespace == "evm" and raw_chain_id:
+        try:
+            normalized_chain_id = str(int(raw_chain_id, 16) if raw_chain_id.startswith("0x") else int(raw_chain_id))
+        except ValueError:
+            normalized_chain_id = ""
+    chain_matches = namespace == target_namespace and (
+        namespace == "solana" or (normalized_chain_id and normalized_chain_id == target_chain_id)
+    )
+    supported_provider = provider if provider in {"okx", "binance"} else ""
+    return {
+        "provider": supported_provider,
+        "namespace": namespace,
+        "address": address if address_valid else "",
+        "chainId": normalized_chain_id,
+        "targetChainId": target_chain_id,
+        "authorized": bool(supported_provider and address_valid),
+        "chainMatches": bool(chain_matches),
+    }
+
+
+NEWS_TRADE_NETWORK_FEE_DEFAULT_USD = {
+    "1": 6.0,
+    "56": 0.15,
+    "8453": 0.05,
+    "42161": 0.08,
+    "501": 0.01,
+    "4663": 0.05,
+}
+
+
+def news_trade_execution_cost_estimate(
+    amount_usdt: float,
+    opportunity: dict[str, Any],
+    security: dict[str, Any],
+    wallet_authorization: dict[str, Any],
+) -> dict[str, Any]:
+    amount = max(0.0, safe_float(amount_usdt, 0))
+    liquidity = max(0.0, safe_float(opportunity.get("liquidityUsd"), 0))
+    chain_id = clean_feed_text(opportunity.get("chainId"), 24)
+    buy_tax_pct = max(0.0, safe_float(security.get("buyTaxPct"), 0))
+    pool_fee_pct = max(
+        0.0,
+        safe_float(
+            security.get("poolFeePct"),
+            safe_float(env_value("NEWS_TRADE_DEFAULT_POOL_FEE_PCT", "0.3"), 0.3),
+        ),
+    )
+    # Conservative pre-quote based on the quote-side half of a constant-product pool.
+    quote_side_liquidity = liquidity / 2
+    price_impact_pct = (
+        amount / (quote_side_liquidity + amount) * 100
+        if amount > 0 and quote_side_liquidity > 0
+        else None
+    )
+    impact_for_estimate = max(0.0, safe_float(price_impact_pct, 0))
+    recommended_slippage_pct = min(
+        50.0,
+        max(0.5, buy_tax_pct + impact_for_estimate * 1.35 + 0.2),
+    )
+    network_default = NEWS_TRADE_NETWORK_FEE_DEFAULT_USD.get(chain_id, 0.1)
+    network_fee_usd = max(
+        0.0,
+        safe_float(env_value(f"NEWS_TRADE_NETWORK_FEE_{chain_id}_USD", str(network_default)), network_default),
+    )
+    bridge_fee_usd = 0.0
+    if not wallet_authorization.get("chainMatches"):
+        bridge_fee_usd = max(
+            safe_float(env_value("NEWS_TRADE_MIN_BRIDGE_FEE_USD", "0.5"), 0.5),
+            amount * max(0.0, safe_float(env_value("NEWS_TRADE_BRIDGE_FEE_PCT", "0.2"), 0.2)) / 100,
+        )
+    pool_fee_usd = amount * pool_fee_pct / 100
+    token_tax_usd = amount * buy_tax_pct / 100
+    price_impact_usd = amount * impact_for_estimate / 100
+    total_estimated_cost_usd = network_fee_usd + bridge_fee_usd + pool_fee_usd + token_tax_usd + price_impact_usd
+    total_estimated_cost_pct = total_estimated_cost_usd / amount * 100 if amount > 0 else 0.0
+    net_before_swap = max(0.0, amount - network_fee_usd - bridge_fee_usd)
+    minimum_received_usd_equivalent = max(
+        0.0,
+        net_before_swap
+        * max(0.0, 1 - pool_fee_pct / 100)
+        * max(0.0, 1 - buy_tax_pct / 100)
+        * max(0.0, 1 - recommended_slippage_pct / 100),
+    )
+    max_impact = max(0.5, safe_float(env_value("NEWS_TRADE_MAX_PRICE_IMPACT_PCT", "3"), 3))
+    max_slippage = max(1.0, safe_float(env_value("NEWS_TRADE_MAX_SLIPPAGE_PCT", "5"), 5))
+    max_total_cost = max(2.0, safe_float(env_value("NEWS_TRADE_MAX_TOTAL_COST_PCT", "8"), 8))
+    warnings: list[str] = []
+    blocking_reasons: list[str] = []
+    if price_impact_pct is None:
+        warnings.append("缺少池子深度，价格冲击只能在最终报价时确认")
+    elif price_impact_pct >= max_impact:
+        blocking_reasons.append(f"预计价格冲击 {price_impact_pct:.2f}% 超过 {max_impact:g}%")
+    elif price_impact_pct >= 1:
+        warnings.append(f"预计价格冲击 {price_impact_pct:.2f}%")
+    if recommended_slippage_pct > max_slippage:
+        blocking_reasons.append(f"建议滑点 {recommended_slippage_pct:.2f}% 超过 {max_slippage:g}%")
+    elif recommended_slippage_pct >= 2:
+        warnings.append(f"建议滑点 {recommended_slippage_pct:.2f}% 偏高")
+    if buy_tax_pct >= 5:
+        warnings.append(f"代币买入税 {buy_tax_pct:g}%")
+    if bridge_fee_usd > 0:
+        warnings.append("钱包不在目标链，预估中已计入跨链费用")
+    if total_estimated_cost_pct > max_total_cost:
+        blocking_reasons.append(f"预计总成本 {total_estimated_cost_pct:.2f}% 超过 {max_total_cost:g}%")
+    return {
+        "estimated": True,
+        "quoteStatus": "pre_quote",
+        "amountUsdt": round(amount, 4),
+        "networkFeeUsd": round(network_fee_usd, 4),
+        "bridgeFeeUsd": round(bridge_fee_usd, 4),
+        "poolFeePct": round(pool_fee_pct, 4),
+        "poolFeeUsd": round(pool_fee_usd, 4),
+        "buyTaxPct": round(buy_tax_pct, 4),
+        "tokenTaxUsd": round(token_tax_usd, 4),
+        "priceImpactPct": round(price_impact_pct, 4) if price_impact_pct is not None else None,
+        "priceImpactUsd": round(price_impact_usd, 4) if price_impact_pct is not None else None,
+        "recommendedSlippagePct": round(recommended_slippage_pct, 4),
+        "minimumReceivedUsdEquivalent": round(minimum_received_usd_equivalent, 4),
+        "totalEstimatedCostUsd": round(total_estimated_cost_usd, 4),
+        "totalEstimatedCostPct": round(total_estimated_cost_pct, 4),
+        "warnings": list(dict.fromkeys(warnings)),
+        "blocked": bool(blocking_reasons),
+        "blockingReasons": list(dict.fromkeys(blocking_reasons)),
+        "notice": "预估值；提交前必须使用聚合器实时报价重新确认手续费、滑点与最低可得数量。",
+    }
+
+
+def prepare_news_trade_execution(
+    payload: dict[str, Any],
+    *,
+    events: list[dict[str, Any]] | None = None,
+    user: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    event_id = clean_feed_text(payload.get("eventId"), 180)
+    rows = events if isinstance(events, list) else event_monitor_payload().get("newsTrades", [])
+    event = next((item for item in rows if str(item.get("id") or "") == event_id), None)
+    if not event:
+        raise ValueError("News Trade 机会不存在或已经过期")
+    manual_intent = str(payload.get("manualIntent") or "").strip().lower() in {"1", "true", "yes", "on"}
+    system_recommended = bool(event.get("executionEligible"))
+    if not system_recommended and not manual_intent:
+        raise ValueError(event.get("newsTradePhaseLabel") or "该主题已经错过先手买入窗口")
+    opportunity = event.get("memeOpportunity") if isinstance(event.get("memeOpportunity"), dict) else None
+    requested_contract = clean_feed_text(payload.get("candidateContract"), 180).lower()
+    requested_chain = clean_feed_text(payload.get("candidateChain"), 40).lower()
+    candidates = event.get("memeCandidates") if isinstance(event.get("memeCandidates"), list) else []
+    if requested_contract:
+        selected = next(
+            (
+                candidate
+                for candidate in candidates
+                if isinstance(candidate, dict)
+                and clean_feed_text(candidate.get("contractAddress"), 180).lower() == requested_contract
+                and (
+                    not requested_chain
+                    or requested_chain
+                    in {
+                        clean_feed_text(candidate.get("chain"), 40).lower(),
+                        clean_feed_text(candidate.get("chainId"), 40).lower(),
+                    }
+                )
+            ),
+            None,
+        )
+        if not selected:
+            raise ValueError("所选标的已变化，请刷新主题卡后重试")
+        opportunity = selected
+    if not opportunity or not opportunity.get("tradeReady"):
+        raise ValueError("尚未确认可交易链与唯一合约地址")
+    candidate_security = opportunity.get("security") if isinstance(opportunity.get("security"), dict) else {}
+    checked_at = int(safe_float(candidate_security.get("checkedAt"), 0))
+    security_fresh = bool(
+        candidate_security.get("verified")
+        and checked_at > 0
+        and int(time.time() * 1000) - checked_at < NEWS_TRADE_SECURITY_CACHE_TTL_SECONDS * 1000
+    )
+    security = dict(candidate_security) if security_fresh else news_trade_security_snapshot(opportunity, synchronous=True)
+    opportunity = {
+        **opportunity,
+        "security": security,
+        "securityScore": security.get("score"),
+        "securityStatus": security.get("status"),
+        "securityLabel": security.get("label"),
+        "securityBuyAllowed": bool(security.get("verified") and not security.get("hardBlocked")),
+    }
+    if security.get("hardBlocked"):
+        reasons = "、".join(security.get("hardBlockReasons") or []) or "合约安全检查命中高危项"
+        raise ValueError(f"安全检查未通过：{reasons}")
+    wallet_authorization = news_trade_wallet_authorization(payload, opportunity)
+    readiness = news_trade_execution_readiness(
+        int(user["id"]) if user and user.get("id") else None,
+        wallet_authorized=wallet_authorization["authorized"],
+    )
+    amount = safe_float(payload.get("amountUsdt"), 0)
+    if amount <= 0:
+        raise ValueError("请输入大于 0 的买入金额")
+    if amount > readiness["maxOrderUsdt"]:
+        raise ValueError(f"单笔金额不能超过 {readiness['maxOrderUsdt']:g} USDT")
+    cost_estimate = news_trade_execution_cost_estimate(amount, opportunity, security, wallet_authorization)
+    security_pending = not security.get("verified")
+    blocking_reasons = [
+        *(security.get("hardBlockReasons") or []),
+        *(cost_estimate.get("blockingReasons") or []),
+    ]
+    if security_pending:
+        blocking_reasons.insert(0, "合约安全性尚未完成独立核验")
+    execution_blocked = bool(blocking_reasons)
+    live_execution = False
+    execution_routes = [
+        {
+            "venue": clean_feed_text(venue, 40),
+            "url": clean_feed_text(url, 800),
+            "requiresWalletConfirmation": True,
+        }
+        for venue, url in (opportunity.get("tradeUrls") or {}).items()
+        if clean_feed_text(venue, 40) and clean_feed_text(url, 800)
+    ]
+    steps = [
+        {
+            "id": "security",
+            "label": "独立核验蜜罐、卖出能力、税费、权限与持仓集中度",
+            "status": "attention" if security_pending else ("blocked" if security.get("hardBlocked") else "ready"),
+        },
+        {
+            "id": "cost",
+            "label": "预估网络费、跨链费、池子费、滑点、价格冲击与最低可得金额",
+            "status": "blocked" if cost_estimate.get("blocked") else ("attention" if cost_estimate.get("warnings") else "ready"),
+        },
+        {"id": "fund", "label": "检查交易所资金并按白名单划转", "status": "blocked" if "交易所划转权限" in readiness["missingConfiguration"] else "ready"},
+        {"id": "bridge", "label": f"选择到 {opportunity.get('chainLabel') or '目标链'} 的最低损耗到账路线", "status": "blocked" if "链上聚合交易权限" in readiness["missingConfiguration"] else "ready"},
+        {
+            "id": "swap",
+            "label": "校验合约、滑点、价格冲击与卖出能力后构造兑换",
+            "status": "blocked"
+            if "签名钱包" in readiness["missingConfiguration"]
+            else ("attention" if not wallet_authorization["chainMatches"] else "ready"),
+        },
+        {"id": "track", "label": "跟踪提币、跨链和链上成交状态", "status": "preview"},
+    ]
+    return {
+        "ok": True,
+        "mode": "blocked" if execution_blocked else ("preview" if not readiness["liveEnabled"] else "confirmation_required"),
+        "liveExecution": live_execution,
+        "requiresConfirmation": True,
+        "executionBlocked": execution_blocked,
+        "blockingReasons": list(dict.fromkeys(blocking_reasons)),
+        "systemRecommended": system_recommended,
+        "manualIntent": bool(manual_intent and not system_recommended),
+        "eventId": event_id,
+        "amountUsdt": round(amount, 4),
+        "opportunity": opportunity,
+        "securityCheck": security,
+        "costEstimate": cost_estimate,
+        "walletAuthorization": wallet_authorization,
+        "executionRoutes": execution_routes,
+        "steps": steps,
+        "missingConfiguration": readiness["missingConfiguration"],
+        "expiresAt": int(time.time() * 1000) + 60_000,
+        "message": (
+            "买入已暂停，请先处理安全、滑点或成本风险。"
+            if execution_blocked
+            else "已生成资金划转、跨链与买入预演；手续费、滑点和最低可得金额将在最终报价时再次确认。"
+        ),
+    }
+
+
+def event_monitor_source_rows() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    news_payload = read_json_cache(api_cache_path("newsflash"))
+    news_items = news_payload.get("items") if isinstance(news_payload.get("items"), list) else []
+    for item in news_items:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            {
+                "id": item.get("id"),
+                "sourceType": "newsflash",
+                "source": "BlockBeats",
+                "sourceLabel": "BB",
+                "title": item.get("title"),
+                "body": item.get("content"),
+                "url": item.get("url") or "https://www.theblockbeats.info/newsflash",
+                "timestamp": item.get("add_time") or news_payload.get("updatedAt"),
+                "capturedAt": news_payload.get("updatedAt"),
+                "claimStatus": "source-reported",
+            }
+        )
+
+    listing_payload = read_json_cache(api_cache_path("listing-events-v3"))
+    listing_observed_at = alert_event_ms(listing_payload.get("updatedAt"))
+    listing_sections = listing_payload.get("sections") if isinstance(listing_payload.get("sections"), list) else []
+    for section in listing_sections:
+        section_id = str(section.get("id") or "") if isinstance(section, dict) else ""
+        if section_id and section_id != "exchange-listings":
+            continue
+        section_rows = section.get("rows") if isinstance(section, dict) and isinstance(section.get("rows"), list) else []
+        for item in section_rows:
+            if not isinstance(item, dict):
+                continue
+            scheduled_at = alert_event_ms(item.get("date"))
+            published_at = alert_event_ms(
+                item.get("publishedAt")
+                or item.get("createdAt")
+                or item.get("discoveredAt")
+            )
+            event_timestamp = published_at or scheduled_at or listing_observed_at
+            if scheduled_at > listing_observed_at > 0:
+                event_timestamp = listing_observed_at
+            rows.append(
+                {
+                    "id": item.get("id"),
+                    "sourceType": "listing",
+                    "source": item.get("source") or section.get("sourceName") or "Listing",
+                    "sourceLabel": item.get("sourceLabel") or "NEW",
+                    "title": item.get("title") or item.get("symbol"),
+                    "body": alert_body_join(item.get("symbol"), item.get("metric"), item.get("note"), item.get("status")),
+                    "symbol": item.get("symbol"),
+                    "url": item.get("url") or "./listings.html",
+                    "timestamp": event_timestamp,
+                    "capturedAt": listing_observed_at,
+                    "claimStatus": "official-source" if item.get("url") else "source-reported",
+                    "scheduledAt": scheduled_at if scheduled_at > event_timestamp else 0,
+                }
+            )
+
+    x_cache_paths = sorted(PERSIST_CACHE_DIR.glob("api_x-kol-feed-v4*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    x_seen: set[str] = set()
+    for path in x_cache_paths:
+        payload = read_json_cache(path)
+        items = payload.get("items") if isinstance(payload.get("items"), list) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_key = js_stable_key("x", item.get("id"), item.get("url"), item.get("publishedAt"))
+            if item_key in x_seen:
+                continue
+            x_seen.add(item_key)
+            quote = item.get("quote") if isinstance(item.get("quote"), dict) else {}
+            rows.append(
+                {
+                    "id": item.get("id"),
+                    "sourceType": "x-kol",
+                    "source": item.get("sourceName") or item.get("handle") or "X KOL",
+                    "sourceLabel": "X",
+                    "title": item.get("text") or item.get("title"),
+                    "body": alert_body_join(item.get("fullText"), quote.get("text")),
+                    "url": item.get("url") or "./xwatch.html",
+                    "timestamp": item.get("publishedAt") or payload.get("updatedAt"),
+                    "capturedAt": payload.get("updatedAt"),
+                    "claimStatus": "original-post" if item.get("url") else "source-reported",
+                }
+            )
+    manual_payload = read_json_cache(PERSIST_CACHE_DIR / "news_trade_search_rows.json")
+    manual_rows = manual_payload.get("rows") if isinstance(manual_payload.get("rows"), list) else []
+    for item in manual_rows[:80]:
+        if not isinstance(item, dict) or not item.get("title"):
+            continue
+        rows.append(
+            {
+                **item,
+                "sourceType": "manual-search",
+                "source": item.get("source") or "主动搜索",
+                "sourceLabel": "搜",
+                "capturedAt": item.get("confirmedAt") or manual_payload.get("updatedAt"),
+                "claimStatus": item.get("claimStatus") or "needs-cross-check",
+            }
+        )
+    intake_payload = read_json_cache(NEWS_TRADE_DESKTOP_INTAKE_PATH)
+    intake_rows = intake_payload.get("rows") if isinstance(intake_payload.get("rows"), list) else []
+
+    def specific_source_url(value: Any) -> str:
+        url = clean_feed_text(value, 800).casefold().rstrip("/")
+        if not url or url.startswith("./") or url.startswith("http://127.0.0.1"):
+            return ""
+        if url in {
+            "https://www.theblockbeats.info/newsflash",
+            "https://www.gate.com/announcements",
+            "https://www.htx.com/support",
+        }:
+            return ""
+        return url
+
+    existing_urls = {
+        specific_source_url(item.get("url"))
+        for item in rows
+        if isinstance(item, dict) and specific_source_url(item.get("url"))
+    }
+    existing_titles = {
+        (
+            clean_feed_text(item.get("source"), 100).casefold(),
+            clean_feed_text(item.get("title"), 240).casefold(),
+        )
+        for item in rows
+        if isinstance(item, dict)
+    }
+    for item in intake_rows[:300]:
+        if not isinstance(item, dict) or not item.get("title"):
+            continue
+        url_key = specific_source_url(item.get("url"))
+        title_key = (
+            clean_feed_text(item.get("source"), 100).casefold(),
+            clean_feed_text(item.get("title"), 240).casefold(),
+        )
+        # The popup may originate from a source already present above. Keep its
+        # persisted intake for cache-rotation recovery, but do not double-count it.
+        if (url_key and url_key in existing_urls) or title_key in existing_titles:
+            continue
+        rows.append(dict(item))
+        if url_key:
+            existing_urls.add(url_key)
+        existing_titles.add(title_key)
+    return rows
+
+
+def event_monitor_listing_is_tradfi(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(?:热门股票|股票永续|股票合约|股指|指数永续|美股永续|港股永续|"
+            r"KODEX|SAMSUNG|NAVER|LGELECTRONICS|HANMI|KR200|ANETUSDT)",
+            str(text or ""),
+            flags=re.I,
+        )
+    )
+
+
+def event_monitor_listing_candidate_eligible(candidate: dict[str, Any] | None, text: str) -> bool:
+    if not candidate or event_monitor_listing_is_tradfi(text):
+        return False
+    return bool(
+        candidate.get("tradeReady")
+        and safe_float(candidate.get("heatScore"), 0) >= 55
+        and safe_float(candidate.get("candidateScore"), 0) >= 85
+        and safe_float(candidate.get("liquidityUsd"), 0) >= 250_000
+        and safe_float(candidate.get("volume24hUsd"), 0) >= 1_000_000
+        and safe_float(candidate.get("onchainTradeScore"), 0) >= 50
+    )
+
+
+def event_monitor_hot_topic_terms(text: str) -> list[str]:
+    terms = (
+        "热搜", "热点", "爆火", "出圈", "刷屏", "争议", "热议", "讨论", "话题",
+        "反常", "反差", "猎奇", "离谱", "荒诞", "奇葩", "反向出圈", "票房", "电影", "动画", "游戏",
+        "名人", "马斯克", "musk", "文化", "网络梗", "社区传播", "聪明钱", "meme",
+        "市值突破", "成交量", "流动性", "回报率", "暴涨", "涨超", "小作文", "万字长文",
+        "大瓜", "吃瓜", "恋情", "绯闻", "爆料", "本人下场", "叫我", "热搜词条",
+    )
+    lowered = str(text or "").casefold()
+    return [term for term in terms if term.casefold() in lowered]
+
+
+def event_monitor_normalized_entity(value: Any) -> str:
+    text = clean_feed_text(value, 80).casefold()
+    text = re.sub(r"(?:usdt|usdc|usd)(?:swap|perp)?$", "", text, flags=re.I)
+    text = re.sub(r"[^a-z0-9\u3400-\u9fff]+", "", text)
+    return text[:48]
+
+
+def event_monitor_counter_consensus_profile(text: Any, candidate: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Describe reusable counter-consensus culture traits without a named-event whitelist."""
+    value = clean_feed_text(text, 2800).casefold()
+    groups = {
+        "lowBase": ("无人问津", "低票房", "冷门", "小众", "关注度极低", "几乎没人", "低基数", "默默无闻"),
+        "nonlinearGrowth": ("突然爆红", "一夜爆红", "暴增", "激增", "飙升", "逆袭", "刷屏", "热搜", "出圈", "现象级"),
+        "extremeContrast": ("反常", "反差", "猎奇", "离谱", "荒诞", "奇葩", "抽象", "反向出圈", "黑红", "越骂越火", "反转"),
+        "negativeConsensus": ("争议", "吐槽", "差评", "质量差", "抵制", "下架", "封禁", "骂声", "嘲讽", "负面", "两极分化", "爆料", "绯闻"),
+        "participatoryConsensus": ("围观", "打卡", "必须看看", "笑死", "玩梗", "二创", "表情包", "模仿", "挑战", "参与", "转发", "热搜词条"),
+        "symbolizability": ("同名", "形象", "角色", "动物", "人物", "电影", "动画", "商品", "名字", "谐音", "口号", "标签", "梗", "叫我", "金句"),
+        "realWorldFeedback": ("加场", "排片", "票房", "售罄", "缺货", "下架", "封禁", "官方回应", "本人下场", "影院", "销量", "订单", "小作文", "万字长文"),
+        "onchainMapping": ("meme", "代币", "合约", "链上", "流动性", "市值", "持币", "交易量", "gmgn", "dex"),
+        "bigGossip": (
+            "大瓜", "吃瓜", "恋情", "绯闻", "爆料", "约会", "暧昧", "女友", "男友", "前女友", "前男友",
+            "结婚", "离婚", "分手", "出轨", "情史", "聊天记录", "亲密照", "实锤", "小作文", "本人回应",
+        ),
+        "publicFigure": (
+            "孙宇晨", "景甜", "马斯克", "特朗普", "周杰伦", "明星", "演员", "歌手", "艺人", "名人",
+            "网红", "主播", "富豪", "创始人", "ceo", "kol", "币圈大佬",
+        ),
+    }
+    hits = {key: [term for term in terms if term in value] for key, terms in groups.items()}
+    pair_match = re.search(
+        r"([\u3400-\u9fff]{2,4})\s*(?:和|与|×|x|&|以及)\s*([\u3400-\u9fff]{2,4})",
+        value,
+        flags=re.I,
+    )
+    pair_signal = ""
+    if pair_match and (hits["bigGossip"] or hits["publicFigure"]):
+        pair_signal = f"{pair_match.group(1)}×{pair_match.group(2)}"
+        hits["bigGossip"].append(pair_signal)
+    gossip_score = min(
+        100,
+        len(set(hits["bigGossip"])) * 20
+        + min(40, len(set(hits["publicFigure"])) * 15)
+        + (30 if pair_signal else 0)
+        + (15 if hits["bigGossip"] and hits["publicFigure"] else 0),
+    )
+    feature_scores = {
+        "lowBase": min(100, len(hits["lowBase"]) * 45),
+        "nonlinearGrowth": min(100, len(hits["nonlinearGrowth"]) * 35),
+        "extremeContrast": min(100, len(hits["extremeContrast"]) * 30),
+        "negativeConsensus": min(100, len(hits["negativeConsensus"]) * 28),
+        "participatoryConsensus": min(100, len(hits["participatoryConsensus"]) * 25),
+        "symbolizability": min(100, len(hits["symbolizability"]) * 24),
+        "realWorldFeedback": min(100, len(hits["realWorldFeedback"]) * 24),
+        "bigGossip": gossip_score,
+        "onchainMapping": min(
+            100,
+            len(hits["onchainMapping"]) * 20
+            + (25 if isinstance(candidate, dict) and candidate.get("contractAddress") else 0),
+        ),
+    }
+    narrative_core = [
+        max(feature_scores["extremeContrast"], feature_scores["bigGossip"]),
+        max(
+            feature_scores["negativeConsensus"],
+            feature_scores["participatoryConsensus"],
+            feature_scores["bigGossip"] * 0.8,
+        ),
+        max(feature_scores["symbolizability"], feature_scores["bigGossip"] * 0.65),
+        max(
+            feature_scores["realWorldFeedback"],
+            feature_scores["nonlinearGrowth"],
+            feature_scores["bigGossip"] * 0.55,
+        ),
+    ]
+    static_score = round(sum(narrative_core) / len(narrative_core))
+    strong_features = sum(1 for score in narrative_core if score >= 45)
+    labels = [
+        label
+        for key, label in (
+            ("lowBase", "低基数"),
+            ("nonlinearGrowth", "热度非线性增长"),
+            ("extremeContrast", "极端反差"),
+            ("negativeConsensus", "负面共识"),
+            ("participatoryConsensus", "参与式共识"),
+            ("symbolizability", "易符号化"),
+            ("realWorldFeedback", "现实反馈"),
+            ("bigGossip", "大瓜"),
+            ("onchainMapping", "链上映射"),
+        )
+        if feature_scores[key] > 0
+    ]
+    return {
+        "score": static_score,
+        "qualified": bool(
+            static_score >= NEWS_TRADE_CONFIG["thresholds"]["cultureStaticMin"]
+            and strong_features >= 2
+        ),
+        "labels": labels,
+        "hits": hits,
+        "features": feature_scores,
+    }
+
+
+def event_monitor_source_platform(event: dict[str, Any]) -> list[str]:
+    source_type = clean_feed_text(event.get("sourceType"), 40).casefold()
+    source = clean_feed_text(event.get("source"), 100).casefold()
+    text = clean_feed_text(f"{event.get('title') or ''} {event.get('body') or ''}", 1200).casefold()
+    platforms: list[str] = []
+
+    def add(label: str) -> None:
+        if label not in platforms:
+            platforms.append(label)
+
+    if source_type in {"newsflash", "web-discovery"} or "blockbeats" in source or "新闻" in source:
+        add("新闻媒体")
+    if source_type == "x-kol" or source in {"x", "twitter"} or "x.com" in text:
+        add("X")
+    if source_type == "manual-search":
+        add("主动搜索")
+    if source_type == "listing":
+        add("交易所公告")
+    if source_type == "onchain-trend":
+        add("链上")
+    for pattern, label in (
+        (r"抖音|douyin|tiktok|短视频", "短视频"),
+        (r"小红书|xiaohongshu", "小红书"),
+        (r"微博|weibo", "微博"),
+        (r"b站|哔哩哔哩|bilibili", "B站"),
+        (r"微信|群聊|公众号", "微信") ,
+        (r"表情包|图片|海报", "图片/表情包"),
+        (r"二创|同人|模仿|挑战", "二创社区"),
+        (r"链上|meme|gmgn|dex|合约地址", "链上") ,
+    ):
+        if re.search(pattern, text, flags=re.I):
+            add(label)
+    return platforms
+
+
+def event_monitor_story_beat(text: Any) -> str:
+    value = clean_feed_text(text, 1200).casefold()
+    beats = (
+        ("restriction", ("下架", "封禁", "停映", "停售", "抵制")),
+        ("participation", ("围观", "打卡", "二创", "表情包", "玩梗", "模仿")),
+        ("breakout", ("爆红", "刷屏", "热搜", "出圈", "逆袭")),
+        ("real-feedback", ("加场", "排片", "票房", "售罄", "缺货", "销量", "订单")),
+        ("onchain", ("meme", "链上", "合约", "流动性", "市值", "持币")),
+        ("official-response", ("官方回应", "声明", "澄清", "确认")),
+    )
+    return next((beat for beat, terms in beats if any(term in value for term in terms)), "update")
+
+
+def event_monitor_topic_metrics(rows: list[dict[str, Any]], now_ms: int) -> dict[str, Any]:
+    unique_rows: dict[str, dict[str, Any]] = {}
+    platforms: list[str] = []
+    discussion_hits: list[str] = []
+    search_signals = 0
+    story_beats: list[str] = []
+    for event in rows:
+        identity = clean_feed_text(event.get("url"), 600).casefold() or clean_feed_text(event.get("title"), 220).casefold()
+        if identity and identity not in unique_rows:
+            unique_rows[identity] = event
+        for platform in event_monitor_source_platform(event):
+            if platform not in platforms:
+                platforms.append(platform)
+        text = clean_feed_text(f"{event.get('title') or ''} {event.get('body') or ''}", 1400).casefold()
+        for term in ("热议", "讨论", "评论", "转发", "围观", "打卡", "二创", "表情包", "玩梗", "笑死", "必须看看"):
+            if term in text and term not in discussion_hits:
+                discussion_hits.append(term)
+        if event.get("sourceType") == "manual-search" or any(term in text for term in ("热搜", "搜索量", "搜索指数")):
+            search_signals += 1
+        beat = event_monitor_story_beat(text)
+        if beat not in story_beats:
+            story_beats.append(beat)
+    timestamps = [int(safe_float(event.get("timestamp"), 0)) for event in unique_rows.values()]
+    counts = {
+        "1h": sum(1 for timestamp in timestamps if timestamp and now_ms - timestamp <= 60 * 60_000),
+        "6h": sum(1 for timestamp in timestamps if timestamp and now_ms - timestamp <= 6 * 60 * 60_000),
+        "24h": sum(1 for timestamp in timestamps if timestamp and now_ms - timestamp <= 24 * 60 * 60_000),
+    }
+    prior_five_hour_rate = max(0.0, (counts["6h"] - counts["1h"]) / 5.0)
+    prior_eighteen_hour_rate = max(0.0, (counts["24h"] - counts["6h"]) / 18.0)
+    one_hour_ratio = counts["1h"] / max(0.2, prior_five_hour_rate)
+    six_hour_rate = counts["6h"] / 6.0
+    six_hour_ratio = six_hour_rate / max(0.05, prior_eighteen_hour_rate)
+    low_base = bool(counts["24h"] <= 3 and counts["1h"] >= 1)
+    velocity_score = min(
+        100.0,
+        counts["1h"] * 22.0
+        + min(35.0, max(0.0, one_hour_ratio - 1.0) * 12.0)
+        + min(20.0, max(0.0, six_hour_ratio - 1.0) * 7.0)
+        + (15.0 if low_base else 0.0),
+    )
+    cross_platform_score = min(100.0, len(platforms) * 25.0)
+    return {
+        "contentCounts": counts,
+        "contentGrowth": {
+            "oneHourVsPriorFiveHourRate": round(one_hour_ratio, 2),
+            "sixHourVsPriorEighteenHourRate": round(six_hour_ratio, 2),
+        },
+        "velocityScore": round(velocity_score, 2),
+        "lowBase": low_base,
+        "platforms": platforms,
+        "platformCount": len(platforms),
+        "crossPlatformScore": round(cross_platform_score, 2),
+        "discussionSignalCount": len(discussion_hits),
+        "discussionSignals": discussion_hits,
+        "searchSignalCount": search_signals,
+        "searchVolumeAvailable": False,
+        "storyBeats": story_beats,
+        "hasNewPlot": len(story_beats) >= 2,
+        "coverageNote": "按已接入来源统计内容与扩散信号；未接入平台的真实搜索量、讨论量不作推测。",
+    }
+
+
+def event_monitor_event_heat_score(
+    profile: dict[str, Any],
+    metrics: dict[str, Any],
+    *,
+    news_count: int,
+) -> dict[str, Any]:
+    features = profile.get("features") if isinstance(profile.get("features"), dict) else {}
+    novelty = max(safe_float(features.get("extremeContrast"), 0), safe_float(profile.get("score"), 0) * 0.55)
+    participation = max(
+        safe_float(features.get("participatoryConsensus"), 0),
+        safe_float(features.get("negativeConsensus"), 0) * 0.65,
+        min(100.0, safe_float(metrics.get("discussionSignalCount"), 0) * 22.0),
+    )
+    symbolizability = safe_float(features.get("symbolizability"), 0)
+    followup = max(
+        100.0 if metrics.get("hasNewPlot") else 0.0,
+        safe_float(features.get("realWorldFeedback"), 0),
+        min(100.0, max(0, news_count - 1) * 30.0),
+    )
+    raw = {
+        "velocity": safe_float(metrics.get("velocityScore"), 0),
+        "crossPlatform": safe_float(metrics.get("crossPlatformScore"), 0),
+        "noveltyContrast": novelty,
+        "participation": participation,
+        "symbolizability": symbolizability,
+        "followupStory": followup,
+        "bigGossip": safe_float(features.get("bigGossip"), 0),
+    }
+    weights = NEWS_TRADE_CONFIG["eventWeights"]
+    points = {key: round(min(100.0, raw[key]) * safe_float(weights[key], 0) / 100.0, 2) for key in weights}
+    return {
+        "score": round(min(100.0, sum(points.values()))),
+        "points": points,
+        "raw": {key: round(min(100.0, value), 2) for key, value in raw.items()},
+        "weights": dict(weights),
+    }
+
+
+def event_monitor_asset_relation(
+    row: dict[str, Any],
+    candidate: dict[str, Any],
+    combined: str,
+    entities: list[str],
+) -> dict[str, Any]:
+    explicit_status = clean_feed_text(row.get("officialAssociationStatus") or candidate.get("officialAssociationStatus"), 48).casefold()
+    official_evidence = clean_feed_text(row.get("officialEvidenceUrl") or candidate.get("officialEvidenceUrl"), 600)
+    contract = clean_feed_text(candidate.get("contractAddress"), 96)
+    direct_contract = bool(contract and contract.casefold() in combined.casefold())
+    symbol = clean_feed_text(candidate.get("symbol"), 40)
+    exact_entity = any(
+        event_monitor_normalized_entity(entity) == event_monitor_normalized_entity(symbol)
+        for entity in entities
+        if event_monitor_normalized_entity(entity)
+    )
+    mapping_context = bool(re.search(r"链上|meme|代币|合约|gmgn|dex|流动性|市值", combined, flags=re.I))
+    if explicit_status in {"official", "official-confirmed", "confirmed"} and official_evidence:
+        code, label, confidence = "official-confirmed", "官方确认", 100
+    elif direct_contract or (exact_entity and mapping_context):
+        code, label, confidence = "highly-related-unconfirmed", "高度相关但未确认", 78
+    else:
+        code, label, confidence = "name-only", "未确认关联 · 仅同名/疑似蹭热点", 35
+    return {
+        "code": code,
+        "label": label,
+        "confidence": confidence,
+        "officialEvidenceUrl": official_evidence,
+        "directContractEvidence": direct_contract,
+        "exactEntityMatch": exact_entity,
+        "disclaimer": "名称或叙事相同不代表事件方发行或官方认可。" if code != "official-confirmed" else "已保存可核验的官方关联来源。",
+    }
+
+
+def event_monitor_onchain_trade_score(candidate: dict[str, Any], relation: dict[str, Any] | None = None) -> dict[str, Any]:
+    relation = relation if isinstance(relation, dict) else {}
+    risks = candidate.get("riskFlags") if isinstance(candidate.get("riskFlags"), list) else []
+    relation_score = safe_float(relation.get("confidence"), 0)
+    if "存在同名合约混淆" in risks:
+        relation_score = min(relation_score, 45)
+    liquidity = event_monitor_metric_score(safe_float(candidate.get("liquidityUsd"), 0), floor=50_000, ceiling=10_000_000)
+    volume_level = event_monitor_metric_score(safe_float(candidate.get("volume24hUsd"), 0), floor=100_000, ceiling=100_000_000)
+    volume_growth_value = candidate.get("volumeGrowth1hPercent")
+    volume_growth_available = volume_growth_value not in (None, "")
+    volume_growth = min(100.0, max(0.0, safe_float(volume_growth_value, 0))) if volume_growth_available else 0.0
+    volume_score = volume_level * (0.65 if not volume_growth_available else 0.45) + volume_growth * (0.0 if not volume_growth_available else 0.55)
+    holder_growth_value = candidate.get("holderGrowth24hPercent")
+    holder_growth_available = holder_growth_value not in (None, "")
+    holder_score = min(100.0, max(0.0, safe_float(holder_growth_value, 0) * 4.0)) if holder_growth_available else 0.0
+    top10 = safe_float(candidate.get("top10HolderPercent"), 0)
+    distribution_available = top10 > 0 or candidate.get("buySellRatio") not in (None, "")
+    distribution_score = 55.0 if not distribution_available else max(0.0, 100.0 - top10)
+    if any(risk in risks for risk in ("持仓高度集中", "卖出能力需复核")):
+        distribution_score = max(0.0, distribution_score - 30.0)
+    safety_score = 0.0
+    if candidate.get("contractAddress"):
+        safety_score += 35.0
+    if candidate.get("tradeReady"):
+        safety_score += 30.0
+    if "卖出能力需复核" not in risks:
+        safety_score += 35.0
+    if any(risk in risks for risk in ("疑似貔貅盘", "合约高风险")):
+        safety_score = min(safety_score, 15.0)
+    raw = {
+        "consensusUniqueness": relation_score,
+        "liquidity": liquidity,
+        "volumeGrowth": volume_score,
+        "holderGrowth": holder_score,
+        "distributionHealth": distribution_score,
+        "contractSafety": safety_score,
+    }
+    weights = NEWS_TRADE_CONFIG["onchainWeights"]
+    points = {key: round(min(100.0, raw[key]) * safe_float(weights[key], 0) / 100.0, 2) for key in weights}
+    return {
+        "score": round(min(100.0, sum(points.values()))),
+        "points": points,
+        "raw": {key: round(min(100.0, value), 2) for key, value in raw.items()},
+        "weights": dict(weights),
+        "coverage": {
+            "volumeGrowth": volume_growth_available,
+            "holderGrowth": holder_growth_available,
+            "distribution": distribution_available,
+        },
+    }
+
+
+def event_monitor_topic_stage(
+    metrics: dict[str, Any],
+    profile: dict[str, Any],
+    phase: dict[str, Any],
+    candidate: dict[str, Any] | None,
+    onchain_score: float,
+) -> dict[str, Any]:
+    text_features = profile.get("features") if isinstance(profile.get("features"), dict) else {}
+    if phase.get("code") in {"expired"}:
+        code, label = "decline", "衰退"
+    elif phase.get("code") == "fermented":
+        code, label = "peak", "高潮"
+    elif candidate and onchain_score >= NEWS_TRADE_CONFIG["thresholds"]["onchainTrade"]:
+        code, label = "onchain-mapping", "链上映射"
+    elif safe_float(metrics.get("crossPlatformScore"), 0) >= 50 or safe_float(text_features.get("realWorldFeedback"), 0) >= 55:
+        code, label = "breakout", "破圈"
+    elif safe_float(metrics.get("velocityScore"), 0) >= 45 or safe_float(text_features.get("nonlinearGrowth"), 0) >= 55:
+        code, label = "accelerating", "加速传播"
+    else:
+        code, label = "budding", "萌芽"
+    if code == "peak" and any(beat in (metrics.get("storyBeats") or []) for beat in ("restriction",)) and phase.get("impliedGainPct", 0) >= 500:
+        label = "高潮 / 高位风险"
+    return {"code": code, "label": label}
+
+
+def event_monitor_is_political_military_text(text: Any) -> bool:
+    value = clean_feed_text(text, 2400)
+    return bool(
+        DESKTOP_ALERT_MILITARY_PATTERN.search(value)
+        or DESKTOP_ALERT_POLITICAL_PATTERN.search(value)
+        or DESKTOP_ALERT_POLITICAL_ACTOR_PATTERN.search(value)
+        or DESKTOP_ALERT_POLITICAL_FIGURE_PATTERN.search(value)
+        or DESKTOP_ALERT_GEOPOLITICAL_ACTOR_PATTERN.search(value)
+    )
+
+
+def event_monitor_curiosity_profile(text: Any) -> dict[str, Any]:
+    """Score the strange, controversial and discussable qualities of a real-world event."""
+    value = clean_feed_text(text, 2400).casefold()
+    term_groups = {
+        "novelty": (
+            "反常", "反差", "猎奇", "离谱", "荒诞", "奇葩", "反向出圈", "戏剧性", "魔幻",
+            "抽象", "反转", "乌龙", "罕见", "意外", "不可思议", "匪夷所思",
+            "bizarre", "absurd", "strange", "unusual", "unexpected",
+        ),
+        "controversy": (
+            "争议", "质疑", "骂战", "抵制", "吐槽", "两极分化", "舆论风波", "吵翻",
+            "controversy", "controversial", "backlash", "debate", "disputed",
+        ),
+        "discussion": (
+            "热议", "讨论", "引发讨论", "登上热搜", "热搜", "刷屏", "出圈", "发酵", "围观",
+            "话题", "评论区", "转发", "全网", "viral", "trending", "discussion",
+        ),
+        "legendary": (
+            "传奇", "神话", "奇迹", "逆袭", "一夜暴富", "草根", "小人物", "创造历史", "史诗",
+            "封神", "现象级", "百倍", "千倍", "万倍", "传奇经历", "legendary", "miracle",
+            "overnight", "rags to riches",
+        ),
+    }
+    hits = {
+        group: [term for term in terms if term.casefold() in value]
+        for group, terms in term_groups.items()
+    }
+    reported_multiples = [safe_float(match.group(1), 0) for match in re.finditer(r"([\d.]+)\s*倍", value)]
+    if max(reported_multiples, default=0) >= 100 and "百倍回报" not in hits["legendary"]:
+        hits["legendary"].append("百倍回报")
+    if "仅花费" in value and "回报" in value and "小额逆袭" not in hits["legendary"]:
+        hits["legendary"].append("小额逆袭")
+    novelty_score = min(45, len(hits["novelty"]) * 18)
+    controversy_score = min(30, len(hits["controversy"]) * 15)
+    discussion_score = min(25, len(hits["discussion"]) * 10)
+    legendary_score = min(20, len(hits["legendary"]) * 10)
+    synergy = 10 if hits["novelty"] and hits["controversy"] and hits["discussion"] else 0
+    score = min(100, novelty_score + controversy_score + discussion_score + legendary_score + synergy)
+    labels: list[str] = []
+    if hits["novelty"]:
+        labels.append("新奇猎奇")
+    if hits["controversy"]:
+        labels.append("争议性")
+    if hits["discussion"]:
+        labels.append("高讨论度")
+    if hits["legendary"]:
+        labels.append("传奇性")
+    return {
+        "score": score,
+        "qualified": bool(
+            hits["novelty"]
+            and (hits["controversy"] or hits["discussion"])
+            and score >= 28
+        ),
+        "labels": labels,
+        "noveltyHits": hits["novelty"],
+        "controversyHits": hits["controversy"],
+        "discussionHits": hits["discussion"],
+        "legendaryHits": hits["legendary"],
+        "breakdown": {
+            "novelty": novelty_score,
+            "controversy": controversy_score,
+            "discussion": discussion_score,
+            "legendary": legendary_score,
+            "synergy": synergy,
+        },
+    }
+
+
+def event_monitor_name_binding(text: Any, candidate: dict[str, Any] | None) -> dict[str, Any]:
+    candidate = candidate if isinstance(candidate, dict) else {}
+    relevance = safe_float(candidate.get("narrativeRelevance"), 0)
+    direct_match = bool(candidate.get("directMatch"))
+    value = clean_feed_text(text, 2400).casefold()
+    meaning_terms = (
+        "同名", "名字", "命名", "取名", "寓意", "谐音", "双关", "一语双关", "梗",
+        "same name", "namesake", "wordplay", "pun",
+    )
+    hits = [term for term in meaning_terms if term.casefold() in value]
+    score = max(
+        100 if direct_match else 0,
+        95 if relevance >= 94 else 80 if relevance >= 88 else round(relevance),
+        min(100, 55 + len(hits) * 20) if hits else 0,
+    )
+    return {
+        "score": int(score),
+        "qualified": bool(score >= 88),
+        "label": "名字寓意强绑定" if score >= 88 else "名字关联待确认",
+        "hits": hits,
+    }
+
+
+def event_monitor_implied_gain_pct(text: Any, candidate: dict[str, Any] | None = None) -> float:
+    value = clean_feed_text(text, 2400)
+    gains = [max(0.0, safe_float((candidate or {}).get("change24hPercent"), 0))]
+    for match in re.finditer(
+        r"(?:涨|上涨|拉升|暴涨|飙升|涨幅|回报)[^\d%倍]{0,12}([\d.]+)\s*(倍|%)",
+        value,
+        flags=re.I,
+    ):
+        number = safe_float(match.group(1), 0)
+        gains.append(number * 100 if match.group(2) == "倍" else number)
+    return max(gains, default=0.0)
+
+
+def event_monitor_news_trade_phase(
+    age_minutes: Any,
+    text: Any,
+    candidate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    age = max(0.0, safe_float(age_minutes, 0))
+    gain_pct = event_monitor_implied_gain_pct(text, candidate)
+    risk_flags = candidate.get("riskFlags") if isinstance(candidate, dict) and isinstance(candidate.get("riskFlags"), list) else []
+    fully_fermented = bool(gain_pct >= 500 or "短时涨幅极端" in risk_flags)
+    if fully_fermented:
+        code, label, urgency, reason = "fermented", "已发酵 · 仅复盘", 15, "price-already-expanded"
+    elif age <= 6 * 60:
+        code, label, urgency, reason = "understanding", "0–6h 先手理解", 100, "fast-understanding-window"
+    elif age <= 24 * 60:
+        code, label, urgency, reason = "pre-fermentation", "6–24h 预发酵", 70, "pre-fermentation-window"
+    else:
+        code, label, urgency, reason = "expired", "超过24h · 已错过", 0, "early-entry-window-expired"
+    return {
+        "code": code,
+        "label": label,
+        "ageMinutes": round(age, 1),
+        "urgencyScore": urgency,
+        "earlyEntryEligible": code in {"understanding", "pre-fermentation"},
+        "fullyFermented": fully_fermented,
+        "impliedGainPct": round(gain_pct, 2),
+        "reason": reason,
+    }
+
+
+def event_monitor_topic_key(event: dict[str, Any]) -> str:
+    candidates = event.get("memeCandidates") if isinstance(event.get("memeCandidates"), list) else []
+    primary = candidates[0] if candidates else event.get("memeOpportunity") if isinstance(event.get("memeOpportunity"), dict) else {}
+    template = clean_feed_text(event.get("template"), 60).casefold()
+    source_type = clean_feed_text(event.get("sourceType"), 40).casefold()
+    assets = event.get("assets") if isinstance(event.get("assets"), list) else []
+    if source_type == "listing" or template == "listing-latency":
+        raw_symbol = (assets or [None])[0] or (primary or {}).get("symbol")
+        if not raw_symbol:
+            title_match = re.search(
+                r"(?:上线|新增|listing)\s*([A-Za-z0-9\u3400-\u9fff]{2,24})\s*(?:/|USDT|USD)",
+                clean_feed_text(event.get("title"), 220),
+                flags=re.I,
+            )
+            raw_symbol = title_match.group(1) if title_match else ""
+        symbol = clean_price_watch_symbol(raw_symbol) or event_monitor_normalized_entity(raw_symbol)
+        source = event_monitor_normalized_entity(event.get("source") or "listing") or "listing"
+        timestamp = int(safe_float(event.get("timestamp"), 0))
+        day_key = datetime.fromtimestamp(timestamp / 1000).strftime("%Y%m%d") if timestamp > 0 else "unknown"
+        return f"listing:{source}:{symbol or 'unknown'}:{day_key}"
+
+    entities = event.get("eventEntities") if isinstance(event.get("eventEntities"), list) else []
+    news_keywords = event.get("newsKeywords") if isinstance(event.get("newsKeywords"), list) else []
+    entities = [
+        *entities,
+        *event_monitor_hot_entities(str(event.get("title") or ""), str(event.get("body") or "")),
+        *[keyword for keyword in news_keywords if str(keyword).casefold() not in NEWS_TRADE_KEYWORD_STOPWORDS],
+    ]
+    candidate_terms = [
+        clean_feed_text((primary or {}).get("symbol"), 40),
+        clean_feed_text((primary or {}).get("name"), 80).split()[0] if (primary or {}).get("name") else "",
+        *[clean_feed_text(asset, 40) for asset in assets],
+    ]
+    normalized_entities = {event_monitor_normalized_entity(entity) for entity in entities if event_monitor_normalized_entity(entity)}
+    normalized_text = re.sub(
+        r"[^a-z0-9\u3400-\u9fff]+",
+        "",
+        clean_feed_text(f"{event.get('title') or ''} {event.get('body') or ''}", 1800).casefold(),
+    )
+    narrative_entity = next(
+        (
+            term
+            for term in candidate_terms
+            if event_monitor_normalized_entity(term)
+            and (
+                event_monitor_normalized_entity(term) in normalized_entities
+                or event_monitor_normalized_entity(term) in normalized_text
+            )
+        ),
+        "",
+    )
+    if not narrative_entity and entities:
+        narrative_entity = entities[0]
+    if not narrative_entity and candidate_terms:
+        narrative_entity = next((term for term in candidate_terms if event_monitor_normalized_entity(term)), "")
+    normalized = event_monitor_normalized_entity(narrative_entity)
+    if normalized:
+        return f"narrative:{normalized}"
+    contract = str((primary or {}).get("contractAddress") or "").casefold()
+    if contract:
+        return f"meme:{(primary or {}).get('chain') or 'unknown'}:{contract}"
+    return f"event:{event.get('id') or js_stable_key(event.get('title'))}"
+
+
+def classify_event_monitor_row(
+    row: dict[str, Any],
+    now_ms: int | None = None,
+    *,
+    candidate_source_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    now_ms = now_ms or int(time.time() * 1000)
+    title = clean_feed_text(row.get("title"), 220)
+    body = clean_feed_text(row.get("body"), 720)
+    if not title:
+        return None
+    text = f"{title} {body}".casefold()
+    timestamp = alert_event_ms(row.get("timestamp"))
+    age_minutes = max(0.0, (now_ms - timestamp) / 60_000)
+    if age_minutes > 48 * 60:
+        return None
+    meme_candidates = event_monitor_rank_meme_candidates(
+        row,
+        title,
+        body,
+        source_rows=candidate_source_rows,
+    )
+    legacy_meme_opportunity = event_monitor_meme_opportunity(row, title, body)
+    if legacy_meme_opportunity:
+        legacy_contract = str(legacy_meme_opportunity.get("contractAddress") or "").casefold()
+        matching_index = next(
+            (
+                index
+                for index, candidate in enumerate(meme_candidates)
+                if (
+                    bool(legacy_contract)
+                    and str(candidate.get("contractAddress") or "").casefold() == legacy_contract
+                ) or (
+                    not legacy_contract
+                    and legacy_meme_opportunity.get("symbol")
+                    and str(candidate.get("symbol") or "").casefold()
+                    == str(legacy_meme_opportunity.get("symbol") or "").casefold()
+                )
+            ),
+            None,
+        )
+        if matching_index is not None:
+            meme_candidates[matching_index] = event_monitor_merge_candidate(
+                meme_candidates[matching_index], legacy_meme_opportunity
+            )
+        elif legacy_meme_opportunity.get("contractAddress"):
+            legacy_meme_opportunity.update(
+                {
+                    "narrativeRelevance": 100.0,
+                    "candidateScore": 70.0,
+                    "heatScore": 0.0,
+                    "directMatch": True,
+                    "rank": len(meme_candidates) + 1,
+                    "role": "backup" if meme_candidates else "primary",
+                }
+            )
+            meme_candidates.append(legacy_meme_opportunity)
+    event_entities = event_monitor_hot_entities(title, body)
+    root_entity = clean_feed_text(row.get("eventRootEntity"), 48)
+    if root_entity and root_entity.casefold() not in {entity.casefold() for entity in event_entities}:
+        event_entities.insert(0, root_entity)
+    event_entities = event_entities[:12]
+    news_keywords = event_monitor_news_keywords(title, body)
+    if root_entity and root_entity.casefold() not in {keyword.casefold() for keyword in news_keywords}:
+        news_keywords.insert(0, root_entity)
+    combined_for_relation = clean_feed_text(f"{title} {body} {row.get('url') or ''}", 2600)
+    for candidate in meme_candidates:
+        relation = event_monitor_asset_relation(row, candidate, combined_for_relation, event_entities)
+        onchain_trade = event_monitor_onchain_trade_score(candidate, relation)
+        candidate.update({
+            "association": relation,
+            "associationStatus": relation["code"],
+            "associationLabel": relation["label"],
+            "onchainTradeScore": onchain_trade["score"],
+            "onchainScoreBreakdown": onchain_trade,
+        })
+    meme_candidates.sort(
+        key=lambda item: (
+            1 if item.get("directMatch") else 0,
+            safe_float(item.get("onchainTradeScore"), 0),
+            safe_float(item.get("candidateScore"), 0),
+            safe_float(item.get("liquidityUsd"), 0),
+            safe_float(item.get("volume24hUsd"), 0),
+        ),
+        reverse=True,
+    )
+    meme_candidates = meme_candidates[:3]
+    for index, candidate in enumerate(meme_candidates, start=1):
+        candidate["rank"] = index
+        candidate["role"] = "primary" if index == 1 else "backup"
+    meme_opportunity = meme_candidates[0] if meme_candidates else None
+    curiosity_profile = event_monitor_curiosity_profile(f"{title} {body}")
+    culture_profile = event_monitor_counter_consensus_profile(f"{title} {body}", meme_opportunity)
+    name_binding = event_monitor_name_binding(f"{title} {body}", meme_opportunity)
+    news_trade_phase = event_monitor_news_trade_phase(
+        age_minutes,
+        f"{title} {body}",
+        meme_opportunity,
+    )
+    for candidate in meme_candidates:
+        candidate["earlyEntryEligible"] = news_trade_phase["earlyEntryEligible"]
+    assets = event_monitor_assets(row.get("symbol"), title, body)
+    if meme_opportunity and meme_opportunity.get("symbol"):
+        meme_symbol = clean_feed_text(meme_opportunity.get("symbol"), 32)
+        assets = [meme_symbol, *[asset for asset in assets if asset != meme_symbol]][:8]
+    source_type = str(row.get("sourceType") or "")
+    direct_terms = ("宣布", "公告", "正式", "确认", "获批", "批准", "胜诉", "上线", "上币", "新增", "推出", "announces", "official", "approved", "listed", "launches")
+    market_terms = ("价格", "市值", "涨幅", "涨超", "跌幅", "跌破", "成交", "交易量", "流动性", "回报率", "持仓", "资金费率", "基差", "溢价", "折价", "脱锚", "清算", "爆仓", "price", "market cap", "volume", "liquidity", "open interest", "funding", "basis", "premium", "depeg", "liquidation")
+    direct_confirmation = source_type == "listing" or any(term in text for term in direct_terms)
+    market_confirmation = any(term in text for term in market_terms)
+
+    best_template: dict[str, Any] | None = None
+    best_hits: list[str] = []
+    best_value = -1
+    for template in EVENT_MONITOR_TEMPLATES:
+        hits = [keyword for keyword in template["keywords"] if keyword.casefold() in text]
+        template_id = template["id"]
+        if template_id == "counter-consensus-culture":
+            if not culture_profile.get("qualified"):
+                continue
+            hits = list(dict.fromkeys(["负面共识破圈", *(culture_profile.get("labels") or []), *hits]))
+        elif template_id == "meme-catalyst":
+            if not meme_candidates:
+                continue
+            hot_hits = event_monitor_hot_topic_terms(text)
+            if not hot_hits and not legacy_meme_opportunity:
+                continue
+            hits = list(dict.fromkeys(["热点主题", "链上候选", *hot_hits, *hits]))
+        elif template_id == "kol-latency":
+            if source_type != "x-kol":
+                continue
+            kol_event_terms = (
+                "elon", "musk", "宣布", "上线", "推出", "合作", "集成", "采用", "购买", "买入",
+                "增持", "减持", "销毁", "空投", "支持", "announc", "launch", "partnership",
+                "integrat", "adopt", "purchase", "buy", "burn", "airdrop",
+            )
+            if not any(term in text for term in kol_event_terms):
+                continue
+            hits = list(dict.fromkeys(["KOL 首发", *hits]))
+        elif template_id == "listing-latency":
+            if source_type != "listing":
+                continue
+            hits = list(dict.fromkeys(["交易所公告", *hits]))
+        elif template_id == "anchor-policy":
+            anchor_terms = ("脱锚", "锚定", "储备", "救助", "depeg", "peg", "reserve", "bailout")
+            policy_terms = ("监管", "政策", "美联储", "法院", "sec", "regulation")
+            decision_terms = ("确认", "宣布", "获批", "批准", "裁决", "判决", "落地", "approved", "ruling")
+            if not any(term in text for term in anchor_terms) and not (
+                any(term in text for term in policy_terms) and any(term in text for term in decision_terms)
+            ):
+                continue
+        elif template_id == "instant-repricing":
+            decisive_terms = ("胜诉", "败诉", "裁决", "获批", "批准", "诉讼", "判决", "ruling", "approved", "lawsuit", "victory")
+            if not any(term in text for term in decisive_terms):
+                continue
+        elif template_id == "market-dislocation":
+            dislocation_terms = ("闪崩", "插针", "宕机", "错价", "市场失灵", "异常清算", "流动性枯竭", "flash crash", "outage", "mispricing")
+            if not any(term in text for term in dislocation_terms):
+                continue
+        elif template_id == "orderbook-risk":
+            anomaly_terms = ("异常", "异动", "失衡", "偏离", "激增", "骤降", "极端")
+            metric_terms = ("盘口", "基差", "深度", "资金费率", "持仓量", "未平仓", "订单簿", "orderbook", "basis", "funding", "open interest", "spread", "depth")
+            if not any(term in text for term in anomaly_terms) or not any(term in text for term in metric_terms):
+                continue
+        value = int(template["base"]) + min(18, len(hits) * 6)
+        if value > best_value and hits:
+            best_template = template
+            best_hits = hits
+            best_value = value
+    if not best_template:
+        return None
+    if not assets and best_template["id"] != "counter-consensus-culture":
+        return None
+
+    preliminary_metrics = event_monitor_topic_metrics([
+        {
+            **row,
+            "title": title,
+            "body": body,
+            "timestamp": timestamp,
+            "sourceType": source_type,
+            "source": row.get("source"),
+        }
+    ], now_ms)
+    preliminary_event_heat = event_monitor_event_heat_score(
+        culture_profile,
+        preliminary_metrics,
+        news_count=1,
+    )
+
+    if age_minutes <= 15:
+        freshness_score = 20
+    elif age_minutes <= 60:
+        freshness_score = 16
+    elif age_minutes <= 180:
+        freshness_score = 12
+    elif age_minutes <= 360:
+        freshness_score = 8
+    else:
+        freshness_score = 3
+    credibility_score = 8 if source_type == "listing" else 6 if source_type == "newsflash" else 4
+    score = min(
+        100,
+        best_value
+        + freshness_score
+        + (10 if assets else 0)
+        + (8 if direct_confirmation else 0)
+        + (8 if market_confirmation else 0)
+        + credibility_score
+        + min(18, round(safe_float(curiosity_profile.get("score"), 0) * 0.18))
+        + min(10, round(safe_float(name_binding.get("score"), 0) * 0.10)),
+    )
+    if score < 44:
+        return None
+
+    confirmations: list[str] = []
+    if direct_confirmation:
+        confirmations.append("官方/原始来源确认")
+    if market_confirmation:
+        confirmations.append("行情或交易数据确认")
+    if age_minutes <= 60:
+        confirmations.append("1 小时内事件")
+    elif age_minutes <= 360:
+        confirmations.append("6 小时内事件")
+    elif age_minutes <= 24 * 60:
+        confirmations.append("24 小时预发酵窗口")
+    if assets:
+        confirmations.append(f"关联标的 {' / '.join(assets[:4])}")
+    confirmations.extend(curiosity_profile.get("labels") or [])
+    if name_binding.get("qualified"):
+        confirmations.append(name_binding["label"])
+    confirmations.append(news_trade_phase["label"])
+    primary_candidate = meme_candidates[0] if meme_candidates else None
+    primary_onchain_score = safe_float((primary_candidate or {}).get("onchainTradeScore"), 0)
+    if best_template["id"] == "counter-consensus-culture":
+        is_news_trade = bool(
+            age_minutes <= 48 * 60
+            and culture_profile.get("qualified")
+        )
+    elif source_type == "listing":
+        is_news_trade = bool(
+            age_minutes <= 24 * 60
+            and event_monitor_listing_candidate_eligible(primary_candidate, f"{title} {body}")
+        )
+    else:
+        hot_topic_terms = event_monitor_hot_topic_terms(text)
+        narrative_trigger = bool(
+            curiosity_profile.get("qualified")
+            or len(hot_topic_terms) >= 2
+            or legacy_meme_opportunity
+            or (
+                name_binding.get("qualified")
+                and primary_candidate
+                and safe_float(primary_candidate.get("candidateScore"), 0) >= 75
+            )
+        )
+        is_news_trade = bool(
+            score >= 72
+            and primary_candidate
+            and primary_candidate.get("tradeReady")
+            and safe_float(primary_candidate.get("candidateScore"), 0) >= 65
+            and age_minutes <= 48 * 60
+            and narrative_trigger
+            and (direct_confirmation or market_confirmation or hot_topic_terms)
+        )
+    if primary_candidate:
+        score = min(
+            100,
+            round(score * 0.45 + safe_float(primary_candidate.get("candidateScore"), 0) * 0.55),
+        )
+    culture_trade_ready = bool(
+        best_template["id"] == "counter-consensus-culture"
+        and safe_float(preliminary_event_heat.get("score"), 0) >= NEWS_TRADE_CONFIG["thresholds"]["eventTrade"]
+        and primary_onchain_score >= NEWS_TRADE_CONFIG["thresholds"]["onchainTrade"]
+        and primary_candidate
+        and primary_candidate.get("tradeReady")
+    )
+    candidate_tier = (
+        "trade-candidate"
+        if (
+            culture_trade_ready
+            or (
+                best_template["id"] != "counter-consensus-culture"
+                and is_news_trade
+                and primary_candidate
+                and primary_candidate.get("tradeReady")
+            )
+        )
+        else "event-observation"
+    )
+    thesis = best_template["description"]
+    if assets:
+        thesis = f"{' / '.join(assets[:3])}：{thesis}"
+    result = {
+        "id": js_stable_key("event-monitor", source_type, row.get("id"), row.get("url"), title),
+        "title": title,
+        "body": body,
+        "url": row.get("url") or "./price-watch.html?mode=events",
+        "timestamp": timestamp,
+        "capturedAt": alert_event_ms(row.get("capturedAt")) if row.get("capturedAt") else now_ms,
+        "scheduledAt": alert_event_ms(row.get("scheduledAt")) if row.get("scheduledAt") else 0,
+        "source": row.get("source") or "市场信息",
+        "sourceLabel": row.get("sourceLabel") or "EV",
+        "sourceType": source_type,
+        "template": best_template["id"],
+        "templateName": best_template["name"],
+        "thesis": thesis,
+        "assets": assets,
+        "eventEntities": event_entities,
+        "newsKeywords": news_keywords,
+        "eventType": best_template["name"],
+        "score": score,
+        "freshnessMinutes": round(age_minutes, 1),
+        "directConfirmation": direct_confirmation,
+        "marketConfirmation": market_confirmation,
+        "confirmation": confirmations,
+        "evidence": list(dict.fromkeys([*(curiosity_profile.get("labels") or []), *best_hits]))[:6],
+        "isNewsTrade": is_news_trade,
+        "newsTradePhase": news_trade_phase["code"],
+        "newsTradePhaseLabel": news_trade_phase["label"],
+        "newsTradePhaseReason": news_trade_phase["reason"],
+        "newsTradeUrgencyScore": news_trade_phase["urgencyScore"],
+        "executionEligible": bool(
+            is_news_trade
+            and news_trade_phase["earlyEntryEligible"]
+            and (culture_trade_ready if best_template["id"] == "counter-consensus-culture" else True)
+        ),
+        "candidateTier": candidate_tier,
+        "eventHeatScore": preliminary_event_heat["score"],
+        "eventHeatBreakdown": preliminary_event_heat,
+        "onchainTradeScore": round(primary_onchain_score),
+        "fullyFermented": news_trade_phase["fullyFermented"],
+        "impliedGainPct": news_trade_phase["impliedGainPct"],
+        "curiosityProfile": curiosity_profile,
+        "counterConsensusProfile": culture_profile,
+        "nameBinding": name_binding,
+        "sourceEvidence": {
+            "source": row.get("source") or "市场信息",
+            "url": row.get("url") or "",
+            "publishedAt": timestamp,
+            "capturedAt": alert_event_ms(row.get("capturedAt")) if row.get("capturedAt") else now_ms,
+            "claimStatus": clean_feed_text(row.get("claimStatus") or "source-reported", 40),
+        },
+        "memeOpportunity": meme_opportunity,
+        "memeCandidates": meme_candidates,
+    }
+    result["topicKey"] = event_monitor_topic_key(result)
+    return result
+
+
+def event_monitor_cluster_topics(
+    events: list[dict[str, Any]],
+    *,
+    now_ms: int | None = None,
+) -> list[dict[str, Any]]:
+    current_ms = int(now_ms or time.time() * 1000)
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        if not isinstance(event, dict) or not event.get("isNewsTrade"):
+            continue
+        topic_key = clean_feed_text(event_monitor_topic_key(event), 220)
+        event["topicKey"] = topic_key
+        grouped.setdefault(topic_key, []).append(event)
+
+    topics: list[dict[str, Any]] = []
+    for topic_key, rows in grouped.items():
+        ordered = sorted(
+            rows,
+            key=lambda item: (int(safe_float(item.get("timestamp"), 0)), int(safe_float(item.get("score"), 0))),
+            reverse=True,
+        )
+        narrative_lead = next((event for event in ordered if event.get("template") == "counter-consensus-culture"), None)
+        if narrative_lead is None:
+            narrative_lead = next((event for event in ordered if event.get("template") == "meme-catalyst"), ordered[0])
+        latest = dict(narrative_lead)
+        candidate_map: dict[str, dict[str, Any]] = {}
+        for event in ordered:
+            candidates = event.get("memeCandidates") if isinstance(event.get("memeCandidates"), list) else []
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                identity = str(candidate.get("contractAddress") or "").casefold() or js_stable_key(
+                    candidate.get("chain"), candidate.get("symbol")
+                )
+                current = candidate_map.get(identity)
+                candidate_map[identity] = event_monitor_merge_candidate(current, candidate) if current else dict(candidate)
+                candidate_map[identity]["candidateScore"] = max(
+                    safe_float((current or {}).get("candidateScore"), 0),
+                    safe_float(candidate.get("candidateScore"), 0),
+                )
+                candidate_map[identity]["narrativeRelevance"] = max(
+                    safe_float((current or {}).get("narrativeRelevance"), 0),
+                    safe_float(candidate.get("narrativeRelevance"), 0),
+                )
+        sources = list(
+            dict.fromkeys(
+                clean_feed_text(event.get("source") or event.get("sourceLabel") or "市场信息", 80)
+                for event in ordered
+            )
+        )
+        related_news = [
+            {
+                "title": clean_feed_text(event.get("title"), 180),
+                "source": clean_feed_text(event.get("source") or "市场信息", 80),
+                "sourceLabel": clean_feed_text(event.get("sourceLabel") or "EV", 12),
+                "url": clean_feed_text(event.get("url"), 600),
+                "timestamp": int(safe_float(event.get("timestamp"), 0)),
+                "publishedAt": int(safe_float(event.get("timestamp"), 0)),
+                "capturedAt": int(safe_float(event.get("capturedAt"), 0)),
+                "claimStatus": clean_feed_text((event.get("sourceEvidence") or {}).get("claimStatus") or "source-reported", 40),
+                "storyBeat": event_monitor_story_beat(f"{event.get('title') or ''} {event.get('body') or ''}"),
+            }
+            for event in ordered[:12]
+        ]
+        first_seen_at = min(
+            (int(safe_float(event.get("firstSeenAt") or event.get("timestamp"), 0)) for event in ordered),
+            default=current_ms,
+        ) or current_ms
+        topic_text = " ".join(
+            clean_feed_text(f"{event.get('title') or ''} {event.get('body') or ''}", 900)
+            for event in ordered[:8]
+        )
+        curiosity_profile = event_monitor_curiosity_profile(topic_text)
+        culture_profile = event_monitor_counter_consensus_profile(topic_text, next(iter(candidate_map.values()), None))
+        metrics = event_monitor_topic_metrics(ordered, current_ms)
+        event_heat = event_monitor_event_heat_score(culture_profile, metrics, news_count=len(ordered))
+        legacy_event_score = max(safe_float(event.get("score"), 0) for event in ordered)
+        is_culture_model = bool(
+            culture_profile.get("qualified")
+            or any(event.get("template") == "counter-consensus-culture" for event in ordered)
+        )
+        if not is_culture_model:
+            event_heat["score"] = max(event_heat["score"], round(legacy_event_score))
+
+        candidates: list[dict[str, Any]] = []
+        for candidate in candidate_map.values():
+            relation = candidate.get("association") if isinstance(candidate.get("association"), dict) else {
+                "code": candidate.get("associationStatus") or "name-only",
+                "label": candidate.get("associationLabel") or "未确认关联 · 仅同名/疑似蹭热点",
+                "confidence": 35,
+                "disclaimer": "名称或叙事相同不代表事件方发行或官方认可。",
+            }
+            onchain = event_monitor_onchain_trade_score(candidate, relation)
+            candidate["association"] = relation
+            candidate["associationStatus"] = relation["code"]
+            candidate["associationLabel"] = relation["label"]
+            candidate["onchainTradeScore"] = onchain["score"]
+            candidate["onchainScoreBreakdown"] = onchain
+            candidate["combinedWeight"] = round(
+                safe_float(event_heat.get("score"), 0) * NEWS_TRADE_CONFIG["candidateBlend"]["event"]
+                + safe_float(onchain.get("score"), 0) * NEWS_TRADE_CONFIG["candidateBlend"]["onchain"],
+            )
+            candidates.append(candidate)
+        candidates.sort(
+            key=lambda item: (
+                safe_float(item.get("combinedWeight"), 0),
+                safe_float(item.get("onchainTradeScore"), 0),
+                safe_float(item.get("liquidityUsd"), 0),
+                safe_float(item.get("volume24hUsd"), 0),
+            ),
+            reverse=True,
+        )
+        candidates = candidates[:3]
+        for index, candidate in enumerate(candidates, start=1):
+            candidate["rank"] = index
+            candidate["role"] = "primary" if index == 1 else "backup"
+
+        name_binding = event_monitor_name_binding(topic_text, candidates[0] if candidates else None)
+        topic_phase = event_monitor_news_trade_phase(
+            max(0.0, (current_ms - first_seen_at) / 60_000),
+            topic_text,
+            candidates[0] if candidates else None,
+        )
+        for candidate in candidates:
+            candidate["earlyEntryEligible"] = topic_phase["earlyEntryEligible"]
+        top_onchain_score = safe_float(candidates[0].get("onchainTradeScore"), 0) if candidates else 0
+        event_heat_score = safe_float(event_heat.get("score"), 0)
+        if is_culture_model and event_heat_score < NEWS_TRADE_CONFIG["thresholds"]["eventObservation"]:
+            continue
+        topic_score = min(
+            100,
+            round(
+                event_heat_score * NEWS_TRADE_CONFIG["candidateBlend"]["event"]
+                + top_onchain_score * NEWS_TRADE_CONFIG["candidateBlend"]["onchain"]
+            ),
+        )
+        trade_candidate = bool(
+            event_heat_score >= NEWS_TRADE_CONFIG["thresholds"]["eventTrade"]
+            and top_onchain_score >= NEWS_TRADE_CONFIG["thresholds"]["onchainTrade"]
+            and candidates
+            and candidates[0].get("tradeReady")
+        )
+        candidate_tier = "trade-candidate" if trade_candidate else "event-observation"
+        stage = event_monitor_topic_stage(
+            metrics,
+            culture_profile,
+            topic_phase,
+            candidates[0] if candidates else None,
+            top_onchain_score,
+        )
+        asset_values: list[str] = []
+        if candidates and candidates[0].get("symbol"):
+            asset_values.append(clean_feed_text(candidates[0]["symbol"], 32))
+        for event in ordered:
+            for asset in event.get("assets") if isinstance(event.get("assets"), list) else []:
+                value = clean_feed_text(asset, 32)
+                if value and value not in asset_values:
+                    asset_values.append(value)
+        topic_keywords = list(dict.fromkeys(
+            clean_feed_text(keyword, 48)
+            for event in ordered
+            for keyword in (event.get("newsKeywords") if isinstance(event.get("newsKeywords"), list) else [])
+            if clean_feed_text(keyword, 48)
+        ))[:18]
+        latest.update(
+            {
+                "id": js_stable_key("news-trade-topic", topic_key),
+                "topicKey": topic_key,
+                "topicScore": topic_score,
+                "score": topic_score,
+                "isHotTopic": True,
+                "isNewTopic": bool(current_ms - int(safe_float(ordered[0].get("timestamp"), 0)) <= 60 * 60_000),
+                "firstSeenAt": first_seen_at,
+                "newsTradePhase": topic_phase["code"],
+                "newsTradePhaseLabel": topic_phase["label"],
+                "newsTradePhaseReason": topic_phase["reason"],
+                "newsTradeUrgencyScore": topic_phase["urgencyScore"],
+                "executionEligible": bool(
+                    topic_phase["earlyEntryEligible"]
+                    and trade_candidate
+                ),
+                "candidateTier": candidate_tier,
+                "candidateTierLabel": "News Trade 交易候选" if trade_candidate else "事件观察",
+                "eventType": (
+                    "反常识文化事件 / 负面共识破圈"
+                    if is_culture_model
+                    else latest.get("templateName") or "事件驱动"
+                ),
+                "eventStage": stage["code"],
+                "eventStageLabel": stage["label"],
+                "eventHeatScore": round(event_heat_score),
+                "eventHeatBreakdown": event_heat,
+                "onchainTradeScore": round(top_onchain_score),
+                "topicMetrics": metrics,
+                "fullyFermented": topic_phase["fullyFermented"],
+                "impliedGainPct": topic_phase["impliedGainPct"],
+                "curiosityProfile": curiosity_profile,
+                "counterConsensusProfile": culture_profile,
+                "nameBinding": name_binding,
+                "newsCount": len(ordered),
+                "sourceCount": len(sources),
+                "sources": sources,
+                "relatedNews": related_news,
+                "memeCandidates": candidates,
+                "memeOpportunity": candidates[0] if candidates else None,
+                "assets": asset_values[:8],
+                "newsKeywords": topic_keywords,
+                "corePropagationLogic": " → ".join(
+                    [
+                        label
+                        for label in (
+                            "低基数" if metrics.get("lowBase") or culture_profile.get("features", {}).get("lowBase", 0) else "",
+                            "负面/反差共识" if max(
+                                safe_float(culture_profile.get("features", {}).get("extremeContrast"), 0),
+                                safe_float(culture_profile.get("features", {}).get("negativeConsensus"), 0),
+                            ) > 0 else "",
+                            "群体参与" if culture_profile.get("features", {}).get("participatoryConsensus", 0) else "",
+                            "跨平台扩散" if metrics.get("platformCount", 0) >= 2 else "",
+                            "链上金融化" if candidates else "",
+                        )
+                        if label
+                    ]
+                ) or "等待更多传播链路证据",
+                "latestCatalyst": {
+                    "title": clean_feed_text(ordered[0].get("title"), 180),
+                    "timestamp": int(safe_float(ordered[0].get("timestamp"), 0)),
+                    "storyBeat": event_monitor_story_beat(f"{ordered[0].get('title') or ''} {ordered[0].get('body') or ''}"),
+                },
+                "watchReasons": list(dict.fromkeys([
+                    *(culture_profile.get("labels") or []),
+                    *(["多平台同步扩散"] if metrics.get("platformCount", 0) >= 2 else []),
+                    *(["内容增速达到高等级"] if metrics.get("velocityScore", 0) >= NEWS_TRADE_CONFIG["thresholds"]["highVelocity"] else []),
+                    *(["已发现可核验链上候选"] if candidates else []),
+                ]))[:6],
+                "invalidationConditions": [
+                    "6小时内容增速持续回落且没有新剧情",
+                    "未形成新的跨平台传播或现实反馈",
+                    "主合约共识分散、流动性或成交额跌破门槛",
+                    "出现无法退出、持仓过度集中或合约安全风险",
+                ],
+                "informationSources": related_news,
+                "updatedAt": current_ms,
+                "politicalMilitary": event_monitor_is_political_military_text(topic_text),
+                "explicitCryptoMapping": bool(
+                    candidates
+                    and candidates[0].get("contractAddress")
+                    and top_onchain_score >= NEWS_TRADE_CONFIG["thresholds"]["onchainTrade"]
+                ),
+                "confirmation": list(
+                    dict.fromkeys(
+                        [
+                            f"{len(ordered)} 条关联信息",
+                            f"{len(sources)} 个来源确认",
+                            *(culture_profile.get("labels") or []),
+                            *(curiosity_profile.get("labels") or []),
+                            *([name_binding["label"]] if name_binding.get("qualified") else []),
+                            topic_phase["label"],
+                            *(latest.get("confirmation") or []),
+                        ]
+                    )
+                ),
+                "weightBreakdown": {
+                    "eventHeat": round(event_heat_score, 2),
+                    "onchainTrade": round(top_onchain_score, 2),
+                    "combined": topic_score,
+                },
+            }
+        )
+        topics.append(latest)
+    topics.sort(
+        key=lambda item: (
+            1 if item.get("candidateTier") == "trade-candidate" else 0,
+            safe_float(item.get("topicScore"), 0),
+            int(safe_float(item.get("firstSeenAt") or item.get("timestamp"), 0)),
+        ),
+        reverse=True,
+    )
+    return topics
+
+
+def news_trade_topic_news_keywords(topic: dict[str, Any]) -> list[str]:
+    """Backfill auditable keywords for both live and historically pooled topic cards."""
+    item = dict(topic or {})
+    related_news = item.get("relatedNews") if isinstance(item.get("relatedNews"), list) else []
+    latest_catalyst = item.get("latestCatalyst") if isinstance(item.get("latestCatalyst"), dict) else {}
+    text_parts = [
+        clean_feed_text(item.get("title"), 240),
+        clean_feed_text(item.get("body"), 720),
+        clean_feed_text(item.get("corePropagationLogic"), 320),
+        clean_feed_text(item.get("attentionReason"), 320),
+        clean_feed_text(latest_catalyst.get("title") or latest_catalyst.get("summary"), 220),
+    ]
+    for row in related_news[:20]:
+        if not isinstance(row, dict):
+            continue
+        text_parts.extend([
+            clean_feed_text(row.get("title"), 220),
+            clean_feed_text(row.get("body") or row.get("summary"), 360),
+        ])
+    combined_text = clean_feed_text(" ".join(part for part in text_parts if part), 5600)
+    keywords: list[str] = []
+
+    def add(value: Any) -> None:
+        keyword = clean_feed_text(value, 48).strip(" ·:：,，。!?！？-—_#＃$《》「」『』“”\"")
+        if (
+            len(keyword) < 2
+            or keyword.casefold() in NEWS_TRADE_KEYWORD_STOPWORDS
+            or keyword.casefold() in {current.casefold() for current in keywords}
+        ):
+            return
+        keywords.append(keyword)
+
+    for value in item.get("newsKeywords") if isinstance(item.get("newsKeywords"), list) else []:
+        add(value)
+    for value in event_monitor_news_keywords(item.get("title") or "", combined_text):
+        add(value)
+    for key in ("eventEntities", "assets", "templateHits"):
+        for value in item.get(key) if isinstance(item.get(key), list) else []:
+            add(value)
+
+    # Legacy cards may predate entity extraction. Preserve an identifiable
+    # title phrase instead of leaving the keyword row blank; the phrase still
+    # comes directly from saved source text and is never model-invented.
+    if not keywords:
+        title = clean_feed_text(item.get("title"), 180)
+        for match in re.finditer(r"[A-Za-z][A-Za-z0-9._-]{1,23}|[\u3400-\u9fff]{2,12}", title):
+            add(match.group(0))
+            if len(keywords) >= 4:
+                break
+    return keywords[:18]
+
+
+def news_trade_topic_identity(topic: dict[str, Any]) -> str:
+    """Return the current canonical identity, including migration of legacy contract keys."""
+    identity = clean_feed_text(event_monitor_topic_key(topic), 240)
+    if identity:
+        return identity
+    return clean_feed_text(topic.get("topicKey") or topic.get("id") or js_stable_key(topic.get("title")), 240)
+
+
+def news_trade_merge_topic_records(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    """Merge duplicate ledger rows without letting a changing primary contract split the narrative."""
+    left = dict(left or {})
+    right = dict(right or {})
+    left_rank = (
+        1 if left.get("sourceActive") else 0,
+        safe_float(left.get("topicScore") or left.get("score"), 0),
+        int(safe_float(left.get("updatedAt") or left.get("lastSeenAt") or left.get("timestamp"), 0)),
+    )
+    right_rank = (
+        1 if right.get("sourceActive") else 0,
+        safe_float(right.get("topicScore") or right.get("score"), 0),
+        int(safe_float(right.get("updatedAt") or right.get("lastSeenAt") or right.get("timestamp"), 0)),
+    )
+    preferred, fallback = (right, left) if right_rank >= left_rank else (left, right)
+    merged = {**fallback, **preferred}
+
+    time_values = [
+        int(safe_float(value, 0))
+        for value in (
+            left.get("firstSeenAt"), left.get("enteredAt"), left.get("timestamp"),
+            right.get("firstSeenAt"), right.get("enteredAt"), right.get("timestamp"),
+        )
+        if int(safe_float(value, 0)) > 0
+    ]
+    if time_values:
+        merged["firstSeenAt"] = min(time_values)
+        merged["enteredAt"] = min(time_values)
+    merged["lastSeenAt"] = max(
+        int(safe_float(left.get("lastSeenAt") or left.get("updatedAt"), 0)),
+        int(safe_float(right.get("lastSeenAt") or right.get("updatedAt"), 0)),
+    )
+    merged["sources"] = list(dict.fromkeys([
+        *(left.get("sources") if isinstance(left.get("sources"), list) else []),
+        *(right.get("sources") if isinstance(right.get("sources"), list) else []),
+    ]))
+
+    related: dict[str, dict[str, Any]] = {}
+    for row in [
+        *(right.get("relatedNews") if isinstance(right.get("relatedNews"), list) else []),
+        *(left.get("relatedNews") if isinstance(left.get("relatedNews"), list) else []),
+    ]:
+        if not isinstance(row, dict):
+            continue
+        key = clean_feed_text(row.get("url"), 600).casefold() or clean_feed_text(row.get("title"), 180).casefold()
+        if key and key not in related:
+            related[key] = dict(row)
+    merged["relatedNews"] = sorted(
+        related.values(),
+        key=lambda row: int(safe_float(row.get("publishedAt") or row.get("timestamp"), 0)),
+        reverse=True,
+    )[:20]
+
+    candidate_map: dict[str, dict[str, Any]] = {}
+    for candidate in [
+        *(left.get("memeCandidates") if isinstance(left.get("memeCandidates"), list) else []),
+        *(right.get("memeCandidates") if isinstance(right.get("memeCandidates"), list) else []),
+    ]:
+        if not isinstance(candidate, dict):
+            continue
+        identity = str(candidate.get("contractAddress") or "").casefold() or js_stable_key(
+            candidate.get("chain"), candidate.get("symbol"), candidate.get("name")
+        )
+        current = candidate_map.get(identity)
+        candidate_map[identity] = event_monitor_merge_candidate(current, candidate) if current else dict(candidate)
+    candidates = sorted(
+        candidate_map.values(),
+        key=lambda item: (
+            safe_float(item.get("combinedWeight"), 0),
+            safe_float(item.get("onchainTradeScore"), 0),
+            safe_float(item.get("candidateScore"), 0),
+            safe_float(item.get("liquidityUsd"), 0),
+        ),
+        reverse=True,
+    )[:3]
+    for index, candidate in enumerate(candidates, start=1):
+        candidate["rank"] = index
+        candidate["role"] = "primary" if index == 1 else "backup"
+    merged["memeCandidates"] = candidates
+    merged["memeOpportunity"] = candidates[0] if candidates else None
+    merged["newsKeywords"] = news_trade_topic_news_keywords(merged)
+    return merged
+
+
+def news_trade_refresh_pooled_topic(topic: dict[str, Any], *, now_ms: int) -> dict[str, Any]:
+    item = dict(topic)
+    item["newsKeywords"] = news_trade_topic_news_keywords(item)
+    first_seen_at = int(safe_float(
+        item.get("firstSeenAt") or item.get("enteredAt") or item.get("timestamp"),
+        now_ms,
+    )) or now_ms
+    candidates = item.get("memeCandidates") if isinstance(item.get("memeCandidates"), list) else []
+    related_news = item.get("relatedNews") if isinstance(item.get("relatedNews"), list) else []
+    topic_text = " ".join(
+        [
+            clean_feed_text(item.get("title"), 220),
+            clean_feed_text(item.get("body"), 720),
+            *[clean_feed_text(row.get("title"), 180) for row in related_news if isinstance(row, dict)],
+        ]
+    )
+    event_heat_score = safe_float(item.get("eventHeatScore"), 0)
+    relation_entities = list(dict.fromkeys([
+        *(item.get("eventEntities") if isinstance(item.get("eventEntities"), list) else []),
+        *(item.get("assets") if isinstance(item.get("assets"), list) else []),
+        *event_monitor_hot_entities(clean_feed_text(item.get("title"), 220), clean_feed_text(item.get("body"), 720)),
+    ]))
+    relation_text = clean_feed_text(f"{topic_text} {item.get('url') or ''}", 2800)
+    refreshed_candidates: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        relation = event_monitor_asset_relation(item, candidate, relation_text, relation_entities)
+        onchain = event_monitor_onchain_trade_score(candidate, relation)
+        candidate.update({
+            "association": relation,
+            "associationStatus": relation["code"],
+            "associationLabel": relation["label"],
+            "onchainTradeScore": onchain["score"],
+            "onchainScoreBreakdown": onchain,
+            "combinedWeight": round(
+                event_heat_score * NEWS_TRADE_CONFIG["candidateBlend"]["event"]
+                + safe_float(onchain.get("score"), 0) * NEWS_TRADE_CONFIG["candidateBlend"]["onchain"]
+            ),
+        })
+        refreshed_candidates.append(candidate)
+    candidates = sorted(
+        refreshed_candidates,
+        key=lambda candidate: (
+            safe_float(candidate.get("combinedWeight"), 0),
+            safe_float(candidate.get("onchainTradeScore"), 0),
+            safe_float(candidate.get("liquidityUsd"), 0),
+        ),
+        reverse=True,
+    )[:3]
+    for index, candidate in enumerate(candidates, start=1):
+        candidate["rank"] = index
+        candidate["role"] = "primary" if index == 1 else "backup"
+    opportunity = candidates[0] if candidates else item.get("memeOpportunity") if isinstance(item.get("memeOpportunity"), dict) else None
+    curiosity_profile = event_monitor_curiosity_profile(topic_text)
+    name_binding = event_monitor_name_binding(topic_text, opportunity)
+    phase = event_monitor_news_trade_phase(
+        max(0.0, (now_ms - first_seen_at) / 60_000),
+        topic_text,
+        opportunity,
+    )
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            candidate["earlyEntryEligible"] = phase["earlyEntryEligible"]
+    onchain_trade_score = safe_float((opportunity or {}).get("onchainTradeScore"), 0)
+    topic_score = min(
+        100,
+        round(
+            event_heat_score * NEWS_TRADE_CONFIG["candidateBlend"]["event"]
+            + onchain_trade_score * NEWS_TRADE_CONFIG["candidateBlend"]["onchain"]
+        ),
+    )
+    trade_candidate = bool(
+        event_heat_score >= NEWS_TRADE_CONFIG["thresholds"]["eventTrade"]
+        and onchain_trade_score >= NEWS_TRADE_CONFIG["thresholds"]["onchainTrade"]
+        and isinstance(opportunity, dict)
+        and opportunity.get("tradeReady")
+    )
+    candidate_tier = "trade-candidate" if trade_candidate else "event-observation"
+    metrics = item.get("topicMetrics") if isinstance(item.get("topicMetrics"), dict) else {}
+    culture_profile = (
+        item.get("counterConsensusProfile")
+        if isinstance(item.get("counterConsensusProfile"), dict)
+        else event_monitor_counter_consensus_profile(topic_text, opportunity)
+    )
+    stage = event_monitor_topic_stage(metrics, culture_profile, phase, opportunity, onchain_trade_score)
+    derived_labels = {
+        "0–6h 先手理解",
+        "6–24h 预发酵",
+        "已发酵 · 仅复盘",
+        "超过24h · 已错过",
+        "新奇猎奇",
+        "争议性",
+        "高讨论度",
+        "传奇性",
+        "名字寓意强绑定",
+        "名字关联待确认",
+    }
+    confirmations = [
+        label
+        for label in (item.get("confirmation") if isinstance(item.get("confirmation"), list) else [])
+        if label not in derived_labels
+    ]
+    confirmations = list(dict.fromkeys([
+        *confirmations,
+        *(curiosity_profile.get("labels") or []),
+        *([name_binding["label"]] if name_binding.get("qualified") else []),
+        phase["label"],
+    ]))
+    item.update({
+        "firstSeenAt": first_seen_at,
+        "newsTradePhase": phase["code"],
+        "newsTradePhaseLabel": phase["label"],
+        "newsTradePhaseReason": phase["reason"],
+        "newsTradeUrgencyScore": phase["urgencyScore"],
+        "executionEligible": bool(
+            phase["earlyEntryEligible"]
+            and trade_candidate
+        ),
+        "candidateTier": candidate_tier,
+        "candidateTierLabel": "News Trade 交易候选" if trade_candidate else "事件观察",
+        "eventStage": stage["code"],
+        "eventStageLabel": stage["label"],
+        "eventHeatScore": round(event_heat_score),
+        "onchainTradeScore": round(onchain_trade_score),
+        "topicScore": topic_score,
+        "score": topic_score,
+        "weightBreakdown": {
+            "eventHeat": round(event_heat_score, 2),
+            "onchainTrade": round(onchain_trade_score, 2),
+            "combined": topic_score,
+        },
+        "fullyFermented": phase["fullyFermented"],
+        "impliedGainPct": phase["impliedGainPct"],
+        "curiosityProfile": curiosity_profile,
+        "counterConsensusProfile": culture_profile,
+        "nameBinding": name_binding,
+        "confirmation": confirmations,
+        "memeCandidates": candidates,
+        "memeOpportunity": opportunity,
+    })
+    return item
+
+
+def news_trade_update_topic_pool(
+    current_topics: list[dict[str, Any]],
+    *,
+    now_ms: int | None = None,
+) -> list[dict[str, Any]]:
+    """Persist every admitted topic; source-cache rotation may update it but never remove it."""
+    current_ms = int(now_ms or time.time() * 1000)
+    path = PERSIST_CACHE_DIR / "news_trade_topic_pool.json"
+    with NEWS_TRADE_TOPIC_POOL_LOCK:
+        payload = read_json_cache(path)
+        stored_rows = payload.get("topics") if isinstance(payload.get("topics"), list) else []
+        pooled: dict[str, dict[str, Any]] = {}
+        for row in stored_rows:
+            if not isinstance(row, dict):
+                continue
+            identity = news_trade_topic_identity(row)
+            if not identity:
+                continue
+            item = dict(row)
+            item["topicKey"] = identity
+            item["id"] = js_stable_key("news-trade-topic", identity)
+            pooled[identity] = news_trade_merge_topic_records(pooled[identity], item) if identity in pooled else item
+        current_keys: set[str] = set()
+        for topic in current_topics:
+            if not isinstance(topic, dict):
+                continue
+            identity = news_trade_topic_identity(topic)
+            if not identity:
+                continue
+            current_keys.add(identity)
+            existing = pooled.get(identity, {})
+            current = dict(topic)
+            current["topicKey"] = identity
+            current["id"] = js_stable_key("news-trade-topic", identity)
+            merged = news_trade_merge_topic_records(existing, current)
+            first_seen_values = [
+                int(safe_float(value, 0))
+                for value in (
+                    existing.get("firstSeenAt"),
+                    existing.get("timestamp"),
+                    topic.get("firstSeenAt"),
+                    topic.get("timestamp"),
+                )
+                if int(safe_float(value, 0)) > 0
+            ]
+            merged["firstSeenAt"] = min(first_seen_values) if first_seen_values else current_ms
+            entered_values = [
+                int(safe_float(value, 0))
+                for value in (
+                    existing.get("enteredAt"),
+                    topic.get("enteredAt"),
+                    merged.get("firstSeenAt"),
+                )
+                if int(safe_float(value, 0)) > 0
+            ]
+            # During migration we may discover an event that entered before the
+            # persistent ledger existed. Use its earliest observed time so the
+            # chronological ordering remains stable and truthful.
+            merged["enteredAt"] = min(entered_values) if entered_values else current_ms
+            merged["lastSeenAt"] = current_ms
+            merged["sourceActive"] = True
+            merged["sources"] = list(dict.fromkeys([
+                *(existing.get("sources") if isinstance(existing.get("sources"), list) else []),
+                *(topic.get("sources") if isinstance(topic.get("sources"), list) else []),
+            ]))
+            pooled[identity] = news_trade_refresh_pooled_topic(merged, now_ms=current_ms)
+
+        for identity, topic in list(pooled.items()):
+            if identity in current_keys:
+                continue
+            topic["sourceActive"] = False
+            pooled[identity] = news_trade_refresh_pooled_topic(topic, now_ms=current_ms)
+
+        topics = sorted(
+            pooled.values(),
+            key=lambda item: (
+                int(safe_float(
+                    item.get("enteredAt") or item.get("firstSeenAt") or item.get("timestamp"),
+                    0,
+                )),
+                int(safe_float(item.get("firstSeenAt") or item.get("timestamp"), 0)),
+                clean_feed_text(item.get("topicKey") or item.get("id"), 180),
+            ),
+            reverse=True,
+        )
+        write_json_cache(path, {
+            "updatedAt": current_ms,
+            "sort": "enteredAt-firstSeenAt-desc",
+            "topics": topics,
+        })
+    return topics
+
+
+def news_trade_search_terms(query: Any) -> list[str]:
+    value = clean_feed_text(query, 100).strip()
+    if not value:
+        return []
+    terms = [value]
+    for token in re.findall(r"[A-Za-z0-9$]{2,32}|[\u3400-\u9fff]{2,24}", value):
+        token = token.strip("$")
+        if token and token.casefold() not in {item.casefold() for item in terms}:
+            terms.append(token)
+    return terms[:8]
+
+
+def news_trade_local_search_rows(
+    query: Any,
+    *,
+    source_rows: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    terms = news_trade_search_terms(query)
+    if not terms:
+        return []
+    ranked: list[tuple[int, int, dict[str, Any]]] = []
+    for row in source_rows if isinstance(source_rows, list) else event_monitor_source_rows():
+        if not isinstance(row, dict):
+            continue
+        title = clean_feed_text(row.get("title"), 260)
+        body = clean_feed_text(row.get("body"), 900)
+        if not title:
+            continue
+        title_folded = title.casefold()
+        body_folded = body.casefold()
+        score = 0
+        for index, term in enumerate(terms):
+            folded = term.casefold()
+            if folded in title_folded:
+                score += 12 if index == 0 else 6
+            if folded in body_folded:
+                score += 6 if index == 0 else 3
+        if score <= 0:
+            continue
+        ranked.append((score, alert_event_ms(row.get("timestamp")), dict(row)))
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [{**row, "searchScore": score} for score, _, row in ranked[:12]]
+
+
+def news_trade_public_search_rows(query: Any) -> list[dict[str, Any]]:
+    value = clean_feed_text(query, 100).strip()
+    if len(value) < 2:
+        return []
+    response = requests.get(
+        "https://www.bing.com/news/search",
+        params={"q": value, "format": "RSS", "setlang": "zh-hans"},
+        headers={**HEADERS, "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8"},
+        timeout=8,
+    )
+    response.raise_for_status()
+    # Parsing decoded text avoids lxml guessing a legacy CJK encoding for an otherwise
+    # valid UTF-8 RSS document.
+    soup = BeautifulSoup(response.content.decode("utf-8", errors="replace"), "xml")
+    rows: list[dict[str, Any]] = []
+    for item in soup.find_all("item")[:12]:
+        title = clean_feed_text(item.title.get_text(" ", strip=True) if item.title else "", 240)
+        if not title:
+            continue
+        description_raw = item.description.get_text(" ", strip=True) if item.description else ""
+        description = clean_feed_text(BeautifulSoup(description_raw, "html.parser").get_text(" ", strip=True), 900)
+        link = clean_feed_text(item.link.get_text(strip=True) if item.link else "", 600)
+        source_node = item.find("source") or item.find("Source")
+        source = clean_feed_text(source_node.get_text(" ", strip=True) if source_node else "公开新闻", 80)
+        published_at = int(time.time() * 1000)
+        pub_date = item.find("pubDate")
+        if pub_date:
+            try:
+                parsed_date = parsedate_to_datetime(pub_date.get_text(strip=True))
+                published_at = int(parsed_date.timestamp() * 1000)
+            except (TypeError, ValueError, OverflowError):
+                pass
+        rows.append(
+            {
+                "id": js_stable_key("news-trade-web-search", link, title),
+                "sourceType": "web-search",
+                "source": source or "公开新闻",
+                "sourceLabel": "WEB",
+                "title": title,
+                "body": description,
+                "url": link,
+                "timestamp": published_at,
+            }
+        )
+    return rows
+
+
+def news_trade_dex_search_rows(query: Any, search_results: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    terms = news_trade_search_terms(query)
+    for row in (search_results or [])[:5]:
+        for entity in event_monitor_hot_entities(str(row.get("title") or ""), str(row.get("body") or "")):
+            if entity.casefold() not in {term.casefold() for term in terms}:
+                terms.append(entity)
+    terms = [term for term in terms if 1 < len(term) <= 48][:3]
+    if not terms:
+        return []
+
+    def fetch(term: str) -> list[dict[str, Any]]:
+        response = requests.get(
+            "https://api.dexscreener.com/latest/dex/search",
+            params={"q": term},
+            headers={**HEADERS, "Accept": "application/json"},
+            timeout=8,
+        )
+        response.raise_for_status()
+        response.encoding = "utf-8"
+        payload = response.json()
+        pairs = payload.get("pairs") if isinstance(payload, dict) and isinstance(payload.get("pairs"), list) else []
+        rows: list[dict[str, Any]] = []
+        for pair in pairs[:20]:
+            if not isinstance(pair, dict):
+                continue
+            base = pair.get("baseToken") if isinstance(pair.get("baseToken"), dict) else {}
+            symbol = clean_feed_text(base.get("symbol"), 40)
+            contract = clean_feed_text(base.get("address"), 96)
+            chain = clean_feed_text(pair.get("chainId"), 40).casefold()
+            if not symbol or not contract:
+                continue
+            liquidity = safe_float((pair.get("liquidity") or {}).get("usd"), 0) if isinstance(pair.get("liquidity"), dict) else 0
+            volume = safe_float((pair.get("volume") or {}).get("h24"), 0) if isinstance(pair.get("volume"), dict) else 0
+            txns = (pair.get("txns") or {}).get("h24") if isinstance(pair.get("txns"), dict) else {}
+            transactions = safe_float((txns or {}).get("buys"), 0) + safe_float((txns or {}).get("sells"), 0)
+            market_cap = safe_float(pair.get("marketCap"), 0) or safe_float(pair.get("fdv"), 0)
+            heat = min(
+                100.0,
+                event_monitor_metric_score(liquidity, floor=50_000, ceiling=10_000_000) * 0.45
+                + event_monitor_metric_score(volume, floor=100_000, ceiling=100_000_000) * 0.40
+                + event_monitor_metric_score(transactions, floor=500, ceiling=100_000) * 0.15,
+            )
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "name": clean_feed_text(base.get("name") or symbol, 80),
+                    "chain": chain,
+                    "chainLabel": (event_monitor_chain_meta(chain) or {}).get("chainLabel") or chain,
+                    "contractAddress": contract,
+                    "heat": round(heat, 2),
+                    "amount": volume,
+                    "volume24hUsd": volume,
+                    "liquidityUsd": liquidity,
+                    "marketCapUsd": market_cap,
+                    "transactions24h": transactions,
+                    "priceUsd": safe_float(pair.get("priceUsd"), 0),
+                    "change24hPercent": safe_float((pair.get("priceChange") or {}).get("h24"), 0) if isinstance(pair.get("priceChange"), dict) else 0,
+                    "pairCreatedAt": int(safe_float(pair.get("pairCreatedAt"), 0)),
+                    "note": (
+                        f"市值 ${market_cap:g} · 流动性 ${liquidity:g} · "
+                        f"交易量 ${volume:g} · 交易 {transactions:g}"
+                    ),
+                    "url": clean_feed_text(pair.get("url"), 600),
+                    "tradeUrl": clean_feed_text(pair.get("url"), 600),
+                    "venue": "DexScreener",
+                }
+            )
+        return rows
+
+    gathered: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=min(3, len(terms))) as pool:
+        futures = [pool.submit(fetch, term) for term in terms]
+        for future in as_completed(futures):
+            try:
+                gathered.extend(future.result())
+            except Exception:
+                continue
+    by_contract: dict[str, dict[str, Any]] = {}
+    for row in gathered:
+        identity = clean_feed_text(row.get("contractAddress"), 96).casefold()
+        current = by_contract.get(identity)
+        if not current or (
+            safe_float(row.get("liquidityUsd"), 0), safe_float(row.get("volume24hUsd"), 0)
+        ) > (
+            safe_float(current.get("liquidityUsd"), 0), safe_float(current.get("volume24hUsd"), 0)
+        ):
+            by_contract[identity] = row
+    return sorted(
+        by_contract.values(),
+        key=lambda row: (safe_float(row.get("heat"), 0), safe_float(row.get("liquidityUsd"), 0)),
+        reverse=True,
+    )[:40]
+
+
+def news_trade_cached_public_search_rows(query: Any) -> list[dict[str, Any]]:
+    value = clean_feed_text(query, 100).strip()
+    cache_key = f"public-search:{value.casefold()}"
+    with NEWS_TRADE_DISCOVERY_CACHE_LOCK:
+        cached = NEWS_TRADE_DISCOVERY_CACHE.get(cache_key)
+    if cached and time.time() - cached[0] < max(600, NEWS_TRADE_DISCOVERY_CACHE_TTL_SECONDS):
+        return [dict(row) for row in cached[1] if isinstance(row, dict)]
+    try:
+        rows = news_trade_public_search_rows(value)
+        with NEWS_TRADE_DISCOVERY_CACHE_LOCK:
+            NEWS_TRADE_DISCOVERY_CACHE[cache_key] = (time.time(), rows)
+        return rows
+    except Exception:
+        return [dict(row) for row in cached[1] if isinstance(row, dict)] if cached else []
+
+
+def news_trade_cached_dex_search_rows(query: Any, search_results: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    value = clean_feed_text(query, 100).strip()
+    cache_key = f"dex-search:{value.casefold()}"
+    with NEWS_TRADE_DISCOVERY_CACHE_LOCK:
+        cached = NEWS_TRADE_DISCOVERY_CACHE.get(cache_key)
+    if cached and time.time() - cached[0] < NEWS_TRADE_DISCOVERY_CACHE_TTL_SECONDS:
+        return [dict(row) for row in cached[1] if isinstance(row, dict)]
+    rows = news_trade_dex_search_rows(value, search_results)
+    with NEWS_TRADE_DISCOVERY_CACHE_LOCK:
+        NEWS_TRADE_DISCOVERY_CACHE[cache_key] = (time.time(), rows)
+    return rows
+
+
+def news_trade_background_discovery(
+    onchain_rows: list[dict[str, Any]],
+    *,
+    now_ms: int | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Turn fresh on-chain acceleration into event discovery, then reverse-search public context."""
+    current_ms = int(now_ms or time.time() * 1000)
+    eligible: list[dict[str, Any]] = []
+    for row in onchain_rows:
+        if not isinstance(row, dict):
+            continue
+        created_at = int(safe_float(row.get("pairCreatedAt"), 0))
+        if created_at <= 0 or current_ms - created_at > 72 * 60 * 60_000:
+            continue
+        liquidity = safe_float(row.get("liquidityUsd"), 0)
+        volume = safe_float(row.get("volume24hUsd") or row.get("amount"), 0)
+        if liquidity < 25_000 or volume < 500_000:
+            continue
+        name = clean_feed_text(row.get("name") or row.get("symbol"), 100)
+        symbol = clean_feed_text(row.get("symbol"), 40)
+        if len(name) < 2 or name.casefold() in {"wrapped bitcoin", "wrapped ether", "tether", "usd coin"}:
+            continue
+        eligible.append({**row, "name": name, "symbol": symbol})
+    eligible.sort(
+        key=lambda row: (
+            safe_float(row.get("heat"), 0),
+            safe_float(row.get("volume24hUsd"), 0),
+            int(safe_float(row.get("pairCreatedAt"), 0)),
+        ),
+        reverse=True,
+    )
+    culture_first = [row for row in eligible if re.search(r"[\u3400-\u9fff]", str(row.get("name") or ""))]
+    selected = culture_first[:4]
+    selected_ids = {js_stable_key(row.get("chain"), row.get("contractAddress")) for row in selected}
+    for row in eligible:
+        identity = js_stable_key(row.get("chain"), row.get("contractAddress"))
+        if identity in selected_ids:
+            continue
+        selected.append(row)
+        selected_ids.add(identity)
+        if len(selected) >= 6:
+            break
+    if not selected:
+        return {"sourceRows": [], "candidateRows": []}
+
+    def discover(row: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        name = clean_feed_text(row.get("name") or row.get("symbol"), 100)
+        with ThreadPoolExecutor(max_workers=2) as query_pool:
+            public_future = query_pool.submit(news_trade_cached_public_search_rows, name)
+            dex_future = query_pool.submit(news_trade_cached_dex_search_rows, name)
+            public_rows = public_future.result()
+            dex_rows = dex_future.result()
+        chain_label = clean_feed_text(row.get("chainLabel") or row.get("chain"), 60)
+        liquidity = safe_float(row.get("liquidityUsd"), 0)
+        volume = safe_float(row.get("volume24hUsd") or row.get("amount"), 0)
+        change = safe_float(row.get("change24hPercent"), 0)
+        contract = clean_feed_text(row.get("contractAddress"), 96)
+        created_at = int(safe_float(row.get("pairCreatedAt"), 0)) or current_ms
+        source_rows: list[dict[str, Any]] = [{
+            "id": js_stable_key("news-trade-onchain-trend", row.get("chain"), contract),
+            "sourceType": "onchain-trend",
+            "source": clean_feed_text(row.get("source") or "链上趋势", 80),
+            "sourceLabel": "DEX",
+            "title": f"链上热点「{name}」在 {chain_label or '链上'} 出现成交与流动性加速",
+            "body": (
+                f"链上可核验数据：Meme 候选合约 {contract}，流动性 ${liquidity:g}，"
+                f"24小时成交量 ${volume:g}，24小时涨跌 {change:g}%。"
+                "名称相同不代表事件方发行或官方认可。"
+            ),
+            "url": clean_feed_text(row.get("url"), 600),
+            "timestamp": created_at,
+            "capturedAt": current_ms,
+            "claimStatus": "onchain-observed",
+            "eventRootEntity": name,
+        }]
+        for public_row in public_rows[:6]:
+            if not isinstance(public_row, dict) or not public_row.get("title"):
+                continue
+            source_rows.append({
+                **public_row,
+                "id": js_stable_key("news-trade-reverse-search", name, public_row.get("url"), public_row.get("title")),
+                "sourceType": "web-discovery",
+                "sourceLabel": "WEB",
+                "title": f"「{name}」相关报道：{clean_feed_text(public_row.get('title'), 200)}",
+                "capturedAt": current_ms,
+                "claimStatus": "source-reported",
+                "eventRootEntity": name,
+            })
+        return source_rows, dex_rows
+
+    source_rows: list[dict[str, Any]] = []
+    candidate_rows: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=min(4, len(selected))) as pool:
+        futures = [pool.submit(discover, row) for row in selected]
+        for future in as_completed(futures):
+            try:
+                discovered_sources, discovered_candidates = future.result()
+                source_rows.extend(discovered_sources)
+                candidate_rows.extend(discovered_candidates)
+            except Exception:
+                continue
+
+    source_map: dict[str, dict[str, Any]] = {}
+    for row in source_rows:
+        identity = clean_feed_text(row.get("url"), 600).casefold() or clean_feed_text(row.get("id"), 180)
+        if identity and identity not in source_map:
+            source_map[identity] = row
+    candidate_map: dict[str, dict[str, Any]] = {}
+    for row in [*selected, *candidate_rows]:
+        contract = clean_feed_text(row.get("contractAddress"), 96).casefold()
+        identity = js_stable_key(row.get("chain"), contract or row.get("symbol"), row.get("url"))
+        current = candidate_map.get(identity)
+        if not current or (
+            safe_float(row.get("liquidityUsd"), 0), safe_float(row.get("volume24hUsd"), 0)
+        ) > (
+            safe_float(current.get("liquidityUsd"), 0), safe_float(current.get("volume24hUsd"), 0)
+        ):
+            candidate_map[identity] = row
+    return {"sourceRows": list(source_map.values()), "candidateRows": list(candidate_map.values())}
+
+
+def news_trade_existing_topics(now_ms: int | None = None) -> list[dict[str, Any]]:
+    current_ms = int(now_ms or time.time() * 1000)
+    events: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in event_monitor_source_rows():
+        event = classify_event_monitor_row(row, current_ms)
+        if not event or event.get("id") in seen:
+            continue
+        seen.add(str(event.get("id")))
+        events.append(event)
+    current_topics = event_monitor_cluster_topics(events, now_ms=current_ms)
+    return news_trade_update_topic_pool(current_topics, now_ms=current_ms)
+
+
+def news_trade_search_preview(
+    query: Any,
+    *,
+    local_rows: list[dict[str, Any]] | None = None,
+    external_rows: list[dict[str, Any]] | None = None,
+    candidate_rows: list[dict[str, Any]] | None = None,
+    now_ms: int | None = None,
+    existing_topics: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    value = clean_feed_text(query, 100).strip()
+    if len(value) < 2:
+        raise ValueError("请输入至少 2 个字的热点、人物、作品或事件关键词")
+    current_ms = int(now_ms or time.time() * 1000)
+    local_matches = news_trade_local_search_rows(
+        value,
+        source_rows=local_rows if isinstance(local_rows, list) else None,
+    )
+    if external_rows is None:
+        try:
+            web_matches = news_trade_public_search_rows(value) if len(local_matches) < 4 else []
+        except Exception:
+            web_matches = []
+    else:
+        web_matches = [dict(row) for row in external_rows if isinstance(row, dict)]
+
+    results: list[dict[str, Any]] = []
+    seen_results: set[str] = set()
+    for row in [*local_matches, *web_matches]:
+        identity = clean_feed_text(row.get("url"), 600).casefold() or clean_feed_text(row.get("title"), 240).casefold()
+        if not identity or identity in seen_results:
+            continue
+        seen_results.add(identity)
+        results.append(row)
+        if len(results) >= 12:
+            break
+    if not results:
+        return {
+            "ok": True,
+            "query": value,
+            "previewId": "",
+            "topics": [],
+            "results": [],
+            "message": "没有找到可核验的近期信息，暂不生成主题卡。",
+        }
+
+    lead = results[0]
+    evidence_parts = []
+    sources: list[str] = []
+    for row in results[:6]:
+        source = clean_feed_text(row.get("source") or "公开新闻", 80)
+        if source and source not in sources:
+            sources.append(source)
+        evidence_parts.append(
+            alert_body_join(
+                clean_feed_text(row.get("title"), 180),
+                clean_feed_text(row.get("body"), 260),
+            )
+        )
+    source_row = {
+        "id": js_stable_key("news-trade-manual-search", value, lead.get("url"), lead.get("title")),
+        "sourceType": "manual-search",
+        "source": f"主动搜索 · {' / '.join(sources[:3])}" if sources else "主动搜索",
+        "sourceLabel": "搜",
+        "title": clean_feed_text(lead.get("title") or f"热点检索：{value}", 220),
+        "body": clean_feed_text(
+            f"主动热点搜索核验：{value}。交易量与流动性需要链上候选确认。 {' '.join(evidence_parts)}",
+            1600,
+        ),
+        "url": clean_feed_text(lead.get("url") or "./price-watch.html?mode=news", 600),
+        "timestamp": alert_event_ms(lead.get("timestamp")) or current_ms,
+        "searchQuery": value,
+        "searchResultCount": len(results),
+    }
+    candidate_source_rows: list[dict[str, Any]] | None = None
+    if isinstance(candidate_rows, list):
+        candidate_source_rows = [*event_monitor_onchain_source_rows(), *candidate_rows]
+    elif external_rows is None:
+        candidate_source_rows = [
+            *event_monitor_onchain_source_rows(),
+            *news_trade_dex_search_rows(value, results),
+        ]
+    event = classify_event_monitor_row(
+        source_row,
+        current_ms,
+        candidate_source_rows=candidate_source_rows,
+    )
+    topics = event_monitor_cluster_topics([event], now_ms=current_ms) if event and event.get("isNewsTrade") else []
+    current_topics = existing_topics if isinstance(existing_topics, list) else news_trade_existing_topics(current_ms)
+    existing_keys = {clean_feed_text(topic.get("topicKey"), 220) for topic in current_topics if isinstance(topic, dict)}
+    for topic in topics:
+        topic["duplicate"] = clean_feed_text(topic.get("topicKey"), 220) in existing_keys
+        topic["searchQuery"] = value
+        topic["searchResultCount"] = len(results)
+
+    preview_id = ""
+    if topics:
+        preview_id = secrets.token_urlsafe(18)
+        with NEWS_TRADE_SEARCH_LOCK:
+            cutoff = time.time() - NEWS_TRADE_SEARCH_PREVIEW_TTL_SECONDS
+            expired = [key for key, item in NEWS_TRADE_SEARCH_PREVIEWS.items() if safe_float(item.get("createdAt"), 0) < cutoff]
+            for key in expired:
+                NEWS_TRADE_SEARCH_PREVIEWS.pop(key, None)
+            NEWS_TRADE_SEARCH_PREVIEWS[preview_id] = {
+                "createdAt": time.time(),
+                "query": value,
+                "sourceRow": source_row,
+                "topic": topics[0],
+            }
+    return {
+        "ok": True,
+        "query": value,
+        "previewId": preview_id,
+        "topics": topics,
+        "results": [
+            {
+                "title": clean_feed_text(row.get("title"), 220),
+                "source": clean_feed_text(row.get("source") or "市场信息", 80),
+                "url": clean_feed_text(row.get("url"), 600),
+                "timestamp": alert_event_ms(row.get("timestamp")),
+            }
+            for row in results[:8]
+        ],
+        "message": (
+            "已生成主题卡预览，请确认后加入监控。"
+            if topics
+            else "找到相关新闻，但没有匹配到满足流动性与合约校验的链上候选，暂不生成主题卡。"
+        ),
+    }
+
+
+def news_trade_confirm_preview(preview_id: Any) -> dict[str, Any]:
+    key = clean_feed_text(preview_id, 120)
+    if not key:
+        raise ValueError("缺少待确认的主题预览")
+    with NEWS_TRADE_SEARCH_LOCK:
+        preview = NEWS_TRADE_SEARCH_PREVIEWS.get(key)
+    if not preview or time.time() - safe_float(preview.get("createdAt"), 0) > NEWS_TRADE_SEARCH_PREVIEW_TTL_SECONDS:
+        raise ValueError("主题预览已过期，请重新搜索")
+    topic = preview.get("topic") if isinstance(preview.get("topic"), dict) else {}
+    source_row = preview.get("sourceRow") if isinstance(preview.get("sourceRow"), dict) else {}
+    path = PERSIST_CACHE_DIR / "news_trade_search_rows.json"
+    payload = read_json_cache(path)
+    rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+    topic_key = clean_feed_text(topic.get("topicKey"), 220)
+    existing = next(
+        (
+            row
+            for row in rows
+            if isinstance(row, dict)
+            and (
+                clean_feed_text(row.get("topicKey"), 220) == topic_key
+                or clean_feed_text(row.get("id"), 180) == clean_feed_text(source_row.get("id"), 180)
+            )
+        ),
+        None,
+    )
+    if existing:
+        return {"ok": True, "alreadyAdded": True, "topic": topic, "message": "该主题已经加入监控。"}
+    stored_row = {**source_row, "topicKey": topic_key, "confirmedAt": int(time.time() * 1000)}
+    rows = [stored_row, *[row for row in rows if isinstance(row, dict)]][:80]
+    write_json_cache(path, {"updatedAt": int(time.time() * 1000), "rows": rows})
+    merged_topic = bool(topic.get("duplicate"))
+    return {
+        "ok": True,
+        "alreadyAdded": False,
+        "mergedTopic": merged_topic,
+        "topic": topic,
+        "message": "新证据已补充到现有主题卡。" if merged_topic else "主题已加入 News Trade 监控。",
+    }
+
+
+def update_price_structure_event_contexts(
+    events: list[dict[str, Any]],
+    *,
+    now_ms: int | None = None,
+) -> dict[str, dict[str, Any]]:
+    current_ms = int(now_ms or time.time() * 1000)
+    contexts: dict[str, dict[str, Any]] = {}
+    for event in events:
+        if not isinstance(event, dict) or not event.get("isNewsTrade"):
+            continue
+        timestamp = int(safe_float(event.get("firstSeenAt") or event.get("timestamp"), 0))
+        source_type = clean_feed_text(event.get("sourceType"), 30)
+        ttl_ms = 24 * 60 * 60_000
+        expires_at = timestamp + ttl_ms
+        if timestamp <= 0 or expires_at <= current_ms:
+            continue
+        record = {
+            "eventId": clean_feed_text(event.get("id"), 180),
+            "title": clean_feed_text(event.get("title"), 160),
+            "template": clean_feed_text(event.get("template"), 40),
+            "source": clean_feed_text(event.get("source"), 80),
+            "sourceType": source_type,
+            "score": int(safe_float(event.get("score"), 0)),
+            "observedAt": timestamp,
+            "expiresAt": expires_at,
+        }
+        for asset in event.get("assets") if isinstance(event.get("assets"), list) else []:
+            symbol = clean_price_watch_symbol(asset)
+            if not symbol:
+                continue
+            current = contexts.get(symbol)
+            if not current or (
+                record["observedAt"], record["score"]
+            ) > (
+                int(safe_float(current.get("observedAt"), 0)),
+                int(safe_float(current.get("score"), 0)),
+            ):
+                contexts[symbol] = dict(record)
+    with PRICE_STRUCTURE_EVENT_CONTEXT_LOCK:
+        PRICE_STRUCTURE_EVENT_CONTEXTS.clear()
+        PRICE_STRUCTURE_EVENT_CONTEXTS.update(contexts)
+    return contexts
+
+
+def event_monitor_payload(user: dict[str, Any] | None = None) -> dict[str, Any]:
+    now_ms = int(time.time() * 1000)
+    static_onchain_rows = event_monitor_onchain_source_rows()
+    trending_onchain_rows = news_trade_trending_onchain_rows()
+    discovery = news_trade_background_discovery(trending_onchain_rows, now_ms=now_ms)
+    candidate_source_rows = [
+        *static_onchain_rows,
+        *(discovery.get("candidateRows") or []),
+    ]
+    source_rows = [
+        *event_monitor_source_rows(),
+        *(discovery.get("sourceRows") or []),
+    ]
+    events: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in source_rows:
+        event = classify_event_monitor_row(
+            row,
+            now_ms,
+            candidate_source_rows=candidate_source_rows,
+        )
+        if not event or event["id"] in seen:
+            continue
+        seen.add(event["id"])
+        events.append(event)
+    events.sort(key=lambda item: (int(item.get("timestamp") or 0), int(item.get("score") or 0)), reverse=True)
+    current_news_trades = event_monitor_cluster_topics(events, now_ms=now_ms)
+    news_trades = news_trade_update_topic_pool(current_news_trades, now_ms=now_ms)
+    news_trades = news_trade_attach_security(news_trades)
+    update_price_structure_event_contexts(news_trades, now_ms=now_ms)
+    template_counts: dict[str, int] = {}
+    for event in events:
+        key = str(event.get("template") or "other")
+        template_counts[key] = template_counts.get(key, 0) + 1
+    return {
+        "ok": True,
+        "updatedAt": now_ms,
+        "events": events[:120],
+        "newsTrades": news_trades,
+        "execution": news_trade_execution_readiness(int(user["id"]) if user and user.get("id") else None),
+        "templates": [
+            {"id": template["id"], "name": template["name"], "description": template["description"]}
+            for template in EVENT_MONITOR_TEMPLATES
+        ],
+        "summary": {
+            "events": len(events),
+            "newsTrades": len(news_trades),
+            "topics": len(news_trades),
+            "assets": len({asset for event in events for asset in event.get("assets") or []}),
+            "templates": template_counts,
+            "onchainTrendCandidates": len(trending_onchain_rows),
+            "reverseDiscoveredSources": len(discovery.get("sourceRows") or []),
+        },
+    }
+
+
+def news_trade_alert_snapshot(topic: dict[str, Any]) -> dict[str, Any]:
+    metrics = topic.get("topicMetrics") if isinstance(topic.get("topicMetrics"), dict) else {}
+    catalyst = topic.get("latestCatalyst") if isinstance(topic.get("latestCatalyst"), dict) else {}
+    opportunity = topic.get("memeOpportunity") if isinstance(topic.get("memeOpportunity"), dict) else {}
+    association = opportunity.get("association") if isinstance(opportunity.get("association"), dict) else {}
+    return {
+        "topicKey": news_trade_topic_identity(topic),
+        "stage": clean_feed_text(topic.get("eventStage"), 40),
+        "phase": clean_feed_text(topic.get("newsTradePhase"), 40),
+        "velocityScore": round(safe_float(metrics.get("velocityScore"), 0), 2),
+        "platformCount": int(safe_float(metrics.get("platformCount"), 0)),
+        "explicitCryptoMapping": bool(topic.get("explicitCryptoMapping")),
+        "storyBeat": clean_feed_text(catalyst.get("storyBeat"), 40),
+        "catalystTimestamp": int(safe_float(catalyst.get("timestamp"), 0)),
+        "associationStatus": clean_feed_text(
+            association.get("code") or opportunity.get("associationStatus"),
+            50,
+        ),
+        "mainContract": clean_feed_text(opportunity.get("contractAddress"), 100).casefold(),
+        "onchainTradeScore": round(safe_float(topic.get("onchainTradeScore"), 0), 2),
+        "candidateTier": clean_feed_text(topic.get("candidateTier"), 40),
+        "topicScore": round(safe_float(topic.get("topicScore"), 0), 2),
+        "updatedAt": int(safe_float(topic.get("updatedAt") or topic.get("lastSeenAt"), 0)),
+    }
+
+
+def news_trade_alert_transition_reason(previous: dict[str, Any], current: dict[str, Any]) -> tuple[str, str]:
+    thresholds = NEWS_TRADE_CONFIG["thresholds"]
+    if (
+        safe_float(previous.get("velocityScore"), 0) < thresholds["highVelocity"]
+        <= safe_float(current.get("velocityScore"), 0)
+    ):
+        return "velocity-high", "热度增速首次达到高等级"
+    if int(safe_float(previous.get("platformCount"), 0)) <= 1 < int(safe_float(current.get("platformCount"), 0)):
+        return "cross-platform", "从单一平台扩散到多个平台"
+    if not previous.get("explicitCryptoMapping") and current.get("explicitCryptoMapping"):
+        return "onchain-mapping", "现实热点首次形成明确链上映射"
+    previous_contract = clean_feed_text(previous.get("mainContract"), 100).casefold()
+    current_contract = clean_feed_text(current.get("mainContract"), 100).casefold()
+    if not previous_contract and current_contract and current.get("associationStatus") in {
+        "official-confirmed", "highly-related-unconfirmed",
+    }:
+        return "main-contract", "链上首次形成较明确的主合约"
+    if (
+        safe_float(previous.get("onchainTradeScore"), 0) < thresholds["onchainTrade"]
+        <= safe_float(current.get("onchainTradeScore"), 0)
+    ):
+        return "onchain-acceleration", "流动性、成交或持币质量进入加速区"
+    if (
+        previous.get("candidateTier") != "trade-candidate"
+        and current.get("candidateTier") == "trade-candidate"
+    ) or (
+        safe_float(previous.get("topicScore"), 0) < thresholds["highRank"]
+        <= safe_float(current.get("topicScore"), 0)
+    ):
+        return "high-rank", "主题首次进入高权重候选前列"
+    current_beat = clean_feed_text(current.get("storyBeat"), 40)
+    if (
+        current_beat
+        and current_beat != "update"
+        and current_beat != clean_feed_text(previous.get("storyBeat"), 40)
+        and int(safe_float(current.get("catalystTimestamp"), 0))
+        > int(safe_float(previous.get("catalystTimestamp"), 0))
+    ):
+        return "new-plot", "事件出现新的关键剧情"
+    return "", ""
+
+
+def news_trade_transition_alert_topics(
+    rows: list[dict[str, Any]],
+    *,
+    now_ms: int | None = None,
+    state_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Emit only early, actionable state transitions; the first snapshot is a quiet baseline."""
+    current_ms = int(now_ms or time.time() * 1000)
+    path = state_path or NEWS_TRADE_ALERT_STATE_PATH
+    with NEWS_TRADE_ALERT_STATE_LOCK:
+        payload = read_json_cache(path)
+        stored = payload.get("topics") if isinstance(payload.get("topics"), dict) else {}
+        next_state: dict[str, dict[str, Any]] = {}
+        alerts: list[dict[str, Any]] = []
+        retention_ms = int(NEWS_TRADE_CONFIG["alert"]["stateRetentionSeconds"] * 1000)
+        cooldown_ms = int(NEWS_TRADE_CONFIG["alert"]["cooldownSeconds"] * 1000)
+
+        for topic in rows:
+            if not isinstance(topic, dict):
+                continue
+            snapshot = news_trade_alert_snapshot(topic)
+            identity = snapshot.get("topicKey")
+            if not identity:
+                continue
+            previous = stored.get(identity) if isinstance(stored.get(identity), dict) else {}
+            state_row = {
+                **snapshot,
+                "lastAlertAt": int(safe_float(previous.get("lastAlertAt"), 0)),
+                "lastAlertReason": clean_feed_text(previous.get("lastAlertReason"), 60),
+                "lastSeenAt": current_ms,
+            }
+            next_state[identity] = state_row
+            if not previous:
+                continue
+            if not topic.get("sourceActive", True):
+                continue
+            if topic.get("fullyFermented") or snapshot.get("phase") not in {"understanding", "pre-fermentation"}:
+                continue
+            if snapshot.get("stage") in {"peak", "decline"}:
+                continue
+            if topic.get("politicalMilitary") and not (
+                topic.get("explicitCryptoMapping")
+                and safe_float(topic.get("onchainTradeScore"), 0) >= NEWS_TRADE_CONFIG["thresholds"]["onchainTrade"]
+            ):
+                continue
+            reason_code, reason_label = news_trade_alert_transition_reason(previous, snapshot)
+            if not reason_code:
+                continue
+            last_alert_at = int(safe_float(previous.get("lastAlertAt"), 0))
+            if last_alert_at and current_ms - last_alert_at < cooldown_ms:
+                continue
+            alert_topic = dict(topic)
+            alert_topic["alertTransition"] = reason_code
+            alert_topic["alertTransitionLabel"] = reason_label
+            alerts.append(alert_topic)
+            state_row["lastAlertAt"] = current_ms
+            state_row["lastAlertReason"] = reason_code
+
+        for identity, previous in stored.items():
+            if identity in next_state or not isinstance(previous, dict):
+                continue
+            if current_ms - int(safe_float(previous.get("lastSeenAt"), 0)) <= retention_ms:
+                next_state[identity] = previous
+        write_json_cache(path, {"updatedAt": current_ms, "topics": next_state})
+    return alerts
+
+
+def parse_site_event_monitor_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = payload.get("newsTrades") if isinstance(payload.get("newsTrades"), list) else []
+    events: list[dict[str, Any]] = []
+    for row in news_trade_transition_alert_topics(rows, now_ms=int(safe_float(payload.get("updatedAt"), 0)) or None):
+        assets = row.get("assets") if isinstance(row.get("assets"), list) else []
+        asset_text = " / ".join(str(asset) for asset in assets[:4])
+        title = clean_feed_text(row.get("title"), 180)
+        if not title:
+            continue
+        opportunity = row.get("memeOpportunity") if isinstance(row.get("memeOpportunity"), dict) else {}
+        primary_symbol = clean_feed_text(opportunity.get("symbol"), 32)
+        if primary_symbol and primary_symbol not in assets:
+            assets = [primary_symbol, *assets]
+            asset_text = " / ".join(str(asset) for asset in assets[:4])
+        events.append(
+            {
+                "key": js_stable_key(
+                    "news-trade-transition",
+                    row.get("id") or row.get("topicKey"),
+                    row.get("alertTransition"),
+                    (row.get("latestCatalyst") or {}).get("timestamp"),
+                ),
+                "kind": f"News Trade · {row.get('templateName') or '事件驱动'}",
+                "source": "News Trade 监控",
+                "sourceLabel": "NT",
+                "title": title,
+                "body": alert_body_join(
+                    row.get("alertTransitionLabel"),
+                    asset_text,
+                    row.get("corePropagationLogic") or row.get("thesis"),
+                ),
+                "url": row.get("url") or "./price-watch.html?mode=news",
+                "time": row.get("timestamp") or payload.get("updatedAt") or int(time.time() * 1000),
+                "priority": "早期变化提醒",
+                "queuePriority": 70,
+                "allowPoliticalCryptoMapping": bool(
+                    row.get("politicalMilitary")
+                    and row.get("explicitCryptoMapping")
+                    and safe_float(row.get("onchainTradeScore"), 0) >= NEWS_TRADE_CONFIG["thresholds"]["onchainTrade"]
+                ),
+                "speech": (
+                    f"News Trade 早期提醒，{row.get('alertTransitionLabel') or '候选权重提升'}，"
+                    f"{asset_text or '市场事件'}，{title}"
+                ),
             }
         )
     return events
@@ -10917,11 +30531,13 @@ def site_alert_feeds() -> list[dict[str, Any]]:
     return [
         {"name": "newsflash", "interval": 12, "maxAgeMs": 6 * 60 * 60 * 1000, "fetch": fetch_blockbeats_flash, "parse": parse_site_newsflash_events},
         {"name": "listings", "interval": 18, "maxAgeMs": 24 * 60 * 60 * 1000, "fetch": listing_events_payload, "parse": parse_site_listing_events},
+        {"name": "aster-contracts", "interval": 12, "maxAgeMs": 48 * 60 * 60 * 1000, "fetch": aster_contracts_payload, "parse": parse_site_aster_contract_events},
         {"name": "newboards", "interval": 18, "maxAgeMs": 48 * 60 * 60 * 1000, "fetch": new_coin_rankings_payload, "parse": parse_site_newboard_events},
         {"name": "market", "interval": 30, "maxAgeMs": 15 * 60 * 1000, "fetch": market_payload, "parse": parse_site_market_events},
         {"name": "gainers", "interval": 30, "maxAgeMs": 15 * 60 * 1000, "fetch": gainers_rankings_payload, "parse": parse_site_gainers_events},
         {"name": "briefs", "interval": 60, "maxAgeMs": 24 * 60 * 60 * 1000, "fetch": automation_briefs_payload, "parse": parse_site_brief_events},
-        {"name": "x-kol", "interval": 45, "maxAgeMs": 48 * 60 * 60 * 1000, "fetch": x_kol_feed_payload, "parse": parse_site_x_kol_events},
+        {"name": "x-kol", "interval": 2, "maxAgeMs": 48 * 60 * 60 * 1000, "fetch": lambda: x_kol_realtime_snapshot(None, wait_seconds=6)[0], "parse": parse_site_x_kol_events},
+        {"name": "event-monitor", "interval": 15, "maxAgeMs": 24 * 60 * 60 * 1000, "fetch": event_monitor_payload, "parse": parse_site_event_monitor_events},
     ]
 
 
@@ -10938,10 +30554,20 @@ def sync_site_alert_feed(feed: dict[str, Any]) -> None:
     ready = set(state.get("ready") or [])
     seen = state.get("seen") if isinstance(state.get("seen"), dict) else {}
     is_ready = feed["name"] in ready
+    ready_scopes = set(state.get("newboardReadyScopes") or [])
+    current_scopes = {
+        clean_feed_text(event.get("sourceScope"), 60)
+        for event in events
+        if clean_feed_text(event.get("sourceScope"), 60)
+    } if feed["name"] == "newboards" else set()
     fresh = [
         event
         for event in events
-        if not site_event_seen(event, seen) and site_event_is_fresh(event, int(feed.get("maxAgeMs") or 0))
+        if (
+            not site_event_seen(event, seen)
+            and site_event_is_fresh(event, int(feed.get("maxAgeMs") or 0))
+            and (feed["name"] != "newboards" or clean_feed_text(event.get("sourceScope"), 60) in ready_scopes)
+        )
     ]
     for event in events:
         for key in alert_dedupe_keys(event):
@@ -10949,6 +30575,8 @@ def sync_site_alert_feed(feed: dict[str, Any]) -> None:
     ready.add(feed["name"])
     state["seen"] = seen
     state["ready"] = list(ready)
+    if feed["name"] == "newboards":
+        state["newboardReadyScopes"] = sorted(ready_scopes | current_scopes)
     save_site_alert_state()
 
     if not is_ready:
@@ -11025,7 +30653,12 @@ def scheduled_wechat_auth_check(run_at: datetime | None = None) -> dict[str, Any
         alert_result = notify_wechat_auth_required(reason, force=True, slot_label=slot_label)
     except Exception as exc:
         return {**status, "alerted": False, "slot": slot_label, "alertError": str(exc)[:180]}
-    return {**status, "alerted": True, "slot": slot_label, "alert": alert_result}
+    return {
+        **status,
+        "alerted": not bool(alert_result.get("suppressed") or alert_result.get("skipped")),
+        "slot": slot_label,
+        "alert": alert_result,
+    }
 
 
 def wechat_auth_monitor_loop() -> None:
@@ -11075,6 +30708,14 @@ def health_payload() -> dict[str, Any]:
         ok = False
         checks["runtimeCache"] = {"ok": False, "error": str(exc)[:180]}
 
+    with PRICE_STRUCTURE_PREARM_STATUS_LOCK:
+        prearm_status = dict(PRICE_STRUCTURE_PREARM_STATUS)
+    with PRICE_STRUCTURE_EVENT_CONTEXT_LOCK:
+        structure_event_context_count = len(PRICE_STRUCTURE_EVENT_CONTEXTS)
+    with NEW_COIN_LOW_LOCK:
+        new_coin_low_scanned = len(NEW_COIN_LOW_ITEMS)
+    new_coin_low_inventory = len(NEW_COIN_LOW_INVENTORY_CACHE[1]) if NEW_COIN_LOW_INVENTORY_CACHE else 0
+
     return {
         "ok": ok,
         "service": "xingyunshe-market-hot-dashboard",
@@ -11086,6 +30727,23 @@ def health_payload() -> dict[str, Any]:
             "siteAlerts": SITE_ALERT_MONITOR_ACTIVE,
             "wechatAuth": WECHAT_AUTH_MONITOR_ACTIVE,
             "desktopAlerts": not env_flag("XINGYUN_DISABLE_DESKTOP_ALERT", default=is_production_mode()),
+            "priceWatch": PRICE_WATCH_MONITOR_ACTIVE,
+            "structureSignals": PRICE_STRUCTURE_MONITOR_ACTIVE,
+            "structureMonitorMode": "parallel-priority",
+            "structureMonitorWorkers": PRICE_STRUCTURE_MONITOR_WORKERS,
+            "structureStrategyVersion": PRICE_STRUCTURE_STRATEGY_VERSION,
+            "structurePrearm": PRICE_STRUCTURE_PREARM_MONITOR_ACTIVE,
+            "structurePrearmIntervalSeconds": PRICE_STRUCTURE_PREARM_INTERVAL_SECONDS,
+            "structurePrearmForecastMinutes": PRICE_STRUCTURE_PREARM_FORECAST_MINUTES,
+            "structurePrearmStatus": prearm_status,
+            "structureEventContexts": structure_event_context_count,
+            "newCoinLowStructure": NEW_COIN_LOW_MONITOR_ACTIVE,
+            "newCoinLowMonitorMode": "parallel-priority",
+            "newCoinLowMonitorWorkers": NEW_COIN_LOW_MONITOR_WORKERS,
+            "newCoinLowInventory": new_coin_low_inventory,
+            "newCoinLowScanned": new_coin_low_scanned,
+            "newCoinLowInactiveExcluded": int(safe_float(NEW_COIN_LOW_ACTIVITY_SUMMARY.get("excluded"), 0)),
+            "newCoinLowActivityUnavailable": int(safe_float(NEW_COIN_LOW_ACTIVITY_SUMMARY.get("unavailable"), 0)),
         },
     }
 
@@ -11142,6 +30800,7 @@ SEO_NOINDEX_PATHS = {
     "/admin.html",
     "/login.html",
     "/profile.html",
+    "/strategy.html",
     "/todo.html",
     "/xwatch.html",
 }
@@ -11355,7 +31014,7 @@ def sitemap_xml(handler: SimpleHTTPRequestHandler) -> str:
     base = request_base_url(handler)
     now = datetime.now().strftime("%Y-%m-%d")
     items = []
-    for path in ["/index.html", "/gainers.html", "/turnover.html", "/newboards.html", "/listings.html", "/newsflash.html", "/briefs.html", "/rss.html", "/legal.html"]:
+    for path in ["/index.html", "/gainers.html", "/turnover.html", "/newboards.html", "/listings.html", "/newsflash.html", "/briefs.html", "/rss.html", "/price-watch.html", "/legal.html"]:
         loc = f"{base}{'/' if path == '/index.html' else path}"
         priority = "1.0" if path == "/index.html" else "0.8"
         changefreq = "hourly" if path in {"/index.html", "/gainers.html", "/turnover.html", "/newsflash.html"} else "daily"
@@ -11366,6 +31025,8 @@ def sitemap_xml(handler: SimpleHTTPRequestHandler) -> str:
 
 
 class Handler(SimpleHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
 
@@ -11449,6 +31110,41 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def send_x_kol_stream(self, user: dict[str, Any] | None, payload_transform=None) -> None:
+        key = x_kol_realtime_key(user)
+        payload, signature = x_kol_realtime_snapshot(user, wait_seconds=0)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        def emit(event_name: str, data: dict[str, Any]) -> None:
+            body = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            self.wfile.write(f"event: {event_name}\ndata: {body}\n\n".encode("utf-8"))
+            self.wfile.flush()
+
+        try:
+            self.wfile.write(b"retry: 1500\n\n")
+            rendered_payload = payload_transform(payload) if payload_transform else payload
+            emit("status" if rendered_payload.get("pending") else "feed", rendered_payload)
+            while True:
+                with X_KOL_REALTIME_CONDITION:
+                    X_KOL_REALTIME_CONDITION.wait(timeout=12)
+                    snapshot = X_KOL_REALTIME_SNAPSHOTS.get(key) or {}
+                next_signature = str(snapshot.get("signature") or "")
+                if next_signature and next_signature != signature:
+                    next_payload = snapshot.get("payload") if isinstance(snapshot.get("payload"), dict) else {}
+                    rendered_payload = payload_transform(next_payload) if payload_transform else next_payload
+                    emit("status" if rendered_payload.get("pending") else "feed", rendered_payload)
+                    signature = next_signature
+                else:
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            return
 
     def read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length") or 0)
@@ -11996,6 +31692,33 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/auth/status":
             self.do_auth_status()
             return
+        if parsed.path == "/api/personal-x-monitor":
+            if force_refresh:
+                X_KOL_PRIORITY_WAKE.set()
+                wake_x_kol_official_stream()
+            try:
+                payload, _ = x_kol_realtime_snapshot(None, wait_seconds=0)
+                self.send_json(personal_x_monitor_payload(payload))
+            except Exception as exc:
+                self.send_json({"ok": False, "items": [], "error": str(exc)}, status=502)
+            return
+        if parsed.path == "/api/personal-x-stream":
+            self.send_x_kol_stream(None, payload_transform=personal_x_monitor_payload)
+            return
+        if parsed.path == "/api/dragon-wave-feedback":
+            user = self.require_auth()
+            if not user:
+                return
+            feedback = dragon_wave_feedback_for_user(user)
+            self.send_json(
+                {
+                    "ok": True,
+                    "storage": "account-sqlite",
+                    "feedback": feedback,
+                    "optimization": dragon_wave_feedback_optimization(feedback),
+                }
+            )
+            return
         if parsed.path == "/api/auth/google/config":
             self.send_json({"ok": True, "enabled": google_oauth_enabled()})
             return
@@ -12038,6 +31761,104 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/market-hot":
             self.send_json(cached_api_payload("market-hot", market_payload, 60, force_refresh=force_refresh))
             return
+        if parsed.path == "/api/binance-wallet-hot":
+            try:
+                period = normalize_binance_wallet_hot_period((query.get("period") or ["24h"])[0])
+                self.send_json(binance_wallet_hot_source(period, force_refresh=force_refresh))
+            except Exception as exc:
+                self.send_json({
+                    "ok": False,
+                    "id": "binance-wallet-hot",
+                    "rows": [],
+                    "period": normalize_binance_wallet_hot_period((query.get("period") or ["24h"])[0]),
+                    "error": str(exc),
+                }, status=502)
+            return
+        if parsed.path == "/api/price-watch":
+            try:
+                # Admission sources and price snapshots are maintained by the
+                # background monitor. Normal page polling must remain read-only;
+                # otherwise every browser request repeats slow exchange discovery
+                # and competes with time-critical alert scans.
+                payload = sync_price_watch_monitor() if force_refresh else price_watch_payload(sync_candidates=False)
+                self.send_json(payload)
+            except Exception as exc:
+                self.send_json({"ok": False, "items": [], "error": str(exc)}, status=502)
+            return
+        if parsed.path == "/api/wechat-group-monitor":
+            user = self.require_auth()
+            if not user:
+                return
+            try:
+                if force_refresh:
+                    poll_wechat_group_monitors_once(user_id=int(user["id"]))
+                self.send_json(wechat_group_monitor_payload(user))
+            except Exception as exc:
+                self.send_json({"ok": False, "monitors": [], "opportunities": [], "error": str(exc)}, status=502)
+            return
+        if parsed.path == "/api/price-structures":
+            try:
+                self.send_json(price_structure_payload(force_refresh=force_refresh))
+            except Exception as exc:
+                self.send_json({"ok": False, "items": [], "error": str(exc)}, status=502)
+            return
+        if parsed.path == "/api/new-coin-low-structures":
+            try:
+                self.send_json(new_coin_low_structure_payload(force_refresh=force_refresh))
+            except Exception as exc:
+                self.send_json({"ok": False, "items": [], "error": str(exc)}, status=502)
+            return
+        if parsed.path == "/api/rotation-map":
+            try:
+                self.send_json(cached_api_payload("rotation-map", rotation_map_payload, ROTATION_REFRESH_SECONDS, force_refresh=force_refresh))
+            except Exception as exc:
+                self.send_json({"ok": False, "maps": [], "error": str(exc)}, status=502)
+            return
+        if parsed.path == "/api/chain-ecosystem":
+            try:
+                chain_identifier = (query.get("chain") or [None])[0]
+                if force_refresh:
+                    payload = CHAIN_ECOSYSTEM_MONITOR.refresh(chain_identifier or "robinhood-chain", force=True)
+                else:
+                    payload = CHAIN_ECOSYSTEM_MONITOR.payload(chain_identifier)
+                self.send_json(payload)
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": safe_monitor_error(exc)}, status=400)
+            except Exception as exc:
+                fallback = CHAIN_ECOSYSTEM_MONITOR.payload((query.get("chain") or [None])[0])
+                fallback["ok"] = False
+                fallback["error"] = safe_monitor_error(exc)
+                self.send_json(fallback, status=200 if fallback.get("selectedChain") else 502)
+            return
+        if parsed.path == "/api/aster-contracts":
+            try:
+                self.send_json(cached_api_payload("aster-contracts", aster_contracts_payload, 12, force_refresh=force_refresh))
+            except Exception as exc:
+                self.send_json({"ok": False, "items": [], "error": str(exc)}, status=502)
+            return
+        if parsed.path == "/api/event-monitor":
+            try:
+                self.send_json(event_monitor_payload(self.current_user()))
+            except Exception as exc:
+                self.send_json({"ok": False, "events": [], "newsTrades": [], "error": str(exc)}, status=502)
+            return
+        if parsed.path == "/api/strategy-board":
+            try:
+                if force_refresh:
+                    sync_price_watch_monitor()
+                self.send_json(strategy_orders_payload(self.current_user()))
+            except Exception as exc:
+                self.send_json({"ok": False, "signals": [], "positions": [], "error": str(exc)}, status=502)
+            return
+        if parsed.path == "/api/strategy-exchanges":
+            user = self.require_auth()
+            if not user:
+                return
+            try:
+                self.send_json(strategy_exchange_settings_payload(int(user["id"])))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=502)
+            return
         if parsed.path == "/api/gainers-rankings":
             self.send_json(cached_api_payload("gainers-rankings", gainers_rankings_payload, 60, force_refresh=force_refresh))
             return
@@ -12059,7 +31880,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if parsed.path == "/api/listing-events":
             try:
-                self.send_json(cached_api_payload("listing-events-v2", listing_events_payload, 180, force_refresh=force_refresh))
+                self.send_json(cached_api_payload("listing-events-v3", listing_events_payload, 180, force_refresh=force_refresh))
             except Exception as exc:
                 self.send_json({"sections": [], "error": str(exc)}, status=502)
             return
@@ -12083,9 +31904,18 @@ class Handler(SimpleHTTPRequestHandler):
             if not user:
                 return
             try:
-                self.send_json(cached_api_payload(f"x-kol-feed-v4-u{user['id']}", lambda: x_kol_feed_payload(user), 60, force_refresh=force_refresh))
+                if force_refresh:
+                    wake_x_kol_realtime_worker(user)
+                payload, _ = x_kol_realtime_snapshot(user, wait_seconds=0)
+                self.send_json(payload)
             except Exception as exc:
                 self.send_json({"ok": False, "sources": [], "items": [], "error": str(exc)}, status=502)
+            return
+        if parsed.path == "/api/x-kol-stream":
+            user = self.require_auth()
+            if not user:
+                return
+            self.send_x_kol_stream(user)
             return
         if parsed.path == "/api/todo-state":
             user = self.require_auth()
@@ -12212,6 +32042,33 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json(model_options_payload(int(user["id"]), self.read_json()))
             except Exception as exc:
                 self.send_json({"ok": False, "models": [], "error": str(exc)}, status=502)
+            return
+        if route == "/api/dragon-wave-feedback":
+            user = self.require_auth()
+            if not user:
+                return
+            try:
+                saved = save_dragon_wave_feedback_for_user(user, self.read_json().get("feedback"))
+                self.audit(
+                    "dragon_wave_feedback_update",
+                    actor=user,
+                    object_type="user_payload",
+                    object_id=int(user["id"]),
+                    metadata={"recordCount": len(saved.get("records") or {})},
+                )
+                if self.headers.get("X-Dragon-Wave-Compact") == "1":
+                    self.send_json(
+                        {
+                            "ok": True,
+                            "storage": "account-sqlite",
+                            "updatedAt": saved.get("updatedAt", 0),
+                            "recordCount": len(saved.get("records") or {}),
+                        }
+                    )
+                else:
+                    self.send_json({"ok": True, "storage": "account-sqlite", "feedback": saved, "optimization": dragon_wave_feedback_optimization(saved)})
+            except (TypeError, ValueError) as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
             return
         if route == "/api/auth/logout":
             self.do_auth_logout()
@@ -12346,6 +32203,20 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=502)
             return
+        if route == "/api/x-kol-translate" or route.endswith("/api/x-kol-translate"):
+            user = self.current_user()
+            ip = self.request_ip()
+            is_local = ip in {"127.0.0.1", "::1", "localhost"} or ip.startswith("::ffff:127.")
+            if not user and not is_local:
+                self.send_json({"ok": False, "error": "unauthorized"}, status=401)
+                return
+            try:
+                model_user = user or admin_user()
+                settings = llm_settings_for_user(int(model_user["id"])) if model_user and model_user.get("id") else system_llm_settings()
+                self.send_json(x_kol_translate_payload(self.read_json(), settings=settings))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=502)
+            return
         if route == "/api/x-kol-sources" or route.endswith("/api/x-kol-sources"):
             user = self.require_auth()
             if not user:
@@ -12369,6 +32240,190 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json(launch_desktop_alert(self.read_json()))
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        if route == "/api/news-trade/search" or route.endswith("/api/news-trade/search"):
+            user = self.current_user()
+            ip = self.request_ip()
+            is_local = ip in {"127.0.0.1", "::1", "localhost"} or ip.startswith("::ffff:127.")
+            if not user and not is_local:
+                self.send_json({"ok": False, "error": "unauthorized"}, status=401)
+                return
+            try:
+                request_payload = self.read_json()
+                action = clean_feed_text(request_payload.get("action") or "preview", 24).casefold()
+                if action in {"add", "confirm"}:
+                    result = news_trade_confirm_preview(request_payload.get("previewId"))
+                    audit_action = "news_trade_search_add"
+                else:
+                    result = news_trade_search_preview(request_payload.get("query"))
+                    audit_action = "news_trade_search_preview"
+                if user:
+                    self.audit(
+                        audit_action,
+                        actor=user,
+                        object_type="news_trade_search",
+                        object_id=result.get("previewId") or clean_feed_text(request_payload.get("previewId"), 120),
+                        metadata={"query": clean_feed_text(request_payload.get("query"), 100)},
+                    )
+                self.send_json(result)
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": safe_error_text(str(exc))}, status=502)
+            return
+        if route == "/api/news-trade/prepare" or route.endswith("/api/news-trade/prepare"):
+            user = self.current_user()
+            ip = self.request_ip()
+            is_local = ip in {"127.0.0.1", "::1", "localhost"} or ip.startswith("::ffff:127.")
+            if not user and not is_local:
+                self.send_json({"ok": False, "error": "unauthorized"}, status=401)
+                return
+            try:
+                request_payload = self.read_json()
+                result = prepare_news_trade_execution(request_payload, user=user)
+                if user:
+                    self.audit(
+                        "news_trade_execution_preview",
+                        actor=user,
+                        object_type="news_trade",
+                        object_id=result.get("eventId", ""),
+                        metadata={"amountUsdt": result.get("amountUsdt"), "mode": result.get("mode")},
+                    )
+                self.send_json(result)
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": safe_error_text(str(exc))}, status=502)
+            return
+        if route == "/api/chain-ecosystem" or route.endswith("/api/chain-ecosystem"):
+            user = self.require_auth()
+            if not user:
+                return
+            try:
+                self.send_json(
+                    CHAIN_ECOSYSTEM_MONITOR.apply_action(
+                        self.read_json(),
+                        actor_id=int(user["id"]),
+                    )
+                )
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": safe_monitor_error(exc)}, status=400)
+            except PermissionError as exc:
+                self.send_json({"ok": False, "error": safe_monitor_error(exc)}, status=401)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": safe_monitor_error(exc)}, status=502)
+            return
+        if route == "/api/price-structures" or route.endswith("/api/price-structures"):
+            try:
+                payload = self.read_json()
+                action = str(payload.get("action") or "").strip().lower()
+                if action in {"exclude", "remove", "exclude_structure"}:
+                    self.send_json(exclude_price_structure_symbol(payload.get("symbol")))
+                elif action in {"set_1m", "toggle_1m"}:
+                    self.send_json(set_price_structure_1m_override(
+                        payload.get("symbol"),
+                        payload.get("enabled"),
+                    ))
+                elif action in {"set_interval", "toggle_interval"}:
+                    self.send_json(set_price_structure_interval_override(
+                        payload.get("symbol"),
+                        payload.get("interval"),
+                        payload.get("enabled"),
+                    ))
+                else:
+                    self.send_json({"ok": False, "error": "unsupported action"}, status=400)
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=502)
+            return
+        if route == "/api/price-watch" or route.endswith("/api/price-watch"):
+            try:
+                payload = self.read_json()
+                action = str(payload.get("action") or "").strip().lower()
+                if action == "add":
+                    self.send_json(add_price_watch_symbol(payload.get("symbol"), payload.get("name")))
+                elif action == "remove":
+                    self.send_json(remove_price_watch_symbol(payload.get("symbol")))
+                elif action in {"confirm", "confirm_signal"}:
+                    self.send_json(confirm_price_watch_signal(payload.get("symbol"), payload.get("episode")))
+                elif action in {"exclude_prior_high", "remove_prior_high"}:
+                    self.send_json(exclude_price_watch_prior_high(payload.get("symbol")))
+                elif action == "refresh":
+                    self.send_json(sync_price_watch_monitor())
+                else:
+                    self.send_json({"ok": False, "error": "unsupported action"}, status=400)
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=502)
+            return
+        if route == "/api/wechat-group-monitor" or route.endswith("/api/wechat-group-monitor"):
+            user = self.require_auth()
+            if not user:
+                return
+            try:
+                payload = self.read_json()
+                action = clean_feed_text(payload.get("action"), 30).lower()
+                if action in {"add", "save", "toggle"}:
+                    save_wechat_group_monitor(
+                        user,
+                        payload.get("groupName"),
+                        payload.get("enabled", True),
+                        platform=payload.get("platform", "wechat"),
+                        sender_filter=payload.get("senderFilter", ""),
+                        forward_to_wechat=payload.get("forwardToWechat", False),
+                        forward_target=payload.get("forwardTarget", ""),
+                    )
+                elif action in {"delete", "remove"}:
+                    remove_wechat_group_monitor(user, payload.get("groupName"))
+                elif action in {"probe", "refresh"}:
+                    poll_wechat_group_monitors_once(user_id=int(user["id"]))
+                else:
+                    self.send_json({"ok": False, "error": "unsupported action"}, status=400)
+                    return
+                self.send_json(wechat_group_monitor_payload(user))
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=502)
+            return
+        if route == "/api/strategy-board" or route.endswith("/api/strategy-board"):
+            try:
+                payload = self.read_json()
+                action = str(payload.get("action") or "").strip().lower()
+                if action == "preview":
+                    self.send_json(strategy_order_preview(payload, self.current_user()))
+                elif action == "refresh":
+                    sync_price_watch_monitor()
+                    self.send_json(strategy_orders_payload(self.current_user()))
+                elif action == "submit":
+                    user = self.require_auth()
+                    if not user:
+                        return
+                    self.send_json(strategy_submit_order(payload, user))
+                elif action in {"break_even", "breakeven"}:
+                    user = self.require_auth()
+                    if not user:
+                        return
+                    self.send_json(strategy_break_even(payload, user))
+                else:
+                    self.send_json({"ok": False, "error": "unsupported action"}, status=400)
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=502)
+            return
+        if route == "/api/strategy-exchanges" or route.endswith("/api/strategy-exchanges"):
+            user = self.require_auth()
+            if not user:
+                return
+            try:
+                self.send_json(save_strategy_exchange_settings(user, self.read_json()))
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=502)
             return
         if route == "/api/ai/rank-insights" or route.endswith("/api/ai/rank-insights"):
             try:
@@ -12491,6 +32546,9 @@ def main():
     parser.add_argument("--port", type=int, default=default_port)
     args = parser.parse_args()
     init_auth_db()
+    CHAIN_ECOSYSTEM_MONITOR.initialize()
+    start_chain_ecosystem_monitor()
+    threading.Thread(target=ensure_local_translation_service, kwargs={"wait_seconds": 180}, daemon=True).start()
     ThreadingHTTPServer.allow_reuse_address = True
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Market hot dashboard: http://{args.host}:{args.port}/")
@@ -12499,11 +32557,22 @@ def main():
     print(f"Listings and IPO: http://{args.host}:{args.port}/listings.html")
     print(f"RSS subscriptions: http://{args.host}:{args.port}/rss.html")
     print(f"X KOL watch: http://{args.host}:{args.port}/xwatch.html")
+    print(f"Price watch: http://{args.host}:{args.port}/price-watch.html")
     print(f"Admin console: http://{args.host}:{args.port}/admin.html")
+    # Trading-signal monitoring must be live before lower-priority dashboard
+    # caches warm up; startup work may otherwise create a blind window.
+    start_price_structure_strategy_monitor()
+    start_new_coin_low_structure_monitor()
     threading.Thread(target=warm_runtime_cache, daemon=True).start()
     warm_api_response_cache()
+    start_x_kol_priority_monitor()
     start_site_alert_monitor()
+    start_price_watch_monitor()
     start_wechat_auth_monitor()
+    start_qq_onebot_bridge()
+    start_wechat_group_monitor()
+    atexit.register(CHAIN_ECOSYSTEM_MONITOR.stop)
+    atexit.register(stop_qq_onebot_bridge)
     atexit.register(stop_discord_newsflash_bridge)
     threading.Timer(1.0, start_discord_newsflash_bridge, args=(args.host, args.port)).start()
     try:

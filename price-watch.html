@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>星云社 · 监控</title>
+    <link rel="icon" href="./favicon.ico?v=2" sizes="any" />
+    <link rel="icon" type="image/png" sizes="32x32" href="./assets/favicon-32.png?v=2" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./assets/apple-touch-icon.png?v=2" />
+    <link rel="manifest" href="./site.webmanifest" />
+    <script src="./desktop_adapter.js?v=1"></script>
+    <link rel="stylesheet" href="./styles.css?v=85" />
+  </head>
+  <body>
+    <main class="app-shell price-watch-shell">
+      <header class="command-deck price-watch-deck">
+        <div class="topbar">
+          <div class="brand">
+            <span class="brand-mark brand-logo">
+              <img src="./assets/xingyunshe-logo.png?v=2" alt="星云社 logo" />
+            </span>
+            <div>
+              <p class="eyebrow">XINGYUN SOCIETY</p>
+              <h1>星云社</h1>
+              <span class="brand-subtitle">市场监控</span>
+            </div>
+          </div>
+          <nav class="page-nav" aria-label="页面导航">
+            <a class="nav-link" href="./index.html">热门榜</a>
+            <a class="nav-link" href="./gainers.html">涨幅榜</a>
+            <a class="nav-link" href="./turnover.html">成交额榜</a>
+            <a class="nav-link" href="./newboards.html">新币新股</a>
+            <a class="nav-link" href="./listings.html">上新IPO</a>
+            <a class="nav-link" href="./newsflash.html">律动快讯</a>
+            <a class="nav-link" href="./briefs.html">自动简报</a>
+            <a class="nav-link" href="./rss.html">RSS订阅</a>
+            <a class="nav-link" href="./xwatch.html">X追踪</a>
+            <a class="nav-link active" href="./price-watch.html">监控</a>
+            <a class="nav-link" href="./strategy.html">策略看盘</a>
+            <a class="nav-link" href="./todo.html">TodoList</a>
+            <a class="nav-link nav-discord" href="https://discord.gg/mKyCwtHW" target="_blank" rel="noreferrer noopener" aria-label="打开星云社 Discord 社区">Discord</a>
+          </nav>
+        </div>
+
+        <section class="price-watch-hero" aria-label="监控概览">
+          <p class="section-label">AICOIN HOT / PRICE / STRUCTURE / ROTATION</p>
+          <div class="price-watch-metrics">
+            <span><b id="watchTotal">0</b><em>监控中</em></span>
+            <span><b id="watchAuto">0</b><em>AICoin 自动</em></span>
+            <span><b id="watchManual">0</b><em>手动添加</em></span>
+            <span class="watch-near-metric"><b id="watchNear">0</b><em>接近前高</em></span>
+            <span class="watch-oversold-metric"><b id="watchOversold">0</b><em>超跌候选</em></span>
+            <span class="watch-rebound-metric"><b id="watchOversoldNear">0</b><em>反弹预警</em></span>
+          </div>
+        </section>
+      </header>
+
+      <section class="price-watch-controls" aria-label="市场监控控制">
+        <form id="watchAddForm" class="price-watch-add-form">
+          <label class="search-box">
+            <span>币种</span>
+            <input id="watchSymbol" type="text" maxlength="24" autocomplete="off" placeholder="输入 HYPE / HYPEUSDT" aria-label="币种代码" />
+          </label>
+          <button class="action-button price-watch-add" type="submit">添加监控</button>
+        </form>
+        <div class="price-watch-control-meta">
+          <span id="watchStatus">读取本地监控数据</span>
+          <button id="watchRefresh" class="action-button" type="button">刷新价格</button>
+        </div>
+      </section>
+
+      <div class="price-watch-modes" role="tablist" aria-label="监控模式">
+        <button type="button" role="tab" aria-selected="false" data-watch-mode="news">News Trade</button>
+        <button class="active" type="button" role="tab" aria-selected="true" data-watch-mode="prior">前高突破</button>
+        <button type="button" role="tab" aria-selected="false" data-watch-mode="oversold">超跌反弹</button>
+        <button type="button" role="tab" aria-selected="false" data-watch-mode="structure">多周期结构</button>
+        <button type="button" role="tab" aria-selected="false" data-watch-mode="newlow">新币低位结构</button>
+        <button type="button" role="tab" aria-selected="false" data-watch-mode="mapping">补涨映射</button>
+        <button type="button" role="tab" aria-selected="false" data-watch-mode="aster">Aster 上新公告</button>
+        <button type="button" role="tab" aria-selected="false" data-watch-mode="events">事件驱动</button>
+        <button type="button" role="tab" aria-selected="false" data-watch-mode="wechat">群聊机会</button>
+        <button type="button" role="tab" aria-selected="false" data-watch-mode="personalx">个人 X</button>
+        <button type="button" role="tab" aria-selected="false" data-watch-mode="chains">公链生态</button>
+      </div>
+
+      <section class="price-watch-heading">
+        <div>
+          <p id="watchHeadingLabel" class="section-label">ACTIVE WATCHLIST</p>
+          <h2 id="watchHeadingTitle">最近 7 日前高监控</h2>
+        </div>
+        <span id="watchHeadingDescription">现价低于前高且距离不超过 <b>3%</b> · 监控数量不限 · 连续 30 天未再上热门榜自动移除</span>
+      </section>
+
+      <section id="priceWatchGrid" class="price-watch-grid" aria-live="polite">
+        <div class="loading-panel"><b>正在读取监控列表</b><span>价格会在后台更新。</span></div>
+      </section>
+    </main>
+
+    <script src="./auth.js?v=17"></script>
+    <script src="./price-watch.js?v=51"></script>
+    <script src="./todo_reminder.js?v=2"></script>
+  </body>
+</html>

@@ -1,0 +1,21 @@
+[
+  {
+    "id": "sample-protocol",
+    "name": "Sample Protocol",
+    "slug": "sample-protocol",
+    "category": "Dexes",
+    "chains": ["Robinhood Chain"],
+    "tvl": 2000000,
+    "change_1d": 5.2,
+    "url": "https://sample.example"
+  },
+  {
+    "id": "sample-loan",
+    "name": "Sample Loan",
+    "slug": "sample-loan",
+    "category": "Lending",
+    "chains": ["Robinhood Chain"],
+    "tvl": 750000,
+    "change_1d": null
+  }
+]

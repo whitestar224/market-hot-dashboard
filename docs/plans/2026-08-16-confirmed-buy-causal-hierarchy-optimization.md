@@ -19,7 +19,11 @@
 5. **多周期只做共振。** Cross-frame alignment upgrades grade and priority after the current-frame boundary is independently valid. It cannot fabricate a consolidation or previous high.
 6. **硬否决优先。** Mother-box interior, unrecovered selloff, high-level distribution, rising wedge/channel, rushed stair-step, opened beyond trigger, launch distance above 7%, and duplicate recross without reset remain earlier than score.
 7. **双层召回继续保留。** A true boundary cross that misses only soft quality gates remains in `retainedCandidates`; it never paints B, triggers popup/voice, or bypasses a permanent denial.
-8. **二次突破是提示层。** 当第一次外沿突破没有明显量能、只完成试盘，随后价格回到边界附近但没有破坏母结构，再次从线下突破且量能/速度改善时，生成独立的 `secondaryBreakoutHints`。盘面用红色 B 标记其重要性；它不进入正式 `signals`，不计入买点数，也不触发弹窗、语音或自动执行。
+8. **二次突破是提示层。** 当第一次外沿突破没有明显量能、只完成试盘，随后价格回到边界附近但没有破坏母结构，再次从线下突破且量能/速度改善时，生成独立的 `secondaryBreakoutHints`。盘面用红色 B 标记其重要性；它不进入正式 `signals`、不计入买点数、不触发自动执行，但允许独立的红色弹窗和语音防洗提示。
+9. **原生 1 小时平台按价格带向左合并。** 当末端局部十余根与更早 K 线在同一压力高度持续交易时，原生 1 小时识别应沿重复触点组向左恢复完整母平台；平台前最后一根拉升 K 只负责证明前置动量，不计入盘整起点。该合并只读取突破 K 及其以前的数据。
+10. **相邻周期只在双方各自有结构时共振。** 5 分钟成熟母平台可以补足 15 分钟短盘整的分辨率，但 15 分钟自身仍须具备拐点与真实前高；15 分钟成熟母平台也可以为随后 5 分钟放量再突破提供母区间。该许可不机械投影到 1 小时。
+11. **急拉后的短消化是独立窄路径。** 已经进入陡峭主升、完成 12–22 根高质量短消化并从线下突破真实前高时，不强制套用约 40 根横盘；急促抬低点、母箱体噪声、风险结构和离线追价仍是一票否决。
+12. **母箱体优先于末端子通道。** 上升通道若只是完整母箱体中后段的内部路径，且最终 K 同时突破母箱体真实外沿与通道上轨，应按母箱体突破处理；没有更早母平台、重复触点组或真实外沿突破时，通道末端仍禁止追入。
 
 ## Tasks
 

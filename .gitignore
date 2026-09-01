@@ -3,6 +3,8 @@
 .env.production
 __pycache__/
 .runtime-cache/
+.runtime/
+.runtime-tools/
 node_modules/
 release/
 .pyinstaller-build/
@@ -19,3 +21,9 @@ Thumbs.db
 .qa-*
 dashboard-*.png
 newsflash-preview.png
+
+# Local logs and generated verification artifacts must never be committed.
+*.log
+@AutomationLog.txt
+deliverables/
+wechatauto_logs/

@@ -1,0 +1,70 @@
+{
+  "fixture": true,
+  "mock": true,
+  "description": "仅用于验证反常识文化事件模型；不是实时票房、社交、代币地址或官方关系数据。",
+  "events": [
+    {
+      "id": "fixture-bull-movie-news",
+      "sourceType": "newsflash",
+      "source": "Fixture 新闻源",
+      "sourceLabel": "FX",
+      "title": "【fixture】冷门动画《牛来》因离谱差评和极端反差突然爆红",
+      "body": "早期关注度极低，用户不是因为认同，而是围观、打卡、吐槽和玩梗；影院出现模拟加场反馈。",
+      "url": "https://example.invalid/fixture/bull-movie-news",
+      "minutesAgo": 240,
+      "claimStatus": "fixture-mock"
+    },
+    {
+      "id": "fixture-bull-movie-social",
+      "sourceType": "x-kol",
+      "source": "Fixture 社交源",
+      "sourceLabel": "FX",
+      "title": "【fixture】《牛来》表情包与二创刷屏，争议讨论跨平台扩散",
+      "body": "模拟短视频、图片和社交平台出现必须看看、笑死、打卡等参与式表达。",
+      "url": "https://example.invalid/fixture/bull-movie-social",
+      "minutesAgo": 80,
+      "claimStatus": "fixture-mock"
+    },
+    {
+      "id": "fixture-bull-movie-onchain",
+      "sourceType": "manual-search",
+      "source": "Fixture 链上核验",
+      "sourceLabel": "FX",
+      "title": "【fixture】链上出现《牛来》同名 Meme 候选",
+      "body": "同名不代表官方发行；当前统一标记为未确认关联，并核验流动性、成交与退出能力。",
+      "url": "https://example.invalid/fixture/bull-movie-onchain",
+      "minutesAgo": 20,
+      "claimStatus": "fixture-mock"
+    }
+  ],
+  "onchainCandidates": {
+    "lowQuality": {
+      "symbol": "牛来",
+      "name": "牛来 fixture 低质量池",
+      "chain": "bsc",
+      "chainLabel": "BNB Chain",
+      "heat": 55,
+      "amount": 18000,
+      "holderGrowth24hPercent": 0.5,
+      "volumeGrowth1hPercent": 5,
+      "top10HolderPercent": 91,
+      "buySellRatio": 0.2,
+      "note": "fixture · 市值 $8万 · 流动性 $1.5万 · 交易 120 笔 · 持仓高度集中 · 卖出能力需复核",
+      "url": "https://example.invalid/fixture/token/0x00000000000000000000000000000000000000a1"
+    },
+    "highQuality": {
+      "symbol": "牛来",
+      "name": "牛来 fixture 可交易池",
+      "chain": "bsc",
+      "chainLabel": "BNB Chain",
+      "heat": 96,
+      "amount": 22000000,
+      "holderGrowth24hPercent": 19,
+      "volumeGrowth1hPercent": 88,
+      "top10HolderPercent": 36,
+      "buySellRatio": 1.08,
+      "note": "fixture · 市值 $2600万 · 流动性 $180万 · 交易 8.2万 笔 · 铸币关闭 非貔貅盘",
+      "url": "https://example.invalid/fixture/token/0x00000000000000000000000000000000000000b2"
+    }
+  }
+}

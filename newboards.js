@@ -286,6 +286,8 @@ function sortedRows(rows) {
   return [...rows].sort((a, b) => {
     const timeDiff = (b.date || 0) - (a.date || 0);
     if (timeDiff) return timeDiff;
+    const rankDiff = (Number(a.rank) || 999) - (Number(b.rank) || 999);
+    if (rankDiff) return rankDiff;
     return String(a.symbol || a.title || "").localeCompare(String(b.symbol || b.title || ""), "zh-CN");
   });
 }
@@ -303,7 +305,17 @@ function renderMetrics() {
 }
 
 function buildCoinBoards() {
-  const order = ["binance-new", "okx-new", "bitget-new"];
+  const order = [
+    "binance-new",
+    "okx-new",
+    "bitget-new",
+    "binance-alpha-new",
+    "hyperliquid-new",
+    "trade-xyz-new",
+    "aster-new",
+    "gate-new",
+    "htx-new"
+  ];
   return [...newboardState.coinSections]
     .sort((a, b) => {
       const aIndex = order.indexOf(a.id);
@@ -463,15 +475,19 @@ function renderStockRow(row, rank, board) {
 }
 
 function renderBoard(board, index) {
-  const moreUrl = board.id === "okx-new"
-    ? "https://www.okx.com/zh-hans/markets/rankings/spot/new-crypto"
-    : board.id === "bitget-new"
-      ? "https://www.bitget.com/zh-CN/markets/rank/hot"
-      : board.id === "binance-new"
-        ? "https://www.binance.com/zh-CN/markets/trading_data/rankings"
-        : board.id === "cn"
-          ? "https://datapc.eastmoney.com/da/purchase/index?color=b"
-        : "#";
+  const moreUrls = {
+    "okx-new": "https://www.okx.com/zh-hans/markets/rankings/spot/new-crypto",
+    "bitget-new": "https://www.bitget.com/zh-CN/markets/rank/hot",
+    "binance-new": "https://www.binance.com/zh-CN/markets/trading_data/rankings",
+    "binance-alpha-new": "https://www.binance.com/zh-CN/alpha",
+    "hyperliquid-new": "https://app.hyperliquid.xyz/trade",
+    "trade-xyz-new": "https://trade.xyz",
+    "aster-new": "https://www.asterdex.com/en",
+    "gate-new": "https://www.gate.com/futures/USDT",
+    "htx-new": "https://www.htx.com/futures/linear_swap/exchange",
+    cn: "https://datapc.eastmoney.com/da/purchase/index?color=b"
+  };
+  const moreUrl = moreUrls[board.id] || "#";
   const isCoin = board.kind === "coin";
   const head = isCoin
     ? `<span>名称 | 成交额</span><span>时间</span><span>最新价 | 涨跌幅</span>`
@@ -484,7 +500,7 @@ function renderBoard(board, index) {
     <article class="board-card newboard-card ${board.rows.length ? "" : "is-muted"}" style="--accent: ${board.accent}; --delay: ${index * 45}ms">
       <header class="board-head newboard-card-head">
         <div>
-          <p>${isCoin ? "交易所新币榜" : "新股榜"}</p>
+          <p>${isCoin ? "新币 / 新市场榜" : "新股榜"}</p>
           <h3>${escapeHtml(board.title)}</h3>
         </div>
         <a href="${escapeHtml(moreUrl)}" target="_blank" rel="noreferrer">更多 ›</a>

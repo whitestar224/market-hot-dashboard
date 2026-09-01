@@ -13,7 +13,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin xingyun
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 --shell /usr/sbin/nologin xingyun
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

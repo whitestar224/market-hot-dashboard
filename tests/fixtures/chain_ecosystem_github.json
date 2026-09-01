@@ -1,0 +1,11 @@
+{
+  "id": 123456,
+  "full_name": "sample/protocol",
+  "html_url": "https://github.com/sample/protocol",
+  "description": "Sample protocol contracts",
+  "stargazers_count": 1000,
+  "forks_count": 100,
+  "open_issues_count": 10,
+  "pushed_at": "2026-08-15T10:00:00Z",
+  "updated_at": "2026-08-15T10:30:00Z"
+}

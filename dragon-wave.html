@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>龙头起爆台 · 策略预览</title>
+    <link rel="icon" href="./favicon.ico?v=2" sizes="any" />
+    <link rel="stylesheet" href="./dragon-wave.css?v=73" />
+  </head>
+  <body>
+    <div class="wave-shell">
+      <header class="wave-topbar">
+        <div class="wave-brand">
+          <div class="wave-sigil" aria-hidden="true"><span></span><span></span><span></span></div>
+          <div>
+            <p>IGNITION LAB / XINGYUN SOCIETY</p>
+            <h1>龙头起爆台</h1>
+          </div>
+          <span class="preview-tag">PREVIEW 01</span>
+        </div>
+        <div class="wave-top-actions">
+          <span class="readonly-badge"><i></i> 只读研究 · 不下单</span>
+          <a href="./strategy.html">返回策略看盘 <b>↗</b></a>
+        </div>
+      </header>
+
+      <section class="control-deck" aria-label="行情参数">
+        <div class="control-lead">
+          <span class="section-code">01 / TARGET</span>
+          <div>
+            <strong id="activePair">TUTUSDT</strong>
+            <small id="activeContext">文档样本 · 等待读取</small>
+          </div>
+        </div>
+        <div class="control-grid">
+          <label>
+            <span>文档案例</span>
+            <select id="caseSelect" aria-label="选择文档案例"></select>
+          </label>
+          <label>
+            <span>交易对</span>
+            <div class="symbol-input"><input id="symbolInput" value="TUTUSDT" spellcheck="false" /><em>USDT</em></div>
+          </label>
+          <label>
+            <span>市场</span>
+            <select id="marketSelect">
+              <option value="futures">永续优先</option>
+              <option value="spot">现货</option>
+            </select>
+          </label>
+          <label>
+            <span>数据源</span>
+            <select id="providerSelect">
+              <option value="auto">自动容灾</option>
+              <option value="binance">Binance</option>
+              <option value="okx">OKX</option>
+              <option value="bitget">Bitget</option>
+              <option value="gate">Gate</option>
+              <option value="mexc">MEXC</option>
+              <option value="kucoin">KuCoin</option>
+              <option value="hyperliquid">Hyperliquid</option>
+            </select>
+          </label>
+          <label>
+            <span>观察锚点</span>
+            <input id="focusTime" type="datetime-local" />
+          </label>
+          <button id="loadButton" class="ignite-button" type="button"><span>扫描起爆点</span><b>↗</b></button>
+        </div>
+        <div class="human-analysis-context" aria-label="人工分析上下文">
+          <label><span>人工盘势</span><select id="mainWaveMode"><option value="auto">策略自判</option><option value="expected">我给出主升浪预期</option><option value="active">我确认已进入主升浪</option></select></label>
+          <label><span>分析备注</span><input id="analysisNote" type="text" maxlength="180" placeholder="例如：主升情绪已起来，只等5分钟盘整外沿突破" /></label>
+          <small id="mainWaveModeHint">策略自判；人工结论不会替代成熟结构、真实外沿和突破触发。</small>
+          <small class="new-coin-permit-note">新币早期若高周期K线不足，但已止跌、完成独立上推，市场热度或情绪保持，并形成成熟结构真实突破，则自动按“新币不跌后的主升浪”许可；EMA90未形成不视为转弱。</small>
+        </div>
+        <div class="control-foot">
+          <div id="sourceRoute" class="source-route"><i></i><span>容灾链：Binance → OKX → Bitget → Hyperliquid → 现货源</span></div>
+          <div class="view-toggles">
+            <label><input id="showRejected" type="checkbox" /><span>显示过滤点</span></label>
+            <button id="jumpNow" type="button">切到实时</button>
+          </div>
+        </div>
+        <div id="leaderRadar" class="leader-radar" aria-label="实时龙头池">
+          <div class="leader-radar-label"><span>LIVE LEADERS</span><strong>实时龙头池</strong><em id="leaderStatus">连接三大交易所…</em></div>
+          <div id="leaderChips" class="leader-chips"><span class="leader-placeholder">正在发现文档之外的强势标的</span></div>
+          <button id="refreshLeaders" type="button" aria-label="刷新实时龙头池">刷新 ↻</button>
+        </div>
+      </section>
+
+      <section class="pulse-strip" aria-label="策略摘要">
+        <article class="pulse-card pulse-status">
+          <span>当前结论</span>
+          <strong id="summaryStatus">准备扫描</strong>
+          <small id="summaryHint">先验证大周期，再寻找低周期触发</small>
+        </article>
+        <article class="pulse-card">
+          <span>最优买点</span>
+          <strong id="bestSignal">—</strong>
+          <small id="bestSignalMeta">尚无可执行结构</small>
+        </article>
+        <article class="pulse-card">
+          <span>周期共振</span>
+          <strong><b id="bullishCount">0</b><em>/ 6</em></strong>
+          <small>日线 / 4H / 1H 决定开仓许可</small>
+        </article>
+        <article class="pulse-card">
+          <span>噪声拦截</span>
+          <strong id="rejectedCount">0</strong>
+          <small>逆势、离位过远、松散与重复结构</small>
+        </article>
+      </section>
+
+      <main class="wave-workspace is-chart-only">
+        <section class="charts-stage" aria-labelledby="chartsTitle">
+          <header class="stage-head">
+            <div>
+              <span class="section-code">02 / PRIMARY CHART</span>
+              <h2 id="chartsTitle">龙头主升盘面</h2>
+            </div>
+            <div class="chart-legend" aria-label="图例">
+              <span class="is-buy"><i></i>因果买点</span>
+              <span class="is-secondary-hint"><i></i>防洗二次突破</span>
+              <span class="is-pending"><i></i>预备触发</span>
+              <span class="is-visual"><i></i>V · 视觉预确认</span>
+              <span class="is-filtered"><i></i>过滤点</span>
+              <span class="is-structure"><i></i>结构预确认</span>
+              <span class="is-ema90"><i></i>EMA90</span>
+            </div>
+          </header>
+          <nav class="timeframe-tabs" aria-label="切换K线周期">
+            <button type="button" data-timeframe="5m">5分</button>
+            <button type="button" class="is-active" data-timeframe="15m">15分</button>
+            <button type="button" data-timeframe="1h">1小时</button>
+            <button type="button" data-timeframe="4h">4小时</button>
+            <button type="button" data-timeframe="1d">日线</button>
+          </nav>
+          <p id="signalPolicyNote" class="signal-policy"><b>绿色只显示高确定性、严格因果买点</b>：盘整母平台的最高外沿会被独立预设，突破盘整前高即触发，不要求用趋势线或附近阳线凑条件；附近阳线无效，试错后重新形成的平台外沿可再次武装。<b>所有周期都先做母结构审查</b>：局部形态若仍处在更大无序箱体中部、上方保留大量未突破空间，就只是箱体内波动，不算起爆；只有真正母结构外沿、主升中继、新币不跌，或4小时/日线长期低位止跌例外可以保留。趋势线只作成熟箱体、收敛三角或下降楔形的低权重辅助，单独穿线绝不开仓；上下轨必须取自同一段拉升后的盘整或回调窗口，下轨绝不借用拉升前低点，同一盘整只保留一组稳定边界。结构线要求接近 95% 的主体包络，少量异常影线可容忍，但实体频繁穿线或在线两侧来回切换即取消结构；自动结构线统一显示为白色实线段。<b>审美分已移除</b>，策略只核验前置拉升、完整盘整、边界触碰、包络/穿插、EMA90与真实突破等可解释事实。<b>白线只代表策略结构预确认，与是否允许在这一根成交分开判断</b>；点选对应 K 线后可校验策略预判，人工补充和去除的结构会进入下一轮对比复盘。手动画线端点会吸附并记录对应 K 线的高点、低点、开盘或收盘；上下线成组后自动预判三角、降楔、箱体或收敛结构，待人工校验后进入学习样本。高位放量大分歧、极端振幅和见顶震荡即使局部可以连线也全部隐藏。本根必须从触发线下方开盘，盘中首次向上穿越就成交。前高突破使用更小周期重建“首次上穿前的突破 K 最低点”，该低点到前高涨幅超过 7% 不做；不读取突破后的整根 K 线最低价。<b>琥珀色是尚未穿越的预备单</b>。成交瞬间价格高于本根开盘，不在阴线状态追入，也不读取本根最终收盘颜色。突破前订单流评分仅使用已完成 K 线的大单代理、主动买量与推进速度；接入交易所后再用逐笔成交确认真实 Big Trade。<b>一旦确认主升浪或给出主升浪预期</b>，主升启动前由4小时/日线下跌留下的旧压力、高点和低点只作背景，不再否决当前周期的成熟突破；主升后新形成的急杀母箱体、高位大分歧与当前结构风险仍继续过滤。BTC 只作背景备注，不否决已筛选龙头的独立起爆结构。5分 / 15分 / 1小时为主操作周期；5分和15分若在主升中短暂失守EMA90，重新站回上行均线并稳定蓄力，可由横盘、箱体、三角、降楔或前高附近盘整的真实外沿重新触发；纯4小时长收敛先作为母结构许可，实际执行下沉到1小时精确突破。<b>1分钟暂不参与默认读取和策略计算</b>，需要复盘时按需生成静态 K 线图片，避免长历史数据持续拖慢看板；独立4小时仍只保留 A+ 买点。<b>安静候选</b>只保留已真实突破母平台边界、但尚未通过执行层的结构，集中放在右侧复盘账本供人工确认；它们不在K线上显示B，也不弹窗或语音播报。</p>
+          <p class="signal-policy secondary-hint-policy"><b>红色B是防洗二次突破提示</b>：第一次缩量试突破后回到母平台边界、结构未破坏，随后量能、订单流或推进速度改善并再次突破时提示；可弹窗和语音，但不属于绿色正式买点，也不进入自动执行。</p>
+          <div id="drawingToolbar" class="drawing-toolbar" aria-label="K线画线工具">
+            <span>MARKUP / 画线</span>
+            <button type="button" class="is-active" data-draw-tool="pan" title="拖动K线">✥ 拖动</button>
+            <button type="button" data-draw-tool="feedback" title="鼠标悬停K线变为手指后，点击该根K线补标遗漏买点">＋ 选择K线补标</button>
+            <button type="button" data-draw-tool="trend" title="按住拖动；端点自动吸附K线高点、低点、开盘或收盘，并预判成组结构">╱ 趋势线</button>
+            <button type="button" data-draw-tool="horizontal" title="点击价格绘制水平线">─ 水平线</button>
+            <button type="button" data-draw-tool="ellipse" title="按住拖动圈选结构">◯ 圈选</button>
+            <button type="button" data-draw-tool="erase" title="点击标记进行删除">⌫ 橡皮擦</button>
+            <button type="button" id="exportChartImage" title="把当前周期盘面直接保存成 PNG 图片">▣ 生成图片</button>
+            <button type="button" id="clearDrawings" title="清空当前标的的所有画线">清空</button>
+          </div>
+
+          <div id="chartGrid" class="chart-grid chart-grid-single">
+            <article id="mainChart" class="timeframe-card main-timeframe-card" data-interval="15m">
+              <header><div><span id="mainChartRole">STRUCTURE</span><h3 id="mainChartInterval">15分钟</h3></div><div class="chart-head-meta"><b data-regime>待加载</b><em data-source>—</em><button data-expand aria-label="放大主盘面">↗</button></div></header>
+              <div class="chart-surface"><canvas role="img" aria-label="可切换周期的K线主盘面及策略买点"></canvas><div class="chart-tooltip"></div><div class="chart-feedback-popover" aria-hidden="true"><header><span>CHART FEEDBACK</span><button type="button" data-chart-feedback-close aria-label="关闭">×</button></header><strong data-chart-feedback-title>选择买点</strong><small data-chart-feedback-meta>—</small><p data-chart-feedback-detail>直接在盘面标记你的判断</p><section class="chart-visual-range"><span>视觉训练区间 · 默认自动</span><strong data-chart-visual-range-label>正在识别母结构范围</strong><div><button type="button" data-chart-visual-range-adjust="expand">← 向左扩大</button><button type="button" data-chart-visual-range-adjust="contract">向右缩短 →</button><button type="button" data-chart-visual-range-reset>恢复自动</button></div><aside class="chart-visual-range-confirm" data-chart-visual-range-confirm hidden><strong data-chart-visual-range-draft-label>请点选左侧起点K线</strong><div><button type="button" data-chart-visual-range-commit disabled>确认起点</button><button type="button" data-chart-visual-range-cancel>取消</button></div></aside><small>“向左扩大”可精确点选K线；确认前只预览，不会修改已保存范围。</small></section><section class="chart-certainty"><span>手动确定性</span><div><button type="button" data-chart-certainty-grade="A+">A+ 核心</button><button type="button" data-chart-certainty-grade="A">A 确定</button><button type="button" data-chart-certainty-grade="B">B 观察</button></div></section><section class="chart-structure-confirm"><span>结构确认 · 可多选</span><aside class="chart-structure-precheck"><em>策略预确认</em><strong data-chart-structure-prediction>等待结构判断</strong><small data-chart-structure-review>由你校验后进入对比复盘</small></aside><div><button type="button" data-chart-structure-tag="horizontalLaunch">横盘起飞</button><button type="button" data-chart-structure-tag="trendlineBreakout">趋势线突破</button><button type="button" data-chart-structure-tag="triangle">三角</button><button type="button" data-chart-structure-tag="box">箱体</button><button type="button" data-chart-structure-tag="fallingWedge">降楔</button><button type="button" data-chart-structure-tag="pivot">拐点</button><button type="button" data-chart-structure-tag="previousHighBreakout">前高突破</button><button type="button" data-chart-structure-tag="consolidationBreakout">盘整突破</button><button type="button" data-chart-structure-tag="ema90Pullback">回踩90均线</button><button type="button" data-chart-structure-tag="volumeBreakout">放量突破</button><button type="button" data-chart-structure-tag="nearPreviousHighConsolidation">前高附近做盘整</button><button type="button" data-chart-structure-tag="newCoinNotFalling">新币不跌</button><button type="button" data-chart-structure-tag="mainWaveActive">主升浪阶段</button><button type="button" data-chart-structure-tag="mainWaveExpected">主升浪预期</button></div></section><div class="chart-feedback-decisions"><button type="button" data-chart-feedback-action="confirmed">确认</button><button type="button" data-chart-feedback-action="pending">待定</button><button type="button" data-chart-feedback-action="denied">彻底否定</button></div><footer><button type="button" data-chart-feedback-clear hidden>取消此标记</button></footer></div><div class="chart-empty"><i></i><span>等待行情</span></div></div>
+              <footer><span data-last-price>—</span><span data-signal-count>0 买点 · 0 预备 · 0 候选</span><span data-filter-count>0 过滤</span></footer>
+            </article>
+          </div>
+        </section>
+
+        <aside class="intel-column" hidden aria-hidden="true">
+          <section class="permission-card">
+            <div class="permission-ring" id="permissionRing"><span><b id="permissionScore">0</b><em>/100</em></span></div>
+            <div>
+              <span class="section-code">ENTRY PERMISSION</span>
+              <h2 id="permissionTitle">等待环境判定</h2>
+              <p id="permissionText">先看日线与 4 小时是否允许做多，再让 15 分钟、5 分钟与 1 分钟给出触发。</p>
+            </div>
+          </section>
+
+          <section class="logic-stack">
+            <header><span class="section-code">03 / RULE STACK</span><h2>只开在起爆点</h2></header>
+            <ol>
+              <li data-rule="environment"><b>01</b><div><strong>环境许可</strong><span>日线 + 4H 多头，回撤未破坏主升结构</span></div><em>待判定</em></li>
+              <li data-rule="structure"><b>02</b><div><strong>结构与节奏</strong><span>长平台、箱体、三角/下降楔形、前高及主升浅回踩再点火</span></div><em>待判定</em></li>
+              <li data-rule="trigger"><b>03</b><div><strong>向上穿越</strong><span>开盘在结构线下，盘中第一次向上突破就买</span></div><em>待判定</em></li>
+              <li data-rule="flow"><b>04</b><div><strong>情绪与共振</strong><span>承接、缩量、节奏及横盘/箱体/三角/前高 + 突破共振</span></div><em>待判定</em></li>
+              <li data-rule="veto"><b>05</b><div><strong>事前噪声否决</strong><span>逆势、离位过远、结构松散与重复突破</span></div><em>待判定</em></li>
+            </ol>
+          </section>
+
+          <section class="signal-ledger">
+            <header>
+              <div><span class="section-code">04 / SIGNAL LEDGER</span><h2>买点与过滤记录</h2></div>
+              <div class="ledger-head-tools">
+                <div class="feedback-sync"><i></i><span id="feedbackSync">读取反馈…</span><b id="feedbackCounts">0 正样本 / 0 待定 / 0 反例</b></div>
+                <div class="ledger-tabs" role="tablist"><button class="is-active" data-ledger-filter="all">全部</button><button data-ledger-filter="buy">买点</button><button data-ledger-filter="secondary-hint">二次</button><button data-ledger-filter="confirmed">已确认</button><button data-ledger-filter="pending">预备</button><button data-ledger-filter="candidate">候选</button><button data-ledger-filter="filtered">过滤</button></div>
+              </div>
+            </header>
+            <div id="signalLedger" class="ledger-list"><div class="ledger-empty"><i></i><strong>尚未扫描</strong><span>策略证据会显示在这里</span></div></div>
+          </section>
+
+          <section class="case-notes">
+            <header><span class="section-code">05 / SOURCE SAMPLE</span><h2>文档样本</h2></header>
+            <div class="case-summary"><strong id="caseName">TUT</strong><span id="caseRange">2026-07-09 → 2026-08-10</span></div>
+            <p id="caseNote">文档只提供主升区间；页面中的具体买点由统一规则从交易所 K 线重新计算，不把日期本身当作买入信号。</p>
+            <div class="case-progress"><span id="caseProgress"></span></div>
+            <footer><span>文档 <b>86</b></span><span>附图标的 <b>2</b></span><span>实时 <b id="liveLeaderCount">0</b></span><span>异常 <b>1</b></span></footer>
+          </section>
+        </aside>
+      </main>
+
+      <footer class="wave-footer">
+        <p>策略展示用于结构研究与复盘，不构成投资建议。人工确认会在浏览器、本机数据库及登录账号中永久保留；反馈权重只调整同类结构排序，不绕过因果与风控条件。</p>
+        <span id="lastUpdated">NOT SYNCED</span>
+      </footer>
+    </div>
+
+    <script src="./dragon-wave-cases.js?v=89"></script>
+    <script src="./dragon-wave-data.js?v=89"></script>
+    <script src="./dragon-wave-vision.js?v=66"></script>
+    <script src="./dragon-wave-engine.js?v=89"></script>
+    <script src="./dragon-wave-feedback.js?v=73"></script>
+    <script src="./dragon-wave.js?v=89"></script>
+  </body>
+</html>

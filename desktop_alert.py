@@ -5,9 +5,13 @@ import base64
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
+import threading
 import textwrap
+import time
+import urllib.error
 import urllib.request
 import webbrowser
 from datetime import datetime
@@ -63,6 +67,43 @@ def play_sound(enabled: bool) -> None:
             pass
 
 
+def speak_text(value: object, enabled: bool) -> None:
+    text = clamp_text(value, 160)
+    if not enabled or os.name != "nt" or not text:
+        return
+
+    def worker() -> None:
+        # Use the Windows speech engine so desktop alerts do not require an
+        # additional Python package or an online text-to-speech service.
+        script = (
+            "$text = [Console]::In.ReadToEnd();"
+            "if ([string]::IsNullOrWhiteSpace($text)) { exit 0 };"
+            "Add-Type -AssemblyName System.Speech;"
+            "$speaker = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+            "$voice = $speaker.GetInstalledVoices() | Where-Object { $_.VoiceInfo.Culture.Name -eq 'zh-CN' } | Select-Object -First 1;"
+            "if ($voice) { $speaker.SelectVoice($voice.VoiceInfo.Name) };"
+            "$speaker.Rate = 1;"
+            "$speaker.Volume = 100;"
+            "$speaker.Speak($text);"
+            "$speaker.Dispose();"
+        )
+        try:
+            time.sleep(0.35)
+            subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                input=text,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                check=False,
+            )
+        except Exception:
+            pass
+
+    threading.Thread(target=worker, daemon=True, name="xingyun-alert-speech").start()
+
+
 def wrapped(value: str, width: int) -> str:
     return "\n".join(
         textwrap.wrap(
@@ -100,6 +141,98 @@ def limited_lines(value: str, max_lines: int) -> str:
     clipped = lines[:max_lines]
     clipped[-1] = clipped[-1].rstrip(" .。；;，,") + "..."
     return "\n".join(clipped)
+
+
+def looks_english(value: object) -> bool:
+    text = " ".join(str(value or "").split())
+    if len(text) < 12:
+        return False
+    latin = len(re.findall(r"[A-Za-z]", text))
+    cjk = len(re.findall(r"[\u3400-\u9fff]", text))
+    words = len(re.findall(r"[A-Za-z]{2,}", text))
+    return latin >= 18 and words >= 5 and latin >= max(18, cjk * 4)
+
+
+def fetch_translation(endpoint: str, text: str) -> str:
+    data = json.dumps({"text": text, "clientMode": "desktop-alert"}).encode("utf-8")
+    request = urllib.request.Request(
+        endpoint,
+        data=data,
+        headers={"Content-Type": "application/json", "User-Agent": "XingyunSociety/desktop-alert"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            payload = json.loads(response.read(200_000).decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read(200_000).decode("utf-8"))
+            message = str(payload.get("error") or payload.get("message") or exc)
+        except Exception:
+            message = str(exc)
+        raise RuntimeError(message) from exc
+    if not payload.get("ok"):
+        raise RuntimeError(str(payload.get("error") or "translation failed"))
+    return clamp_text(payload.get("translation") or "", 360)
+
+
+def post_price_watch_confirmation(endpoint: str, symbol: str, episode: int) -> dict:
+    data = json.dumps(
+        {"action": "confirm", "symbol": symbol, "episode": episode},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        endpoint,
+        data=data,
+        headers={"Content-Type": "application/json", "User-Agent": "XingyunSociety/desktop-alert"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read(200_000).decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read(200_000).decode("utf-8"))
+            message = str(payload.get("error") or payload.get("message") or exc)
+        except Exception:
+            message = str(exc)
+        raise RuntimeError(message) from exc
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        raise RuntimeError(str(payload.get("error") if isinstance(payload, dict) else "确认失败"))
+    return payload
+
+
+def post_price_watch_exclusion(
+    endpoint: str,
+    symbol: str,
+    action: str = "exclude_prior_high",
+) -> dict:
+    safe_action = str(action or "").strip().lower()
+    if safe_action not in {"exclude_prior_high", "exclude_structure"}:
+        safe_action = "exclude_prior_high"
+    data = json.dumps(
+        {"action": safe_action, "symbol": symbol},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        endpoint,
+        data=data,
+        headers={"Content-Type": "application/json", "User-Agent": "XingyunSociety/desktop-alert"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read(200_000).decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read(200_000).decode("utf-8"))
+            message = str(payload.get("error") or payload.get("message") or exc)
+        except Exception:
+            message = str(exc)
+        raise RuntimeError(message) from exc
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        raise RuntimeError(str(payload.get("error") if isinstance(payload, dict) else "剔除失败"))
+    return payload
 
 
 def payload_image_path(payload: dict) -> tuple[Path | None, Path | None]:
@@ -207,8 +340,27 @@ def show_popup(payload: dict, slot: int) -> int:
     source_label = clamp_text(payload.get("sourceLabel") or "NX", 5)
     priority = clamp_text(payload.get("priority") or "实时", 8)
     url = str(payload.get("url") or "").strip()
+    translation_text = clamp_text(payload.get("translationText") or "", 1800)
+    translate_endpoint = str(payload.get("translateEndpoint") or "").strip()
+    can_translate = bool(translation_text and translate_endpoint and looks_english(translation_text))
+    confirm_endpoint = str(payload.get("confirmEndpoint") or "").strip()
+    confirm_symbol = clamp_text(payload.get("confirmSymbol") or "", 30)
+    try:
+        confirm_episode = int(payload.get("confirmEpisode") or 0)
+    except (TypeError, ValueError):
+        confirm_episode = 0
+    confirm_label = clamp_text(payload.get("confirmLabel") or "确认首次", 8)
+    can_confirm = bool(confirm_endpoint and confirm_symbol and confirm_episode > 0)
+    exclude_endpoint = str(payload.get("excludeEndpoint") or "").strip()
+    exclude_symbol = clamp_text(payload.get("excludeSymbol") or "", 30)
+    exclude_label = clamp_text(payload.get("excludeLabel") or "剔除前高", 8)
+    exclude_action = str(payload.get("excludeAction") or "exclude_prior_high").strip().lower()
+    if exclude_action not in {"exclude_prior_high", "exclude_structure"}:
+        exclude_action = "exclude_prior_high"
+    can_exclude = bool(exclude_endpoint and exclude_symbol)
     alert_time = time_label(payload.get("time"))
     sound = payload.get("sound") is not False
+    speech = payload.get("speech") or ""
     is_hot = "高热" in priority or "重点" in priority or "高热" in title
     image_path, temp_image_path = payload_image_path(payload)
     title_text = limited_lines(soft_wrap_text(title, 24), 2)
@@ -301,6 +453,38 @@ def show_popup(payload: dict, slot: int) -> int:
         )
         view_btn.pack(side="right", padx=(4, 0), pady=(12, 7))
 
+    translate_btn = None
+    if can_translate:
+        translate_btn = tk.Button(
+            top,
+            text="翻译",
+            command=lambda: request_translation(),
+            bg="#d7f0fb",
+            fg="#455660",
+            activebackground="#eef9ff",
+            relief="flat",
+            width=5,
+            height=1,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+        translate_btn.pack(side="right", padx=(4, 0), pady=(12, 7))
+
+    confirm_btn = None
+    if can_confirm:
+        confirm_btn = tk.Button(
+            top,
+            text=confirm_label,
+            command=lambda: request_confirmation(),
+            bg="#f6bb48",
+            fg="#20272b",
+            activebackground="#ffd06a",
+            relief="flat",
+            width=7,
+            height=1,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+        confirm_btn.pack(side="right", padx=(4, 0), pady=(12, 7))
+
     content_height = 420 - 58 - 48 if image_path else 212 - 58 - 42
     content = tk.Frame(outer, bg="#f8fcff", height=max(96, content_height))
     content.pack(fill="x")
@@ -337,6 +521,95 @@ def show_popup(payload: dict, slot: int) -> int:
     if body:
         text.insert("end", body_text, "body")
     text.configure(state="disabled")
+
+    translation_inserted = {"value": False}
+
+    def show_translation(value: str, error: str = "") -> None:
+        if not translate_btn:
+            return
+        has_value = bool(value)
+        translate_btn.configure(text="已翻译" if has_value else "翻译失败", state="normal")
+        translation_inserted["value"] = has_value
+        result = value or error or "翻译失败"
+        if "402" in result or "Payment Required" in result:
+            result = "翻译失败：当前大模型额度不足，请在个人资料/设置里换一个可用模型或更新 API Key。"
+        elif "missing API_KEY" in result:
+            result = "翻译失败：还没有配置可用的大模型 API Key。"
+        text.configure(state="normal")
+        text.delete("1.0", "end")
+        text.insert("end", f"{kind}\n", "kind")
+        text.insert("end", f"{'译文' if has_value else '翻译失败'}\n", "title")
+        text.insert("end", limited_lines(soft_wrap_text(result, 38), 5), "body")
+        text.configure(state="disabled")
+
+    def request_translation() -> None:
+        if not translate_btn:
+            return
+        translate_btn.configure(text="翻译中", state="disabled")
+
+        def worker() -> None:
+            try:
+                result = fetch_translation(translate_endpoint, translation_text)
+                root.after(0, lambda: show_translation(result))
+            except Exception as exc:
+                root.after(0, lambda: show_translation("", f"翻译失败：{exc}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def show_confirmation(success: bool, message: str = "") -> None:
+        if not confirm_btn:
+            return
+        confirm_btn.configure(
+            text="已确认首次" if success else "确认失败",
+            state="disabled" if success else "normal",
+            bg="#23c99a" if success else "#f6bb48",
+        )
+        if not success and message:
+            print(f"price watch confirmation failed: {message}", file=sys.stderr)
+
+    def request_confirmation() -> None:
+        if not confirm_btn:
+            return
+        confirm_btn.configure(text="确认中", state="disabled")
+
+        def worker() -> None:
+            try:
+                post_price_watch_confirmation(confirm_endpoint, confirm_symbol, confirm_episode)
+                root.after(0, lambda: show_confirmation(True))
+            except Exception as exc:
+                root.after(0, lambda: show_confirmation(False, str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    exclude_btn = None
+
+    def show_exclusion(success: bool, message: str = "") -> None:
+        if not exclude_btn:
+            return
+        exclude_btn.configure(
+            text="已剔除" if success else "重试剔除",
+            state="disabled" if success else "normal",
+            bg="#dcefe8" if success else "#ffffff",
+            fg="#18745c" if success else "#a43a32",
+        )
+        if success:
+            root.after(900, close)
+        elif message:
+            print(f"price watch prior-high exclusion failed: {message}", file=sys.stderr)
+
+    def request_exclusion() -> None:
+        if not exclude_btn:
+            return
+        exclude_btn.configure(text="剔除中", state="disabled")
+
+        def worker() -> None:
+            try:
+                post_price_watch_exclusion(exclude_endpoint, exclude_symbol, exclude_action)
+                root.after(0, lambda: show_exclusion(True))
+            except Exception as exc:
+                root.after(0, lambda message=str(exc): show_exclusion(False, message))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     alert_image = None
     if image_path:
@@ -376,6 +649,22 @@ def show_popup(payload: dict, slot: int) -> int:
         fg="#6b7880",
         font=("Microsoft YaHei UI", 10),
     ).pack(side="left", pady=12)
+    if can_exclude:
+        exclude_btn = tk.Button(
+            footer,
+            text=exclude_label,
+            command=request_exclusion,
+            bg="#ffffff",
+            fg="#a43a32",
+            activebackground="#fff0ed",
+            activeforeground="#8e2d27",
+            relief="solid",
+            bd=1,
+            width=7,
+            height=1,
+            font=("Microsoft YaHei UI", 8, "bold"),
+        )
+        exclude_btn.pack(side="right", padx=(6, 14), pady=8)
     tk.Label(
         footer,
         text=priority,
@@ -395,6 +684,7 @@ def show_popup(payload: dict, slot: int) -> int:
     root.after(10, fade)
     root.after(AUTO_CLOSE_MS, close)
     play_sound(sound)
+    speak_text(speech, sound)
     root.mainloop()
     if temp_image_path:
         try:
