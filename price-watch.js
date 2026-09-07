@@ -38,6 +38,7 @@
     { key: "1d", label: "日", name: "日线" },
   ];
   let newsTradePage = 1;
+  let lastNewsTradeAiRequest = { signature: "", requestedAt: 0 };
   let newsTradeSearchState = { query: "", loading: false, preview: null, error: "", message: "" };
   let newsTradeExecutionNotice = null;
   let eventSummary = {};
@@ -80,6 +81,7 @@
   let chainEcosystemLoaded = false;
   let chainActionLoading = false;
   let chainEcosystemRequestId = 0;
+  let chainAiPollTimer = 0;
   let selectedChainSlug = new URLSearchParams(window.location.search).get("chain") || "";
   let lastStructureLoadAt = 0;
   let lastNewLowStructureLoadAt = 0;
@@ -640,6 +642,40 @@
     const invalidations = Array.isArray(item?.invalidationConditions) ? item.invalidationConditions : [];
     const sources = Array.isArray(item?.informationSources) ? item.informationSources.slice(0, 8) : [];
     const tier = item?.candidateTier === "trade-candidate" ? "交易候选" : "事件观察";
+    const xMeme = item?.xMemePotential && typeof item.xMemePotential === "object" && item.xMemePotential.evaluated
+      ? item.xMemePotential
+      : null;
+    const xMemeLevel = ["high", "medium", "low"].includes(String(xMeme?.level || ""))
+      ? String(xMeme.level)
+      : "low";
+    const xMemeReasons = Array.isArray(xMeme?.reasons) ? xMeme.reasons.slice(0, 4) : [];
+    const ai = item?.aiAnalysis && typeof item.aiAnalysis === "object" ? item.aiAnalysis : null;
+    const aiStatus = String(item?.aiAnalysisStatus || "");
+    const rawProvider = String(item?.aiAnalysisProvider || "").toLowerCase();
+    const aiProvider = rawProvider === "codex-cli"
+      ? "Codex"
+      : (rawProvider === "deepseek" ? "DeepSeek" : "AI");
+    const verdictLabels = { "trade-candidate": "交易候选", watch: "继续观察", reject: "暂不参与" };
+    const aiTags = Array.isArray(ai?.tags) ? ai.tags.slice(0, 5) : [];
+    const aiPanel = ai ? `
+      <div class="news-trade-ai-analysis is-ready">
+        <header><span><i>AI</i><b>事件与 Meme 判断</b></span><em>${escapeHtml(aiProvider)} · ${escapeHtml(verdictLabels[ai.verdict] || "继续观察")}</em></header>
+        <div class="news-trade-ai-scores">
+          <span><b>${Math.round(Number(ai.confidence) || 0)}</b><em>AI 置信</em></span>
+          <span><b>${Math.round(Number(ai.narrativeStrength) || 0)}</b><em>叙事强度</em></span>
+          <span><b>${Math.round(Number(ai.memePotential) || 0)}</b><em>Meme 机会</em></span>
+        </div>
+        <p><b>${escapeHtml(ai.thesis || "等待更多有效证据")}</b>${aiTags.length ? `<span>${aiTags.map((tag) => `<i>${escapeHtml(tag)}</i>`).join("")}</span>` : ""}</p>
+        <div class="news-trade-ai-notes">
+          <span><em>催化</em><b>${escapeHtml(ai.catalyst || "暂无明确催化")}</b></span>
+          <span><em>风险</em><b>${escapeHtml(ai.risk || "仍需核验来源与链上质量")}</b></span>
+          <span><em>应对</em><b>${escapeHtml(ai.actionHint || "等待进一步确认")}</b></span>
+        </div>
+      </div>` : (aiStatus === "pending" ? `
+      <div class="news-trade-ai-analysis is-pending">
+        <header><span><i>AI</i><b>事件与 Meme 判断</b></span><em>${escapeHtml(aiProvider)} 分析中</em></header>
+        <p><b>正在结合原文、来源身份、传播叙事与链上候选进行判断…</b></p>
+      </div>` : "");
     return `
       <section class="news-trade-intelligence">
         <div class="news-trade-dual-score">
@@ -647,6 +683,12 @@
           <span class="is-onchain"><b>${Math.round(Number(item?.onchainTradeScore) || 0)}</b><em>链上可交易 / 100</em></span>
           <span class="is-tier ${item?.candidateTier === "trade-candidate" ? "is-ready" : ""}"><b>${escapeHtml(tier)}</b><em>${escapeHtml(item?.eventType || "事件驱动")}</em></span>
         </div>
+        ${aiPanel}
+        ${xMeme ? `<div class="news-trade-x-meme is-${escapeHtml(xMemeLevel)}">
+          <span><em>推文 Meme 潜力</em><b>${Math.round(Number(xMeme.score) || 0)} / 100 · ${escapeHtml(xMeme.label || "已完成判断")}</b></span>
+          <strong>${escapeHtml(xMeme.role || item?.xCategoryLabel || "X 原发")}</strong>
+          <p>${escapeHtml(xMemeReasons.join(" · ") || "未发现足够的名称、形象、玩梗或社区参与信号")}</p>
+        </div>` : ""}
         <div class="news-trade-intel-grid">
           <span><em>事件阶段</em><b>${escapeHtml(stage.label)}</b></span>
           <span><em>热度增速</em><b>${Math.round(Number(metrics.velocityScore) || 0)} / 100</b></span>
@@ -981,6 +1023,7 @@
       return;
     }
     grid.innerHTML = `${searchToolbar}${walletToolbar}${executionNotice}${visibleItems.map((item) => eventMonitorCardTemplate(item, newsMode)).join("")}${newsMode ? newsTradePaginationTemplate(newsTradeItems.length) : ""}`;
+    if (newsMode) Promise.resolve().then(() => requestVisibleNewsTradeAi(visibleItems));
   }
 
   function wechatStatusTone(status) {
@@ -1237,6 +1280,33 @@
     return "潜在发行";
   }
 
+  function chainAiMeta(item) {
+    const analysis = item?.aiAnalysis && typeof item.aiAnalysis === "object" ? item.aiAnalysis : null;
+    const status = String(item?.aiAnalysisStatus || "");
+    const providerKey = String(item?.aiAnalysisProvider || "").toLowerCase();
+    const provider = providerKey === "codex-cli" ? "Codex" : providerKey === "deepseek" ? "DeepSeek" : "AI";
+    const verdictLabels = { strong: "强", watch: "观察", weak: "偏弱", avoid: "规避" };
+    const ready = Boolean(analysis && status === "ready");
+    const pending = status === "pending";
+    const summary = ready ? String(analysis.summary || "等待更多证据") : pending ? "分析中…" : "";
+    const tooltip = ready
+      ? `${provider} AI 研判：${summary}｜催化：${analysis.catalyst || "待确认"}｜风险：${analysis.risk || "待确认"}｜下一步：${analysis.nextFocus || "继续验证"}`
+      : pending ? `${provider} AI 正在分析` : "AI 暂不可用，当前保留来源事实";
+    return {
+      analysis,
+      status,
+      provider,
+      ready,
+      pending,
+      summary,
+      tooltip,
+      verdict: ready ? (verdictLabels[analysis.verdict] || "观察") : "",
+      confidence: ready ? Math.round(Number(analysis.confidence) || 0) : 0,
+      narrativeStrength: ready ? Math.round(Number(analysis.narrativeStrength) || 0) : 0,
+      importance: ready ? Math.round(Number(analysis.importance) || 0) : 0
+    };
+  }
+
   function chainSidebarTemplate(chains, selectedSlug) {
     const stageOrder = ["early_watch", "mainnet_focus", "tradable_ecosystem"];
     return stageOrder.map((stage) => {
@@ -1258,6 +1328,7 @@
 
   function chainRankingTemplate(row, index, marketKey = "") {
     const metrics = row.marketMetrics && typeof row.marketMetrics === "object" ? row.marketMetrics : {};
+    const ai = chainAiMeta(row);
     const href = safeExternalUrl(row.officialUrl);
     const isNft = marketKey === "nft";
     const primaryMetric = isNft
@@ -1265,10 +1336,10 @@
       : compactUsd(metrics.liquidityUsd);
     const content = `
       <span class="chain-rank-index">${index + 1}</span>
-      <span class="chain-rank-asset"><b>${escapeHtml(isNft ? row.name : row.symbol || row.name || "--")}</b><em>${escapeHtml(isNft ? "OpenSea · NFT" : row.name || "等待项目资料")}</em></span>
+      <span class="chain-rank-asset" title="${escapeHtml(ai.tooltip)}"><b>${escapeHtml(isNft ? row.name : row.symbol || row.name || "--")}</b><em>${escapeHtml(ai.ready ? `AI · ${ai.summary}` : ai.pending ? "AI 研判中…" : isNft ? "OpenSea · NFT" : row.name || "等待项目资料")}</em></span>
       <span class="chain-rank-metrics"><b>${primaryMetric}</b><em>${isNft ? "地板价" : "流动性"}</em></span>
       <span class="chain-rank-metrics"><b>${compactUsd(metrics.volume24hUsd)}</b><em>24H成交</em></span>
-      <span class="chain-rank-score"><b>${Number(row.score) || 0}</b><em>生态分</em></span>`;
+      <span class="chain-rank-score ${ai.ready ? "is-ai" : ""}" title="${escapeHtml(ai.tooltip)}"><b>${ai.ready ? ai.narrativeStrength : Number(row.score) || 0}</b><em>${ai.ready ? `AI叙事 · 生态${Number(row.score) || 0}` : ai.pending ? "AI分析中" : "生态分"}</em></span>`;
     return href
       ? `<a class="chain-ranking-row ${index === 0 ? "is-leader" : ""}" href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener">${content}</a>`
       : `<div class="chain-ranking-row ${index === 0 ? "is-leader" : ""}">${content}</div>`;
@@ -1277,11 +1348,12 @@
   function chainDiscoveryTemplate(row) {
     const href = safeExternalUrl(row.officialUrl);
     const score = Number(row.potentialScore?.score) || 0;
+    const ai = chainAiMeta(row);
     const content = `
       <span class="chain-discovery-mark">发现</span>
       <span class="chain-discovery-asset"><b>${escapeHtml(row.symbol || row.name || "--")}</b><em>${escapeHtml(row.name || "等待项目资料")}</em></span>
-      <span class="chain-discovery-stage"><b>${escapeHtml(tokenStageLabel(row.tokenStage))}</b><em>${Number(row.evidenceCount) || 0} 条证据</em></span>
-      <span class="chain-discovery-score"><b>${score}</b><em>潜力分</em></span>`;
+      <span class="chain-discovery-stage" title="${escapeHtml(ai.tooltip)}"><b>${escapeHtml(tokenStageLabel(row.tokenStage))}</b><em>${escapeHtml(ai.ready ? `AI · ${ai.summary}` : ai.pending ? "AI 研判中…" : `${Number(row.evidenceCount) || 0} 条证据`)}</em></span>
+      <span class="chain-discovery-score ${ai.ready ? "is-ai" : ""}" title="${escapeHtml(ai.tooltip)}"><b>${ai.ready ? ai.narrativeStrength : score}</b><em>${ai.ready ? `AI叙事 · 潜力${score}` : ai.pending ? "AI分析中" : "潜力分"}</em></span>`;
     return href
       ? `<a class="chain-discovery-row" href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener">${content}</a>`
       : `<div class="chain-discovery-row">${content}</div>`;
@@ -1290,11 +1362,12 @@
   function chainMarketTemplate(market) {
     const top = Array.isArray(market.top) ? market.top.slice(0, 5) : [];
     const candidates = Array.isArray(market.candidates) ? market.candidates.slice(0, 5) : [];
+    const ai = chainAiMeta(market);
     return `
-      <article class="chain-market-card ${top.length ? "has-ranking" : candidates.length ? "has-discovery" : "is-empty"}">
+      <article class="chain-market-card ${top.length ? "has-ranking" : candidates.length ? "has-discovery" : "is-empty"} ${ai.ready ? "has-ai-analysis" : ""}">
         <header>
-          <span><b>${escapeHtml(market.name || market.key || "细分市场")}</b><em>${escapeHtml(market.description || market.key || "")}</em></span>
-          <small>${top.length ? `TOP ${top.length}` : candidates.length ? `发现 ${candidates.length}` : "待发现"}</small>
+          <span title="${escapeHtml(ai.tooltip)}"><b>${escapeHtml(market.name || market.key || "细分市场")}</b><em>${escapeHtml(ai.ready ? `AI 研判 · ${ai.summary}` : ai.pending ? "AI 正在研判该市场…" : market.description || market.key || "")}</em></span>
+          <small title="${escapeHtml(ai.tooltip)}">${ai.ready ? `AI ${ai.narrativeStrength}` : top.length ? `TOP ${top.length}` : candidates.length ? `发现 ${candidates.length}` : "待发现"}</small>
         </header>
         <div class="chain-ranking-list">
           ${top.length
@@ -1308,16 +1381,17 @@
 
   function chainPotentialTemplate(project) {
     const score = project.potentialScore || {};
+    const ai = chainAiMeta(project);
     const markets = Array.isArray(project.markets) ? project.markets : [];
     const evidence = Array.isArray(project.evidence) ? project.evidence : [];
     const officialUrl = safeExternalUrl(project.officialUrl);
     return `
       <article class="chain-potential-card">
-        <header><span><b>${escapeHtml(project.name || "未命名项目")}</b><em>${tokenStageLabel(project.tokenStage)}</em></span><strong>${Number(score.score) || 0}</strong></header>
+        <header><span><b>${escapeHtml(project.name || "未命名项目")}</b><em>${tokenStageLabel(project.tokenStage)}${ai.ready ? ` · AI研判${escapeHtml(ai.verdict)}` : ai.pending ? " · AI分析中" : ""}</em></span><strong title="${escapeHtml(ai.tooltip)}">${ai.ready ? `AI ${ai.narrativeStrength}` : Number(score.score) || 0}</strong></header>
         <div class="chain-potential-tags">${markets.length ? markets.map((row) => `<span>${escapeHtml(row.name || row.marketKey)}</span>`).join("") : "<span>待分类</span>"}</div>
-        <p>${escapeHtml(project.description || "等待更多官方进度、代码与生态证据。")}</p>
+        <p title="${escapeHtml(ai.tooltip)}">${escapeHtml(ai.ready ? `${ai.summary}${ai.analysis.catalyst ? ` · 催化：${ai.analysis.catalyst}` : ""}${ai.analysis.risk ? ` · 风险：${ai.analysis.risk}` : ""}` : ai.pending ? "AI 正在结合官方进度、代码、生态与链上证据进行研判…" : project.description || "等待更多官方进度、代码与生态证据。")}</p>
         <footer>
-          <span>${evidence.length} 条证据 · 覆盖度 ${Number(score.confidence) || 0}%</span>
+          <span>${evidence.length} 条证据 · ${ai.ready ? `AI置信 ${ai.confidence}%` : `覆盖度 ${Number(score.confidence) || 0}%`}</span>
           ${officialUrl ? `<a href="${escapeHtml(officialUrl)}" target="_blank" rel="noreferrer noopener">官方入口</a>` : ""}
         </footer>
       </article>`;
@@ -1330,10 +1404,11 @@
       leader_change: "龙头变化",
       market_surge: "量能放大"
     };
+    const ai = chainAiMeta(alert);
     return `
       <article class="chain-alert-row ${alert.acknowledgedAt ? "is-read" : ""}">
-        <span class="chain-alert-kind">${escapeHtml(typeLabels[alert.eventType] || "生态变化")}</span>
-        <span><b>${escapeHtml(alert.title || "公链生态变化")}</b><em>${relativeTime(alert.observedAt)} · 置信度 ${Number(alert.confidence) || 0}</em></span>
+        <span class="chain-alert-kind">${escapeHtml(ai.ready ? `AI ${ai.importance}` : typeLabels[alert.eventType] || "生态变化")}</span>
+        <span title="${escapeHtml(ai.tooltip)}"><b>${escapeHtml(ai.ready ? ai.summary : ai.pending ? `AI研判中 · ${alert.title || "链上投研变化"}` : alert.title || "链上投研变化")}</b><em>${relativeTime(alert.observedAt)} · ${ai.ready ? `AI重要性 ${ai.importance} · AI置信 ${ai.confidence}` : `置信度 ${Number(alert.confidence) || 0}`}</em></span>
         ${alert.acknowledgedAt ? "<small>已确认</small>" : `<button type="button" data-chain-alert-ack="${Number(alert.id) || 0}">确认</button>`}
       </article>`;
   }
@@ -1350,7 +1425,7 @@
     grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-chains");
     grid.classList.add("is-chains");
     if (!chainEcosystemLoaded) {
-      grid.innerHTML = `<div class="price-watch-empty"><b>正在读取公链生态图谱</b><span>加载生命周期、细分市场、潜在发行项目和 Top 5 快照。</span></div>`;
+      grid.innerHTML = `<div class="price-watch-empty"><b>正在读取链上投研图谱</b><span>加载生命周期、细分市场、潜在发行项目和 Top 5 快照。</span></div>`;
       return;
     }
     if (!chain) {
@@ -1366,6 +1441,8 @@
       markets: markets.filter((market) => market.level === level)
     }));
     const confirmedSources = sourceHealth.filter((row) => row.status === "ok").length;
+    const chainAi = chainAiMeta(chain);
+    const aiCoverage = payload.aiCoverage && typeof payload.aiCoverage === "object" ? payload.aiCoverage : {};
     grid.innerHTML = `
       <section class="chain-ecosystem-console">
         <aside class="chain-ecosystem-sidebar">
@@ -1381,13 +1458,13 @@
           <header class="chain-overview-card">
             <div class="chain-overview-title">
               <span class="chain-overview-mark">${escapeHtml((chain.gasSymbol || chain.name).slice(0, 2))}</span>
-              <span><p class="section-label">CHAIN / EVIDENCE / MARKET TREE</p><h3>${escapeHtml(chain.name)}</h3><em>${escapeHtml(chain.chainType || "公链生态")}${chain.chainId ? ` · Chain ID ${escapeHtml(chain.chainId)}` : ""}</em></span>
+              <span title="${escapeHtml(chainAi.tooltip)}"><p class="section-label">CHAIN / AI / EVIDENCE / MARKET TREE</p><h3>${escapeHtml(chain.name)}</h3><em>${escapeHtml(chain.chainType || "公链生态")}${chain.chainId ? ` · Chain ID ${escapeHtml(chain.chainId)}` : ""}${chainAi.ready ? ` · AI研判：${escapeHtml(chainAi.summary)}` : chainAi.pending ? " · AI正在研判…" : ""}</em></span>
             </div>
             <div class="chain-overview-status">
-              <span class="chain-stage-badge is-${stageTone}">${stageLabel}</span>
+              <span class="chain-stage-badge is-${stageTone}" title="${escapeHtml(chainAi.tooltip)}">${chainAi.ready ? `AI ${chainAi.narrativeStrength} · ${stageLabel}` : chainAi.pending ? `AI分析中 · ${stageLabel}` : stageLabel}</span>
               <span><b>${sourceHealth.length ? `${confirmedSources}/${sourceHealth.length}` : "—"}</b><em>来源可用</em></span>
               <span><b>${markets.filter((market) => market.top?.length || market.candidates?.length).length}</b><em>已发现市场</em></span>
-              <span><b>${potentialProjects.length}</b><em>潜在发行</em></span>
+              <span><b>${potentialProjects.length}</b><em>潜在发行 · AI ${Number(aiCoverage.ready) || 0}/${Number(aiCoverage.total) || 0}</em></span>
             </div>
             <div class="chain-overview-actions">
               ${officialEvidence ? `<a href="${escapeHtml(safeExternalUrl(officialEvidence.url))}" target="_blank" rel="noreferrer noopener">查看官方证据</a>` : ""}
@@ -1473,7 +1550,13 @@
     const progress = hasDistance ? Math.max(0, Math.min(100, 100 - distance)) : 0;
     const sourceLabel = item.origin === "new-contract"
       ? (item.newContractSource || "交易所新合约")
-      : item.personalXPriority ? "个人 X 提及" : item.manual ? "手动" : "AICoin 新进";
+      : item.personalXPriority
+        ? "个人 X 提及"
+        : item.manual
+          ? "手动"
+          : item.origin === "binance-wallet"
+            ? "币安钱包 4H 热门"
+            : "AICoin 新进";
     const icon = item.icon
       ? `<img src="${escapeHtml(item.icon)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.closest('.price-watch-icon').classList.add('is-fallback');this.remove()" />`
       : "";
@@ -1543,7 +1626,13 @@
     const progress = hasDistance ? Math.max(0, Math.min(100, 100 - distance)) : 0;
     const sourceLabel = item.origin === "new-contract"
       ? (item.newContractSource || "交易所新合约")
-      : item.personalXPriority ? "个人 X 提及" : item.manual ? "手动" : "AICoin 新进";
+      : item.personalXPriority
+        ? "个人 X 提及"
+        : item.manual
+          ? "手动"
+          : item.origin === "binance-wallet"
+            ? "币安钱包 4H 热门"
+            : "AICoin 新进";
     const icon = item.icon
       ? `<img src="${escapeHtml(item.icon)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.closest('.price-watch-icon').classList.add('is-fallback');this.remove()" />`
       : "";
@@ -1575,7 +1664,7 @@
             <em>${escapeHtml(item.name || item.symbol)}</em>
           </span>
           <span class="price-watch-origin">${sourceLabel}</span>
-          <button class="price-watch-remove" type="button" title="移除 ${escapeHtml(item.symbol)}" aria-label="移除 ${escapeHtml(item.symbol)}" data-remove="${escapeHtml(item.symbol)}">×</button>
+          <button class="price-watch-remove" type="button" title="从超跌反弹监控剔除 ${escapeHtml(item.symbol)}" aria-label="从超跌反弹监控剔除 ${escapeHtml(item.symbol)}" data-exclude-oversold="${escapeHtml(item.symbol)}">×</button>
         </header>
         <div class="price-watch-values oversold-values">
           ${valueColumns}
@@ -1659,9 +1748,9 @@
       return;
     }
     if (chains) {
-      headingLabel.textContent = "CHAIN / ECOSYSTEM / MARKET TREE / TOP 5";
-      headingTitle.textContent = "公链生态监控";
-      headingDescription.innerHTML = `<b>早期观察</b> → 主网重点 → 可交易生态 · L0-L3 市场与潜在发行池`;
+      headingLabel.textContent = "ONCHAIN / AI / RESEARCH / MARKET TREE";
+      headingTitle.textContent = "链上投研";
+      headingDescription.innerHTML = `<b>AI 全域研判</b> · 早期观察 → 主网重点 → 可交易生态 · 原始事实保留来源校验`;
       return;
     }
     headingLabel.textContent = oversold ? "OVERSOLD / LOW RANGE / REBOUND" : "ACTIVE WATCHLIST";
@@ -1787,6 +1876,42 @@
     return payload;
   }
 
+  async function requestVisibleNewsTradeAi(visibleItems) {
+    const pendingItems = (Array.isArray(visibleItems) ? visibleItems : [])
+      .filter((item) => item?.aiAnalysisStatus !== "ready")
+      .slice(0, NEWS_TRADE_PAGE_SIZE);
+    const topicKeys = pendingItems
+      .map((item) => String(item?.topicKey || item?.id || "").trim())
+      .filter(Boolean);
+    if (!topicKeys.length) return;
+    const signature = topicKeys.join("|");
+    const now = Date.now();
+    if (lastNewsTradeAiRequest.signature === signature && now - lastNewsTradeAiRequest.requestedAt < 60_000) return;
+    lastNewsTradeAiRequest = { signature, requestedAt: now };
+    try {
+      const response = await fetch("/api/ai/news-trade", {
+        method: "POST",
+        cache: "no-store",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ topicKeys })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || payload.ok === false) return;
+      const updates = Array.isArray(payload.items) ? payload.items : [];
+      let changed = false;
+      updates.forEach((update) => {
+        const key = String(update?.topicKey || update?.id || "");
+        const target = newsTradeItems.find((item) => String(item?.topicKey || item?.id || "") === key);
+        if (!target) return;
+        Object.assign(target, update);
+        changed = true;
+      });
+      if (changed && currentMode === "news") renderEventMonitor();
+    } catch (_) {
+      // Existing rule analysis stays visible and the next refresh retries.
+    }
+  }
+
   async function prepareNewsTrade(eventId, amountUsdt, opportunity) {
     const response = await fetch("/api/news-trade/prepare", {
       method: "POST",
@@ -1887,7 +2012,7 @@
     const response = await fetch(`${url.pathname}${url.search}`, { cache: "no-store" });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok || (payload.ok === false && !payload.selectedChain)) {
-      throw new Error(payload.error || "公链生态读取失败");
+      throw new Error(payload.error || "链上投研读取失败");
     }
     return payload;
   }
@@ -1900,8 +2025,8 @@
       body: JSON.stringify({ action, ...extra })
     });
     const payload = await response.json().catch(() => ({}));
-    if (response.status === 401) throw new Error("请先登录后再人工补充公链生态证据");
-    if (!response.ok || payload.ok === false) throw new Error(payload.error || "公链生态操作失败");
+    if (response.status === 401) throw new Error("请先登录后再人工补充链上投研证据");
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || "链上投研操作失败");
     return payload;
   }
 
@@ -2063,7 +2188,8 @@
   }
 
   async function loadChainEcosystem({ refresh = false, quiet = false } = {}) {
-    const cacheFresh = chainEcosystemLoaded && Date.now() - lastChainEcosystemLoadAt < 60_000;
+    const aiPending = chainEcosystemPayload.aiAnalysisStatus === "pending";
+    const cacheFresh = chainEcosystemLoaded && Date.now() - lastChainEcosystemLoadAt < (aiPending ? 3_000 : 60_000);
     if (!refresh && cacheFresh) {
       renderChainEcosystem();
       return;
@@ -2080,14 +2206,26 @@
       renderChainEcosystem();
       const activeMarkets = (chainEcosystemPayload.markets || []).filter((market) => market.top?.length || market.candidates?.length).length;
       const potential = (chainEcosystemPayload.potentialProjects || []).length;
+      const aiCoverage = chainEcosystemPayload.aiCoverage || {};
+      const aiStatus = chainEcosystemPayload.aiAnalysisStatus === "ready"
+        ? `AI 已完成 ${Number(aiCoverage.ready) || 0}/${Number(aiCoverage.total) || 0}`
+        : chainEcosystemPayload.aiAnalysisStatus === "pending"
+          ? `AI 研判中 ${Number(aiCoverage.ready) || 0}/${Number(aiCoverage.total) || 0}`
+          : "AI 暂不可用，保留事实结果";
       statusNode.textContent = chainEcosystemPayload.stale
-        ? `正在显示最后可信快照 · ${activeMarkets} 个已发现市场 · ${potential} 个潜在发行项目`
-        : `${activeMarkets} 个已发现市场 · ${potential} 个潜在发行项目 · 每 60 秒检查页面快照`;
+        ? `正在显示最后可信快照 · ${activeMarkets} 个已发现市场 · ${potential} 个潜在发行项目 · ${aiStatus}`
+        : `${activeMarkets} 个已发现市场 · ${potential} 个潜在发行项目 · ${aiStatus}`;
+      window.clearTimeout(chainAiPollTimer);
+      if (chainEcosystemPayload.aiAnalysisStatus === "pending") {
+        chainAiPollTimer = window.setTimeout(() => {
+          if (currentMode === "chains") loadChainEcosystem({ quiet: true });
+        }, 4_000);
+      }
     } catch (error) {
       if (!quiet) statusNode.textContent = error.message;
       if (!chainEcosystemLoaded) {
         grid.classList.add("is-chains");
-        grid.innerHTML = `<div class="price-watch-empty"><b>公链生态暂不可用</b><span>${escapeHtml(error.message)}</span></div>`;
+        grid.innerHTML = `<div class="price-watch-empty"><b>链上投研暂不可用</b><span>${escapeHtml(error.message)}</span></div>`;
       }
     }
   }
@@ -2107,7 +2245,7 @@
   async function load({ refresh = false, quiet = false } = {}) {
     if (loading) return;
     setBusy(true, refresh
-      ? (["structure", "newlow"].includes(currentMode) ? (currentMode === "newlow" ? "后台推进近一年新币低位结构轮询…" : "后台运行龙头策略六周期扫描…") : currentMode === "mapping" ? "后台重建补涨映射…" : currentMode === "aster" ? "后台核对 Aster 合约上新公告…" : ["events", "news"].includes(currentMode) ? "后台核对事件来源与确认依据…" : currentMode === "wechat" ? "后台检查当前可见群聊…" : currentMode === "personalx" ? "后台唤醒个人 X 实时通道…" : currentMode === "chains" ? "后台重新扫描公链生态证据…" : "后台核对 7 日价格数据…")
+      ? (["structure", "newlow"].includes(currentMode) ? (currentMode === "newlow" ? "后台推进近一年新币低位结构轮询…" : "后台运行龙头策略六周期扫描…") : currentMode === "mapping" ? "后台重建补涨映射…" : currentMode === "aster" ? "后台核对 Aster 合约上新公告…" : ["events", "news"].includes(currentMode) ? "后台核对事件来源与确认依据…" : currentMode === "wechat" ? "后台检查当前可见群聊…" : currentMode === "personalx" ? "后台唤醒个人 X 实时通道…" : currentMode === "chains" ? "后台重新扫描链上投研证据…" : "后台核对 7 日价格数据…")
       : statusNode.textContent);
     try {
       if (currentMode === "wechat") {
@@ -2387,7 +2525,7 @@
     const structureExcludeButton = event.target.closest("[data-exclude-structure]");
     if (structureExcludeButton && !loading) {
       const symbol = structureExcludeButton.dataset.excludeStructure;
-      setBusy(true, `正在从多周期结构监控剔除 ${symbol}…`);
+      setBusy(true, `正在从整个监控系统剔除 ${symbol}…`);
       try {
         await postStructureAction("exclude", symbol);
         if (currentMode === "newlow") {
@@ -2398,9 +2536,7 @@
           lastStructureLoadAt = Date.now();
         }
         renderStructures();
-        statusNode.textContent = currentMode === "newlow"
-          ? `${symbol} 已从新币低位结构监控剔除`
-          : `${symbol} 已从多周期结构监控剔除；离榜后再次上榜会自动恢复`;
+        statusNode.textContent = `${symbol} 已从整个监控系统剔除；离榜后再次上榜或手动重新加入会恢复`;
       } catch (error) {
         statusNode.textContent = error.message;
       } finally {
@@ -2508,7 +2644,7 @@
       else url.searchParams.delete("chain");
       window.history.replaceState({}, "", url);
       lastChainEcosystemLoadAt = 0;
-      setBusy(true, "正在切换公链生态…");
+      setBusy(true, "正在切换链上投研…");
       try {
         await loadChainEcosystem();
       } finally {
@@ -2592,12 +2728,12 @@
     const opportunityRemove = event.target.closest("[data-wechat-opportunity-remove]");
     if (opportunityRemove && !loading) {
       const symbol = opportunityRemove.dataset.wechatOpportunityRemove;
-      setBusy(true, `正在停止 ${symbol} 的长期机会监控…`);
+      setBusy(true, `正在从整个监控系统剔除 ${symbol}…`);
       try {
         await postAction("remove", symbol);
         lastWechatLoadAt = 0;
         await loadWechatMonitor({ refresh: false });
-        statusNode.textContent = `${symbol} 已手动移出长期监控；机会记录仍会保留`;
+        statusNode.textContent = `${symbol} 已从整个监控系统剔除；历史机会记录仍会保留`;
       } catch (error) {
         statusNode.textContent = error.message;
       } finally {
@@ -2628,11 +2764,27 @@
     const priorHighExcludeButton = event.target.closest("[data-exclude-prior-high]");
     if (priorHighExcludeButton && !loading) {
       const symbol = priorHighExcludeButton.dataset.excludePriorHigh;
-      setBusy(true, `正在从前高监控池剔除 ${symbol}…`);
+      setBusy(true, `正在从整个监控系统剔除 ${symbol}…`);
       try {
-        const payload = await postAction("exclude_prior_high", symbol);
-        render(payload);
-        statusNode.textContent = `${symbol} 已从 AICoin 前高监控池剔除；离榜后再次上榜会自动恢复`;
+        await postAction("exclude_prior_high", symbol);
+        render(await getPayload(false));
+        statusNode.textContent = `${symbol} 已从整个监控系统剔除；离榜后再次上榜或手动重新加入会恢复`;
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
+
+    const oversoldExcludeButton = event.target.closest("[data-exclude-oversold]");
+    if (oversoldExcludeButton && !loading) {
+      const symbol = oversoldExcludeButton.dataset.excludeOversold;
+      setBusy(true, `正在从整个监控系统剔除 ${symbol}…`);
+      try {
+        await postAction("exclude_prior_high", symbol);
+        render(await getPayload(false));
+        statusNode.textContent = `${symbol} 已从整个监控系统剔除；离榜后再次上榜或手动重新加入会恢复`;
       } catch (error) {
         statusNode.textContent = error.message;
       } finally {
@@ -2644,11 +2796,11 @@
     const removeButton = event.target.closest("[data-remove]");
     if (!removeButton || loading) return;
     const symbol = removeButton.dataset.remove;
-    setBusy(true, `正在移除 ${symbol}…`);
+    setBusy(true, `正在从整个监控系统剔除 ${symbol}…`);
     try {
       const payload = await postAction("remove", symbol);
       render(payload);
-      statusNode.textContent = `${symbol} 已移除`;
+      statusNode.textContent = `${symbol} 已从整个监控系统剔除`;
     } catch (error) {
       statusNode.textContent = error.message;
     } finally {

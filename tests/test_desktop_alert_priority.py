@@ -34,10 +34,10 @@ class DesktopAlertPriorityTests(unittest.TestCase):
 
         self.assertEqual([item["key"] for item in server.DESKTOP_ALERT_QUEUE], [first["key"], second["key"]])
 
-    def test_chain_ecosystem_alert_sits_between_price_signal_and_news(self):
+    def test_onchain_research_alert_sits_between_price_signal_and_news(self):
         news = server.normalize_desktop_alert({"key": "news:1", "kind": "律动快讯"})
         chain = server.normalize_desktop_alert(
-            {"key": "chain-ecosystem:1", "kind": "公链生态监控", "queuePriority": 60}
+            {"key": "chain-ecosystem:1", "kind": "链上投研", "queuePriority": 60}
         )
         price = server.normalize_desktop_alert({"key": "price-watch:HYPE:episode:2", "kind": "价格监控"})
 
@@ -46,6 +46,30 @@ class DesktopAlertPriorityTests(unittest.TestCase):
         server.enqueue_desktop_alert(price)
 
         self.assertEqual([item["key"] for item in server.DESKTOP_ALERT_QUEUE], [price["key"], chain["key"], news["key"]])
+
+    def test_x_status_id_dedupes_changed_retweet_formats(self):
+        first = server.normalize_desktop_alert({
+            "key": "x-kol:first-format",
+            "kind": "X KOL动态",
+            "sourceType": "x-kol",
+            "sourceId": "crypto-koryo",
+            "source": "CryptoKoryo",
+            "title": "CryptoKoryo：转推了 _dexuai 的动态",
+            "url": "https://x.com/_dexuai/status/2096555530281959754",
+        })
+        second = server.normalize_desktop_alert({
+            "key": "x-kol:expanded-format",
+            "kind": "X KOL动态",
+            "sourceType": "x-kol",
+            "sourceId": "crypto-koryo",
+            "source": "CryptoKoryo",
+            "title": "CryptoKoryo：完整转推原文",
+            "url": "https://x.com/_dexuai/status/2096555530281959754?ref=feed",
+        })
+
+        shared = set(server.alert_dedupe_keys(first)) & set(server.alert_dedupe_keys(second))
+
+        self.assertIn("alert-x-status:crypto-koryo|2096555530281959754", shared)
 
     def test_dragon_wave_signals_are_critical_but_serialized_for_popup_and_tts(self):
         signal = server.normalize_desktop_alert(
@@ -201,7 +225,10 @@ class DesktopAlertPriorityTests(unittest.TestCase):
         self.assertEqual(normalized["excludeLabel"], "剔除前高")
         self.assertTrue(normalized["excludeEndpoint"].endswith("/api/price-watch"))
         self.assertEqual(normalized["excludeAction"], "exclude_prior_high")
-        self.assertNotIn("excludeEndpoint", oversold)
+        self.assertTrue(oversold["excludeEndpoint"].endswith("/api/price-watch"))
+        self.assertEqual(oversold["excludeSymbol"], "TEST")
+        self.assertEqual(oversold["excludeLabel"], "剔除监控")
+        self.assertEqual(oversold["excludeAction"], "exclude_prior_high")
 
     def test_desktop_exclusion_posts_the_requested_structure_action(self):
         class Response:

@@ -1,3 +1,4 @@
+import json
 import threading
 import time
 import unittest
@@ -20,6 +21,16 @@ class XKolRealtimeTests(unittest.TestCase):
         with server.X_KOL_OFFICIAL_STREAM_LOCK:
             server.X_KOL_OFFICIAL_STREAM_USERS.clear()
             server.X_KOL_OFFICIAL_STREAM_STARTED = False
+            server.X_KOL_OFFICIAL_STREAM_HEALTH.update({
+                "connected": False,
+                "rulesReady": False,
+                "targetCount": 0,
+                "lastConnectedAt": 0,
+                "lastEventAt": 0,
+                "lastErrorAt": 0,
+                "lastError": "",
+                "updatedAt": 0,
+            })
         with server.X_KOL_RSS_MIRROR_HEALTH_LOCK:
             server.X_KOL_RSS_MIRROR_HEALTH.clear()
 
@@ -54,7 +65,9 @@ class XKolRealtimeTests(unittest.TestCase):
         with (
             patch.object(server, "load_x_kol_sources", return_value=sources),
             patch.object(server, "x_kol_token", return_value=""),
-            patch.object(server, "x_kol_fetch_rss_source", side_effect=fake_fetch),
+            # Python 3.14 serializes MagicMock side effects internally, which
+            # would make this test measure the mock lock instead of our pool.
+            patch.object(server, "x_kol_fetch_rss_source", new=fake_fetch),
         ):
             payload = server.x_kol_feed_payload({"id": 101})
 
@@ -238,6 +251,166 @@ class XKolRealtimeTests(unittest.TestCase):
 
         self.assertEqual(next_candidates, [templates[1]])
 
+    def test_rss_candidate_pool_half_opens_earliest_mirror_when_all_are_cooling_down(self):
+        templates = ["https://first.example/{handle}/rss", "https://second.example/{handle}/rss"]
+        now = time.time()
+        with server.X_KOL_RSS_MIRROR_HEALTH_LOCK:
+            server.X_KOL_RSS_MIRROR_HEALTH.update({
+                templates[0]: {"failures": 3, "retryAt": now + 30},
+                templates[1]: {"failures": 2, "retryAt": now + 10},
+            })
+
+        candidates = server.x_kol_rss_template_candidates("alpha", templates, limit=2)
+
+        self.assertEqual(candidates, [templates[1]])
+
+    def test_valid_empty_rss_feed_is_healthy_instead_of_an_upstream_error(self):
+        source = {"id": "x-alpha", "handle": "alpha", "displayName": "Alpha", "enabled": True}
+        result = server.x_kol_rss_result_payload(source, [{
+            "ok": True,
+            "template": "https://rss.example/{handle}",
+            "url": "https://rss.example/alpha",
+            "rows": [],
+            "elapsed": 0.1,
+        }])
+
+        self.assertEqual(result["source"]["status"], "ok")
+        self.assertEqual(result["source"]["itemsReturned"], 0)
+        self.assertEqual(result["items"], [])
+
+    def test_public_timeline_fallback_parses_current_posts_without_paid_api(self):
+        source = {"id": "x-long", "handle": "longdotxyz", "displayName": "long.xyz", "enabled": True}
+        page_props = {
+            "timeline": {
+                "entries": [{
+                    "content": {
+                        "tweet": {
+                            "id_str": "2094955556545122753",
+                            "created_at": "Wed Sep 02 01:08:21 +0000 2026",
+                            "full_text": "LONG passed $425M in tokenized stock volume",
+                            "favorite_count": 12,
+                            "retweet_count": 3,
+                            "reply_count": 2,
+                            "quote_count": 1,
+                            "permalink": "https://x.com/longdotxyz/status/2094955556545122753",
+                            "user": {
+                                "name": "long.xyz",
+                                "screen_name": "longdotxyz",
+                                "profile_image_url_https": "https://pbs.twimg.com/profile_images/long.jpg",
+                            },
+                        }
+                    }
+                }]
+            },
+            "headerProps": {},
+        }
+        body = (
+            '<html><script id="__NEXT_DATA__" type="application/json">'
+            + json.dumps({"props": {"pageProps": page_props}})
+            + "</script></html>"
+        ).encode()
+
+        result = server.x_kol_parse_public_timeline(source, body, "https://syndication.twitter.com/test")
+
+        self.assertEqual(result["source"]["status"], "ok")
+        self.assertEqual(result["source"]["upstreamSource"], "x-public-timeline")
+        self.assertEqual(result["items"][0]["tweetId"], "2094955556545122753")
+        self.assertEqual(result["items"][0]["provider"], "x-public-timeline")
+
+    def test_fxtwitter_fallback_parses_profile_statuses_without_a_key(self):
+        source = {"id": "x-long", "handle": "longdotxyz", "displayName": "long.xyz", "enabled": True}
+        payload = {
+            "code": 200,
+            "results": [{
+                "type": "status",
+                "id": "2094955556545122753",
+                "url": "https://x.com/longdotxyz/status/2094955556545122753",
+                "text": "LONG passed $425M in tokenized stock volume",
+                "created_at": "Wed Sep 02 01:08:21 +0000 2026",
+                "created_timestamp": 1788311301,
+                "replies": 30,
+                "reposts": 18,
+                "likes": 206,
+                "quotes": 13,
+                "views": 27343,
+                "author": {
+                    "name": "long.xyz",
+                    "screen_name": "longdotxyz",
+                    "avatar_url": "https://pbs.twimg.com/profile_images/long.jpg",
+                },
+            }],
+        }
+
+        result = server.x_kol_parse_fxtwitter_timeline(source, payload, "https://api.fxtwitter.com/test")
+
+        self.assertEqual(result["source"]["status"], "ok")
+        self.assertEqual(result["source"]["upstreamSource"], "fxtwitter")
+        self.assertEqual(result["items"][0]["metrics"]["view"], 27343)
+        self.assertEqual(result["items"][0]["provider"], "fxtwitter")
+
+    def test_rss_source_uses_public_timeline_when_every_mirror_fails(self):
+        source = {"id": "x-long", "handle": "longdotxyz", "displayName": "long.xyz", "enabled": True}
+        fallback = {
+            "source": {
+                **source,
+                "status": "ok",
+                "provider": "rss",
+                "upstreamSource": "x-public-timeline",
+                "itemsReturned": 1,
+            },
+            "items": [{"id": "post-1", "tweetId": "1", "publishedAt": 1, "text": "fresh"}],
+        }
+        with (
+            patch.object(server, "x_rss_templates", return_value=["https://bad.example/{handle}/rss"]),
+            patch.object(server, "x_kol_rss_template_candidates", return_value=["https://bad.example/{handle}/rss"]),
+            patch.object(server, "x_kol_fetch_rss_template", return_value={
+                "ok": False,
+                "template": "https://bad.example/{handle}/rss",
+                "url": "https://bad.example/longdotxyz/rss",
+                "rows": [],
+                "elapsed": 0.1,
+                "error": "timeout",
+            }),
+            patch.object(server, "x_kol_public_timeline_fallback_enabled", return_value=True),
+            patch.object(server, "x_kol_fxtwitter_fallback_enabled", return_value=False),
+            patch.object(server, "x_kol_fetch_public_timeline", return_value=fallback) as fetch_public,
+        ):
+            result = server.x_kol_fetch_rss_source(source)
+
+        self.assertEqual(result, fallback)
+        fetch_public.assert_called_once_with(source)
+
+    def test_priority_rss_source_uses_free_timeline_when_mirrors_fail(self):
+        source = {"id": "x-owner", "handle": "whitestar224", "displayName": "白星", "enabled": True}
+        fallback = {
+            "source": {
+                **source,
+                "status": "ok",
+                "provider": "rss",
+                "upstreamSource": "fxtwitter",
+                "itemsReturned": 1,
+            },
+            "items": [{"id": "post-1", "tweetId": "1", "publishedAt": 1, "text": "fresh"}],
+        }
+        failed = {
+            "ok": False,
+            "template": "https://bad.example/{handle}/rss",
+            "url": "https://bad.example/whitestar224/rss",
+            "rows": [],
+            "elapsed": 0.1,
+            "error": "timeout",
+        }
+        with (
+            patch.object(server, "x_kol_rss_template_candidates", return_value=[failed["template"]]),
+            patch.object(server, "x_kol_fetch_rss_template", return_value=failed),
+            patch.object(server, "x_kol_fxtwitter_fallback_enabled", return_value=True),
+            patch.object(server, "x_kol_fetch_fxtwitter_timeline", return_value=fallback) as fetch_fx,
+        ):
+            result = server.x_kol_fetch_priority_rss_source(source)
+
+        self.assertEqual(result, fallback)
+        fetch_fx.assert_called_once_with(source)
+
     def test_stream_and_rss_use_tweet_id_for_cross_provider_deduplication(self):
         now = int(time.time() * 1000)
         previous = {
@@ -374,6 +547,129 @@ class XKolRealtimeTests(unittest.TestCase):
         thread_class.assert_called_once()
         thread_class.return_value.start.assert_called_once()
 
+    def test_global_stream_targets_all_enabled_accounts_when_opted_in(self):
+        sources = [
+            {"id": "x-alpha", "handle": "alpha", "enabled": True},
+            {"id": "x-beta", "handle": "beta", "enabled": True},
+            {"id": "x-off", "handle": "disabled", "enabled": False},
+        ]
+        with server.X_KOL_OFFICIAL_STREAM_LOCK:
+            server.X_KOL_OFFICIAL_STREAM_USERS[0] = {}
+
+        with (
+            patch.dict(server.os.environ, {"X_KOL_STREAM_ALL_TRACKED_ACCOUNTS": "1"}),
+            patch.object(server, "load_x_kol_sources", return_value=sources),
+            patch.object(server, "x_kol_priority_sources", return_value=[sources[0]]),
+        ):
+            targets = server.x_kol_official_stream_targets()
+
+        self.assertEqual(set(targets), {"alpha", "beta"})
+
+    def test_registering_user_with_existing_handles_does_not_restart_stream(self):
+        source = {"id": "x-alpha", "handle": "alpha", "enabled": True}
+        targets = {"alpha": [({}, source)]}
+        with server.X_KOL_OFFICIAL_STREAM_LOCK:
+            server.X_KOL_OFFICIAL_STREAM_USERS[0] = {}
+            server.X_KOL_OFFICIAL_STREAM_STARTED = True
+
+        with (
+            patch.object(server, "x_kol_official_stream_available", return_value=True),
+            patch.dict(server.os.environ, {"X_KOL_STREAM_ALL_TRACKED_ACCOUNTS": "1"}),
+            patch.object(server, "x_kol_official_stream_targets", return_value=targets),
+            patch.object(server, "wake_x_kol_official_stream") as wake,
+            patch.object(server.threading, "Thread") as thread_class,
+        ):
+            server.register_x_kol_official_stream_user({"id": 7, "username": "admin"})
+
+        self.assertIn(7, server.X_KOL_OFFICIAL_STREAM_USERS)
+        wake.assert_not_called()
+        thread_class.assert_not_called()
+
+    def test_snapshot_immediately_overlays_connected_stream_on_cached_rss_errors(self):
+        user = {"id": 808}
+        source = {
+            "id": "x-alpha",
+            "handle": "alpha",
+            "enabled": True,
+            "status": "error",
+            "provider": "rss",
+            "error": "上游暂时波动",
+        }
+        payload = {
+            "ok": True,
+            "sources": [source],
+            "items": [{"id": "post-1", "sourceId": "x-alpha", "publishedAt": 1, "text": "cached"}],
+            "enabledCount": 1,
+            "provider": "rss",
+            "upstreamMode": "rss-resilient",
+        }
+        with server.X_KOL_REALTIME_CONDITION:
+            server.X_KOL_REALTIME_DISK_HYDRATED.add(808)
+            server.X_KOL_REALTIME_SNAPSHOTS[808] = {
+                "payload": payload,
+                "signature": server.x_kol_payload_signature(payload),
+            }
+
+        with (
+            patch.object(server, "ensure_x_kol_realtime_worker"),
+            patch.object(server, "x_kol_token", return_value="test-token"),
+            patch.dict(
+                server.os.environ,
+                {
+                    "X_KOL_OFFICIAL_API_ENABLED": "1",
+                    "X_KOL_STREAM_ALL_TRACKED_ACCOUNTS": "1",
+                },
+            ),
+            patch.object(
+                server,
+                "x_kol_official_stream_health_snapshot",
+                return_value={
+                    "connected": True,
+                    "rulesReady": True,
+                    "targetCount": 1,
+                    "lastConnectedAt": int(time.time() * 1000),
+                },
+            ),
+        ):
+            result, _ = server.x_kol_realtime_snapshot(user, wait_seconds=0)
+
+        self.assertEqual(result["provider"], "x-stream")
+        self.assertEqual(result["upstreamMode"], "official-stream")
+        self.assertEqual(result["sources"][0]["status"], "ok")
+        self.assertEqual(result["sources"][0]["error"], "")
+
+    def test_connected_official_stream_overrides_failed_rss_source_status(self):
+        source = {"id": "x-alpha", "handle": "alpha", "displayName": "Alpha", "enabled": True}
+        failed = {
+            "source": {**source, "status": "error", "provider": "rss", "error": "上游暂时波动"},
+            "items": [],
+        }
+        with (
+            patch.object(server, "load_x_kol_sources", return_value=[source]),
+            patch.object(server, "x_kol_token", return_value="test-token"),
+            patch.dict(
+                server.os.environ,
+                {
+                    "X_KOL_OFFICIAL_API_ENABLED": "1",
+                    "X_KOL_STREAM_ALL_TRACKED_ACCOUNTS": "1",
+                    "X_KOL_OFFICIAL_REST_POLL_ENABLED": "0",
+                },
+            ),
+            patch.object(server, "x_kol_fetch_rss_source", return_value=failed),
+            patch.object(
+                server,
+                "x_kol_official_stream_health_snapshot",
+                return_value={"connected": True, "lastConnectedAt": 1234, "targetCount": 1},
+            ),
+        ):
+            payload = server.x_kol_feed_payload({"id": 101})
+
+        self.assertEqual(payload["provider"], "x-stream")
+        self.assertEqual(payload["upstreamMode"], "official-stream")
+        self.assertEqual(payload["sources"][0]["status"], "ok")
+        self.assertEqual(payload["sources"][0]["provider"], "x-stream")
+        self.assertEqual(payload["sources"][0]["error"], "")
+
     def test_priority_poll_publishes_global_and_admin_snapshots(self):
         payload = {
             "ok": True,
@@ -393,6 +689,25 @@ class XKolRealtimeTests(unittest.TestCase):
         expected_age = server.personal_x_monitor_backfill_seconds()
         publish.assert_any_call(None, payload, monitor_max_age_seconds=expected_age)
         publish.assert_any_call(administrator, payload, monitor_max_age_seconds=expected_age)
+
+    def test_priority_monitor_starts_saved_sources_worker_for_admin(self):
+        administrator = {"id": 7, "username": "admin"}
+        previous_started = server.X_KOL_PRIORITY_STARTED
+        server.X_KOL_PRIORITY_STARTED = False
+        try:
+            with (
+                patch.object(server, "admin_user", return_value=administrator),
+                patch.object(server, "register_x_kol_official_stream_user"),
+                patch.object(server, "ensure_x_kol_realtime_worker") as ensure_worker,
+                patch.object(server.threading, "Thread") as thread,
+            ):
+                server.start_x_kol_priority_monitor()
+
+            thread.assert_called_once()
+            thread.return_value.start.assert_called_once_with()
+            ensure_worker.assert_called_once_with(administrator)
+        finally:
+            server.X_KOL_PRIORITY_STARTED = previous_started
 
     def test_priority_payload_uses_rss_when_token_exists_but_paid_api_is_disabled(self):
         source = {
@@ -574,6 +889,35 @@ class XKolRealtimeTests(unittest.TestCase):
 
         self.assertNotIn(101, server.X_KOL_OFFICIAL_STREAM_USERS)
         thread_class.assert_not_called()
+
+    def test_x_source_preserves_each_supported_monitor_category(self):
+        expected = {
+            "普通KOL": "kol",
+            "明星": "celebrity",
+            "名人": "notable",
+            "项目创始人/联合创始人": "founder",
+            "项目官方X": "project_official",
+        }
+        for label, category_id in expected.items():
+            with self.subTest(label=label):
+                source = server.normalize_x_source({
+                    "handle": f"category_{category_id}",
+                    "displayName": label,
+                    "category": label,
+                })
+                self.assertEqual(source["category"], category_id)
+
+    def test_existing_x_sources_receive_identity_based_categories(self):
+        cases = {
+            "RobinhoodApp": "project_official",
+            "Natan_benish": "founder",
+            "elonmusk": "notable",
+            "alpha_pls": "kol",
+        }
+        for handle, expected in cases.items():
+            with self.subTest(handle=handle):
+                source = server.normalize_x_source({"handle": handle, "displayName": handle})
+                self.assertEqual(source["category"], expected)
 
 
 if __name__ == "__main__":

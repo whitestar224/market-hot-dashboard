@@ -131,6 +131,8 @@ class WechatOpportunityLifecycleTests(unittest.TestCase):
         self.assertNotIn("TUT", restored)
         self.assertEqual(asset["opportunity_active"], 0)
         self.assertGreater(asset["opportunity_manual_removed_at"], 0)
+        self.assertTrue(server.price_structure_symbol_excluded("TUT"))
+        self.assertEqual(server.price_watch_active_rows(), [])
 
     def test_opportunity_dies_only_after_thirty_days_without_any_quote(self):
         now_ms = int(time.time() * 1000)

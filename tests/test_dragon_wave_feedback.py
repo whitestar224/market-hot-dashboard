@@ -8,13 +8,68 @@ import quiet_http_server as feedback_server
 class DragonWaveFeedbackStorageTests(unittest.TestCase):
     def setUp(self):
         self.original_db = feedback_server.FEEDBACK_DB
+        self.original_precomputed_root = feedback_server.PRECOMPUTED_ROOT
         self.tempdir = tempfile.TemporaryDirectory()
         feedback_server.FEEDBACK_DB = Path(self.tempdir.name) / "feedback.db"
+        feedback_server.PRECOMPUTED_ROOT = Path(self.tempdir.name) / "precomputed"
         feedback_server.init_feedback_db()
 
     def tearDown(self):
         feedback_server.FEEDBACK_DB = self.original_db
+        feedback_server.PRECOMPUTED_ROOT = self.original_precomputed_root
         self.tempdir.cleanup()
+
+    def test_precomputed_miss_creates_an_atomic_background_request(self):
+        query = {
+            "version": ["v89"], "pair": ["XRPUSDT"],
+            "start": ["2024-11-04"], "end": ["2025-01-18"],
+            "interval": ["1h"], "market": ["futures"], "stage": ["active"],
+        }
+        request = feedback_server.queue_precomputed_request(query)
+        repeated = feedback_server.queue_precomputed_request(query)
+        files = list((feedback_server.PRECOMPUTED_ROOT / "v89.requests").glob("*.json"))
+        self.assertEqual(request["pair"], "XRPUSDT")
+        self.assertTrue(request["_newRequest"])
+        self.assertFalse(repeated["_newRequest"])
+        self.assertEqual(len(files), 1)
+        self.assertFalse(list(files[0].parent.glob("*.tmp")))
+
+    def test_precompute_manifest_completion_is_explicit(self):
+        version_root = feedback_server.PRECOMPUTED_ROOT / "v89"
+        version_root.mkdir(parents=True)
+        (version_root / "manifest.json").write_text(
+            '{"status":{"state":"running"}}', encoding="utf-8"
+        )
+        self.assertFalse(feedback_server.precompute_manifest_complete("v89"))
+        (version_root / "manifest.json").write_text(
+            '{"status":{"state":"complete"}}', encoding="utf-8"
+        )
+        self.assertTrue(feedback_server.precompute_manifest_complete("v89"))
+
+    def test_confirmed_historical_intervals_are_seeded_before_catalog_warming(self):
+        confirmed_time = 1740180600000  # PI 2025-02-22 03:30 UTC, inside its document range.
+        feedback_server.save_local_feedback("confirmed-seed-device", {
+            "version": 1,
+            "updatedAt": confirmed_time,
+            "records": {
+                f"PIUSDT|5m|{confirmed_time}": {
+                    "key": f"PIUSDT|5m|{confirmed_time}",
+                    "decision": "confirmed",
+                    "createdAt": confirmed_time,
+                    "updatedAt": confirmed_time,
+                    "pair": "PIUSDT",
+                    "interval": "5m",
+                    "signal": {"time": confirmed_time},
+                }
+            },
+        })
+        self.assertEqual(feedback_server.seed_confirmed_precompute_requests("v89"), 1)
+        requests = list((feedback_server.PRECOMPUTED_ROOT / "v89.requests").glob("*.json"))
+        self.assertEqual(len(requests), 1)
+        payload = __import__("json").loads(requests[0].read_text(encoding="utf-8"))
+        self.assertEqual(payload["pair"], "PIUSDT")
+        self.assertEqual(payload["interval"], "5m")
+        self.assertEqual(payload["priority"], 497)
 
     @staticmethod
     def document(decision="confirmed", updated_at=10):
@@ -40,6 +95,50 @@ class DragonWaveFeedbackStorageTests(unittest.TestCase):
         feedback_server.save_local_feedback(device_id, self.document())
         loaded = feedback_server.load_local_feedback(device_id)
         self.assertEqual(loaded["records"]["TUTUSDT|15m|1000"]["decision"], "confirmed")
+
+    def test_local_display_index_restores_decisions_without_heavy_visual_payload(self):
+        device_id = "dragon-device-index-123456"
+        document = self.document()
+        signal = document["records"]["TUTUSDT|15m|1000"]["signal"]
+        signal.update({
+            "pattern": "盘整突破 + 前高突破",
+            "foundationTypes": ["base"],
+            "auxiliaryTypes": ["previousHigh"],
+            "visualSignature": {"version": 1, "windows": [{"wick": "1" * 1000}]},
+            "evidence": ["heavy evidence" * 100],
+            "triangleLines": {"upper": {"startIndex": 1, "endIndex": 20}},
+        })
+        feedback_server.save_local_feedback(device_id, document)
+        display = feedback_server.load_local_feedback_index(device_id)
+        saved = display["records"]["TUTUSDT|15m|1000"]
+        self.assertEqual(saved["decision"], "confirmed")
+        self.assertEqual(saved["signal"]["time"], 1000)
+        self.assertIn("pattern:base", saved["signal"]["feedbackTokens"])
+        self.assertNotIn("visualSignature", saved["signal"])
+        self.assertNotIn("evidence", saved["signal"])
+        self.assertNotIn("triangleLines", saved["signal"])
+
+    def test_global_local_index_survives_browser_origin_or_device_changes(self):
+        first = self.document("confirmed", 10)
+        second = self.document("denied", 20)
+        second_record = second["records"].pop("TUTUSDT|15m|1000")
+        second_record.update({
+            "key": "XRPUSDT|1h|2000",
+            "pair": "XRPUSDT",
+            "interval": "1h",
+            "decision": "confirmed",
+            "updatedAt": 20,
+            "signal": {"time": 2000, "patternKey": "triangle"},
+        })
+        second["records"] = {second_record["key"]: second_record}
+        feedback_server.save_local_feedback("dragon-origin-a-123456", first)
+        feedback_server.save_local_feedback("dragon-origin-b-123456", second)
+        display = feedback_server.load_local_feedback_index(
+            "dragon-new-origin-123456", global_scope=True
+        )
+        self.assertEqual(len(display["records"]), 2)
+        self.assertEqual(display["records"]["TUTUSDT|15m|1000"]["decision"], "confirmed")
+        self.assertEqual(display["records"]["XRPUSDT|1h|2000"]["decision"], "confirmed")
 
     def test_binance_candle_proxy_accepts_native_chinese_contract(self):
         query = {

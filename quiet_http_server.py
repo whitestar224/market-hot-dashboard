@@ -1,10 +1,14 @@
+import hashlib
 import json
 import math
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import threading
 import time
+from datetime import date, datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -20,6 +24,11 @@ except ImportError:  # The bundled quiet runtime intentionally has no third-part
 ROOT = Path(__file__).resolve().parent
 FEEDBACK_DB = ROOT / ".runtime-cache" / "dragon_wave_feedback.db"
 PRECOMPUTED_ROOT = ROOT / ".runtime-cache" / "dragon-wave-precomputed"
+PRECOMPUTE_SCRIPT = ROOT / "tools" / "precompute_dragon_wave_cases.js"
+PRECOMPUTE_CASES = ROOT / "dragon-wave-cases.js"
+PRECOMPUTE_DEFAULT_VERSION = os.getenv("DRAGON_WAVE_PRECOMPUTE_VERSION", "v89").strip()
+PRECOMPUTE_PROCESS_LOCK = threading.Lock()
+PRECOMPUTE_PROCESSES = {}
 FEEDBACK_LOCK = threading.Lock()
 ACCOUNT_API = os.getenv("DRAGON_WAVE_ACCOUNT_API", "http://127.0.0.1:8765/api/dragon-wave-feedback").strip()
 MAX_BODY = 8_000_000
@@ -292,6 +301,204 @@ def precomputed_lookup(query):
     return file_path, record
 
 
+def queue_precomputed_request(query, priority=1000):
+    version = str((query.get("version") or [""])[0]).strip()
+    pair = str((query.get("pair") or [""])[0]).upper().strip()
+    start = str((query.get("start") or [""])[0]).strip()
+    end = str((query.get("end") or [""])[0]).strip()
+    interval = str((query.get("interval") or [""])[0]).strip()
+    market = str((query.get("market") or ["futures"])[0]).lower().strip()
+    stage = str((query.get("stage") or ["active"])[0]).lower().strip()
+    # Reuse lookup validation before writing anything to disk.
+    precomputed_lookup({
+        "version": [version], "pair": [pair], "start": [start], "end": [end],
+        "interval": [interval], "market": [market], "stage": [stage],
+    })
+    request = {
+        "version": version, "pair": pair, "start": start, "end": end,
+        "interval": interval, "market": market, "stage": stage,
+        "priority": max(0, min(1000, int(priority))),
+        "requestedAt": int(time.time() * 1000),
+    }
+    key = "|".join((version, pair, start, end, interval, market, stage))
+    request_root = PRECOMPUTED_ROOT / f"{version}.requests"
+    request_root.mkdir(parents=True, exist_ok=True)
+    file_path = request_root / f"{hashlib.sha256(key.encode('utf-8')).hexdigest()}.json"
+    is_new_request = not file_path.exists()
+    temporary = request_root / f"{file_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    temporary.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
+    os.replace(temporary, file_path)
+    # This flag is returned only to the local request handler. It is deliberately
+    # not written into the queue file, whose schema remains stable for Node.
+    request["_newRequest"] = is_new_request
+    return request
+
+
+def precompute_manifest_complete(version):
+    manifest_path = PRECOMPUTED_ROOT / version / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return (manifest.get("status") or {}).get("state") == "complete"
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def historical_precompute_cases():
+    try:
+        source = PRECOMPUTE_CASES.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    aliases = {
+        "AGIX": "AGIXBUSD",
+        "SHIB": "1000SHIBUSDT",
+        "SATS": "1000SATSUSDT",
+        "PEPE": "1000PEPEUSDT",
+        "FLOKI": "1000FLOKIUSDT",
+        "LUNC": "1000LUNCUSDT",
+        "币安人生": "币安人生USDT",
+    }
+    rows = re.findall(
+        r'\["([^"]+)",\s*"(\d{4}-\d{2}-\d{2})",\s*"(\d{4}-\d{2}-\d{2})"\]',
+        source,
+    )
+    return [{
+        "symbol": symbol,
+        "pair": aliases.get(symbol, f"{symbol}USDT"),
+        "start": start,
+        "end": end,
+    } for symbol, start, end in rows]
+
+
+def confirmed_precompute_targets():
+    if not FEEDBACK_DB.is_file():
+        return []
+    latest_by_key = {}
+    with FEEDBACK_LOCK:
+        connection = sqlite3.connect(FEEDBACK_DB)
+        try:
+            payloads = connection.execute("SELECT payload FROM feedback_documents").fetchall()
+        finally:
+            connection.close()
+    for (raw_payload,) in payloads:
+        try:
+            records = (json.loads(raw_payload).get("records") or {}).items()
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        for key, record in records:
+            if not isinstance(record, dict):
+                continue
+            existing = latest_by_key.get(key)
+            if existing is None or int(record.get("updatedAt") or 0) >= int(existing.get("updatedAt") or 0):
+                latest_by_key[key] = record
+    cases = historical_precompute_cases()
+    targets = {}
+    eligible_intervals = {"5m", "15m", "1h", "4h", "1d"}
+    for record in latest_by_key.values():
+        if record.get("decision") != "confirmed":
+            continue
+        pair = str(record.get("pair") or "").upper().strip()
+        interval = str(record.get("interval") or "").strip()
+        signal = record.get("signal") if isinstance(record.get("signal"), dict) else {}
+        try:
+            signal_time = int(signal.get("time") or 0)
+        except (TypeError, ValueError):
+            signal_time = 0
+        if not pair or interval not in eligible_intervals or signal_time <= 0:
+            continue
+        signal_day = datetime.fromtimestamp(signal_time / 1000, timezone.utc).date()
+        for item in cases:
+            if item["pair"].upper() != pair:
+                continue
+            start_day = date.fromisoformat(item["start"]) - timedelta(days=2)
+            end_day = date.fromisoformat(item["end"]) + timedelta(days=2)
+            if not start_day <= signal_day <= end_day:
+                continue
+            key = (pair, item["start"], item["end"], interval)
+            targets[key] = {
+                "pair": [pair], "start": [item["start"]], "end": [item["end"]],
+                "interval": [interval], "market": ["futures"], "stage": ["active"],
+            }
+    return list(targets.values())
+
+
+def seed_confirmed_precompute_requests(version):
+    queued = 0
+    # Queue writes carry their request time and the Node worker reads newest first.
+    # Enqueue slower/lower-priority periods first so 1h and 4h confirmations become
+    # visible before large 5m archives; interactive page requests are newer still.
+    interval_priority = {"1h": 0, "4h": 1, "15m": 2, "5m": 3, "1d": 4}
+    targets = sorted(
+        confirmed_precompute_targets(),
+        key=lambda item: interval_priority.get(str((item.get("interval") or [""])[0]), 9),
+        reverse=True,
+    )
+    for query in targets:
+        query = {**query, "version": [version]}
+        if precomputed_lookup(query):
+            continue
+        interval = str((query.get("interval") or [""])[0])
+        request = queue_precomputed_request(
+            query,
+            priority=500 - interval_priority.get(interval, 9),
+        )
+        if request.get("_newRequest"):
+            queued += 1
+    return queued
+
+
+def ensure_precompute_running(version, force=False, preempt=False):
+    if not PRECOMPUTED_VERSION_RE.fullmatch(version) or not PRECOMPUTE_SCRIPT.is_file():
+        return False
+    node = shutil.which("node.exe") or shutil.which("node")
+    if not node:
+        return False
+    with PRECOMPUTE_PROCESS_LOCK:
+        current = PRECOMPUTE_PROCESSES.get(version)
+        if current and current["process"].poll() is None:
+            if not preempt:
+                return True
+            # A dashboard miss has higher priority than catalog warm-up. Files and
+            # manifests are atomically replaced, so stopping between writes is safe;
+            # the next process drains the queued visible interval before resuming.
+            current["process"].terminate()
+            try:
+                current["process"].wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                current["process"].kill()
+                current["process"].wait(timeout=2)
+        if current:
+            current["stdout"].close()
+            current["stderr"].close()
+            PRECOMPUTE_PROCESSES.pop(version, None)
+        if not force and precompute_manifest_complete(version):
+            return False
+        PRECOMPUTED_ROOT.mkdir(parents=True, exist_ok=True)
+        stdout = (PRECOMPUTED_ROOT / f"{version}.stdout.log").open("ab", buffering=0)
+        stderr = (PRECOMPUTED_ROOT / f"{version}.stderr.log").open("ab", buffering=0)
+        creation_flags = 0
+        if os.name == "nt":
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+        try:
+            process = subprocess.Popen(
+                [node, str(PRECOMPUTE_SCRIPT), f"--version={version}"],
+                cwd=str(ROOT), stdout=stdout, stderr=stderr, creationflags=creation_flags,
+            )
+        except OSError:
+            stdout.close()
+            stderr.close()
+            return False
+        PRECOMPUTE_PROCESSES[version] = {"process": process, "stdout": stdout, "stderr": stderr}
+        return True
+
+
+def supervise_precompute():
+    time.sleep(1)
+    seed_confirmed_precompute_requests(PRECOMPUTE_DEFAULT_VERSION)
+    while True:
+        ensure_precompute_running(PRECOMPUTE_DEFAULT_VERSION)
+        time.sleep(10)
+
+
 def normalize_feedback_document(value):
     payload = value if isinstance(value, dict) else {}
     raw_records = payload.get("records") if isinstance(payload.get("records"), dict) else {}
@@ -430,6 +637,47 @@ def feedback_feature_tokens(signal):
     if grade in {"A+", "A", "B"}:
         tokens.append(f"manual-grade:{grade}")
     return list(dict.fromkeys(tokens))
+
+
+# 看板首屏只需要“哪根 K 线是什么人工结论”和少量用于监督权重的因果特征。
+# 完整视觉签名、证据、趋势线端点继续永久保存在 feedback_documents 中，不能在
+# 每次刷新时把数 MB 的学习库重新传给浏览器。
+FEEDBACK_INDEX_SIGNAL_FIELDS = (
+    "time", "interval", "pattern", "patternKey", "price", "triggerPrice", "level",
+    "selectedPrice", "status", "score", "certaintyScore", "relativeVolume",
+    "structureShape", "manualCandleSelection", "manualSource",
+    "open", "high", "low", "close", "volume",
+)
+
+
+def feedback_display_index(value):
+    normalized = normalize_feedback_document(value)
+    records = {}
+    for key, record in normalized["records"].items():
+        signal = record.get("signal") if isinstance(record.get("signal"), dict) else {}
+        compact_signal = {
+            field: signal[field]
+            for field in FEEDBACK_INDEX_SIGNAL_FIELDS
+            if field in signal
+        }
+        compact_signal["feedbackTokens"] = feedback_feature_tokens({
+            **signal,
+            "interval": record.get("interval") or signal.get("interval"),
+        })[:32]
+        records[key] = {
+            field: record.get(field)
+            for field in (
+                "key", "decision", "createdAt", "updatedAt", "pair", "interval", "venue",
+                "certaintyGrade", "structureTags", "predictedStructureTags",
+            )
+            if field in record
+        }
+        records[key]["signal"] = compact_signal
+    return {
+        "version": 1,
+        "updatedAt": normalized.get("updatedAt", 0),
+        "records": records,
+    }
 
 
 def feedback_supervised_prototype_profile(rows):
@@ -584,6 +832,15 @@ def init_feedback_db():
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS feedback_display_indexes (
+                    device_id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
             conn.commit()
         finally:
             conn.close()
@@ -607,9 +864,75 @@ def load_local_feedback(device_id):
         return normalize_feedback_document({})
 
 
+def load_all_local_feedback():
+    with FEEDBACK_LOCK:
+        conn = sqlite3.connect(FEEDBACK_DB)
+        try:
+            rows = conn.execute("SELECT payload FROM feedback_documents").fetchall()
+        finally:
+            conn.close()
+    documents = []
+    for row in rows:
+        try:
+            documents.append(json.loads(row[0]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return merge_feedback_documents(*documents)
+
+
+def load_local_feedback_index(device_id, global_scope=False):
+    storage_id = "__all_local_feedback__" if global_scope else device_id
+    with FEEDBACK_LOCK:
+        conn = sqlite3.connect(FEEDBACK_DB)
+        try:
+            row = conn.execute(
+                "SELECT payload FROM feedback_display_indexes WHERE device_id = ?",
+                (storage_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    if row:
+        try:
+            payload = json.loads(row[0])
+            if isinstance(payload, dict) and isinstance(payload.get("records"), dict):
+                return payload
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    # 旧数据库第一次升级时生成一次，后续刷新直接读取持久化的小索引。
+    index = feedback_display_index(
+        load_all_local_feedback() if global_scope else load_local_feedback(device_id)
+    )
+    text = json.dumps(index, ensure_ascii=False, separators=(",", ":"))
+    with FEEDBACK_LOCK:
+        conn = sqlite3.connect(FEEDBACK_DB)
+        try:
+            conn.execute(
+                """
+                INSERT INTO feedback_display_indexes (device_id, payload, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(device_id) DO UPDATE SET
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (storage_id, text, int(time.time() * 1000)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return index
+
+
 def save_local_feedback(device_id, incoming):
     merged = merge_feedback_documents(load_local_feedback(device_id), incoming)
     text = json.dumps(merged, ensure_ascii=False, separators=(",", ":"))
+    display_index = feedback_display_index(merged)
+    index_text = json.dumps(display_index, ensure_ascii=False, separators=(",", ":"))
+    global_index = merge_feedback_documents(
+        load_local_feedback_index(device_id, global_scope=True),
+        display_index,
+    )
+    global_index_text = json.dumps(global_index, ensure_ascii=False, separators=(",", ":"))
+    saved_at = int(time.time() * 1000)
     with FEEDBACK_LOCK:
         conn = sqlite3.connect(FEEDBACK_DB)
         try:
@@ -621,7 +944,27 @@ def save_local_feedback(device_id, incoming):
                     payload = excluded.payload,
                     updated_at = excluded.updated_at
                 """,
-                (device_id, text, int(time.time() * 1000)),
+                (device_id, text, saved_at),
+            )
+            conn.execute(
+                """
+                INSERT INTO feedback_display_indexes (device_id, payload, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(device_id) DO UPDATE SET
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (device_id, index_text, saved_at),
+            )
+            conn.execute(
+                """
+                INSERT INTO feedback_display_indexes (device_id, payload, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(device_id) DO UPDATE SET
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                ("__all_local_feedback__", global_index_text, saved_at),
             )
             conn.commit()
         finally:
@@ -768,9 +1111,21 @@ class QuietHandler(SimpleHTTPRequestHandler):
             return
         if path == "/api/dragon-wave-precomputed":
             try:
-                match = precomputed_lookup(parse_qs(parsed.query))
+                query = parse_qs(parsed.query)
+                match = precomputed_lookup(query)
                 if not match:
-                    self.send_json({"ok": False, "available": False, "error": "precomputed result not found"}, 404)
+                    request = queue_precomputed_request(query)
+                    started = ensure_precompute_running(
+                        request["version"], force=True,
+                        preempt=bool(request.pop("_newRequest", False)),
+                    )
+                    self.send_json({
+                        "ok": False,
+                        "available": False,
+                        "pending": True,
+                        "backgroundRunning": started,
+                        "error": "local precomputed result is being generated",
+                    }, 202)
                 else:
                     self.send_precomputed(*match)
             except ValueError as error:
@@ -783,8 +1138,20 @@ class QuietHandler(SimpleHTTPRequestHandler):
             if not device_id:
                 self.send_json({"ok": False, "error": "invalid device id"}, 400)
                 return
-            feedback = load_local_feedback(device_id)
-            self.send_json({"ok": True, "storage": "local-sqlite", "feedback": feedback, "optimization": feedback_optimization_dataset(feedback)})
+            compact = self.headers.get("X-Dragon-Wave-Compact") == "1" \
+                or (parse_qs(parsed.query).get("view") or [""])[0] == "index"
+            if compact:
+                global_scope = (parse_qs(parsed.query).get("scope") or [""])[0] == "all"
+                feedback = load_local_feedback_index(device_id, global_scope=global_scope)
+                self.send_json({
+                    "ok": True,
+                    "storage": "local-sqlite-index",
+                    "feedback": feedback,
+                    "recordCount": len(feedback.get("records") or {}),
+                })
+            else:
+                feedback = load_local_feedback(device_id)
+                self.send_json({"ok": True, "storage": "local-sqlite", "feedback": feedback, "optimization": feedback_optimization_dataset(feedback)})
             return
         if path == "/api/dragon-wave-feedback/account":
             self.proxy_account("GET")
@@ -820,4 +1187,6 @@ class QuietHandler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     init_feedback_db()
-    ThreadingHTTPServer(("127.0.0.1", 8791), QuietHandler).serve_forever()
+    server = ThreadingHTTPServer(("127.0.0.1", 8791), QuietHandler)
+    threading.Thread(target=supervise_precompute, name="dragon-wave-precompute", daemon=True).start()
+    server.serve_forever()

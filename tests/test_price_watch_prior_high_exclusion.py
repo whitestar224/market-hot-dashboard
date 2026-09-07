@@ -36,7 +36,7 @@ class PriceWatchPriorHighExclusionTests(unittest.TestCase):
             )
         return now_ms
 
-    def test_exclusion_removes_only_prior_high_state_and_hides_aicoin_pool_item(self):
+    def test_prior_high_exclusion_removes_all_monitor_state(self):
         now_ms = self.insert_asset()
         with server.auth_db() as conn:
             conn.execute(
@@ -64,9 +64,8 @@ class PriceWatchPriorHighExclusionTests(unittest.TestCase):
         payload = server.exclude_price_watch_prior_high("TEST")
 
         self.assertTrue(payload["ok"])
-        item = next(item for item in payload["items"] if item["symbol"] == "TEST")
-        self.assertFalse(item["priorHighEnabled"])
-        self.assertEqual(payload["summary"]["priorHighTotal"], 0)
+        self.assertFalse(payload["exclusion"]["priorHighEnabled"])
+        self.assertEqual(payload["exclusion"]["restoreRule"], "leave_then_reenter_or_manual_readd")
         with server.auth_db() as conn:
             asset = conn.execute(
                 "SELECT prior_high_excluded_at, prior_high_absent_at FROM price_watch_assets WHERE symbol = 'TEST'"
@@ -83,14 +82,19 @@ class PriceWatchPriorHighExclusionTests(unittest.TestCase):
             fib_state = conn.execute(
                 "SELECT 1 FROM price_watch_fib_alert_state WHERE symbol = 'TEST'"
             ).fetchone()
+            global_exclusion = conn.execute(
+                "SELECT 1 FROM price_structure_exclusions WHERE symbol = 'TEST'"
+            ).fetchone()
         self.assertGreater(asset["prior_high_excluded_at"], 0)
         self.assertEqual(asset["prior_high_absent_at"], 0)
         self.assertIsNone(prior_state)
         self.assertIsNone(confirmation)
-        self.assertIsNotNone(oversold_state)
-        self.assertIsNotNone(fib_state)
+        self.assertIsNone(oversold_state)
+        self.assertIsNone(fib_state)
+        self.assertIsNotNone(global_exclusion)
+        self.assertEqual(server.price_watch_active_rows(), [])
 
-    def test_excluded_symbol_stays_out_until_it_leaves_and_reenters_aicoin(self):
+    def test_excluded_symbol_stays_out_after_aicoin_source_flaps_and_reentry(self):
         self.insert_asset()
         server.exclude_price_watch_prior_high("TEST")
         test_row = {"symbol": "TEST", "name": "Test", "note": "crypto"}
@@ -132,9 +136,10 @@ class PriceWatchPriorHighExclusionTests(unittest.TestCase):
             restored = conn.execute(
                 "SELECT prior_high_excluded_at, prior_high_absent_at FROM price_watch_assets WHERE symbol = 'TEST'"
             ).fetchone()
-        self.assertEqual(dict(restored), {"prior_high_excluded_at": 0, "prior_high_absent_at": 0})
+        self.assertGreater(restored["prior_high_excluded_at"], 0)
+        self.assertEqual(restored["prior_high_absent_at"], 0)
 
-    def test_exclusion_suppresses_prior_high_but_keeps_oversold_evaluation(self):
+    def test_exclusion_suppresses_every_price_watch_evaluation(self):
         now_ms = self.insert_asset()
         server.exclude_price_watch_prior_high("TEST")
         result = {
@@ -165,7 +170,36 @@ class PriceWatchPriorHighExclusionTests(unittest.TestCase):
 
         events = server.update_price_watch_snapshot(result)
 
-        self.assertEqual([event["eventType"] for event in events], ["oversold_rebound"])
+        self.assertEqual(events, [])
+
+    def test_startup_promotes_legacy_pool_exclusion_to_global_registry(self):
+        now_ms = self.insert_asset("LEGACY")
+        with server.auth_db() as conn:
+            conn.execute(
+                """
+                UPDATE price_watch_assets
+                SET prior_high_excluded_at = ?, opportunity_active = 1
+                WHERE symbol = 'LEGACY'
+                """,
+                (now_ms,),
+            )
+
+        server.init_auth_db()
+
+        with server.auth_db() as conn:
+            exclusion = conn.execute(
+                "SELECT excluded_at FROM price_structure_exclusions WHERE symbol = 'LEGACY'"
+            ).fetchone()
+            asset = conn.execute(
+                """
+                SELECT opportunity_active, opportunity_manual_removed_at
+                FROM price_watch_assets WHERE symbol = 'LEGACY'
+                """
+            ).fetchone()
+        self.assertEqual(exclusion["excluded_at"], now_ms)
+        self.assertEqual(asset["opportunity_active"], 0)
+        self.assertGreater(asset["opportunity_manual_removed_at"], 0)
+        self.assertEqual(server.price_watch_active_rows(), [])
 
 
 if __name__ == "__main__":

@@ -29,3 +29,29 @@ test("price watch exposes the existing personal X realtime monitor", () => {
   assert.match(css, /\.personal-x-tactical-panel/);
   assert.match(css, /border-radius: 999px/);
 });
+
+test("News Trade shows an auditable Meme-potential verdict for project X posts", () => {
+  const js = fs.readFileSync("price-watch.js", "utf8");
+  const css = fs.readFileSync("styles.css", "utf8");
+
+  assert.match(js, /xMemePotential/);
+  assert.match(js, /推文 Meme 潜力/);
+  assert.match(js, /未发现足够的名称、形象、玩梗或社区参与信号/);
+  assert.match(css, /\.news-trade-x-meme/);
+  assert.match(css, /\.news-trade-x-meme\.is-high/);
+});
+
+test("News Trade renders AI event and Meme analysis without replacing safety gates", () => {
+  const js = fs.readFileSync("price-watch.js", "utf8");
+  const css = fs.readFileSync("styles.css", "utf8");
+
+  assert.match(js, /事件与 Meme 判断/);
+  assert.match(js, /aiAnalysisStatus/);
+  assert.match(js, /narrativeStrength/);
+  assert.match(js, /memePotential/);
+  assert.match(js, /candidate\?\.security/);
+  assert.match(js, /\/api\/ai\/news-trade/);
+  assert.match(js, /requestVisibleNewsTradeAi/);
+  assert.match(css, /\.news-trade-ai-analysis/);
+  assert.match(css, /\.news-trade-ai-analysis\.is-pending/);
+});

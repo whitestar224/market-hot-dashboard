@@ -23,6 +23,12 @@ const MAX_CASES = Math.max(0, Number(process.argv.find((arg) => arg.startsWith("
 const OUTPUT_ROOT = path.join(ROOT, ".runtime-cache", "dragon-wave-precomputed", STRATEGY_VERSION);
 const MANIFEST_PATH = path.join(OUTPUT_ROOT, "manifest.json");
 const LOCK_PATH = path.join(ROOT, ".runtime-cache", "dragon-wave-precomputed", `${STRATEGY_VERSION}.lock`);
+const REQUEST_ROOT = path.join(ROOT, ".runtime-cache", "dragon-wave-precomputed", `${STRATEGY_VERSION}.requests`);
+const LOCAL_ARCHIVE_CACHE = new Map();
+const LOCAL_ARCHIVE_DIRS = [
+  path.join(ROOT, ".runtime-cache", "confirmed-native-audit-candles"),
+  path.join(ROOT, ".runtime-cache", "strategy-issue-candles"),
+];
 
 global.location = { hostname: "127.0.0.1" };
 const nativeFetch = global.fetch;
@@ -98,6 +104,81 @@ function releaseLock() {
   try { fs.rmSync(LOCK_PATH, { force: true }); } catch (_error) { /* best effort */ }
 }
 
+function priorityRequests() {
+  let names = [];
+  try {
+    names = fs.readdirSync(REQUEST_ROOT).filter((name) => /^[0-9a-f]{64}\.json$/.test(name));
+  } catch (_error) {
+    return [];
+  }
+  const requests = [];
+  names.forEach((name) => {
+    const filePath = path.join(REQUEST_ROOT, name);
+    try {
+      const request = JSON.parse(fs.readFileSync(filePath, "utf8"));
+      const item = cases.find((candidate) => candidate.valid
+        && Data.normalizePair(candidate.pair) === Data.normalizePair(request.pair)
+        && candidate.start === request.start
+        && candidate.end === request.end);
+      if (item) requests.push({
+        filePath,
+        item,
+        interval: INTERVALS.includes(request.interval) ? request.interval : "",
+        priority: Math.max(0, Number(request.priority || 0)),
+        requestedAt: Number(request.requestedAt || 0),
+      });
+      else fs.rmSync(filePath, { force: true });
+    } catch (_error) {
+      try { fs.rmSync(filePath, { force: true }); } catch (_removeError) { /* best effort */ }
+    }
+  });
+  return requests.sort((left, right) => right.priority - left.priority || right.requestedAt - left.requestedAt);
+}
+
+async function buildCaseSafely(
+  item,
+  manifest,
+  position,
+  total,
+  preferredIntervals = [],
+  onlyPreferred = false,
+  afterInterval = null,
+) {
+  try {
+    return await buildCase(
+      item,
+      manifest,
+      position,
+      total,
+      preferredIntervals,
+      onlyPreferred,
+      afterInterval,
+    );
+  } catch (error) {
+    process.stderr.write(`[${position}/${total}] ${item.symbol} 预计算失败：${error?.stack || error}\n`);
+    return { built: 0, skipped: 0, failed: onlyPreferred ? preferredIntervals.length : INTERVALS.length };
+  }
+}
+
+async function drainPriorityRequests(manifest, totals) {
+  const queued = priorityRequests();
+  if (!queued.length) return;
+  // Keep each requested interval independently schedulable. Grouping all periods
+  // of one symbol made a long 5m history block confirmed 1h/4h points elsewhere.
+  for (const entry of queued) {
+    const preferredIntervals = entry.interval ? [entry.interval] : [];
+    const result = await buildCaseSafely(entry.item, manifest, "优先", queued.length, preferredIntervals, true);
+    totals.built += result.built;
+    totals.skipped += result.skipped;
+    totals.failed += result.failed;
+    try {
+      fs.unlinkSync(entry.filePath);
+    } catch (error) {
+      if (error?.code !== "ENOENT") process.stderr.write(`无法清理优先请求 ${entry.filePath}：${error?.message || error}\n`);
+    }
+  }
+}
+
 const SOFT_VISUAL_FILTERS = [
   /母结构尚未成熟/,
   /突破前未贴近关键位蓄力/,
@@ -148,9 +229,64 @@ function compactExistingRecords(manifest) {
   console.log(`现有本地结果压缩完成：${compacted} 个周期。`);
 }
 
+function readArchive(filePath) {
+  if (LOCAL_ARCHIVE_CACHE.has(filePath)) return LOCAL_ARCHIVE_CACHE.get(filePath);
+  try {
+    const value = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    LOCAL_ARCHIVE_CACHE.set(filePath, value);
+    return value;
+  } catch (_error) {
+    LOCAL_ARCHIVE_CACHE.set(filePath, null);
+    return null;
+  }
+}
+
+function localArchivePaths(item) {
+  const pair = Data.normalizePair(item.pair);
+  const paths = [];
+  const fullAudit = path.join(ROOT, ".runtime-cache", `${item.symbol.toLowerCase()}-full-audit.json`);
+  if (fs.existsSync(fullAudit)) paths.push(fullAudit);
+  LOCAL_ARCHIVE_DIRS.forEach((directory) => {
+    try {
+      fs.readdirSync(directory)
+        .filter((name) => name.toUpperCase().startsWith(`${pair}-`) && name.toLowerCase().endsWith(".json"))
+        .forEach((name) => paths.push(path.join(directory, name)));
+    } catch (_error) {
+      // Local audit archives are opportunistic; network fallback remains available.
+    }
+  });
+  return [...new Set(paths)];
+}
+
+function readLocalArchivedCandles(item, interval) {
+  const window = Data.buildCaseWindow(item.start, item.end, interval);
+  const byTime = new Map();
+  let provider = "";
+  localArchivePaths(item).forEach((filePath) => {
+    const archive = readArchive(filePath);
+    if (!archive || Data.normalizePair(archive.pair) !== Data.normalizePair(item.pair)) return;
+    const intervalValue = archive.intervals?.[interval];
+    const candles = Array.isArray(intervalValue) ? intervalValue : intervalValue?.candles;
+    if (!Array.isArray(candles)) return;
+    provider ||= archive.provider || "local";
+    candles.forEach((candle) => {
+      const time = Number(candle?.time);
+      if (Number.isFinite(time) && time >= window.start && time <= window.end) byTime.set(time, candle);
+    });
+  });
+  const candles = [...byTime.values()].sort((left, right) => left.time - right.time);
+  if (!Data.isCandleCoverageAcceptable(candles, window, interval)) return null;
+  return {
+    candles,
+    venue: { id: "local-archive", provider: provider || "local", market: "futures", label: "本机K线库" },
+    attempts: [],
+    coverage: Data.assessCandleCoverage(candles, window, interval),
+  };
+}
+
 async function fetchAndAnalyze(item, interval) {
   const window = Data.buildCaseWindow(item.start, item.end, interval);
-  const payload = await Data.fetchCandles({
+  const payload = readLocalArchivedCandles(item, interval) || await Data.fetchCandles({
     pair: item.pair,
     interval,
     provider: "auto",
@@ -170,24 +306,48 @@ async function fetchAndAnalyze(item, interval) {
   return { interval, rawResult, venue: payload.venue, attempts: payload.attempts || [], coverage: payload.coverage };
 }
 
-async function buildCase(item, manifest, position, total) {
-  const missingIntervals = INTERVALS.filter((interval) => !recordUsable(manifest, item, interval));
-  if (!missingIntervals.length) {
-    process.stdout.write(`[${position}/${total}] ${item.symbol} 已缓存\n`);
-    return { built: 0, skipped: INTERVALS.length, failed: 0 };
-  }
-  const loaded = [];
-  const failures = [];
-  // Parallel network reads, then one deterministic cross-timeframe gate.
-  await Promise.all(missingIntervals.map(async (interval) => {
-    try {
-      loaded.push(await fetchAndAnalyze(item, interval));
-    } catch (error) {
-      failures.push({ interval, message: error?.message || String(error) });
-    }
-  }));
-  const gated = new Map(Engine.applyContextGates(
-    loaded.map((entry) => entry.rawResult),
+function storeAnalyzedEntry(item, manifest, entry, result) {
+  const key = cacheKey(item, entry.interval);
+  const file = fileNameFor(key);
+  const value = {
+    schema: 1,
+    version: STRATEGY_VERSION,
+    generatedAt: Date.now(),
+    key,
+    pair: Data.normalizePair(item.pair),
+    symbol: item.symbol,
+    start: item.start,
+    end: item.end,
+    interval: entry.interval,
+    market: "futures",
+    mainWaveStage: "active",
+    venue: entry.venue,
+    attempts: entry.attempts,
+    coverage: entry.coverage,
+    result: compactResultForDashboard(result || entry.rawResult),
+  };
+  const compressed = zlib.gzipSync(Buffer.from(JSON.stringify(value)), { level: 6 });
+  atomicWrite(path.join(OUTPUT_ROOT, file), compressed);
+  manifest.records[key] = {
+    file,
+    pair: value.pair,
+    symbol: item.symbol,
+    start: item.start,
+    end: item.end,
+    interval: entry.interval,
+    market: value.market,
+    mainWaveStage: value.mainWaveStage,
+    venue: entry.venue?.label || "",
+    candleCount: value.result?.candles?.length || 0,
+    bytes: compressed.length,
+    generatedAt: value.generatedAt,
+    compactSchema: 1,
+  };
+}
+
+function contextGate(entries) {
+  return new Map(Engine.applyContextGates(
+    entries.map((entry) => entry.rawResult),
     [],
     {
       preselectedLeader: true,
@@ -196,43 +356,55 @@ async function buildCase(item, manifest, position, total) {
       mainWaveContextLabel: "龙头默认主升浪环境",
     },
   ).map((result) => [result.interval, result]));
+}
+
+async function buildCase(
+  item,
+  manifest,
+  position,
+  total,
+  preferredIntervals = [],
+  onlyPreferred = false,
+  afterInterval = null,
+) {
+  const eligibleIntervals = onlyPreferred
+    ? preferredIntervals.filter((interval) => INTERVALS.includes(interval))
+    : INTERVALS;
+  const missingIntervals = eligibleIntervals.filter((interval) => !recordUsable(manifest, item, interval));
+  if (!missingIntervals.length) {
+    process.stdout.write(`[${position}/${total}] ${item.symbol} 已缓存\n`);
+    return { built: 0, skipped: eligibleIntervals.length, failed: 0 };
+  }
+  const loaded = [];
+  const failures = [];
+  const preferred = [...new Set([...preferredIntervals, "1h"])]
+    .filter((interval) => missingIntervals.includes(interval));
+  const remaining = missingIntervals.filter((interval) => !preferred.includes(interval));
+  const loadAndStore = async (interval) => {
+    try {
+      const entry = await fetchAndAnalyze(item, interval);
+      loaded.push(entry);
+      // The requested/primary interval is written as soon as it is ready. The final
+      // pass below overwrites it with the complete five-timeframe gate.
+      const partialGate = contextGate(loaded);
+      storeAnalyzedEntry(item, manifest, entry, partialGate.get(interval));
+      writeManifest(manifest);
+      process.stdout.write(`[${position}/${total}] ${item.symbol} ${interval} 已落盘 ${entry.rawResult.candles.length} 根\n`);
+    } catch (error) {
+      failures.push({ interval, message: error?.message || String(error) });
+    }
+  };
+  // Full-catalog warming is intentionally sequential. A long historical symbol
+  // must not occupy every fetch/worker slot while the user is waiting for another
+  // symbol. After every interval is persisted, service the newest dashboard
+  // request before continuing the low-priority warm-up.
+  for (const interval of [...preferred, ...remaining]) {
+    await loadAndStore(interval);
+    if (!onlyPreferred && typeof afterInterval === "function") await afterInterval();
+  }
+  const gated = contextGate(loaded);
   for (const entry of loaded) {
-    const key = cacheKey(item, entry.interval);
-    const file = fileNameFor(key);
-    const value = {
-      schema: 1,
-      version: STRATEGY_VERSION,
-      generatedAt: Date.now(),
-      key,
-      pair: Data.normalizePair(item.pair),
-      symbol: item.symbol,
-      start: item.start,
-      end: item.end,
-      interval: entry.interval,
-      market: "futures",
-      mainWaveStage: "active",
-      venue: entry.venue,
-      attempts: entry.attempts,
-      coverage: entry.coverage,
-      result: compactResultForDashboard(gated.get(entry.interval) || entry.rawResult),
-    };
-    const compressed = zlib.gzipSync(Buffer.from(JSON.stringify(value)), { level: 6 });
-    atomicWrite(path.join(OUTPUT_ROOT, file), compressed);
-    manifest.records[key] = {
-      file,
-      pair: value.pair,
-      symbol: item.symbol,
-      start: item.start,
-      end: item.end,
-      interval: entry.interval,
-      market: value.market,
-      mainWaveStage: value.mainWaveStage,
-      venue: entry.venue?.label || "",
-      candleCount: value.result?.candles?.length || 0,
-      bytes: compressed.length,
-      generatedAt: value.generatedAt,
-      compactSchema: 1,
-    };
+    storeAnalyzedEntry(item, manifest, entry, gated.get(entry.interval));
   }
   writeManifest(manifest);
   const detail = loaded.map((entry) => `${entry.interval}:${entry.rawResult.candles.length}`).join(" ");
@@ -258,14 +430,46 @@ async function main() {
     let selected = cases.filter((item) => item.valid && (!SYMBOL_FILTER.size || SYMBOL_FILTER.has(item.symbol)));
     if (MAX_CASES) selected = selected.slice(0, MAX_CASES);
     const totals = { built: 0, skipped: 0, failed: 0 };
+    manifest.status = {
+      state: "running",
+      pid: process.pid,
+      startedAt: Date.now(),
+      totalCases: selected.length,
+      processedCases: 0,
+      intervals: INTERVALS,
+    };
+    writeManifest(manifest);
+    await drainPriorityRequests(manifest, totals);
     for (let index = 0; index < selected.length; index += 1) {
-      const result = await buildCase(selected[index], manifest, index + 1, selected.length);
+      const result = await buildCaseSafely(
+        selected[index],
+        manifest,
+        index + 1,
+        selected.length,
+        [],
+        false,
+        () => drainPriorityRequests(manifest, totals),
+      );
       totals.built += result.built;
       totals.skipped += result.skipped;
       totals.failed += result.failed;
+      manifest.status.processedCases = index + 1;
+      manifest.status.updatedAt = Date.now();
+      writeManifest(manifest);
+      await drainPriorityRequests(manifest, totals);
       // 后台预热让出一点 CPU，避免用户正在看盘或确认买点时被批量分析抢占。
       await new Promise((resolve) => setTimeout(resolve, 300));
     }
+    await drainPriorityRequests(manifest, totals);
+    manifest.status = {
+      ...manifest.status,
+      state: "complete",
+      finishedAt: Date.now(),
+      built: totals.built,
+      skipped: totals.skipped,
+      failed: totals.failed,
+      recordCount: Object.keys(manifest.records || {}).length,
+    };
     writeManifest(manifest);
     console.log(`预计算结束：新增 ${totals.built}，复用 ${totals.skipped}，失败 ${totals.failed}。`);
   } finally {

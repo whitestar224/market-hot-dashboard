@@ -3,8 +3,10 @@
   const CACHE_KEY = "xingyun:deepseek-rank-insights:v6";
   const CACHE_TTL_MS = 12 * 60 * 60 * 1000;
   const CACHE_LIMIT = 700;
+  const REQUEST_BATCH_ROWS = 24;
   const state = {
     insights: new Map(),
+    pendingKeys: new Set(),
     pending: false,
     lastSignature: "",
     disabledUntil: 0
@@ -61,6 +63,28 @@
     return JSON.stringify(payload);
   }
 
+  function sourceBatches(sources, maxRows = REQUEST_BATCH_ROWS) {
+    const batches = [];
+    let current = [];
+    let count = 0;
+    (Array.isArray(sources) ? sources : []).forEach((source) => {
+      let rows = Array.isArray(source.rows) ? source.rows.slice() : [];
+      while (rows.length) {
+        const room = Math.max(1, maxRows - count);
+        const chunk = rows.splice(0, room);
+        current.push({ ...source, rows: chunk });
+        count += chunk.length;
+        if (count >= maxRows) {
+          batches.push(current);
+          current = [];
+          count = 0;
+        }
+      }
+    });
+    if (current.length) batches.push(current);
+    return batches;
+  }
+
   function normalizeInsight(item) {
     if (!item || !item.detail) return null;
     if (isEmptyInsight(item.reason) || isEmptyInsight(item.theme) || isEmptyInsight(item.detail)) return null;
@@ -71,6 +95,13 @@
       tone: item.tone === "is-hot" ? "is-hot" : "",
       provider: item.provider || "deepseek"
     };
+  }
+
+  function providerLabel(provider) {
+    const value = stableText(provider, 30).toLowerCase();
+    if (value === "codex-cli") return "Codex";
+    if (value === "taxonomy" || value === "rules") return "规则";
+    return "AI";
   }
 
   function loadPersistedInsights() {
@@ -134,38 +165,45 @@
     if (signature === state.lastSignature) return;
     state.pending = true;
     state.lastSignature = signature;
+    compact.forEach((source) => source.rows.forEach((row) => state.pendingKeys.add(row.key)));
+    if (typeof options.onUpdate === "function") options.onUpdate();
     try {
-      const response = await fetch(API_URL, {
-        method: "POST",
-        cache: "no-store",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok || data.ok === false || data.enabled === false) {
-        state.disabledUntil = Date.now() + 5 * 60 * 1000;
-        return;
-      }
-      const insights = data.insights && typeof data.insights === "object" ? data.insights : {};
       let changed = false;
-      compact.forEach((source) => {
-        source.rows.forEach((row) => {
-          if (state.insights.delete(row.key)) changed = true;
+      for (const batch of sourceBatches(compact)) {
+        const response = await fetch(API_URL, {
+          method: "POST",
+          cache: "no-store",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mode, sources: batch })
         });
-      });
-      Object.entries(insights).forEach(([key, value]) => {
-        const insight = normalizeInsight(value);
-        if (!insight) return;
-        state.insights.set(key, insight);
-        changed = true;
-      });
-      if (changed) persistInsights();
-      if (changed && typeof options.onUpdate === "function") options.onUpdate();
+        const data = await response.json().catch(() => ({}));
+        const batchKeys = batch.flatMap((source) => source.rows.map((row) => row.key));
+        batchKeys.forEach((key) => state.pendingKeys.delete(key));
+        if (!response.ok || data.ok === false || data.enabled === false) {
+          state.disabledUntil = Date.now() + 5 * 60 * 1000;
+          if (typeof options.onUpdate === "function") options.onUpdate();
+          break;
+        }
+        const insights = data.insights && typeof data.insights === "object" ? data.insights : {};
+        batchKeys.forEach((key) => {
+          if (state.insights.delete(key)) changed = true;
+        });
+        Object.entries(insights).forEach(([key, value]) => {
+          const insight = normalizeInsight(value);
+          if (!insight) return;
+          state.insights.set(key, insight);
+          changed = true;
+        });
+        if (changed) persistInsights();
+        if (typeof options.onUpdate === "function") options.onUpdate();
+      }
     } catch (error) {
       state.disabledUntil = Date.now() + 90_000;
       console.warn("DeepSeek rank insights failed", error);
     } finally {
+      compact.forEach((source) => source.rows.forEach((row) => state.pendingKeys.delete(row.key)));
       state.pending = false;
+      if (typeof options.onUpdate === "function") options.onUpdate();
     }
   }
 
@@ -179,7 +217,11 @@
     return insight;
   }
 
+  function isPending(row, context = {}) {
+    return state.pendingKeys.has(rowKey(row, context.source || row?.source || {}, context.mode || "hot"));
+  }
+
   loadPersistedInsights();
 
-  window.XingyunAiInsights = { requestForSources, getRowInsight, rowKey, shouldDeferFallback };
+  window.XingyunAiInsights = { requestForSources, getRowInsight, isPending, rowKey, shouldDeferFallback, providerLabel };
 })();

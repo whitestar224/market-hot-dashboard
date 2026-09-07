@@ -157,6 +157,39 @@ class PriceWatchFibonacciStructureTests(unittest.TestCase):
         self.assertEqual(result["swingHigh"], 0.062)
         self.assertGreater(result["impulseGainPct"], 100)
 
+    def test_index_like_late_acceleration_keeps_the_full_wave_base(self):
+        values = [
+            (0.00621, 0.00340, 0.00502),  # Full-wave launch base.
+            (0.00585, 0.00438, 0.00479),
+            (0.00729, 0.00469, 0.00673),
+            (0.00972, 0.00669, 0.00823),
+            (0.00913, 0.00681, 0.00688),
+            (0.02423, 0.00576, 0.01789),
+            (0.02207, 0.01441, 0.01480),
+            (0.02351, 0.01471, 0.01692),
+            (0.02553, 0.01389, 0.02319),
+            (0.02913, 0.02027, 0.02319),
+            (0.02537, 0.01715, 0.02252),
+            (0.03062, 0.01503, 0.02630),  # Secondary acceleration, not launch.
+            (0.04187, 0.02505, 0.02900),
+            (0.03567, 0.02245, 0.03202),
+            (0.03308, 0.02087, 0.02665),
+            (0.04863, 0.02306, 0.04765),
+            (0.07626, 0.04609, 0.07387),
+            (0.07605, 0.04435, 0.04797),
+            (0.06324, 0.04105, 0.04928),
+            (0.05444, 0.03453, 0.04979),
+            (0.05073, 0.04376, 0.04425),
+        ]
+
+        result = server.price_watch_fib_structure(daily_candles(values), 0.04425)
+
+        self.assertTrue(result["candidate"])
+        self.assertEqual(result["launchLow"], 0.0034)
+        self.assertEqual(result["launchMethod"], "cycle-base")
+        self.assertAlmostEqual(result["level0618"], 0.03123252, places=6)
+
+
     def test_uses_strong_departure_low_for_btw_current_main_leg(self):
         values = [
             (0.20510, 0.07589, 0.13325),

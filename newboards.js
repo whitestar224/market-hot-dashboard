@@ -406,7 +406,8 @@ function renderInsight(row, board, rank) {
   );
   if (!insight) return "";
   const tone = insight.tone === "is-hot" ? " is-hot" : "";
-  return `<em class="row-insight-text${tone}" title="${escapeHtml(insight.detail)}">${escapeHtml(insight.detail)}</em>`;
+  const provider = window.XingyunAiInsights?.providerLabel?.(insight.provider) || "规则";
+  return `<em class="row-insight-text${tone}" title="${escapeHtml(`${provider} 分析 · ${insight.detail}`)}"><b>${escapeHtml(provider)}</b>${escapeHtml(insight.detail)}</em>`;
 }
 
 function renderCoinRow(row, rank, board) {

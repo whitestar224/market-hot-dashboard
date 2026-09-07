@@ -7,6 +7,54 @@ import server
 
 
 class MarketAlertSpeechTests(unittest.TestCase):
+    def test_undated_x_rows_are_not_replayed_as_fresh_alerts(self):
+        payload = {
+            "updatedAt": 1_800_000_000_000,
+            "sources": [{"id": "kol", "displayName": "Old KOL", "handle": "old_kol"}],
+            "items": [{
+                "id": "old-row",
+                "sourceId": "kol",
+                "text": "an old cached post",
+                "url": "https://x.com/old_kol/status/2096555530281959754",
+            }],
+        }
+
+        self.assertEqual(server.parse_site_x_kol_events(payload), [])
+
+    def test_x_popup_feed_uses_short_freshness_window(self):
+        feed = next(row for row in server.site_alert_feeds() if row["name"] == "x-kol")
+
+        self.assertEqual(feed["maxAgeMs"], server.X_KOL_DESKTOP_ALERT_MAX_AGE_MS)
+        self.assertLessEqual(feed["maxAgeMs"], 15 * 60 * 1000)
+
+    def test_x_project_roles_are_explicit_in_alert_title_and_speech(self):
+        payload = {
+            "updatedAt": 1_800_000_000_000,
+            "sources": [
+                {"id": "official", "handle": "project_xyz", "displayName": "Project XYZ", "category": "project_official"},
+                {"id": "founder", "handle": "alice_xyz", "displayName": "Alice", "category": "founder"},
+                {"id": "kol", "handle": "watcher", "displayName": "Watcher", "category": "kol"},
+            ],
+            "items": [
+                {"id": "1", "sourceId": "official", "text": "Meet our new mascot", "publishedAt": 1_800_000_000_000},
+                {"id": "2", "sourceId": "founder", "text": "I named the character LOBSTER", "publishedAt": 1_800_000_000_000},
+                {"id": "3", "sourceId": "kol", "text": "Market observation", "publishedAt": 1_800_000_000_000},
+            ],
+        }
+
+        official, founder, kol = server.parse_site_x_kol_events(payload)
+
+        self.assertTrue(official["title"].startswith("【项目官方】Project XYZ："))
+        self.assertTrue(official["speech"].startswith("项目官方发布，Project XYZ："))
+        self.assertEqual(official["xCategory"], "project_official")
+        self.assertEqual(official["queuePriority"], 80)
+        self.assertTrue(founder["title"].startswith("【创始人/联合创始人】Alice："))
+        self.assertTrue(founder["speech"].startswith("项目创始人或联合创始人发布，Alice："))
+        self.assertEqual(founder["xCategory"], "founder")
+        self.assertEqual(founder["queuePriority"], 82)
+        self.assertFalse(kol["title"].startswith("【"))
+        self.assertEqual(kol["speech"], "")
+
     def test_aster_contract_rows_keep_perpetual_and_pending_contracts(self):
         class Response:
             def json(self):
@@ -273,6 +321,88 @@ class MarketAlertSpeechTests(unittest.TestCase):
         self.assertEqual(new_event["speech"], "榜单新进，HYPE 新进入热门榜前十。")
         self.assertNotIn("speech", rank_event)
 
+    def test_binance_wallet_new_entry_uses_contract_identity_and_specific_speech(self):
+        source = {
+            "id": "binance-wallet-hot",
+            "title": "币安钱包热门榜",
+            "sourceLabel": "BW",
+            "group": "crypto",
+            "period": "24h",
+            "periodLabel": "24 小时",
+        }
+        row = {
+            "rank": 3,
+            "symbol": "我的女友景甜",
+            "name": "我的女友景甜",
+            "chain": "56",
+            "chainLabel": "BSC",
+            "contractAddress": "0xFf673079235560e4de3fe4554c9981d759Af7777",
+            "url": "https://web3.binance.com/en/token/bsc/0xff673079235560e4de3fe4554c9981d759af7777",
+        }
+
+        snapshot = server.rank_monitor_snapshot(source, row, 2, "hot")
+        event = server.rank_monitor_event("hot", snapshot, "new")
+
+        self.assertEqual(snapshot["assetKey"], "WALLET:56:0xff673079235560e4de3fe4554c9981d759af7777")
+        self.assertEqual(event["kind"], "币安钱包24小时热门榜新进")
+        self.assertEqual(event["title"], "币安钱包24小时热门榜新进：我的女友景甜")
+        self.assertEqual(event["speech"], "币安钱包热门榜新进，我的女友景甜 新进入24小时热门榜前十。")
+        self.assertEqual(event["url"], row["url"])
+        self.assertEqual(event["queuePriority"], 74)
+
+    def test_binance_wallet_monitor_baselines_then_broadcasts_every_new_top_ten_entry(self):
+        def source(rows):
+            return {
+                "id": "binance-wallet-hot",
+                "title": "币安钱包热门榜",
+                "sourceLabel": "BW",
+                "group": "crypto",
+                "period": "24h",
+                "periodLabel": "24 小时",
+                "status": "ok",
+                "rows": rows,
+            }
+
+        old_row = {
+            "rank": 1,
+            "symbol": "FONE",
+            "chain": "CT_501",
+            "contractAddress": "So11111111111111111111111111111111111111112",
+        }
+        first_new = {
+            "rank": 2,
+            "symbol": "我的女友景甜",
+            "chain": "56",
+            "contractAddress": "0xff673079235560e4de3fe4554c9981d759af7777",
+        }
+        second_new = {
+            "rank": 3,
+            "symbol": "NEWMEME",
+            "chain": "8453",
+            "contractAddress": "0x1111111111111111111111111111111111111111",
+        }
+        with (
+            TemporaryDirectory() as directory,
+            patch.object(
+                server,
+                "BINANCE_WALLET_HOT_ALERT_STATE_PATH",
+                Path(directory) / "binance-wallet-hot-alert-state.json",
+            ),
+            patch.object(server, "launch_desktop_alert") as launch_alert,
+        ):
+            with patch.object(server.time, "time", return_value=1_800_000_000):
+                events = server.sync_binance_wallet_hot_alert_feed(source([old_row]))
+            self.assertEqual(events, [])
+            self.assertEqual(launch_alert.call_count, 0)
+            with patch.object(server.time, "time", return_value=1_800_000_031):
+                events = server.sync_binance_wallet_hot_alert_feed(source([old_row, first_new, second_new]))
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(launch_alert.call_count, 2)
+        titles = {call.args[0]["title"] for call in launch_alert.call_args_list}
+        self.assertIn("币安钱包24小时热门榜新进：我的女友景甜", titles)
+        self.assertIn("币安钱包24小时热门榜新进：NEWMEME", titles)
+
     def test_stock_rank_new_entry_uses_company_name(self):
         row = {
             "key": "futu-us:US:NVDA",
@@ -506,82 +636,6 @@ class MarketAlertSpeechTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["leaders"], 0)
         self.assertEqual(payload["maps"], [])
 
-    def test_rotation_map_adds_recent_aicoin_hot_coin_only_when_it_is_low(self):
-        now_ms = 1_800_000_000_000
-        launch_at = now_ms - 5 * 24 * 60 * 60 * 1000
-        market = {
-            "sources": [
-                {
-                    "id": "binance",
-                    "title": "Binance 热门币种",
-                    "rows": [{"rank": 1, "symbol": "LEAD", "name": "Leader", "change": "+40%"}],
-                }
-            ]
-        }
-        tickers = {
-            "LEAD": {
-                "symbol": "LEAD",
-                "priceValue": 4.2,
-                "changeValue": 40,
-                "turnoverValue": 20_000_000,
-                "exchange": "Binance Futures",
-                "marketSymbol": "LEADUSDT",
-            },
-            "FRESH": {
-                "symbol": "FRESH",
-                "priceValue": 0.15,
-                "changeValue": 2,
-                "turnoverValue": 2_000_000,
-                "exchange": "OKX Futures",
-                "marketSymbol": "FRESH-USDT-SWAP",
-            },
-            "HIGH": {
-                "symbol": "HIGH",
-                "priceValue": 0.98,
-                "changeValue": 12,
-                "turnoverValue": 3_000_000,
-                "exchange": "Bitget Futures",
-                "marketSymbol": "HIGHUSDT",
-            },
-        }
-
-        payload = server.rotation_map_payload(
-            market=market,
-            tickers=tickers,
-            leader_metrics={
-                "LEAD": {
-                    "impulseGainPct": 420,
-                    "launchLow": 1,
-                    "swingHigh": 5.2,
-                    "launchAt": launch_at,
-                }
-            },
-            candidate_metrics={
-                "FRESH": {
-                    "name": "Fresh Coin",
-                    "firstSeenAt": now_ms - 2 * 24 * 60 * 60 * 1000,
-                    "lastSeenAt": now_ms - 60_000,
-                    "distancePct": 35,
-                    "recentNew": True,
-                },
-                "HIGH": {
-                    "name": "High Coin",
-                    "firstSeenAt": now_ms - 2 * 24 * 60 * 60 * 1000,
-                    "lastSeenAt": now_ms - 60_000,
-                    "distancePct": 4,
-                    "recentNew": True,
-                },
-            },
-            gainer_history=[],
-            now_ms=now_ms,
-        )
-
-        candidates = {item["symbol"]: item for item in payload["maps"][0]["candidates"]}
-        self.assertIn("FRESH", candidates)
-        self.assertNotIn("HIGH", candidates)
-        self.assertIn("recent-hot-low", candidates["FRESH"]["signals"])
-        self.assertTrue(any("较 7 日高点低 35.0%" in reason for reason in candidates["FRESH"]["reasons"]))
-
     def test_rotation_map_adds_only_gainer_leaders_observed_after_leader_launch(self):
         now_ms = 1_800_000_000_000
         launch_at = now_ms - 2 * 24 * 60 * 60 * 1000
@@ -617,7 +671,6 @@ class MarketAlertSpeechTests(unittest.TestCase):
                     "launchAt": launch_at,
                 }
             },
-            candidate_metrics={},
             gainer_history=[
                 {
                     "assetKey": "CRYPTO:TOP",
@@ -642,7 +695,7 @@ class MarketAlertSpeechTests(unittest.TestCase):
         self.assertNotIn("OLD", candidates)
         self.assertIn("post-leader-gainer-top", candidates["TOP"]["signals"])
 
-    def test_rotation_map_merges_family_hot_low_and_gainer_evidence(self):
+    def test_rotation_map_merges_family_and_gainer_evidence(self):
         now_ms = 1_800_000_000_000
         launch_at = now_ms - 2 * 24 * 60 * 60 * 1000
         market = {
@@ -684,15 +737,6 @@ class MarketAlertSpeechTests(unittest.TestCase):
                     "launchAt": launch_at,
                 }
             },
-            candidate_metrics={
-                "TST": {
-                    "name": "Test Token",
-                    "firstSeenAt": now_ms - 24 * 60 * 60 * 1000,
-                    "lastSeenAt": now_ms - 60_000,
-                    "distancePct": 28,
-                    "recentNew": True,
-                }
-            },
             gainer_history=[
                 {
                     "assetKey": "CRYPTO:TST",
@@ -709,7 +753,7 @@ class MarketAlertSpeechTests(unittest.TestCase):
         self.assertEqual(len(matches), 1)
         self.assertEqual(
             set(matches[0]["signals"]),
-            {"family", "recent-hot-low", "post-leader-gainer-top"},
+            {"family", "post-leader-gainer-top"},
         )
 
     def test_gainer_leader_history_baselines_then_records_real_change(self):

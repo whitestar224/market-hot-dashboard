@@ -318,6 +318,9 @@
     const mode = context.mode || "";
     const aiInsight = window.XingyunAiInsights?.getRowInsight(row, { source, rank, mode });
     if (aiInsight?.detail) return aiInsight;
+    if (window.XingyunAiInsights?.isPending?.(row, { source, rank, mode })) {
+      return { reason: "AI", theme: "", tone: "", detail: "正在分析题材", provider: "pending" };
+    }
     if (window.XingyunAiInsights?.shouldDeferFallback?.(row, { source, rank, mode })) return null;
     const imp = importance(row, source, rank, mode);
     if (!imp.ok) return null;

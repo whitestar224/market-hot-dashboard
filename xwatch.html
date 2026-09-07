@@ -9,7 +9,7 @@
     <link rel="apple-touch-icon" sizes="180x180" href="./assets/apple-touch-icon.png?v=2" />
     <link rel="manifest" href="./site.webmanifest" />
     <script src="./desktop_adapter.js?v=1"></script>
-    <link rel="stylesheet" href="./styles.css?v=53" />
+    <link rel="stylesheet" href="./styles.css?v=54" />
   </head>
   <body>
     <main class="app-shell xwatch-shell">
@@ -82,6 +82,16 @@
               <input id="xwatchName" type="text" placeholder="可选" autocomplete="off" />
             </label>
             <label>
+              <span>分类</span>
+              <select id="xwatchCategory">
+                <option value="kol">普通KOL</option>
+                <option value="celebrity">明星</option>
+                <option value="notable">名人</option>
+                <option value="founder">项目创始人/联合创始人</option>
+                <option value="project_official">项目官方X</option>
+              </select>
+            </label>
+            <label>
               <span>关注词</span>
               <input id="xwatchKeywords" type="text" placeholder="只标记，不过滤" autocomplete="off" />
             </label>
@@ -104,6 +114,14 @@
               <span>搜索</span>
               <input id="xwatchSearch" type="search" placeholder="搜索内容 / KOL / 关键词" />
             </label>
+            <select id="xwatchCategoryFilter" aria-label="分类筛选">
+              <option value="all">全部分类</option>
+              <option value="kol">普通KOL</option>
+              <option value="celebrity">明星</option>
+              <option value="notable">名人</option>
+              <option value="founder">项目创始人/联合创始人</option>
+              <option value="project_official">项目官方X</option>
+            </select>
             <select id="xwatchSourceFilter" aria-label="KOL筛选">
               <option value="all">全部KOL</option>
             </select>
@@ -119,8 +137,8 @@
       </section>
     </main>
 
-    <script src="./auth.js?v=17"></script>
-    <script src="./xwatch.js?v=8"></script>
+    <script src="./auth.js?v=18"></script>
+    <script src="./xwatch.js?v=9"></script>
     <script src="./todo_reminder.js?v=2"></script>
   </body>
 </html>

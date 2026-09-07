@@ -1,13 +1,14 @@
-# 星云社 · 跨市场热榜雷达
+# 星云社 · 跨市场交易情报工作台
 
-> Local-first cross-market trading intelligence dashboard for crypto, stocks, RSS, X/KOL tracking, AI insights, and desktop alerts.
+> Local-first cross-market trading intelligence dashboard for crypto, stocks, on-chain markets, RSS, X/KOL tracking, News Trade, AI insights, and desktop alerts.
 
-星云社是一个面向交易员和信息流研究者的跨市场热榜仪表盘。它把加密货币交易所、链上 DEX、港股、美股、A 股、交易所上新、IPO、新股新币、律动快讯、RSS/公众号、X KOL 动态和 TodoList 聚合到同一套本地优先的工作台里。
+星云社是一个面向交易员和信息流研究者的本地优先交易情报工作台。它把中心化交易所、链上 DEX、币安钱包、港股、美股、A 股、交易所上新、News Trade、律动快讯、RSS/公众号、X/KOL 和群聊线索整合在同一套界面中，并将热榜标的继续送入多周期结构监控。
 
 如果这个项目对你有帮助，欢迎点一个 Star 支持一下，也欢迎加入 [Discord 社群](https://discord.gg/mKyCwtHW) 交流数据源、交易信息流自动化和产品建议。
 
-> **使用声明**：本项目仅供学习使用，如要商用，请获得本人授权；如需二次商业发行或作为商业服务的一部分使用，也请先获得作者本人授权。
-> **风险提示**：页面数据和 AI 分析仅作信息聚合与研究辅助，不构成任何投资建议。
+> **使用声明**：本项目仅供学习、研究和个人使用；商用、二次商业发行或作为商业服务的一部分使用前，请先获得作者本人授权。
+>
+> **风险提示**：页面数据、结构信号和 AI 分析仅作信息聚合与研究辅助，不构成投资建议。任何链上交易都应再次核对合约、报价、手续费、滑点和授权内容。
 
 ## 页面截图
 
@@ -27,24 +28,41 @@
 | --- |
 | <img src="assets/screenshots/rss.png" alt="星云社 RSS 订阅" width="100%"> |
 
+## 常用页面
+
+| 页面 | 路径 | 用途 |
+| --- | --- | --- |
+| 热门榜 | `/` | 独立热榜、币圈去重总榜、叙事强弱排序 |
+| 涨幅榜 | `/gainers.html` | 各市场涨幅排行 |
+| 成交额榜 | `/turnover.html` | 各市场成交额排行 |
+| 新币新股 | `/newboards.html` | 新币、新合约、Binance Alpha 与 IPO |
+| 上新播报 | `/listings.html` | 交易所和项目上新时间线 |
+| 监控中心 | `/price-watch.html` | News Trade、多周期结构、X、群聊与链上投研 |
+| 起爆台 | `/dragon-wave.html` | 结构策略与案例反馈 |
+| RSS / 公众号 | `/rss.html` | 订阅源和公众号信息流 |
+| TodoList | `/todo.html` | 本地任务与提醒 |
+
 ## 功能概览
 
-- **热门榜**：Binance、OKX、Bitget、AIcoin、OKX DEX、币安钱包、港股、美股、A 股同花顺热榜；各榜保持独立卡片和原有布局。
+- **热门榜**：Binance、OKX、Bitget、AIcoin、OKX DEX、币安钱包、港股、美股和 A 股热榜保持独立卡片；额外提供仅合并币圈标的的去重总榜，每页 10 个，不混入港美股或 A 股。
+- **叙事强弱排序**：支持近 1 小时、6 小时和 24 小时窗口，将近期热度与叙事证据结合后，在每个原始榜单内部重新排序，不改变各数据源的卡片布局。
+- **币安钱包热门榜**：默认展示 24 小时 Top 10，卡片右上角可切换 5 分钟、1 小时、4 小时和 24 小时；24 小时榜新进标的可触发播报，进入过 4 小时榜的标的会进入结构监控候选池。
 - **涨幅榜**：按交易所和市场拆分展示，不做混合榜；支持榜首异动提醒。
 - **成交额榜**：按交易所和市场独立展示资金最集中的标的。
-- **新币新股**：交易所新币、新合约、IPO、港美 A 新股集中展示，高热标的红色标注。
-- **上新 IPO**：按发布时间聚合交易所上新、合约上线、IPO 日历和上市动态。
+- **新币新股**：聚合交易所新币、新合约、Binance Alpha、Hyperliquid、trade.xyz、Aster，以及港美 A 新股；高热标的红色标注。
+- **上新 IPO**：按发布时间聚合交易所上新、合约上线、Binance Alpha、Aster 官方公告、IPO 日历和上市动态。
 - **律动快讯**：独立快讯流，支持重要市场信息桌面弹窗。
 - **自动简报**：读取自动化任务生成的交易简报，并支持 GitHub Raw JSON 兜底。
 - **RSS / 公众号**：支持 RSS、Atom、JSON Feed，以及参考 WeWe RSS 逻辑的微信公众号订阅。
-- **X KOL 追踪**：追踪指定 KOL 动态，正文和引用分开展示，支持桌面提醒。
-- **公链生态监控**：按 L0-L3 市场树跟踪新链生态、市场 Top5、潜在发币项目和高价值变化提醒，内置 Robinhood Chain 样例。
-- **多周期结构监控**：持续跟踪 AIcoin、个人 X 和币安钱包 4 小时榜入池标的；链上币按链 ID 与合约地址解析，低于 1000 万美元 24 小时成交额的标的统一剔除。
-- **News Trade**：按发布时间展示事件与链上标的，包含安全检查、手续费/滑点预估、钱包授权和人工确认后的买入准备流程。
+- **X 追踪**：监控源可分为普通 KOL、明星、名人、项目创始人/联合创始人和项目官方 X；正文与引用分开展示，官方或创始人发文会在播报中标明身份。
+- **群聊监控**：通过微信监控和本机 QQ OneBot 后台通道读取线索，只转发土狗、链上或项目相关信息；识别出的标的可送入结构监控，并可将原文转发到微信。
+- **链上投研**：按 L0-L3 市场树跟踪新链生态、市场 Top5、潜在发币项目和高价值变化提醒，所有层级均使用 AI 研判，内置 Robinhood Chain 样例。
+- **多周期结构监控**：持续跟踪 AIcoin、个人 X、群聊线索和币安钱包 4 小时榜入池标的；按 1 分钟、5 分钟、15 分钟、1 小时、4 小时和日线识别结构。链上币优先用链 ID 与合约地址定位，24 小时成交额低于 1000 万美元的标的统一剔除。
+- **News Trade**：按时间倒序展示事件卡片，突出涉及标的；包含 AI 叙事强度、Meme 潜力、催化、风险和应对建议，以及独立的事件热度、链上可交易性、安全检查、手续费/滑点预估和人工确认流程。
 - **TodoList**：项目分组、任务增删改查、今日提醒，按用户隔离数据。
 - **账号系统**：账号密码、邮箱验证码、Google OAuth，支持用户资料和交易所 UID 绑定。
-- **桌面弹窗**：市场异动、快讯、RSS、X 动态、Todo 提醒、公众号授权失效均可弹窗。
-- **AI 分析**：可接入 DeepSeek、OpenAI、Moonshot、Qwen、Claude、Gemini 等兼容模型做榜单叙事解析。
+- **桌面弹窗**：市场异动、结构信号、快讯、RSS、X 动态和 Todo 提醒可进入弹窗队列；新弹窗不会覆盖旧弹窗，过时信号不会在服务重启后集中补播。
+- **AI 分析**：可接入 DeepSeek、OpenAI、Moonshot、Qwen、Claude、Gemini 等兼容模型分析榜单与 News Trade；API 不可用时可切换到已登录的本机 Codex CLI，并在页面明确标出 `Codex`、`AI` 或 `规则` 来源。
 
 ## 返佣注册链接
 
@@ -73,7 +91,17 @@
 需要 Python 3.11+ 和 Node.js 18+。Node.js 用于运行与起爆台完全一致的结构策略引擎；缺少 Node.js 时，结构监控不会使用降级版或旧版规则。
 
 ```powershell
+git clone https://github.com/whitestar224/market-hot-dashboard.git
+Set-Location market-hot-dashboard
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+Copy-Item .env.example .env
+```
+
+启动本地服务：
+
+```powershell
 python server.py --host 127.0.0.1 --port 8765
 ```
 
@@ -142,11 +170,30 @@ docker compose down
 
 “监控 → 多周期结构”和起爆台共用仓库中的当前策略实现，不维护第二套监控专用规则。服务端通过 `tools/dragon_wave_monitor_bridge.js` 调用 `dragon-wave-engine.js`、`dragon-wave-cases.js`、`dragon-wave-data.js`、`dragon-wave-feedback.js` 和 `dragon-wave-vision.js`，因此后续策略优化会自动同步到结构监控。
 
-链上标的使用“链 ID + 合约地址”作为第一身份，行情按 Binance Wallet K 线、可选的 OKX OnchainOS DEX K 线、GeckoTerminal OHLCV 轮换；DexScreener 用于解析主池并聚合同一合约的流动性与 24 小时成交额。Robinhood Chain 的 `4663`、BSC、Ethereum、Base、Solana 等常用链均有显式映射。极新代币尚未形成日线时会保留已经可用的分钟、小时和 4 小时数据，不再因为单个周期历史不足让整张卡片失败。
+链上标的使用“链 ID + 合约地址”作为第一身份，行情按 Binance Wallet K 线、可选的 OKX OnchainOS DEX K 线、GeckoTerminal OHLCV 轮换；DexScreener 用于解析主池并聚合同一合约的流动性与 24 小时成交额。Robinhood Chain 的 `4663`、BSC、Ethereum、Base、Solana 等常用链均有显式映射。点击链上标的弹窗“查看”会使用合约地址直接打开对应的币安钱包 Token 页面。极新代币尚未形成日线时会保留已经可用的分钟、小时和 4 小时数据，不再因为单个周期历史不足让整张卡片失败。
 
 默认扫描 1 分钟、5 分钟、15 分钟、1 小时、4 小时和日线；1 小时、4 小时识别出的三角、降楔等有效结构突破按 B 点处理。主升浪或主升浪预期、人工反馈、多周期共振以及已确认案例的回归保护，也都由同一策略引擎统一判定。
 
 Docker 镜像已内置 Node.js；直接本地运行时请确保 `node --version` 可用，也可以通过 `DRAGON_WAVE_NODE_BINARY` 指定 Node.js 可执行文件。结构监控接口为 `/api/price-structures`，起爆台页面为 `/dragon-wave.html`。
+
+## News Trade 与 AI 分析
+
+News Trade 会将快讯、X、项目官方/创始人动态和链上热门标的聚合成主题卡，并按入池时间从新到旧排列。每张卡片将规则计算与 AI 判断分开显示：
+
+- **事件层**：事件热度、传播速度、跨平台扩散、大瓜、新奇反差、群体参与、符号传播和后续剧情。
+- **AI 层**：置信度、叙事强度、Meme 机会、核心判断、催化、风险和当前应对；当前页按需分析并缓存，等待期间显示“AI 分析中”。
+- **链上层**：候选标的关联度、流动性、成交量、交易笔数、合约安全和退出能力。
+- **执行层**：报价、网络费、平台费、跨链费、价格冲击、建议滑点和最低可得金额。AI 不会绕过安全检查、时效门槛或人工确认。
+
+模型 API 不可用时，开发环境可通过本机 Codex CLI 继续完成榜单与 News Trade 分析。备用进程使用临时只读目录，不浏览网页、不调用项目工具，也不会继承项目内的 API 密钥。分析结果会明确标记来源，便于区分模型输出和规则兜底。
+
+## X 与群聊信息流
+
+X 追踪优先使用用户配置的官方 API 实时流，并保留 RSS、FxTwitter 和公开时间线作为逐级备用源。官方实时流默认只用于 `X_KOL_PRIORITY_HANDLES`，避免把全部 KOL 都纳入付费读取；服务启动时可用一次近期历史读取补齐离线期间遗漏的个人账号动态。
+
+项目官方 X 和创始人/联合创始人的动态会带身份标签进入播报，并送入 News Trade 判断其是否存在潜在 Meme 机会。普通 KOL、明星和名人仍保持各自分类，不与项目方身份混淆。
+
+群聊监控只保留土狗、链上、代币或项目相关信息；闲聊不会转发。符合条件的 QQ/微信消息保留原文，提取到的标的可加入结构监控，并可按配置转发到微信目标会话。
 
 ## 配置说明
 
@@ -155,22 +202,35 @@ Docker 镜像已内置 Node.js；直接本地运行时请确保 `node --version`
 常用环境变量：
 
 - `XINGYUN_FIELD_ENCRYPTION_KEY`：本地数据库敏感字段加密密钥。
-- `DEEPSEEK_API_KEY` / `LLM_API_KEY`：AI 榜单分析。
+- `DEEPSEEK_API_KEY` / `LLM_API_KEY`：榜单和 News Trade AI 分析的首选 API。
+- `CODEX_CLI_FALLBACK`：本机 AI 备用通道，默认在开发环境开启。模型 API 缺少密钥、超时、限额或故障时，改用已登录的本机 `codex exec`。
+- `CODEX_CLI_TIMEOUT` / `CODEX_CLI_FAILURE_COOLDOWN`：Codex CLI 超时和失败熔断时间，默认为 90 秒和 300 秒。
+- `CODEX_CLI_MODEL` / `CODEX_CLI_REASONING_EFFORT`：备用模型与推理强度，默认使用 `gpt-5.4-mini` 和 `low`，以减少后台分析延迟。
+- `CODEX_CLI_MAX_ROWS_PER_REQUEST`：每批最多交给 Codex CLI 解析的榜单行数，默认 24；页面按批次渐进回填，避免后面的榜单被遗漏或整页长时间等待。
+- Windows 下会自动继承当前系统代理供 Codex CLI 连接模型服务，但不会把项目 API Key 或其他业务密钥传给备用进程。
 - `EMAIL_SMTP_*`：邮箱验证码登录。
 - `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`：Google OAuth 登录。
 - `X_BEARER_TOKEN`：X KOL 官方 API。
 - `WECHAT_*`：微信公众号订阅授权。
 - `OKX_*` / `BITGET_*` / `AICOIN_*`：交易所和客户端数据源配置。
 - `OKX_DEX_API_KEY` / `OKX_DEX_SECRET_KEY` / `OKX_DEX_PASSPHRASE`：可选的 OKX OnchainOS 行情密钥，用于增加链上合约 K 线备用源；未配置时自动跳过。
-- `CHAIN_ECOSYSTEM_REFRESH_SECONDS`：公链生态后台扫描间隔，默认 300 秒；数据源连续失败时会自动退避。
-- `XINGYUN_DISABLE_CHAIN_ECOSYSTEM_MONITOR`：设为 `1` 可暂停公链生态后台扫描。
+- `CHAIN_ECOSYSTEM_REFRESH_SECONDS`：链上投研后台扫描间隔，默认 300 秒；数据源连续失败时会自动退避。
+- `XINGYUN_DISABLE_CHAIN_ECOSYSTEM_MONITOR`：设为 `1` 可暂停链上投研后台扫描。
 - `GITHUB_TOKEN`：可选，仅用于提高手动添加项目仓库的 GitHub 公共接口额度。
 
-## 公链生态监控
+## 链上投研
 
-在“监控 → 公链生态”中可查看三阶段公链列表、L0-L3 细分市场、每个市场 Top5、潜在发币池及证据来源。自动扫描使用 GeckoTerminal、DEX Screener、DefiLlama、Blockscout 和 GitHub 的公开接口；也可以手动添加公链、项目或证据，系统会把二者合并后重新评估。
+在“监控 → 链上投研”中可查看三阶段公链列表、L0-L3 细分市场、每个市场 Top5、潜在发币池及证据来源。自动扫描使用 GeckoTerminal、DEX Screener、DefiLlama、Blockscout 和 GitHub 的公开接口，并对链、细分市场、项目、资产和变化预警逐条生成 AI 研判；也可以手动添加公链、项目或证据，系统会把二者合并后重新评估。
 
 桌面端只推送四类高价值变化：公链阶段升级、新细分市场、Top1 连续两轮确认变更，以及流动性/成交量/交易笔数显著放大。代币形成有效交易只更新市场状态和排名，不弹窗、不播报。首次成功扫描仅建立基线，不补发历史提醒；某个数据源失败时保留上一份完整快照，也不会据此触发阶段或龙头变化。
+
+## QQ 后台群消息通道
+
+QQ 群监控默认通过本机 NapCat / OneBot 11 接口工作，不需要 QQ 窗口保持可见。系统使用 WebSocket 接收实时群消息，并定时调用 `get_group_msg_history` 回补服务重启或短暂断线期间的消息；群名、发送人过滤、币种提取、去重、结构监控入池和微信转发仍由原有业务链路处理。
+
+安全约束：HTTP 与 WebSocket 必须只监听 `127.0.0.1`，两个接口使用相同 Token，禁止将端口暴露到局域网或公网。运行配置位于 `.env`：`QQ_ONEBOT_HTTP_URL`、`QQ_ONEBOT_WS_URL`、`QQ_ONEBOT_TOKEN`。确认 OneBot 连通后保持 `QQ_UI_FALLBACK_ENABLED=0`，避免重新依赖窗口或 OCR。
+
+`QQ_ONEBOT_RECOVERY_ENABLED` 默认保持为 `0`。这样 OneBot 断线只会显示通道不可用，不会结束、隐藏启动或抢占用户手动登录的 QQ。只有使用独立 QQ 账号的无人值守环境才应显式设为 `1`；即使开启，恢复脚本也只管理 NapCat 自己的进程树，检测到普通 QQ 正在运行时会跳过后台拉起。
 
 ## 钉钉热门币监控机器人
 
@@ -234,13 +294,13 @@ npm run desktop:build:mac
 
 项目会聚合多个公开页面、公开接口或用户本地授权后的数据源，包括但不限于：
 
-- Binance、OKX、Bitget、OKX DEX、AIcoin
-- 富途、同花顺、东方财富
-- BlockBeats
-- RSS / 微信公众号
-- X / Twitter
+- **中心化与衍生品市场**：Binance、OKX、Bitget、Gate、HTX、AIcoin、Aster、Hyperliquid、trade.xyz。
+- **链上市场与行情**：币安钱包、OKX DEX / OnchainOS、DEX Screener、GMGN、GeckoTerminal，以及各链可用的交易对和 K 线接口。
+- **股票市场**：富途、同花顺、东方财富，以及公开的港股、美股和 A 股榜单。
+- **新闻与社区**：BlockBeats、RSS、微信公众号、X / Twitter，以及用户本地授权的微信或 QQ 群聊。
+- **链上投研**：DefiLlama、Blockscout、GitHub、GeckoTerminal 和 DEX Screener。
 
-不同数据源稳定性和可访问性会受网络环境、接口变动、地区访问限制影响。项目内置缓存和兜底逻辑，但不保证任何数据源持续可用。
+不同数据源稳定性和可访问性会受网络环境、接口变动、地区限制、登录状态和限流策略影响。项目会在可用数据源之间轮换并保留最近有效缓存，但不会把估算值伪装成官方数据，也不保证任何第三方数据源持续可用。
 
 ## 安全说明
 
@@ -257,10 +317,3 @@ Copyright (c) 2026 星云社。
 本项目仅供学习、研究和个人使用。未经作者本人授权，不得用于商业用途、商业分发、SaaS 服务、付费产品、企业内部商业化部署或任何以盈利为目的的再发布。
 
 如需商用授权，请通过 Discord 或 GitHub 联系作者。
-# QQ 后台群消息通道
-
-QQ 群监控默认通过本机 NapCat / OneBot 11 接口工作，不需要 QQ 窗口保持可见。系统使用 WebSocket 接收实时群消息，并定时调用 `get_group_msg_history` 回补服务重启或短暂断线期间的消息；群名、发送人过滤、币种提取、去重、结构监控入池和微信转发仍由原有业务链路处理。
-
-安全约束：HTTP 与 WebSocket 必须只监听 `127.0.0.1`，两个接口使用相同 Token，禁止将端口暴露到局域网或公网。运行配置位于 `.env`：`QQ_ONEBOT_HTTP_URL`、`QQ_ONEBOT_WS_URL`、`QQ_ONEBOT_TOKEN`。确认 OneBot 连通后保持 `QQ_UI_FALLBACK_ENABLED=0`，避免重新依赖窗口或 OCR。
-
-`QQ_ONEBOT_RECOVERY_ENABLED` 默认必须保持为 `0`。这样 OneBot 断线只会显示通道不可用，不会结束、隐藏启动或抢占用户手动登录的 QQ。只有使用独立 QQ 账号的无人值守环境才应显式设为 `1`；即使开启，恢复脚本也只管理 NapCat 自己的进程树，检测到普通 QQ 正在运行时会跳过后台拉起。

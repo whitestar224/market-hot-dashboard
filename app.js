@@ -4,6 +4,7 @@ const MARKET_CACHE_KEY = "xingyunshe:market-hot:payload:v8";
 const MARKET_PRIORITY_VIEW_KEY = "xingyunshe:market-hot:priority-view:v1";
 const MARKET_PRIORITY_PERIOD_KEY = "xingyunshe:market-hot:priority-period:v1";
 const MARKET_PRIORITY_PERIODS = new Set(["1h", "6h", "24h"]);
+const TOTAL_BOARD_PAGE_SIZE = 10;
 
 function readLocalPreference(key, fallback) {
   try {
@@ -61,7 +62,8 @@ const state = {
   binanceWalletPeriod: readBinanceWalletPeriod(),
   binanceWalletLoading: false,
   priorityPeriod: normalizePriorityPeriod(readLocalPreference(MARKET_PRIORITY_PERIOD_KEY, "24h")),
-  smartPriority: {}
+  smartPriority: {},
+  totalPage: 1
 };
 
 const boardsEl = document.querySelector("#leaderboards");
@@ -75,6 +77,7 @@ const dataStatus = document.querySelector("#dataStatus");
 const priorityPeriodSelect = document.querySelector("#priorityPeriodSelect");
 
 const groupLabels = {
+  total: "币圈 · 跨榜去重",
   crypto: "币圈",
   aicoin: "AIcoin",
   hk: "港股",
@@ -362,12 +365,66 @@ function sortRows(rows, priorityScores = null) {
 
 function visibleSources() {
   const priorityScores = state.sort === "priority" ? activePriorityScores() : null;
+  if (state.filter === "total") return [buildTotalBoardSource(priorityScores)];
   return state.sources
     .filter(matchesFilter)
     .map((source) => ({
       ...source,
       rows: sortRows((source.rows || []).filter(matchesQuery), priorityScores)
     }));
+}
+
+function buildTotalBoardSource(priorityScores = null) {
+  const deduper = window.XingyunMarketTotalBoard;
+  const totalSources = state.sources.filter((source) => deduper?.isTotalBoardSource(source));
+  const buckets = deduper?.dedupeTotalBoardEntries(totalSources, {
+    matchesRow: (row) => matchesQuery(row)
+  }) || [];
+  const rows = buckets.map((bucket) => {
+    const candidates = bucket.entries.map((entry) => ({
+      ...entry.row,
+      totalOriginSource: entry.source
+    }));
+    const representative = sortRows(candidates, priorityScores)[0] || {};
+    const sourceLabels = [...new Set(bucket.entries.map((entry) => String(entry.source?.sourceLabel || "").trim()).filter(Boolean))];
+    const sourceTitles = [...new Set(bucket.entries.map((entry) => String(entry.source?.title || "").trim()).filter(Boolean))];
+    return {
+      ...representative,
+      heat: Math.max(0, ...candidates.map((row) => Number(row.heat || 0))),
+      amount: Math.max(0, ...candidates.map((row) => Number(row.amount || 0))),
+      totalIdentity: bucket.identity,
+      totalSourceCount: sourceTitles.length,
+      totalSourceLabels: sourceLabels,
+      totalSourceTitles: sourceTitles
+    };
+  });
+  const rankedRows = sortRows(rows, priorityScores).map((row, index) => ({
+    ...row,
+    rank: index + 1
+  }));
+  const pagination = deduper?.paginateTotalBoardEntries(rankedRows, state.totalPage, TOTAL_BOARD_PAGE_SIZE) || {
+    page: 1,
+    rows: rankedRows.slice(0, TOTAL_BOARD_PAGE_SIZE),
+    totalCount: rankedRows.length,
+    totalPages: Math.max(1, Math.ceil(rankedRows.length / TOTAL_BOARD_PAGE_SIZE))
+  };
+  state.totalPage = pagination.page;
+  return {
+    id: "total-board",
+    group: "total",
+    title: "币圈热门总榜",
+    subtitle: "币圈与 AIcoin 热门来源合并 · 合约地址优先去重",
+    accent: "#f6bb48",
+    sourceLabel: "ALL",
+    status: rankedRows.length ? "ok" : "unavailable",
+    rows: pagination.rows,
+    summaryRows: rankedRows,
+    totalCount: pagination.totalCount,
+    totalPage: pagination.page,
+    totalPages: pagination.totalPages,
+    emptyTitle: "总榜暂无匹配标的",
+    emptyMessage: state.query ? "没有标的符合当前搜索条件。" : "当前热门来源暂时没有返回可用标的。"
+  };
 }
 
 function activePriorityPayload() {
@@ -385,7 +442,7 @@ function syncPriorityControls() {
 
 function renderSummary(sources) {
   const rows = sources.flatMap((source) =>
-    source.rows.map((row) => ({
+    (source.summaryRows || source.rows).map((row) => ({
       ...row,
       board: row.originalBoard || source.title,
       group: row.group || source.group,
@@ -474,7 +531,7 @@ function renderBoards() {
   boardsEl.innerHTML = sources
     .map(
       (source, index) => `
-        <article class="board-card ${source.status === "unavailable" ? "is-muted" : ""}" style="--accent: ${source.accent}; --delay: ${index * 55}ms">
+        <article class="board-card ${source.status === "unavailable" ? "is-muted" : ""} ${source.id === "total-board" ? "is-total-board" : ""}" style="--accent: ${source.accent}; --delay: ${index * 55}ms">
           <header class="board-head">
             <div class="board-head-copy">
               <p>${groupLabels[source.group] || source.group}</p>
@@ -489,14 +546,18 @@ function renderBoards() {
                 : renderEmpty(source)
             }
           </div>
+          ${renderTotalPagination(source)}
         </article>
       `
     )
     .join("");
-  requestAiInsights(sources);
+  if (state.filter !== "total") requestAiInsights(sources);
 }
 
 function renderBoardHeadActions(source) {
+  if (String(source?.id || "") === "total-board") {
+    return `<div class="board-head-actions is-total-head"><span>${source.totalCount || source.rows.length} 个去重标的</span><strong>ALL</strong></div>`;
+  }
   if (String(source?.id || "") !== "binance-wallet-hot") {
     return `<div class="board-head-actions"><strong>${escapeHtml(source.sourceLabel || "--")}</strong></div>`;
   }
@@ -530,6 +591,36 @@ function renderBoardHeadActions(source) {
   `;
 }
 
+function totalPageTokens(currentPage, totalPages) {
+  if (totalPages <= 7) return Array.from({ length: totalPages }, (_, index) => index + 1);
+  const pages = new Set([1, totalPages, currentPage - 1, currentPage, currentPage + 1]);
+  const visible = [...pages].filter((page) => page >= 1 && page <= totalPages).sort((a, b) => a - b);
+  const tokens = [];
+  visible.forEach((page, index) => {
+    if (index && page - visible[index - 1] > 1) tokens.push("ellipsis");
+    tokens.push(page);
+  });
+  return tokens;
+}
+
+function renderTotalPagination(source) {
+  if (String(source?.id || "") !== "total-board" || Number(source.totalPages || 1) <= 1) return "";
+  const currentPage = Number(source.totalPage || 1);
+  const totalPages = Number(source.totalPages || 1);
+  const pageButtons = totalPageTokens(currentPage, totalPages)
+    .map((token) => token === "ellipsis"
+      ? '<span class="total-page-ellipsis" aria-hidden="true">…</span>'
+      : `<button type="button" class="total-page-button ${token === currentPage ? "active" : ""}" data-role="total-page" data-page="${token}" ${token === currentPage ? 'aria-current="page"' : ""}>${token}</button>`)
+    .join("");
+  return `
+    <nav class="total-pagination" aria-label="总榜分页">
+      <button type="button" class="total-page-button total-page-nav" data-role="total-page" data-page="${currentPage - 1}" ${currentPage <= 1 ? "disabled" : ""}>上一页</button>
+      <div class="total-page-numbers">${pageButtons}</div>
+      <button type="button" class="total-page-button total-page-nav" data-role="total-page" data-page="${currentPage + 1}" ${currentPage >= totalPages ? "disabled" : ""}>下一页</button>
+      <span class="total-page-status">第 ${currentPage} / ${totalPages} 页 · 每页 ${TOTAL_BOARD_PAGE_SIZE} 个</span>
+    </nav>`;
+}
+
 function requestAiInsights(sources) {
   window.XingyunAiInsights?.requestForSources(sources, {
     mode: "hot",
@@ -550,7 +641,8 @@ function renderInsight(row, source, rank) {
   const insight = window.XingyunInsights?.buildRowInsight(row, { source, rank, mode: "hot" });
   if (!insight) return "";
   const tone = insight.tone === "is-hot" ? " is-hot" : "";
-  return `<em class="row-insight-text${tone}" title="${escapeHtml(insight.detail)}">${escapeHtml(insight.detail)}</em>`;
+  const provider = window.XingyunAiInsights?.providerLabel?.(insight.provider) || "规则";
+  return `<em class="row-insight-text${tone}" title="${escapeHtml(`${provider} 分析 · ${insight.detail}`)}"><b>${escapeHtml(provider)}</b>${escapeHtml(insight.detail)}</em>`;
 }
 
 function renderChainBadge(row, source) {
@@ -614,24 +706,30 @@ async function loadBinanceWalletPeriod(period, options = {}) {
 }
 
 function renderRow(row, source, rank) {
+  const rowSource = row.totalOriginSource || source;
   const change = parseSignedNumber(row.change);
   const direction = change >= 0 ? "up" : "down";
-  const stockGroup = isStockGroup(source?.group);
+  const stockGroup = isStockGroup(rowSource?.group);
   const symbol = escapeHtml(stockGroup ? row.name || row.symbol || "--" : row.symbol || "--");
   const name = escapeHtml(stockGroup ? row.symbol || "" : row.name || "");
   const metric = escapeHtml(primaryMetric(row));
   const metricHint = escapeHtml(row.price ? row.turnover || row.metricLabel || "" : row.note || "");
   const changeLabel = escapeHtml(row.change || "--");
-  const insight = renderInsight(row, source, rank || row.rank || 999);
+  const insight = renderInsight(row, rowSource, rank || row.rank || 999);
+  const totalSourceTitles = Array.isArray(row.totalSourceTitles) ? row.totalSourceTitles : [];
+  const totalSourceLabels = Array.isArray(row.totalSourceLabels) ? row.totalSourceLabels : [];
+  const sourceTrace = totalSourceTitles.length
+    ? `<em class="total-source-trace" title="来源：${escapeHtml(totalSourceTitles.join(" / "))}">${escapeHtml(totalSourceLabels.join(" / ") || `${totalSourceTitles.length} 个榜单`)}</em>`
+    : "";
 
   return `
-    <a class="rank-row rank-row-link" href="${escapeHtml(rowTargetUrl(row, source) || "#")}" target="_blank" rel="noreferrer" title="打开 ${symbol} 交易/行情页面">
+    <a class="rank-row rank-row-link" href="${escapeHtml(rowTargetUrl(row, rowSource) || "#")}" target="_blank" rel="noreferrer" title="打开 ${symbol} 交易/行情页面">
       <div class="rank-badge">${escapeHtml(row.rank ?? "")}</div>
       <div class="asset-cell">
-        ${renderAssetIcon(row, source)}
+        ${renderAssetIcon(row, rowSource)}
         <div class="asset-line">
-          <strong title="${symbol}">${symbol}${renderChainBadge(row, source)}</strong>
-          <span title="${name}${insight ? ` · ${insight.replace(/<[^>]+>/g, "")}` : ""}">${name}${insight}</span>
+          <strong title="${symbol}">${symbol}${renderChainBadge(row, rowSource)}</strong>
+          <span title="${name}${totalSourceTitles.length ? ` · 来源：${escapeHtml(totalSourceTitles.join(" / "))}` : ""}${insight ? ` · ${insight.replace(/<[^>]+>/g, "")}` : ""}">${name}${sourceTrace}${insight}</span>
         </div>
       </div>
       <div class="price-cell">
@@ -718,11 +816,13 @@ function updateClock() {
 
 searchInput.addEventListener("input", (event) => {
   state.query = event.target.value.trim();
+  state.totalPage = 1;
   renderBoards();
 });
 
 sortSelect.addEventListener("change", (event) => {
   state.sort = event.target.value;
+  state.totalPage = 1;
   saveLocalPreference(MARKET_PRIORITY_VIEW_KEY, state.sort === "priority" ? "smart" : "platform");
   renderBoards();
 });
@@ -731,6 +831,7 @@ filterButtons.addEventListener("click", (event) => {
   const button = event.target.closest("button");
   if (!button) return;
   state.filter = button.dataset.filter;
+  state.totalPage = 1;
   filterButtons.querySelectorAll("button").forEach((item) => {
     item.classList.toggle("active", item === button);
     item.setAttribute("aria-pressed", item === button ? "true" : "false");
@@ -740,8 +841,21 @@ filterButtons.addEventListener("click", (event) => {
 
 priorityPeriodSelect?.addEventListener("change", (event) => {
   state.priorityPeriod = normalizePriorityPeriod(event.target.value);
+  state.totalPage = 1;
   saveLocalPreference(MARKET_PRIORITY_PERIOD_KEY, state.priorityPeriod);
   renderBoards();
+});
+
+boardsEl.addEventListener("click", (event) => {
+  const button = event.target.closest('button[data-role="total-page"]');
+  if (!button || button.disabled) return;
+  const page = Number.parseInt(button.dataset.page || "1", 10);
+  if (!Number.isFinite(page) || page < 1 || page === state.totalPage) return;
+  state.totalPage = page;
+  renderBoards();
+  requestAnimationFrame(() => {
+    boardsEl.querySelector(".board-card.is-total-board")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
 });
 
 boardsEl.addEventListener("change", (event) => {

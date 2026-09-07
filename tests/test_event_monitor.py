@@ -60,6 +60,118 @@ class EventMonitorTests(unittest.TestCase):
 
         self.assertIn("牛来", entities)
 
+    def test_news_trade_ai_worker_persists_model_analysis_with_provider(self):
+        topic = {
+            "id": "topic-ai-1",
+            "topicKey": "narrative:景甜",
+            "title": "孙宇晨与景甜话题突然引发大量二创",
+            "body": "社区开始围绕人物关系与同名链上 Meme 玩梗。",
+            "source": "X",
+            "newsTradePhaseLabel": "0–6h 先手理解",
+            "newsKeywords": ["孙宇晨", "景甜", "二创"],
+            "assets": ["我的女友景甜"],
+            "memeCandidates": [{"symbol": "我的女友景甜", "chain": "bsc"}],
+        }
+        settings = {"provider": "deepseek", "model": "deepseek-chat", "apiKey": "test", "maxTokens": 1800}
+        model_payload = {
+            "items": [{
+                "key": "topic-1",
+                "verdict": "watch",
+                "confidence": 82,
+                "narrativeStrength": 91,
+                "memePotential": 88,
+                "eventType": "大瓜",
+                "thesis": "人物大瓜形成强传播梗",
+                "catalyst": "名人话题与社区二创共振",
+                "risk": "同名代币关系仍需核验",
+                "actionHint": "等待链上量价与安全确认",
+                "tags": ["大瓜", "人物梗"],
+            }]
+        }
+        response = {
+            "choices": [{"message": {"content": json.dumps(model_payload, ensure_ascii=False)}}],
+            "_provider": "codex-cli",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "NEWS_TRADE_AI_CACHE_PATH", Path(temp_dir) / "news-trade-ai.json"
+        ), patch.object(server, "deepseek_chat", return_value=response):
+            signature = server.news_trade_ai_topic_signature(topic, settings)
+            with server.NEWS_TRADE_AI_LOCK:
+                server.NEWS_TRADE_AI_INFLIGHT.add(signature)
+            server.news_trade_ai_worker([topic], settings)
+            cached = server.read_json_cache(server.NEWS_TRADE_AI_CACHE_PATH)
+
+        stored = cached["items"][signature]
+        self.assertEqual(stored["provider"], "codex-cli")
+        self.assertEqual(stored["analysis"]["eventType"], "大瓜")
+        self.assertEqual(stored["analysis"]["memePotential"], 88)
+
+    def test_news_trade_attach_ai_uses_fresh_cached_result_without_rescheduling(self):
+        topic = {
+            "id": "topic-ai-cache",
+            "topicKey": "narrative:pons",
+            "title": "PONS 社区话题",
+            "body": "项目与链上候选出现关联。",
+            "newsKeywords": ["PONS"],
+            "assets": ["PONS"],
+        }
+        settings = {"provider": "deepseek", "model": "deepseek-chat", "apiKey": "test"}
+        signature = server.news_trade_ai_topic_signature(topic, settings)
+        cached = {
+            "updatedAt": self.now_ms,
+            "items": {
+                signature: {
+                    "updatedAt": self.now_ms,
+                    "provider": "codex-cli",
+                    "analysis": {
+                        "verdict": "watch",
+                        "confidence": 70,
+                        "narrativeStrength": 76,
+                        "memePotential": 68,
+                        "eventType": "Meme文化",
+                        "thesis": "社区叙事正在形成",
+                        "catalyst": "项目讨论升温",
+                        "risk": "标的关系待核验",
+                        "actionHint": "观察",
+                        "tags": ["社区"],
+                    },
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "NEWS_TRADE_AI_CACHE_PATH", Path(temp_dir) / "news-trade-ai.json"
+        ), patch.object(server, "deepseek_enabled", return_value=True), patch.object(
+            server.NEWS_TRADE_AI_POOL, "submit"
+        ) as submit:
+            server.write_json_cache(server.NEWS_TRADE_AI_CACHE_PATH, cached)
+            rows = server.news_trade_attach_ai([topic], settings)
+
+        self.assertEqual(rows[0]["aiAnalysisStatus"], "ready")
+        self.assertEqual(rows[0]["aiAnalysisProvider"], "codex-cli")
+        self.assertEqual(rows[0]["aiAnalysis"]["thesis"], "社区叙事正在形成")
+        submit.assert_not_called()
+
+    def test_news_trade_ai_request_schedules_the_visible_page_by_topic_key(self):
+        topics = [
+            {"id": "topic-1", "topicKey": "narrative:first", "title": "第一页"},
+            {"id": "topic-2", "topicKey": "narrative:second", "title": "第二页"},
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "PERSIST_CACHE_DIR", Path(temp_dir)
+        ), patch.object(server, "news_trade_attach_ai", side_effect=lambda rows, settings: [
+            {**row, "aiAnalysisStatus": "pending", "aiAnalysisProvider": "codex-cli"}
+            for row in rows
+        ]) as attach:
+            server.write_json_cache(Path(temp_dir) / "news_trade_topic_pool.json", {"topics": topics})
+            result = server.news_trade_ai_request_payload(
+                {"topicKeys": ["narrative:second"]},
+                {"provider": "deepseek"},
+            )
+
+        self.assertEqual(result["matched"], 1)
+        self.assertEqual(result["items"][0]["topicKey"], "narrative:second")
+        attach.assert_called_once()
+
     def test_hot_event_entities_extract_repeated_catchphrase_aliases(self):
         entities = server.event_monitor_hot_entities(
             "名人长文中的传播金句",
@@ -99,6 +211,84 @@ class EventMonitorTests(unittest.TestCase):
         self.assertEqual(len(payload["rows"]), 1)
         self.assertEqual(payload["rows"][0]["sourceType"], "newsflash")
         self.assertTrue(payload["rows"][0]["fromDesktopAlert"])
+
+    def test_x_alert_intake_preserves_project_identity_and_original_text(self):
+        with tempfile.TemporaryDirectory() as tempdir, patch.object(
+            server, "NEWS_TRADE_DESKTOP_INTAKE_PATH", Path(tempdir) / "desktop-intake.json"
+        ):
+            item = server.normalize_desktop_alert({
+                "key": "x-kol:official-1",
+                "kind": "X KOL动态",
+                "sourceType": "x-kol",
+                "source": "Project XYZ",
+                "sourceLabel": "X",
+                "title": "【项目官方】Project XYZ：Meet LOBSTER",
+                "body": "Meet LOBSTER",
+                "originalText": "Meet LOBSTER, our new community mascot.",
+                "xCategory": "project_official",
+                "authorHandle": "project_xyz",
+                "time": self.now_ms,
+            })
+            server.record_desktop_alert_news_trade_intake(item)
+            payload = server.read_json_cache(server.NEWS_TRADE_DESKTOP_INTAKE_PATH)
+
+        row = payload["rows"][0]
+        self.assertEqual(row["sourceType"], "x-kol")
+        self.assertEqual(row["xCategory"], "project_official")
+        self.assertEqual(row["xCategoryLabel"], "项目官方X")
+        self.assertEqual(row["claimStatus"], "project-official")
+        self.assertIn("new community mascot", row["body"])
+
+    def test_project_official_meme_post_enters_news_trade_without_fake_trade_route(self):
+        event = server.classify_event_monitor_row(
+            {
+                "id": "official-mascot-1",
+                "sourceType": "x-kol",
+                "source": "Project XYZ",
+                "sourceLabel": "X",
+                "xCategory": "project_official",
+                "xCategoryLabel": "项目官方X",
+                "authorHandle": "project_xyz",
+                "title": "官方发布新吉祥物龙虾，并命名为 LONGXIA",
+                "body": "欢迎社区制作表情包、玩梗和二创，一起参与传播。",
+                "url": "https://x.com/project_xyz/status/1",
+                "timestamp": self.now_ms,
+            },
+            self.now_ms,
+            candidate_source_rows=[],
+        )
+
+        self.assertIsNotNone(event)
+        self.assertEqual(event["template"], "project-x-meme")
+        self.assertTrue(event["isNewsTrade"])
+        self.assertTrue(event["xMemePotential"]["qualified"])
+        self.assertEqual(event["xMemePotential"]["role"], "项目官方")
+        self.assertEqual(event["candidateTier"], "event-observation")
+        self.assertFalse(event["executionEligible"])
+
+        topic = server.event_monitor_cluster_topics([event], now_ms=self.now_ms)[0]
+        self.assertTrue(topic["xMemePotential"]["qualified"])
+        self.assertGreaterEqual(topic["topicScore"], event["xMemePotential"]["score"])
+        self.assertIsNone(topic["memeOpportunity"])
+
+    def test_routine_project_status_post_is_not_misread_as_meme_opportunity(self):
+        event = server.classify_event_monitor_row(
+            {
+                "id": "official-maintenance-1",
+                "sourceType": "x-kol",
+                "source": "Project XYZ",
+                "sourceLabel": "X",
+                "xCategory": "project_official",
+                "title": "系统维护完成",
+                "body": "API 延迟已经恢复，服务运行正常。",
+                "url": "https://x.com/project_xyz/status/2",
+                "timestamp": self.now_ms,
+            },
+            self.now_ms,
+            candidate_source_rows=[],
+        )
+
+        self.assertIsNone(event)
 
     def test_curiosity_profile_scores_absurd_controversial_discussion_and_legend(self):
         profile = server.event_monitor_curiosity_profile(

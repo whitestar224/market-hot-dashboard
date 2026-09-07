@@ -70,7 +70,12 @@ class PersonalXMonitorPriorityTests(unittest.TestCase):
         self.assertEqual(prior_item["origin"], "personal-x")
         self.assertEqual(prior_item["personalXSourceText"], "$chip好像有新币止跌的势头")
 
-        with patch.object(server, "price_watch_aicoin_source", return_value={"status": "ok", "rows": []}):
+        with (
+            patch.object(server, "price_watch_aicoin_source", return_value={"status": "ok", "rows": []}),
+            patch.object(server, "binance_wallet_4h_structure_rows", return_value=[]),
+            patch.object(server, "strategy_active_adaptive_contexts", return_value=[]),
+            patch.object(server, "filter_price_monitor_rows_by_activity", side_effect=lambda rows: rows),
+        ):
             structure_rows = server.price_structure_watch_rows()
         self.assertEqual(structure_rows[0]["symbol"], "CHIP")
         self.assertEqual(structure_rows[0]["adaptiveContext"]["label"], "个人 X 提及")
@@ -139,7 +144,12 @@ class PersonalXMonitorPriorityTests(unittest.TestCase):
 
         prior_rows = server.price_watch_active_rows()
         self.assertEqual(prior_rows[0]["symbol"], "LONGXIA")
-        with patch.object(server, "price_watch_aicoin_source", return_value={"status": "ok", "rows": []}):
+        with (
+            patch.object(server, "price_watch_aicoin_source", return_value={"status": "ok", "rows": []}),
+            patch.object(server, "binance_wallet_4h_structure_rows", return_value=[]),
+            patch.object(server, "strategy_active_adaptive_contexts", return_value=[]),
+            patch.object(server, "filter_price_monitor_rows_by_activity", side_effect=lambda rows: rows),
+        ):
             structure_rows = server.price_structure_watch_rows()
         self.assertEqual(structure_rows[0]["symbol"], "LONGXIA")
 
@@ -179,6 +189,8 @@ class PersonalXMonitorPriorityTests(unittest.TestCase):
             "turnover24hUsd": 18_500_000,
             "source": "DexScreener 链上聚合",
             "thresholdUsd": server.NEW_COIN_LOW_MIN_TURNOVER_24H_USD,
+            "network": "robinhood",
+            "contractAddress": "0x9fe1a89c2b5a702dd2f5eb9f783a08e3d6cec737",
         }
         with (
             patch.object(server.time, "time", return_value=now / 1000),
@@ -190,7 +202,38 @@ class PersonalXMonitorPriorityTests(unittest.TestCase):
 
         self.assertEqual(structure_rows[0]["symbol"], "PONS")
         self.assertEqual(structure_rows[0]["marketActivity"]["source"], "DexScreener 链上聚合")
+        self.assertEqual(structure_rows[0]["chain"], "robinhood")
+        self.assertEqual(
+            structure_rows[0]["contractAddress"],
+            "0x9fe1a89c2b5a702dd2f5eb9f783a08e3d6cec737",
+        )
         fallback.assert_called_once_with("PONS", contract_address=None, chain=None)
+
+    def test_personal_x_explicit_contract_identity_is_persisted_for_structure_kline(self):
+        now = 1_800_000_000_000
+        contract = "0xeb9e768c42d6f5b08d34980c6f721494372a7777"
+        self.ingest(now, f"$CAILI BSC 合约地址 {contract} 重点关注链上结构")
+
+        with server.auth_db() as conn:
+            asset = conn.execute(
+                """
+                SELECT onchain_chain, onchain_chain_label, onchain_contract_address
+                FROM price_watch_assets WHERE symbol = 'CAILI'
+                """
+            ).fetchone()
+        self.assertEqual(asset["onchain_chain"], "56")
+        self.assertEqual(asset["onchain_chain_label"], "BNB Chain")
+        self.assertEqual(asset["onchain_contract_address"], contract)
+
+        with (
+            patch.object(server, "price_watch_aicoin_source", return_value={"status": "ok", "rows": []}),
+            patch.object(server, "binance_wallet_4h_structure_rows", return_value=[]),
+            patch.object(server, "strategy_active_adaptive_contexts", return_value=[]),
+            patch.object(server, "filter_price_monitor_rows_by_activity", side_effect=lambda rows: rows),
+        ):
+            structure_rows = server.price_structure_watch_rows()
+        self.assertEqual(structure_rows[0]["contractAddress"], contract)
+        self.assertEqual(structure_rows[0]["chain"], "56")
 
     def test_onchain_pool_aggregates_same_contract_volume_across_pools(self):
         response = Mock()

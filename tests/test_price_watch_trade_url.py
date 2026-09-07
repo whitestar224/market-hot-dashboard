@@ -29,6 +29,17 @@ class PriceWatchTradeUrlTests(unittest.TestCase):
             "./price-watch.html",
         )
 
+    def test_onchain_contract_opens_matching_binance_wallet_token(self):
+        self.assertEqual(
+            server.price_watch_trade_url(
+                "INDEX",
+                "链上多源 K线",
+                chain_id="4663",
+                contract_address="0x56910d4409f3a0c78c64dd8d0545ff0705389870",
+            ),
+            "https://web3.binance.com/en/token/robinhood/0x56910d4409f3a0c78c64dd8d0545ff0705389870?ref=MQ6JD2X4",
+        )
+
     def test_price_alert_view_uses_signal_provider_trade_page(self):
         event = {
             "symbol": "WLD",
@@ -60,6 +71,22 @@ class PriceWatchTradeUrlTests(unittest.TestCase):
             payload = server.launch_price_watch_alert(event)
 
         self.assertEqual(payload["url"], "https://www.okx.com/zh-hans/trade-swap/test-usdt-swap")
+
+    def test_onchain_price_alert_view_prefers_binance_wallet(self):
+        event = {
+            "symbol": "INDEX",
+            "distancePct": 1.2,
+            "currentPrice": 0.044,
+            "weekHigh": 0.045,
+            "episode": 1,
+            "provider": "链上多源 K线",
+            "chain": "4663",
+            "contractAddress": "0x56910d4409f3a0c78c64dd8d0545ff0705389870",
+        }
+        with patch.object(server, "launch_desktop_alert", side_effect=lambda payload: payload):
+            payload = server.launch_price_watch_alert(event)
+
+        self.assertIn("/token/robinhood/0x56910d4409f3a0c78c64dd8d0545ff0705389870", payload["url"])
 
 
 if __name__ == "__main__":

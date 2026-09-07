@@ -13,7 +13,7 @@ test("new coin page includes the four additional market sources", () => {
     assert.match(server, new RegExp(`\\(\\"${source}\\"`));
     assert.match(js, new RegExp(`\\"${source}\\"`));
   }
-  assert.match(html, /newboards\.js\?v=13/);
+  assert.match(html, /newboards\.js\?v=14/);
 });
 
 test("additional new markets reuse the existing ten-row board and alert feed", () => {

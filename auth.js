@@ -486,8 +486,10 @@
     modelSettingsModal.querySelector("[data-model-max-rows]").value = String(settings.maxRows || 36);
     const keyState = modelSettingsModal.querySelector("[data-model-key-state]");
     keyState.textContent = settings.hasApiKey
-      ? `已保存 ${settings.maskedApiKey || "API Key"}，留空保存时会继续沿用`
-      : "未保存 API Key，会使用环境变量兜底；环境变量也为空时解析会停用";
+      ? `已保存 ${settings.maskedApiKey || "API Key"}，接口异常时${settings.codexCliFallback ? "自动切换 Codex CLI" : "将暂停 AI 解析"}`
+      : settings.codexCliFallback
+        ? "未保存 API Key，当前已启用 Codex CLI 本机备用分析"
+        : "未保存 API Key，且 Codex CLI 备用分析未启用";
     applyModelPreset(false);
     fetchModelOptions(false).catch((error) => {
       setModelListState(error.message || "模型列表读取失败，已使用内置列表", "error");
@@ -712,7 +714,12 @@
       loadModelSettings()
         .then((payload) => {
           const settings = payload?.settings || {};
-          modelState.textContent = `${settings.providerName || settings.provider || "大模型"} / ${settings.model || "未设置"}${settings.hasApiKey ? " / 已保存 Key" : " / 未保存 Key"}`;
+          const route = settings.hasApiKey
+            ? `${settings.providerName || settings.provider || "大模型"}${settings.codexCliFallback ? " + Codex CLI 备用" : ""}`
+            : settings.codexCliFallback
+              ? "Codex CLI 本机备用"
+              : "AI 未启用";
+          modelState.textContent = `${route} / ${settings.model || "未设置"}`;
         })
         .catch(() => {
           modelState.textContent = "点击配置模型类型、API Key 和解析参数";

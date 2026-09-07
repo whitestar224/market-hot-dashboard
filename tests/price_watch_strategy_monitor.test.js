@@ -27,7 +27,7 @@ test("News Trade is the first monitor tab", () => {
 test("hot-coin structure tab now describes all six shared strategy frames", () => {
   assert.match(js, /1分钟、5分钟、15分钟、1小时、4小时和日线/);
   assert.match(js, /使用龙头起爆策略识别A\+买点与多周期共振/);
-  assert.match(html, /price-watch\.js\?v=51/);
+  assert.match(html, /price-watch\.js\?v=59/);
 });
 
 test("multi-timeframe page follows the authoritative background pool every three seconds", () => {
@@ -38,25 +38,37 @@ test("multi-timeframe page follows the authoritative background pool every three
   assert.doesNotMatch(js, /每 3 分钟更新/);
 });
 
-test("prior-high removal is isolated from oversold and restores only after an AICoin re-entry", () => {
+test("removing from any pool creates one global monitor exclusion", () => {
   assert.match(js, /data-exclude-prior-high=/);
+  assert.match(js, /data-exclude-oversold=/);
   assert.match(js, /postAction\("exclude_prior_high", symbol\)/);
   assert.match(js, /item\.priorHighEnabled !== false/);
   assert.match(server, /prior_high_excluded_at/);
   assert.match(server, /prior_high_absent_at/);
-  assert.match(server, /restoreRule": "aicoin_leave_then_reenter"/);
+  assert.match(server, /restoreRule": "leave_then_reenter_or_manual_readd"/);
+  assert.match(server, /def exclude_monitor_symbol_globally/);
+  assert.match(server, /opportunity_manual_removed_at = \?/);
+  assert.match(server, /price_watch_oversold_alert_state/);
+  assert.match(server, /price_watch_fib_alert_state/);
   assert.match(server, /DELETE FROM price_watch_alert_state WHERE symbol = \?/);
   assert.match(server, /DELETE FROM price_watch_first_confirmations WHERE symbol = \?/);
 });
 
-test("multi-timeframe cards support an isolated manual exclusion", () => {
+test("Binance Wallet 4h hot members also enter prior-high monitoring", () => {
+  assert.match(server, /def sync_price_watch_binance_wallet_candidates/);
+  assert.match(server, /binance_wallet_hot_last_seen_at/);
+  assert.match(server, /personal_x_active or aicoin_active or binance_wallet_active/);
+  assert.match(js, /币安钱包 4H 热门/);
+});
+
+test("multi-timeframe cards use the global manual exclusion", () => {
   assert.match(js, /data-exclude-structure=/);
   assert.match(js, /postStructureAction\("exclude", symbol\)/);
   assert.match(js, /structureItems = structureItems\.filter/);
   assert.match(server, /CREATE TABLE IF NOT EXISTS price_structure_exclusions/);
   assert.match(server, /def exclude_price_structure_symbol/);
   assert.match(server, /price_structure_symbol_excluded\(symbol\)/);
-  assert.match(html, /styles\.css\?v=85/);
+  assert.match(html, /styles\.css\?v=87/);
 });
 
 test("group monitoring supports a targeted QQ speaker, structure admission, and WeChat forwarding", () => {
@@ -180,4 +192,15 @@ test("chain watch admission responds before the background ecosystem scan", () =
   assert.match(js, /\u9996\u6b21\u626b\u63cf\u5df2\u5728\u540e\u53f0\u8fd0\u884c/);
   assert.match(chainMonitor, /"refreshScheduled": refresh_scheduled/);
   assert.match(css, /chain-submit-pulse/);
+});
+
+test("public-chain monitoring uses AI analysis for every visible judgement slot", () => {
+  assert.match(server, /def chain_ecosystem_ai_subjects/);
+  assert.match(server, /def chain_ecosystem_attach_ai/);
+  assert.match(server, /chain_ecosystem_attach_ai\(payload, settings\)/);
+  assert.match(server, /"analysisMode"\] = "ai-primary"/);
+  assert.match(js, /function chainAiMeta/);
+  assert.match(js, /AI 研判/);
+  assert.match(js, /AI叙事/);
+  assert.match(js, /AI重要性/);
 });

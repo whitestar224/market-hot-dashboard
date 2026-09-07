@@ -103,6 +103,7 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         try:
             with (
                 patch.object(server, "fetch_price_structure_item", return_value=fresh_h) as fetch,
+                patch.object(server, "price_structure_excluded_symbols", return_value=set()),
                 patch.object(server, "launch_price_structure_strategy_alerts", return_value=1),
                 patch.object(server, "write_json_cache"),
             ):
@@ -911,6 +912,7 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         with (
             patch.object(server, "price_structure_allows_short_history", return_value=True),
             patch.object(server, "price_structure_candles_from_binance_wallet", side_effect=wallet_kline),
+            patch.object(server, "price_structure_candles_from_onchain_fallbacks", side_effect=RuntimeError("not ready")),
             patch.object(server, "run_dragon_wave_monitor_strategy", return_value=strategy_payload) as strategy,
         ):
             item = server.fetch_price_structure_item({
@@ -923,6 +925,42 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         observed = strategy.call_args.args[0]
         self.assertEqual(set(observed), {"1m", "5m", "15m", "1h", "4h"})
         self.assertNotIn("1d", observed)
+
+    def test_contract_asset_fills_wallet_missing_timeframe_from_another_onchain_source(self):
+        market_rows = candles([0.1, 0.11, 0.12])
+        daily_rows = candles([0.08, 0.1, 0.12])
+
+        def wallet_kline(_contract, _chain, interval, **_kwargs):
+            if interval == "1d":
+                raise RuntimeError("wallet daily history not ready")
+            return market_rows, "Binance Wallet K线"
+
+        strategy_payload = {
+            "ok": True,
+            "strategyVersion": "shared-engine-live",
+            "frames": [],
+            "signals": [],
+            "alertHints": [],
+        }
+        with (
+            patch.object(server, "price_structure_allows_short_history", return_value=True),
+            patch.object(server, "price_structure_candles_from_binance_wallet", side_effect=wallet_kline),
+            patch.object(
+                server,
+                "price_structure_candles_from_onchain_fallbacks",
+                return_value=(daily_rows, "链上 K线 · robinhood"),
+            ) as fallback,
+            patch.object(server, "run_dragon_wave_monitor_strategy", return_value=strategy_payload) as strategy,
+        ):
+            item = server.fetch_price_structure_item({
+                "symbol": "FABLE",
+                "chain": "4663",
+                "contractAddress": "0x9fe1a89c2b5a702dd2f5eb9f783a08e3d6cec737",
+            })
+
+        self.assertEqual(set(strategy.call_args.args[0]), {"1m", "5m", "15m", "1h", "4h", "1d"})
+        self.assertEqual(item["timeframeProviders"]["1d"], "链上 K线 · robinhood")
+        self.assertEqual(fallback.call_count, 1)
 
     def test_structure_cache_identity_does_not_change_with_display_order(self):
         rows = [

@@ -20,7 +20,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 LOGO_PATH = ROOT / "assets" / "xingyunshe-logo-transparent.png"
-AUTO_CLOSE_MS = 10 * 60 * 1000
+AUTO_CLOSE_MS = max(
+    20 * 1000,
+    int(float(os.getenv("XINGYUN_DESKTOP_ALERT_AUTO_CLOSE_SECONDS", "180") or "180") * 1000),
+)
+MIN_AUTO_CLOSE_MS = 60 * 1000
+MAX_AUTO_CLOSE_MS = 2 * 60 * 60 * 1000
 
 
 def clamp_text(value: object, limit: int) -> str:
@@ -189,10 +194,10 @@ def post_price_watch_confirmation(endpoint: str, symbol: str, episode: int) -> d
     )
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
-            payload = json.loads(response.read(200_000).decode("utf-8"))
+            payload = json.loads(response.read(8_000_000).decode("utf-8"))
     except urllib.error.HTTPError as exc:
         try:
-            payload = json.loads(exc.read(200_000).decode("utf-8"))
+            payload = json.loads(exc.read(8_000_000).decode("utf-8"))
             message = str(payload.get("error") or payload.get("message") or exc)
         except Exception:
             message = str(exc)
@@ -222,10 +227,10 @@ def post_price_watch_exclusion(
     )
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
-            payload = json.loads(response.read(200_000).decode("utf-8"))
+            payload = json.loads(response.read(8_000_000).decode("utf-8"))
     except urllib.error.HTTPError as exc:
         try:
-            payload = json.loads(exc.read(200_000).decode("utf-8"))
+            payload = json.loads(exc.read(8_000_000).decode("utf-8"))
             message = str(payload.get("error") or payload.get("message") or exc)
         except Exception:
             message = str(exc)
@@ -326,6 +331,37 @@ def work_area(root):
         return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
 
 
+def popup_position(
+    bounds: tuple[int, int, int, int],
+    width: int,
+    height: int,
+    slot: int,
+) -> tuple[int, int]:
+    """Lay concurrent popups out bottom-to-top, then continue in a new column."""
+    left, top_edge, right, bottom = bounds
+    edge_gap = 18
+    stack_gap = 10
+    usable_height = max(height, bottom - top_edge - edge_gap * 2)
+    rows = max(1, usable_height // (height + stack_gap))
+    row = max(0, slot) % rows
+    column = max(0, slot) // rows
+    x = left + edge_gap + column * (width + stack_gap)
+    x = min(max(left + 8, x), max(left + 8, right - width - 8))
+    y = bottom - height - edge_gap - row * (height + stack_gap)
+    y = max(top_edge + 8, y)
+    return x, y
+
+
+def popup_auto_close_ms(payload: dict) -> int:
+    try:
+        requested = int(float(payload.get("autoCloseMs") or 0))
+    except (TypeError, ValueError):
+        requested = 0
+    if requested <= 0:
+        return AUTO_CLOSE_MS
+    return min(MAX_AUTO_CLOSE_MS, max(MIN_AUTO_CLOSE_MS, requested))
+
+
 def show_popup(payload: dict, slot: int) -> int:
     try:
         import tkinter as tk
@@ -382,10 +418,7 @@ def show_popup(payload: dict, slot: int) -> int:
 
     width = 374
     height = 420 if image_path else 212
-    left, top_edge, right, bottom = work_area(root)
-    stack_index = min(max(0, slot), 3)
-    x = min(max(left + 18, left + 8), max(left + 8, right - width - 8))
-    y = max(top_edge + 8, bottom - height - 18 - stack_index * (height + 10))
+    x, y = popup_position(work_area(root), width, height, slot)
     root.geometry(f"{width}x{height}+{x}+{y}")
 
     outer = tk.Frame(root, bg="#9dcfe8", bd=1, relief="solid")
@@ -682,7 +715,7 @@ def show_popup(payload: dict, slot: int) -> int:
             root.after(20, lambda: fade(step + 1))
 
     root.after(10, fade)
-    root.after(AUTO_CLOSE_MS, close)
+    root.after(popup_auto_close_ms(payload), close)
     play_sound(sound)
     speak_text(speech, sound)
     root.mainloop()

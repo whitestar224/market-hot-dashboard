@@ -231,6 +231,12 @@
 
   function featureTokens(signal) {
     if (!signal || typeof signal !== "object") return [];
+    // 本地首屏索引已经由服务端从完整因果快照预计算好这些 token。
+    // 使用它们可以保留正反样本权重与否决规则，而无需下载视觉签名等重数据。
+    const storedTokens = Array.isArray(signal.feedbackTokens)
+      ? signal.feedbackTokens.map(String).filter(Boolean)
+      : [];
+    if (storedTokens.length) return [...new Set(storedTokens)];
     const tokens = [];
     const foundations = [...new Set((signal.foundationTypes || []).map(String))].sort();
     const auxiliaries = [...new Set((signal.auxiliaryTypes || []).map(String))].sort();

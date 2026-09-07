@@ -14,6 +14,7 @@
   // 需要复盘时改为一次性静态图片，避免长历史窗口持续拖慢看板。
   const intervals = Object.keys(Data.INTERVALS).filter((interval) => interval !== "1m");
   const FEEDBACK_STORAGE_KEY = "dragon-wave-feedback-v1";
+  const FEEDBACK_INDEX_STORAGE_KEY = "dragon-wave-feedback-index-v1";
   const DRAWING_STORAGE_KEY = "dragon-wave-structure-drawings-v1";
   const DEVICE_STORAGE_KEY = "dragon-wave-feedback-device-v1";
   const ANALYSIS_CONTEXT_STORAGE_KEY = "dragon-wave-analysis-context-v1";
@@ -27,6 +28,12 @@
   const ANALYSIS_WORKER_URL = new URL("./dragon-wave-analysis-worker.js?v=89", window.location.href);
   const ANALYSIS_WORKER_COUNT = Math.max(1, Math.min(2, Number(navigator.hardwareConcurrency) || 2));
   const VISUAL_RANGE_MIN_BARS = 12;
+  const FEEDBACK_INDEX_SIGNAL_FIELDS = Object.freeze([
+    "time", "interval", "pattern", "patternKey", "price", "triggerPrice", "level",
+    "selectedPrice", "status", "score", "certaintyScore", "relativeVolume",
+    "structureShape", "manualCandleSelection", "manualSource",
+    "open", "high", "low", "close", "volume",
+  ]);
   const TUT_DISPLAY_CUTOFF = new Date("2026-08-05T13:00:00+08:00").getTime();
   const SPK_DISPLAY_CUTOFF = new Date("2025-07-22T07:00:00+08:00").getTime();
   const STRUCTURE_TAG_LABELS = Object.freeze({
@@ -2044,6 +2051,7 @@
     activeCase: null,
     liveLeaders: [],
     feedback: Feedback.emptyDocument(),
+    feedbackIndexOnly: true,
     feedbackWeights: {},
     feedbackSync: { local: "checking", account: "checking", saving: false },
     feedbackDirtyKeys: new Set(),
@@ -2062,6 +2070,7 @@
     lastFocusTime: null,
     marketContextCount: 0,
     loadingWorkspace: false,
+    precomputedRetryTimer: null,
   };
 
   // 文档案例、附件标的与实时龙头池中的交易对，本身就是用户已经完成的
@@ -2145,14 +2154,46 @@
 
   function readBrowserFeedback() {
     try {
-      return Feedback.normalizeDocument(JSON.parse(localStorage.getItem(FEEDBACK_STORAGE_KEY) || "{}"));
+      // 不再同步解析旧的数 MB 完整视觉学习库。完整数据以 SQLite 为准，
+      // 浏览器只保留可以立即恢复 B 点的轻量索引。
+      return Feedback.normalizeDocument(JSON.parse(localStorage.getItem(FEEDBACK_INDEX_STORAGE_KEY) || "{}"));
     } catch (_error) {
       return Feedback.emptyDocument();
     }
   }
 
+  function compactFeedbackDocument(document) {
+    const normalized = Feedback.normalizeDocument(document);
+    const records = {};
+    Object.entries(normalized.records || {}).forEach(([key, record]) => {
+      const source = record.signal || {};
+      const signal = {};
+      FEEDBACK_INDEX_SIGNAL_FIELDS.forEach((field) => {
+        if (source[field] !== undefined) signal[field] = source[field];
+      });
+      signal.feedbackTokens = Feedback.featureTokens({
+        ...source,
+        interval: record.interval || source.interval,
+      }).slice(0, 32);
+      records[key] = {
+        key: record.key,
+        decision: record.decision,
+        createdAt: record.createdAt,
+        updatedAt: record.updatedAt,
+        pair: record.pair,
+        interval: record.interval,
+        venue: record.venue,
+        certaintyGrade: record.certaintyGrade,
+        structureTags: record.structureTags,
+        ...(record.predictedStructureTags ? { predictedStructureTags: record.predictedStructureTags } : {}),
+        signal,
+      };
+    });
+    return { version: 1, updatedAt: normalized.updatedAt, records };
+  }
+
   function writeBrowserFeedback() {
-    localStorage.setItem(FEEDBACK_STORAGE_KEY, JSON.stringify(state.feedback));
+    localStorage.setItem(FEEDBACK_INDEX_STORAGE_KEY, JSON.stringify(compactFeedbackDocument(state.feedback)));
   }
 
   function flushBrowserFeedbackWrite() {
@@ -2186,6 +2227,9 @@
   }
 
   function hydrateVisualFeedbackForResult(result, pair) {
+    // 完整视觉样本保存在本地库并用于离线优化；首屏索引不做自动回填，
+    // 否则每次打开历史案例都会再次膨胀并重写整个反馈库。
+    if (state.feedbackIndexOnly) return 0;
     if (!result?.candles?.length) return 0;
     const normalizedPair = Data.normalizePair(pair);
     const updates = {};
@@ -2313,9 +2357,15 @@
       : "当前已加载窗口内：确认买点全部被新策略原生命中，彻底否定点均未复活";
   }
 
-  async function readFeedbackEndpoint(url) {
+  async function readFeedbackEndpoint(url, { compact = false } = {}) {
     if (!url) return null;
-    const response = await fetch(url, { headers: { Accept: "application/json" }, credentials: "same-origin" });
+    const response = await fetch(url, {
+      headers: {
+        Accept: "application/json",
+        ...(compact ? { "X-Dragon-Wave-Compact": "1" } : {}),
+      },
+      credentials: "same-origin",
+    });
     if (response.status === 401 || response.status === 403) {
       const error = new Error("signed-out");
       error.code = "signed-out";
@@ -2361,12 +2411,14 @@
         result: applyFeedbackPolicy(baseResult, Data.normalizePair($("#symbolInput").value), preparedContext),
       });
     });
-    if (state.results.size && !state.loadingWorkspace) {
+    if (state.results.size) {
       renderActiveChart(state.lastFocusTime || parseInputTime($("#focusTime").value));
       renderLedger();
-      const usable = [...state.results.entries()].map(([interval, item]) => ({ interval, ...item }));
-      const failed = [...state.failures.keys()].map((interval) => ({ interval, ok: false }));
-      updateSummary(usable, failed, state.lastFocusTime || parseInputTime($("#focusTime").value), state.marketContextCount);
+      if (!state.loadingWorkspace) {
+        const usable = [...state.results.entries()].map(([interval, item]) => ({ interval, ...item }));
+        const failed = [...state.failures.keys()].map((interval) => ({ interval, ok: false }));
+        updateSummary(usable, failed, state.lastFocusTime || parseInputTime($("#focusTime").value), state.marketContextCount);
+      }
     }
     updateFeedbackStatus();
   }
@@ -2467,27 +2519,42 @@
     state.feedbackWeights = Feedback.buildWeights(state.feedback);
     updateFeedbackStatus();
     const endpoints = feedbackEndpoints();
-    const localTask = endpoints.local
-      ? readFeedbackEndpoint(`${endpoints.local}?deviceId=${encodeURIComponent(state.deviceId)}`).then((document) => {
+    const loadAccount = async () => {
+      const accountDocument = await readFeedbackEndpoint(endpoints.account, { compact: true }).then((document) => {
+        state.feedbackSync.account = "saved";
+        return document;
+      }).catch((error) => {
+        state.feedbackSync.account = error.code === "signed-out" ? "signed-out" : "unavailable";
+        return null;
+      });
+      if (!accountDocument) {
+        updateFeedbackStatus();
+        return;
+      }
+      state.feedback = Feedback.mergeDocuments(state.feedback, accountDocument);
+      queueBrowserFeedbackWrite(600);
+      refreshLoadedFeedback();
+    };
+    if (endpoints.local) {
+      const separator = endpoints.local.includes("?") ? "&" : "?";
+      const localDocument = await readFeedbackEndpoint(
+        `${endpoints.local}${separator}deviceId=${encodeURIComponent(state.deviceId)}&view=index&scope=all`,
+        { compact: true },
+      ).then((document) => {
         state.feedbackSync.local = "saved";
         return document;
       }).catch(() => {
         state.feedbackSync.local = "error";
         return null;
-      })
-      : Promise.resolve(null);
-    const accountTask = readFeedbackEndpoint(endpoints.account).then((document) => {
-      state.feedbackSync.account = "saved";
-      return document;
-    }).catch((error) => {
-      state.feedbackSync.account = error.code === "signed-out" ? "signed-out" : "unavailable";
-      return null;
-    });
-    const [localDocument, accountDocument] = await Promise.all([localTask, accountTask]);
-    state.feedback = Feedback.mergeDocuments(state.feedback, localDocument, accountDocument);
-    queueBrowserFeedbackWrite(1200);
-    refreshLoadedFeedback();
-    await persistFeedback({ full: true });
+      });
+      state.feedback = Feedback.mergeDocuments(state.feedback, localDocument);
+      queueBrowserFeedbackWrite(300);
+      refreshLoadedFeedback();
+      // 账号同步不再阻塞本机 B 点和 K 线首屏。
+      setTimeout(() => void loadAccount(), 1200);
+      return;
+    }
+    await loadAccount();
   }
 
   function syncCrosshair(time, source) {
@@ -2869,8 +2936,8 @@
         cache: "default",
         headers: { Accept: "application/json" },
       });
-      if (response.status === 404) return null;
-      if (!response.ok) return null;
+      if (response.status === 202 || response.status === 404) return { pending: true };
+      if (!response.ok) return { pending: true };
       const value = await response.json();
       const matchesRequest = value?.version === STRATEGY_CACHE_VERSION
         && value?.pair === Data.normalizePair(params.pair)
@@ -2885,15 +2952,21 @@
       return value;
     } catch (error) {
       if (error?.name === "AbortError") throw error;
-      return null;
+      return { pending: true };
     }
+  }
+
+  function localPrecomputePendingError() {
+    const error = new Error("本地策略结果正在后台生成");
+    error.code = "local-precompute-pending";
+    return error;
   }
 
   async function loadAnalyzedInterval(params) {
     // 历史龙头优先读取 Node 在本机预先算好的完整结果。命中后浏览器不再
     // 拉交易所、不再跑单周期识别；人工确认/否定仍会在最终提交阶段即时叠加。
     const precomputed = await readLocalPrecomputed(params);
-    if (precomputed) {
+    if (precomputed && !precomputed.pending) {
       return {
         result: precomputed.result,
         venue: precomputed.venue,
@@ -2911,6 +2984,9 @@
       && Data.isCandleCoverageAcceptable(cached.result.candles, params.window, params.interval)) {
       return { ...cached, persistentCacheHit: true };
     }
+    // 历史文档案例严格采用“本机后台计算、看板只读展示”。本地结果尚未生成时
+    // 立即返回等待状态，绝不在浏览器里拉整段行情并启动策略 Worker。
+    if (params.historicalDocument) throw localPrecomputePendingError();
     const payload = await fetchWithCache(params);
     const analysisOptions = {
       interval: params.interval,
@@ -3053,6 +3129,15 @@
     };
   }
 
+  function schedulePrecomputedReload(generation) {
+    if (state.precomputedRetryTimer) clearTimeout(state.precomputedRetryTimer);
+    state.precomputedRetryTimer = window.setTimeout(() => {
+      state.precomputedRetryTimer = null;
+      if (generation !== state.generation || state.loadingWorkspace) return;
+      void loadWorkspace();
+    }, 2500);
+  }
+
   async function loadWorkspace() {
     const pair = Data.normalizePair($("#symbolInput").value);
     const preselectedLeader = isPreselectedLeaderPair(pair);
@@ -3061,6 +3146,10 @@
     const provider = $("#providerSelect").value;
     const market = $("#marketSelect").value;
     const generation = ++state.generation;
+    if (state.precomputedRetryTimer) {
+      clearTimeout(state.precomputedRetryTimer);
+      state.precomputedRetryTimer = null;
+    }
     state.loadingWorkspace = true;
     state.controller?.abort();
     state.controller = new AbortController();
@@ -3096,8 +3185,11 @@
       try {
         const loaded = await loadAnalyzedInterval(buildParams(pair, interval));
         if (generation !== state.generation) return null;
+        const firstPaintResult = loaded.localPrecomputedHit
+          ? applyFeedbackPolicy(loaded.result, pair)
+          : provisionalChartResult(loaded.result);
         state.results.set(interval, {
-          result: provisionalChartResult(loaded.result),
+          result: firstPaintResult,
           baseResult: loaded.result,
           venue: loaded.venue,
           attempts: loaded.attempts,
@@ -3105,9 +3197,11 @@
         return { interval, ok: true, ...loaded };
       } catch (error) {
         if (error?.name === "AbortError" || generation !== state.generation) return null;
-        const detail = error?.attempts?.length ? `已尝试 ${error.attempts.length} 个数据源` : "公开接口不可用";
+        const detail = error?.code === "local-precompute-pending"
+          ? "后台生成完成后自动刷新"
+          : error?.attempts?.length ? `已尝试 ${error.attempts.length} 个数据源` : "公开接口不可用";
         state.failures.set(interval, `${error.message} · ${detail}`);
-        return { interval, ok: false, error };
+        return { interval, ok: false, error, precomputedPending: error?.code === "local-precompute-pending" };
       }
     };
 
@@ -3191,6 +3285,12 @@
         $("#loadButton span").textContent = "扫描起爆点";
         $("#lastUpdated").textContent = `SYNC ${formatDateTime(Date.now(), true)}`;
         state.loadingWorkspace = false;
+        if (failed.some((item) => item.precomputedPending)) {
+          $("#summaryStatus").textContent = "后台正在生成本地策略结果";
+          $("#summaryHint").textContent = "看板没有现场运算；生成完成后会自动读取并显示 B 点";
+          $("#sourceRoute span").textContent = `本机预计算进行中 · 已就绪 ${usable.length}/${intervals.length} 个周期 · 页面仅负责加载展示`;
+          schedulePrecomputedReload(generation);
+        }
       }
       if (hydratedVisualRecords) await persistFeedback();
     };
@@ -3565,7 +3665,7 @@
   renderLeaderUniverse();
   // 行情首屏不再等待反馈账号与实时龙头池网络请求；二者完成后会自行刷新
   // 已加载结果。这样刷新页面时，当前 K 线盘面拥有最高加载优先级。
-  void initializeFeedback();
-  void loadWorkspace();
+  // B 点索引先于行情结果就绪，避免 K 线已出现、确认点却被迟到结果覆盖。
+  void initializeFeedback().finally(() => loadWorkspace());
   void loadLiveLeaders();
 })();

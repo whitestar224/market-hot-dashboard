@@ -70,9 +70,9 @@ class BinanceWalletHotTests(unittest.TestCase):
         self.assertEqual(first["chainLabel"], "BSC")
         self.assertEqual(first["contractAddress"], "0xabc7777")
         self.assertEqual(first["icon"], "https://bin.bnbstatic.com/images/fone.png")
-        self.assertEqual(first["url"], "https://web3.binance.com/en/token/bsc/0xabc7777")
+        self.assertEqual(first["url"], "https://web3.binance.com/en/token/bsc/0xabc7777?ref=MQ6JD2X4")
         self.assertEqual(source["rows"][0]["name"], "我的女友景甜")
-        self.assertEqual(source["rows"][2]["url"], "https://web3.binance.com/en/token/sol/So11111111111111111111111111111111111111112")
+        self.assertEqual(source["rows"][2]["url"], "https://web3.binance.com/en/token/sol/So11111111111111111111111111111111111111112?ref=MQ6JD2X4")
 
     def test_periods_map_to_binance_wallet_rank_fields(self):
         expectations = {

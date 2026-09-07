@@ -476,7 +476,19 @@ test("refresh restores the active chart first and reuses a bounded persistent an
   assert.ok(activeFirst >= 0 && remainingLater > activeFirst);
   assert.match(js, /await nextPaint\(\)/);
   assert.match(js, /主图已恢复 · 后台验证多周期/);
-  assert.match(js, /void initializeFeedback\(\);\s*void loadWorkspace\(\);\s*void loadLiveLeaders\(\);/);
+  assert.match(js, /void initializeFeedback\(\)\.finally\(\(\) => loadWorkspace\(\)\);\s*void loadLiveLeaders\(\);/);
+});
+
+test("confirmed B markers load from a compact local index before candles and never wait for the visual library", () => {
+  assert.match(js, /FEEDBACK_INDEX_STORAGE_KEY = "dragon-wave-feedback-index-v1"/);
+  assert.match(js, /localStorage\.getItem\(FEEDBACK_INDEX_STORAGE_KEY\)/);
+  assert.match(js, /localStorage\.setItem\(FEEDBACK_INDEX_STORAGE_KEY/);
+  assert.match(js, /deviceId=\$\{encodeURIComponent\(state\.deviceId\)\}&view=index&scope=all/);
+  assert.match(js, /"X-Dragon-Wave-Compact": "1"/);
+  assert.match(js, /if \(state\.feedbackIndexOnly\) return 0/);
+  assert.match(js, /if \(state\.results\.size\) \{\s*renderActiveChart/);
+  const initializeBody = js.slice(js.indexOf("async function initializeFeedback()"), js.indexOf("function syncCrosshair"));
+  assert.doesNotMatch(initializeBody, /persistFeedback\(\{ full: true \}\)/);
 });
 
 test("one-minute replay is excluded and historical analysis runs off the interaction thread", () => {
@@ -498,6 +510,10 @@ test("historical cases load locally precomputed results before browser or exchan
   assert.match(js, /allLocallyPrecomputed\s*\? usable\.map\(\(item\) => item\.rawResult\)/);
   assert.match(js, /本机预计算/);
   assert.match(js, /applyFeedbackPolicy\(baseResult, pair\)/);
+  assert.match(js, /if \(params\.historicalDocument\) throw localPrecomputePendingError\(\)/);
+  assert.match(js, /看板只读展示/);
+  assert.match(js, /loaded\.localPrecomputedHit[\s\S]*applyFeedbackPolicy\(loaded\.result, pair\)/);
+  assert.match(js, /schedulePrecomputedReload\(generation\)/);
   assert.match(quietServerSource, /\/api\/dragon-wave-precomputed/);
   assert.match(quietServerSource, /Content-Encoding", "gzip"/);
   assert.match(quietServerSource, /X-Dragon-Wave-Precomputed/);
@@ -515,6 +531,19 @@ test("the launcher warms historical leaders in a hidden low-priority process", (
   assert.match(precomputeSource, /function compactResultForDashboard/);
   assert.match(precomputeSource, /Data\.isCandleCoverageAcceptable/);
   assert.match(precomputeSource, /setTimeout\(resolve, 300\)/);
+  assert.match(quietServerSource, /supervise_precompute/);
+  assert.match(quietServerSource, /queue_precomputed_request/);
+  assert.match(quietServerSource, /seed_confirmed_precompute_requests/);
+  assert.match(quietServerSource, /preempt=bool\(request\.pop\("_newRequest"/);
+  assert.match(precomputeSource, /drainPriorityRequests/);
+  assert.match(precomputeSource, /onlyPreferred/);
+  assert.match(precomputeSource, /each requested interval independently schedulable/);
+  assert.match(precomputeSource, /right\.priority - left\.priority/);
+  assert.match(precomputeSource, /afterInterval/);
+  assert.match(precomputeSource, /drainPriorityRequests\(manifest, totals\)/);
+  assert.doesNotMatch(precomputeSource, /Promise\.all\(remaining\.map\(loadAndStore\)\)/);
+  assert.match(precomputeSource, /readLocalArchivedCandles/);
+  assert.match(precomputeSource, /本机K线库/);
 });
 
 test("chart motion and feedback persistence are coalesced away from pointer and confirmation frames", () => {

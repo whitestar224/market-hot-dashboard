@@ -2,6 +2,21 @@
   const CACHE_KEY = "xingyunshe:xwatch:feed:v5";
   const SOURCES_KEY = "xingyunshe:xwatch:sources:v1";
   const FRESH_WINDOW_MS = 24 * 60 * 60 * 1000;
+  const CATEGORY_OPTIONS = [
+    { id: "kol", label: "普通KOL" },
+    { id: "celebrity", label: "明星" },
+    { id: "notable", label: "名人" },
+    { id: "founder", label: "项目创始人/联合创始人" },
+    { id: "project_official", label: "项目官方X" }
+  ];
+  const CATEGORY_LABELS = new Map(CATEGORY_OPTIONS.map((category) => [category.id, category.label]));
+  const CATEGORY_BADGE_LABELS = new Map([
+    ["kol", "普通KOL"],
+    ["celebrity", "明星"],
+    ["notable", "名人"],
+    ["founder", "创始人/联创"],
+    ["project_official", "项目官方X"]
+  ]);
 
   const state = {
     sources: [],
@@ -10,6 +25,7 @@
     provider: "--",
     hasToken: false,
     query: "",
+    activeCategory: "all",
     activeSource: "all",
     saving: false,
     editingId: "",
@@ -33,6 +49,7 @@
     form: $("xwatchForm"),
     handle: $("xwatchHandle"),
     name: $("xwatchName"),
+    category: $("xwatchCategory"),
     keywords: $("xwatchKeywords"),
     submit: $("xwatchSubmit"),
     cancelEdit: $("xwatchCancelEdit"),
@@ -41,6 +58,7 @@
     timeline: $("xwatchTimeline"),
     refresh: $("xwatchRefresh"),
     search: $("xwatchSearch"),
+    categoryFilter: $("xwatchCategoryFilter"),
     sourceFilter: $("xwatchSourceFilter")
   };
 
@@ -69,6 +87,19 @@
 
   function sourceId(handle) {
     return `x:${normalizeHandle(handle).toLowerCase()}`;
+  }
+
+  function normalizeCategory(value) {
+    const category = String(value || "").trim().toLowerCase();
+    return CATEGORY_LABELS.has(category) ? category : "kol";
+  }
+
+  function categoryLabel(value) {
+    return CATEGORY_LABELS.get(normalizeCategory(value)) || "普通KOL";
+  }
+
+  function categoryBadgeLabel(value) {
+    return CATEGORY_BADGE_LABELS.get(normalizeCategory(value)) || "普通KOL";
   }
 
   function fallbackAvatar(handle) {
@@ -269,6 +300,7 @@
         id: sourceId(handle),
         handle,
         displayName: String(source.displayName || source.name || handle).trim() || handle,
+        category: normalizeCategory(source.category || source.categoryId || source.categoryType),
         keywords: splitKeywords(source.keywords),
         enabled: source.enabled !== false,
         avatar: source.avatar || source.avatarUrl || fallbackAvatar(handle),
@@ -412,12 +444,49 @@
 
   function renderSourceFilter() {
     const current = state.activeSource;
+    const availableSources = state.activeCategory === "all"
+      ? state.sources
+      : state.sources.filter((source) => normalizeCategory(source.category) === state.activeCategory);
+    if (nodes.categoryFilter) nodes.categoryFilter.value = state.activeCategory;
     nodes.sourceFilter.innerHTML = [
       '<option value="all">全部KOL</option>',
-      ...state.sources.map((source) => `<option value="${escapeHtml(source.id)}">${escapeHtml(source.displayName || source.handle)}</option>`)
+      ...availableSources.map((source) => `<option value="${escapeHtml(source.id)}">${escapeHtml(source.displayName || source.handle)}</option>`)
     ].join("");
-    nodes.sourceFilter.value = state.sources.some((source) => source.id === current) ? current : "all";
+    nodes.sourceFilter.value = availableSources.some((source) => source.id === current) ? current : "all";
     state.activeSource = nodes.sourceFilter.value;
+  }
+
+  function sourceRowMarkup(source) {
+    const live = sourceState(source.id);
+    const statusClass = live.status === "error" ? "error" : live.status === "recovering" ? "recovering" : source.enabled ? "ok" : "muted";
+    const displayName = source.displayName || live.displayName || source.handle;
+    const avatar = live.avatar || source.avatar || fallbackAvatar(source.handle);
+    const initials = (displayName || source.handle || "X").slice(0, 2).toUpperCase();
+    const isEditing = source.id === state.editingId;
+    return `
+      <article class="xwatch-source-row${isEditing ? " is-editing" : ""}" data-source-id="${escapeHtml(source.id)}" data-state="${statusClass}">
+        <button class="xwatch-source-avatar" type="button" data-action="filter" title="只看这个KOL">
+          ${avatarMarkup(avatar, initials)}
+        </button>
+        <div class="xwatch-source-main">
+          <div class="xwatch-source-title">
+            <b>${escapeHtml(displayName)}</b>
+            <span class="xwatch-category-badge" data-category="${escapeHtml(normalizeCategory(source.category))}">${escapeHtml(categoryBadgeLabel(source.category))}</span>
+          </div>
+          <em>@${escapeHtml(source.handle)} · ${escapeHtml(live.provider || state.provider || "--")} · ${escapeHtml(live.itemsReturned ?? 0)}/${escapeHtml(live.fetchLimit ?? "--")}</em>
+          <input data-action="keywords" value="${escapeHtml((source.keywords || []).join(", "))}" placeholder="关注词，不裁剪动态" />
+          ${live.error ? `<small>${escapeHtml(live.error)}</small>` : ""}
+        </div>
+        <label class="xwatch-switch" title="启用/暂停">
+          <input data-action="toggle" type="checkbox" ${source.enabled ? "checked" : ""} />
+          <span></span>
+        </label>
+        <div class="xwatch-source-actions">
+          <button class="xwatch-edit" type="button" data-action="edit" title="编辑">编辑</button>
+          <button class="xwatch-delete" type="button" data-action="delete" title="删除">×</button>
+        </div>
+      </article>
+    `;
   }
 
   function renderSources() {
@@ -430,33 +499,17 @@
       `;
       return;
     }
-    nodes.sourceList.innerHTML = state.sources.map((source) => {
-      const live = sourceState(source.id);
-      const statusClass = live.status === "error" ? "error" : live.status === "recovering" ? "recovering" : source.enabled ? "ok" : "muted";
-      const displayName = source.displayName || live.displayName || source.handle;
-      const avatar = live.avatar || source.avatar || fallbackAvatar(source.handle);
-      const initials = (displayName || source.handle || "X").slice(0, 2).toUpperCase();
-      const isEditing = source.id === state.editingId;
+    nodes.sourceList.innerHTML = CATEGORY_OPTIONS.map((category) => {
+      const sources = state.sources.filter((source) => normalizeCategory(source.category) === category.id);
+      if (!sources.length) return "";
       return `
-        <article class="xwatch-source-row${isEditing ? " is-editing" : ""}" data-source-id="${escapeHtml(source.id)}" data-state="${statusClass}">
-          <button class="xwatch-source-avatar" type="button" data-action="filter" title="只看这个KOL">
-            ${avatarMarkup(avatar, initials)}
-          </button>
-          <div class="xwatch-source-main">
-            <b>${escapeHtml(displayName)}</b>
-            <em>@${escapeHtml(source.handle)} · ${escapeHtml(live.provider || state.provider || "--")} · ${escapeHtml(live.itemsReturned ?? 0)}/${escapeHtml(live.fetchLimit ?? "--")}</em>
-            <input data-action="keywords" value="${escapeHtml((source.keywords || []).join(", "))}" placeholder="关注词，不裁剪动态" />
-            ${live.error ? `<small>${escapeHtml(live.error)}</small>` : ""}
+        <section class="xwatch-source-group" data-category="${escapeHtml(category.id)}">
+          <div class="xwatch-source-group-head">
+            <b>${escapeHtml(category.label)}</b>
+            <span>${sources.length}</span>
           </div>
-          <label class="xwatch-switch" title="启用/暂停">
-            <input data-action="toggle" type="checkbox" ${source.enabled ? "checked" : ""} />
-            <span></span>
-          </label>
-          <div class="xwatch-source-actions">
-            <button class="xwatch-edit" type="button" data-action="edit" title="编辑">编辑</button>
-            <button class="xwatch-delete" type="button" data-action="delete" title="删除">×</button>
-          </div>
-        </article>
+          <div class="xwatch-source-group-list">${sources.map(sourceRowMarkup).join("")}</div>
+        </section>
       `;
     }).join("");
     nodes.save.textContent = state.saving ? "保存中" : "保存";
@@ -465,6 +518,8 @@
   function filteredItems() {
     const query = state.query.trim().toLowerCase();
     return state.items.filter((item) => {
+      const matchingSource = state.sources.find((source) => source.id === item.sourceId);
+      if (state.activeCategory !== "all" && normalizeCategory(matchingSource?.category) !== state.activeCategory) return false;
       if (state.activeSource !== "all" && item.sourceId !== state.activeSource) return false;
       if (!query) return true;
       return [
@@ -539,6 +594,7 @@
               <div>
                 <b>${escapeHtml(item.sourceName || item.handle || "KOL")}</b>
                 <em>@${escapeHtml(item.handle || "")}</em>
+                <span class="xwatch-category-badge" data-category="${escapeHtml(normalizeCategory(matchingSource?.category))}">${escapeHtml(categoryLabel(matchingSource?.category))}</span>
               </div>
               <time>${escapeHtml(timeLabel(item.publishedAt))}</time>
             </header>
@@ -596,6 +652,7 @@
     state.editingId = id;
     nodes.handle.value = source.handle || "";
     nodes.name.value = source.displayName || "";
+    nodes.category.value = normalizeCategory(source.category);
     nodes.keywords.value = (source.keywords || []).join(", ");
     render();
     nodes.handle.focus();
@@ -622,6 +679,7 @@
       id,
       handle,
       displayName: nodes.name.value.trim() || previous?.displayName || handle,
+      category: normalizeCategory(nodes.category.value),
       keywords: splitKeywords(nodes.keywords.value),
       enabled: previous?.enabled !== false,
       avatar: previous?.handle && normalizeHandle(previous.handle).toLowerCase() === handle.toLowerCase()
@@ -662,6 +720,7 @@
       beginEdit(id);
     }
     if (action === "filter") {
+      state.activeCategory = normalizeCategory(getSource(id)?.category);
       state.activeSource = id;
       render();
     }
@@ -695,6 +754,16 @@
 
   nodes.search.addEventListener("input", (event) => {
     state.query = event.target.value;
+    renderTimeline();
+  });
+
+  nodes.categoryFilter.addEventListener("change", (event) => {
+    state.activeCategory = event.target.value === "all" ? "all" : normalizeCategory(event.target.value);
+    const selectedSource = getSource(state.activeSource);
+    if (selectedSource && state.activeCategory !== "all" && normalizeCategory(selectedSource.category) !== state.activeCategory) {
+      state.activeSource = "all";
+    }
+    renderSourceFilter();
     renderTimeline();
   });
 
