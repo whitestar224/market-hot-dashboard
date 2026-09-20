@@ -173,6 +173,10 @@ class GmgnTrenchHotBoardTests(unittest.TestCase):
             self.assertEqual(source["historyCount"], 1)
             self.assertEqual(source["rows"][0]["symbol"], "NEW")
             self.assertEqual(source["rows"][0]["icon"], "https://img.example/NEW.png")
+            self.assertEqual(
+                source["rows"][0]["binanceWalletUrl"],
+                "https://web3.binance.com/en/token/sol/SoLaNaContract123?ref=MQ6JD2X4",
+            )
             self.assertEqual(source["rows"][0]["xOriginal"]["text"], "NEW original post")
             self.assertEqual(source["refreshIntervalSeconds"], server.GMGN_TRENCH_BOARD_REFRESH_SECONDS)
             self.assertEqual(source["aiProvider"], "binance")

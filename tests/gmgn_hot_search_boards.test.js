@@ -51,10 +51,15 @@ test("GMGN trench history is scrollable and uses the cached Binance AI narrative
   assert.match(js, /sourceId === "gmgn-trenches"/);
   assert.match(js, /sourceRows\.slice\(0, Math\.min\(10/);
   assert.match(js, /const gmgnTrenchBatchLimit = 4/);
+  assert.match(js, /class="gmgn-trench-token-link"/);
+  assert.match(js, /kind: "wallet"/);
+  assert.match(js, /noopener noreferrer/);
   assert.doesNotMatch(js, /gmgn-trenches\/ai/);
   assert.match(server, /"gmgn-trenches",\s*\n?\}/);
   assert.match(server, /worker_limit = 2 if contains_trenches else 6/);
   assert.match(server, /GMGN_TRENCH_BOARD_REFRESH_SECONDS/);
+  assert.match(server, /def binance_wallet_contract_url/);
+  assert.match(server, /"binanceWalletUrl": binance_wallet_contract_url/);
   assert.match(server, /gmgn_trenches_received_history\.json/);
   assert.match(server, /"excludeFromTotal": True/);
   assert.match(html, /styles\.css\?v=111/);

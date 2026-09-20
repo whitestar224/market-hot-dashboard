@@ -752,9 +752,9 @@ function gmgnTrenchSocialLinks(row) {
 }
 
 function renderGmgnTrenchTool({ kind, label, href = "", tooltip = "", disabled = false, statusId = "", xHandle = "", symbol = "", publishedAt = 0 }) {
-  const icons = { ai: "✦", x: "𝕏", web: "◎", gmgn: "↗" };
+  const icons = { ai: "✦", wallet: "▣", x: "𝕏", web: "◎", gmgn: "↗" };
   const tag = href ? "a" : "button";
-  const linkAttrs = href ? `href="${escapeHtml(href)}" target="_blank" rel="noreferrer"` : 'type="button"';
+  const linkAttrs = href ? `href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer"` : 'type="button"';
   const xAttrs = kind === "x"
     ? `data-status-id="${escapeHtml(statusId)}" data-x-handle="${escapeHtml(xHandle)}" data-symbol="${escapeHtml(symbol)}" data-published-at="${escapeHtml(publishedAt)}"`
     : "";
@@ -832,6 +832,13 @@ function renderGmgnTrenchRow(row, source, index) {
   const symbol = String(row?.symbol || "--");
   const name = String(row?.name || symbol);
   const contract = String(row?.contractAddress || "");
+  const binanceWallet = safeExternalUrl(row?.binanceWalletUrl);
+  const binanceWalletAttrs = binanceWallet
+    ? `href="${escapeHtml(binanceWallet)}" target="_blank" rel="noopener noreferrer"`
+    : "";
+  const avatarMarkup = binanceWallet
+    ? `<a class="gmgn-trench-wallet-avatar" ${binanceWalletAttrs} title="在币安钱包交易 ${escapeHtml(symbol)}" aria-label="在币安钱包交易 ${escapeHtml(symbol)}">${renderAssetIcon(row, source)}</a>`
+    : `<span class="gmgn-trench-avatar">${renderAssetIcon(row, source)}</span>`;
   const shortContract = contract.length > 13 ? `${contract.slice(0, 5)}…${contract.slice(-5)}` : contract;
   const filterWarnings = Array.isArray(row?.filterWarnings) ? row.filterWarnings.filter(Boolean) : [];
   const filterWarningBadge = filterWarnings.length
@@ -865,6 +872,12 @@ function renderGmgnTrenchRow(row, source, index) {
   const xTooltip = socials.x ? renderGmgnTrenchXTooltip(symbol, socials.original) : "";
   const tools = [
     renderGmgnTrenchTool({ kind: "ai", label: `查看 ${symbol} 的币安 AI 叙事`, tooltip: aiTooltip }),
+    binanceWallet ? renderGmgnTrenchTool({
+      kind: "wallet",
+      label: `在币安钱包交易 ${symbol}`,
+      href: binanceWallet,
+      tooltip: "打开币安 Web3 对应合约交易页；沿用当前浏览器已登录的币安会话。"
+    }) : "",
     socials.x ? renderGmgnTrenchTool({
       kind: "x",
       label: `查看 ${symbol} 的对应原 X`,
@@ -883,11 +896,12 @@ function renderGmgnTrenchRow(row, source, index) {
     <article class="gmgn-trench-hot-row ${researchMark ? "is-research-pick" : ""}" data-live-key="gmgn-trench:${escapeHtml(liveKey)}" role="listitem">
       <div class="gmgn-trench-identity">
         <span class="gmgn-trench-rank">${escapeHtml(index)}</span>
-        <span class="gmgn-trench-avatar">${renderAssetIcon(row, source)}</span>
+        ${avatarMarkup}
         <div class="gmgn-trench-copy">
           <div class="gmgn-trench-name">
-            <strong>${escapeHtml(symbol)}</strong>
-            <span>${escapeHtml(name)}</span>
+            ${binanceWallet
+              ? `<a class="gmgn-trench-token-link" ${binanceWalletAttrs} title="在币安钱包交易 ${escapeHtml(symbol)}"><strong>${escapeHtml(symbol)}</strong><span>${escapeHtml(name)}</span></a>`
+              : `<span class="gmgn-trench-token-link is-static"><strong>${escapeHtml(symbol)}</strong><span>${escapeHtml(name)}</span></span>`}
             ${researchBadge}
             ${filterWarningBadge}
           </div>

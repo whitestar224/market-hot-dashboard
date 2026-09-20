@@ -9499,7 +9499,14 @@ def binance_wallet_icon_url(value: Any) -> str:
     return icon
 
 
-def binance_wallet_token_url(chain_id: Any, contract_address: Any) -> str:
+def binance_wallet_contract_url(chain_id: Any, contract_address: Any) -> str:
+    """Build a direct Binance Web3 token page when the chain is supported.
+
+    The URL deliberately contains no login credential. Opening it from the
+    dashboard lets the user's existing browser session supply its own
+    cookies/session state without copying a local Binance Wallet token into
+    the page or server.
+    """
     contract = str(contract_address or "").strip()
     normalized_chain = str(chain_id or "").strip()
     _, route_chain = BINANCE_WALLET_CHAIN_META.get(normalized_chain, ("", ""))
@@ -9509,10 +9516,15 @@ def binance_wallet_token_url(chain_id: Any, contract_address: Any) -> str:
         if route_chain == "solana":
             route_chain = "sol"
     if not contract or not route_chain:
-        return "https://web3.binance.com/en/markets"
+        return ""
     base_url = f"https://web3.binance.com/en/token/{route_chain}/{quote(contract, safe='')}"
     referral = quote(BINANCE_WALLET_REFERRAL_CODE, safe="")
     return f"{base_url}?ref={referral}" if referral else base_url
+
+
+def binance_wallet_token_url(chain_id: Any, contract_address: Any) -> str:
+    """Return a Binance Web3 token page, preserving the legacy market fallback."""
+    return binance_wallet_contract_url(chain_id, contract_address) or "https://web3.binance.com/en/markets"
 
 
 def binance_wallet_ai_narrative_available(raw: dict[str, Any]) -> bool:
@@ -12058,6 +12070,7 @@ def gmgn_trench_board_rows(
             "chainLabel": chain_labels.get(network, network.upper()),
             "icon": clean_feed_text(raw.get("imageUrl"), 900),
             "url": clean_feed_text(raw.get("tradeUrl"), 900),
+            "binanceWalletUrl": binance_wallet_contract_url(network, raw.get("contractAddress")),
             "price": price_usd(metrics.get("priceUsd")),
             "turnover": f"24H {money_usd(volume)}",
             "amount": volume,
