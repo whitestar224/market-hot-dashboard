@@ -64,7 +64,7 @@ test("GMGN trench history is scrollable and uses the cached Binance AI narrative
   assert.match(server, /"excludeFromTotal": True/);
   assert.match(html, /styles\.css\?v=111/);
   assert.match(html, /market_total_board\.js\?v=3/);
-  assert.match(html, /app\.js\?v=35/);
+  assert.match(html, /app\.js\?v=36/);
   assert.match(js, /market-hot:payload:v15/);
 });
 

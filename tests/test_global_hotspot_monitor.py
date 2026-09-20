@@ -120,6 +120,34 @@ class GlobalHotspotMonitorTests(unittest.TestCase):
             {**base, "contractAddress": ""}, snapshot=snapshot, now_ms=NOW
         )["decision"], "watching")
 
+    def test_gmgn_narrative_fallback_uses_h24_only_when_h1_is_missing(self):
+        snapshot = {
+            "events": [{
+                "id": "hotspot:gmgn-fallback", "title": "新 Meme 叙事形成热点", "summary": "公开事件快速传播",
+                "entityNames": ["FALLBACK"], "searchTerms": ["FALLBACK"], "hotnessScore": 90,
+                "occurredAt": NOW - 60_000, "primaryUrl": "https://example.com/fallback",
+            }]
+        }
+        row = {
+            "network": "solana", "contractAddress": "Fallback111111111111111111111111111111111",
+            "symbol": "FALLBACK", "name": "Fallback", "decision": "warming",
+            "narrativeFallbackEligible": True,
+            "narrativeContext": {"socials": ["https://x.com/fallback"]},
+            "metrics": {"liquidityUsd": 35_000, "volumeH1Usd": None, "transactionsH1": 0,
+                        "volumeH24Usd": 80_000, "transactionsH24": 120},
+            "reasons": [], "risks": [],
+        }
+        promoted = server.global_hotspot_enrich_candidate(
+            row, snapshot=snapshot, now_ms=NOW, allow_narrative_fallback=True,
+        )
+
+        self.assertEqual(promoted["decision"], "shortlisted")
+        self.assertTrue(promoted["narrativeFallbackApplied"])
+        self.assertTrue(any("1小时成交数据尚未形成" in reason for reason in promoted["reasons"]))
+        self.assertEqual(server.global_hotspot_enrich_candidate(
+            row, snapshot=snapshot, now_ms=NOW,
+        )["decision"], "warming")
+
     def test_web_hotspot_is_visible_in_news_trade_even_before_a_contract_is_found(self):
         event = server.normalize_global_hotspot_event({
             "title": "新人物事件形成全网热点",

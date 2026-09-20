@@ -371,6 +371,17 @@ def activate_news_trigger(row):
     liquid = float(metrics.get("liquidityUsd") or 0) >= (5_000 if exact_contract else 20_000)
     active = (float(metrics.get("volumeH1Usd") or 0) >= (5_000 if exact_contract else 10_000)
               or int(float(metrics.get("transactionsH1") or 0)) >= (8 if exact_contract else 50))
+    h1_missing = not any(float(metrics.get(key) or 0) > 0 for key in (
+        "volumeH1Usd", "transactionsH1", "buysH1", "sellsH1",
+    ))
+    if not active and row.get("narrativeFallbackEligible") and h1_missing:
+        # GMGN's newly migrated rows can legitimately arrive before the first
+        # hourly candle is populated.  A recent news/CA match may still enter
+        # the V4.4 queue, but only with a conservative H24 activity floor.
+        active = (
+            float(metrics.get("volumeH24Usd") or 0) >= (20_000 if exact_contract else 20_000)
+            or int(float(metrics.get("transactionsH24") or 0)) >= (25 if exact_contract else 50)
+        )
     if liquid and active:
         result["decision"] = "shortlisted"
         result["selectedScore"] = max(62, float(result.get("selectedScore") or 0))

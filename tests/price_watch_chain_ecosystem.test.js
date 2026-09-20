@@ -59,6 +59,7 @@ test("price watch exposes chain ecosystem mode and API", () => {
   const html = fs.readFileSync("price-watch.html", "utf8");
   const js = fs.readFileSync("price-watch.js", "utf8");
   const css = fs.readFileSync("styles.css", "utf8");
+  const server = fs.readFileSync("server.py", "utf8");
 
   assert.match(html, /data-watch-mode="chains"/);
   assert.match(js, /\/api\/chain-ecosystem/);
@@ -74,6 +75,10 @@ test("price watch exposes chain ecosystem mode and API", () => {
   assert.match(js, /动态增量扫盘/);
   assert.match(js, /战壕 · 已开盘/);
   assert.match(js, /\/api\/onchain-trenches/);
+  assert.match(js, /const direct = safeExternalUrl\(row\?\.binanceWalletUrl\)/);
+  assert.match(js, /const href = binanceWalletTokenUrl\(row\) \|\| safeExternalUrl\(row\.tradeUrl\)/);
+  assert.match(js, /币安钱包 ↗/);
+  assert.match(server, /row\["binanceWalletUrl"\] = binance_wallet_contract_url/);
   assert.match(js, /正在直接连接 GMGN/);
   assert.match(js, /同一请求 90 秒合并复用/);
   assert.match(js, /已接入个人 Key/);

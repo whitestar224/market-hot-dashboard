@@ -12326,6 +12326,10 @@ def gmgn_trench_daily_research_payload(
         if decision == "filtered":
             continue
         row = dict(raw)
+        metrics = row.get("metrics") if isinstance(row.get("metrics"), dict) else {}
+        h1_missing = not any(safe_float(metrics.get(key), 0) > 0 for key in (
+            "volumeH1Usd", "transactionsH1", "buysH1", "sellsH1",
+        ))
         row.update({
             "network": network,
             "poolCreatedAt": created_at,
@@ -12336,6 +12340,7 @@ def gmgn_trench_daily_research_payload(
             "researchTier": "gmgn-trench-new",
             "researchSource": "GMGN 战壕",
             "researchSourceLabel": "GMGN 战壕今日新币",
+            "narrativeFallbackEligible": h1_missing,
             "reasons": list(dict.fromkeys([
                 f"GMGN 战壕 {day} 新币 · {decision}",
                 *(raw.get("reasons") or []),
@@ -12361,7 +12366,7 @@ def gmgn_trench_daily_research_payload(
     fast_research = globals().get("ONCHAIN_FAST_RESEARCH")
     if candidates and fast_research is not None:
         try:
-            fast_research.ingest(candidates, match_recent_news=False)
+            fast_research.ingest(candidates, match_recent_news=True)
             research_ingested_at = current_ms
         except Exception as exc:
             ingest_errors.append(f"GMGN 新币投研入队失败：{safe_monitor_error(exc)}")
@@ -12456,7 +12461,7 @@ def attach_gmgn_trench_research(research: dict[str, Any]) -> dict[str, Any]:
     # The write is idempotent and does not call any external provider.
     if pool and not int(safe_float(research.get("trenchResearchIngestedAt"), 0)):
         try:
-            fast_research.ingest(pool, match_recent_news=False)
+            fast_research.ingest(pool, match_recent_news=True)
         except Exception as exc:
             base["errors"] = [*(base.get("errors") or []), f"GMGN 新币投研入队失败：{safe_monitor_error(exc)}"][:12]
 
@@ -12475,6 +12480,54 @@ def attach_gmgn_trench_research(research: dict[str, Any]) -> dict[str, Any]:
             "trenchCandidatePool": None,
             "errors": [*(base.get("errors") or []), f"V4.4 投研读取失败：{safe_monitor_error(exc)}"][:12],
         }
+
+    # FastResearch.attach aggregates the whole durable day queue.  Scope the
+    # funnel back to this GMGN pool so historical jobs cannot make today's
+    # “unavailable/evidence不足” counters look larger than they are.
+    job_counts = {
+        "quantified": 0,
+        "pending": 0,
+        "unavailable": 0,
+        "filteredByAi": 0,
+        "needsEvidence": 0,
+        "upgrading": 0,
+        "narrativeResonance": 0,
+    }
+    job_counts_from_store = False
+    if pool_keys and hasattr(fast_research, "_query"):
+        try:
+            placeholders = ",".join("?" for _ in pool_keys)
+            jobs = fast_research._query(
+                f"SELECT key,status,analyzed_at,candidate_json,analysis_json FROM onchain_fast_jobs WHERE key IN ({placeholders})",
+                tuple(pool_keys),
+            )
+            job_counts_from_store = True
+            for job in jobs:
+                try:
+                    candidate = json.loads(job.get("candidate_json") or "{}")
+                    analysis = json.loads(job.get("analysis_json") or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    candidate, analysis = {}, {}
+                if candidate.get("decision") == "shortlisted":
+                    job_counts["quantified"] += 1
+                if candidate.get("narrativeFallbackApplied") or candidate.get("newsSignal"):
+                    job_counts["narrativeResonance"] += 1
+                status = clean_feed_text(job.get("status"), 20)
+                if status in {"pending", "running"}:
+                    job_counts["pending"] += 1
+                    if int(safe_float(job.get("analyzed_at"), 0)) > 0:
+                        job_counts["upgrading"] += 1
+                elif status == "unavailable":
+                    job_counts["unavailable"] += 1
+                elif status == "ready":
+                    verdict = clean_feed_text(analysis.get("verdict"), 20).lower()
+                    if verdict in {"weak", "avoid"}:
+                        job_counts["filteredByAi"] += 1
+                    elif not formal_research_worthy(analysis):
+                        job_counts["needsEvidence"] += 1
+        except Exception:
+            # A telemetry failure must not block the actual V4.4 result.
+            pass
 
     # Only formal V4.4 recommendations enter the main list.  Keep the
     # quantitative breakout lane visible as structure confirmation, but never
@@ -12495,7 +12548,7 @@ def attach_gmgn_trench_research(research: dict[str, Any]) -> dict[str, Any]:
         -safe_float(row.get("poolCreatedAt"), 0),
         onchain_candidate_key(row),
     ))
-    eligible_quantified = sum(
+    eligible_quantified = job_counts["quantified"] or sum(
         1 for row in pool if str(row.get("decision") or "").lower() == "shortlisted"
     )
     review = dict(evaluated.get("reviewQueue") or {}) if isinstance(evaluated, dict) else {}
@@ -12504,7 +12557,12 @@ def attach_gmgn_trench_research(research: dict[str, Any]) -> dict[str, Any]:
         "quantified": eligible_quantified,
         "selected": len(formal),
         "provisional": len(provisional),
-        "pending": max(0, eligible_quantified - len(formal) - len(provisional)),
+        "pending": job_counts["pending"] if job_counts_from_store else max(0, eligible_quantified - len(formal) - len(provisional)),
+        "unavailable": job_counts["unavailable"],
+        "filteredByAi": job_counts["filteredByAi"],
+        "needsEvidence": job_counts["needsEvidence"],
+        "upgrading": job_counts["upgrading"],
+        "narrativeResonance": job_counts["narrativeResonance"],
     })
     funnel = dict(research.get("funnel") or {})
     funnel.update({
@@ -12516,6 +12574,12 @@ def attach_gmgn_trench_research(research: dict[str, Any]) -> dict[str, Any]:
         "provisional": len(provisional),
     })
     errors = list(research.get("errors") or [])[:12]
+    research_analysis_status = (
+        "ready" if formal
+        else "unavailable"
+        if job_counts_from_store and eligible_quantified and job_counts["unavailable"] >= eligible_quantified
+        else "pending" if eligible_quantified else "screened"
+    )
     return {
         **evaluated,
         "selected": formal,
@@ -12530,7 +12594,7 @@ def attach_gmgn_trench_research(research: dict[str, Any]) -> dict[str, Any]:
         "fastResearchManaged": True,
         "gmgnTrenchOnly": True,
         "researchSystem": "onchain-fast-v4.4",
-        "researchAnalysisStatus": "ready" if formal else "pending" if eligible_quantified else "screened",
+        "researchAnalysisStatus": research_analysis_status,
         "researchSource": "gmgn-trenches",
         "researchSourceLabel": "GMGN 战壕今日新币 · V4.4精选",
         "researchSourceCount": len(pool),
@@ -45018,6 +45082,11 @@ def attach_gmgn_native_trench_narrative(source_payload: dict[str, Any]) -> dict[
         if not isinstance(raw, dict):
             continue
         row = dict(raw)
+        if not clean_feed_text(row.get("binanceWalletUrl"), 900):
+            row["binanceWalletUrl"] = binance_wallet_contract_url(
+                row.get("network") or row.get("chain"),
+                row.get("contractAddress"),
+            )
         narrative = clean_feed_text(row.get("gmgnNarrative"), 2400)
         if narrative:
             ready += 1
@@ -45211,7 +45280,8 @@ def analyze_fast_onchain_candidates(rows: list[dict[str, Any]], *, lane="onchain
             "poolCreatedAt", "firstSeenAt", "metrics", "reasons", "risks", "providers",
             "researchEvidence", "narrativeContext", "launchFacts", "walletProfile",
             "crossValidation", "sameSymbolRole", "sameSymbolLeaderReason", "observedAt",
-            "quoteAsset", "frameworkSnapshot",
+            "quoteAsset", "frameworkSnapshot", "narrativeFallbackEligible",
+            "narrativeFallbackApplied",
         )},
     } for index, row in enumerate(rows, 1)]
     for model_row, row in zip(model_rows, rows):
@@ -45390,7 +45460,10 @@ def send_fast_onchain_news_resonance_alert(
 
 ONCHAIN_FAST_RESEARCH = FastResearch(CHAIN_ECOSYSTEM_MONITOR.store, analyze_fast_onchain_candidates, send_fast_onchain_alert,
     realtime_analyzer=lambda rows: analyze_fast_onchain_candidates(rows, lane="onchain-live"),
-    candidate_enricher=lambda row: global_hotspot_enrich_candidate(row),
+    candidate_enricher=lambda row: global_hotspot_enrich_candidate(
+        row,
+        allow_narrative_fallback=bool(row.get("narrativeFallbackEligible")),
+    ),
     resonance_sink=send_fast_onchain_news_resonance_alert)
 
 
@@ -45937,6 +46010,7 @@ def global_hotspot_enrich_candidate(
     *,
     snapshot: dict[str, Any] | None = None,
     now_ms: int | None = None,
+    allow_narrative_fallback: bool = False,
 ) -> dict[str, Any]:
     row = dict(candidate)
     if row.get("decision") == "filtered" or not clean_feed_text(row.get("contractAddress"), 96):
@@ -45962,6 +46036,35 @@ def global_hotspot_enrich_candidate(
     # an exact CA; this blocks generic words from promoting an unrelated clone.
     liquid = safe_float(metrics.get("liquidityUsd"), 0) >= 20_000
     active = safe_float(metrics.get("volumeH1Usd"), 0) >= 10_000 or safe_float(metrics.get("transactionsH1"), 0) >= 50
+    h1_missing = not any(safe_float(metrics.get(key), 0) > 0 for key in (
+        "volumeH1Usd", "transactionsH1", "buysH1", "sellsH1",
+    ))
+    context = row.get("narrativeContext") if isinstance(row.get("narrativeContext"), dict) else {}
+    original_x = row.get("xOriginal") if isinstance(row.get("xOriginal"), dict) else {}
+    has_narrative_material = bool(
+        clean_feed_text(row.get("gmgnNarrative"), 2400)
+        or clean_feed_text(context.get("description"), 500)
+        or any(clean_feed_text(value, 900) for value in (context.get("websites") or []))
+        or any(clean_feed_text(value, 900) for value in (context.get("socials") or []))
+        or clean_feed_text(original_x.get("url") or original_x.get("text"), 900)
+    )
+    narrative_fallback = bool(
+        allow_narrative_fallback
+        and row.get("narrativeFallbackEligible")
+        and h1_missing
+        and has_narrative_material
+        and (
+            safe_float(metrics.get("volumeH24Usd"), 0) >= 20_000
+            or safe_float(metrics.get("transactionsH24"), 0) >= 50
+        )
+    )
+    if narrative_fallback:
+        active = True
+        row["narrativeFallbackApplied"] = True
+        row["reasons"] = list(dict.fromkeys([
+            "1小时成交数据尚未形成：改用 GMGN 叙事资料与热点共振送入 V4.4 复核",
+            *(row.get("reasons") or []),
+        ]))[:5]
     if liquid and active:
         row["decision"] = "shortlisted"
         row["selectedScore"] = max(62, int(safe_float(row.get("selectedScore"), 0)))
@@ -45975,7 +46078,11 @@ def global_hotspot_enrich_candidate(
             "publishedAt": event.get("occurredAt") or current_ms,
             "observedAt": current_ms,
             "identityStatus": "event-name-contract-unverified",
-            "reason": "全网热点与币名强匹配，已先进入精选视野，AI 正在核验事件与合约关系",
+            "reason": (
+                "1小时成交数据尚未形成，GMGN 叙事与全网热点已共振，AI 正在核验事件与合约关系"
+                if narrative_fallback
+                else "全网热点与币名强匹配，已先进入精选视野，AI 正在核验事件与合约关系"
+            ),
         }
     return row
 

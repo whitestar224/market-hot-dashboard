@@ -1520,13 +1520,15 @@
   }
 
   function binanceWalletTokenUrl(row) {
+    const direct = safeExternalUrl(row?.binanceWalletUrl);
+    if (direct) return direct;
     const contract = String(row?.contractAddress || "").trim();
     const rawNetwork = String(row?.network || row?.chain || "").trim().toLowerCase();
     const aliases = {
       "56": "bsc", bnb: "bsc", bsc: "bsc", "bnb chain": "bsc", "bnb smart chain": "bsc",
       "1": "ethereum", eth: "ethereum", ethereum: "ethereum",
       "8453": "base", base: "base",
-      sol: "solana", solana: "solana", "501": "solana",
+      sol: "sol", solana: "sol", "501": "sol",
       robinhood: "robinhood", "robinhood-chain": "robinhood"
     };
     const network = aliases[rawNetwork] || rawNetwork.replace(/[^a-z0-9-]/g, "");
@@ -1933,7 +1935,7 @@
             const facts = row.launchFacts || {};
             const [decisionTone, decisionLabel] = onchainTrenchDecisionMeta(row.decision);
             const contract = String(row.contractAddress || "");
-            const href = safeExternalUrl(row.tradeUrl);
+            const href = binanceWalletTokenUrl(row) || safeExternalUrl(row.tradeUrl);
             const avatar = safeExternalUrl(row.imageUrl);
             const volume = Number(metrics.volumeH1Usd) > 0 ? metrics.volumeH1Usd : metrics.volumeH24Usd;
             const volumeLabel = Number(metrics.volumeH1Usd) > 0 ? "1H 成交" : "24H 成交";
@@ -1974,7 +1976,7 @@
               </div>
               ${changes ? `<div class="onchain-trench-changes">${changes}</div>` : ""}
               <div class="onchain-trench-chipline">${chips || `<span class="onchain-trench-chip"><em>数据</em><b>GMGN 补充中</b></span>`}</div>
-              <footer><span title="${escapeHtml(contract)}">${escapeHtml(contract ? `${contract.slice(0, 8)}…${contract.slice(-6)}` : "GMGN 未返回 CA")}</span><em>CA · GMGN API</em>${href ? `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener">GMGN ↗</a>` : ""}${monitorBuyButton(row)}</footer>
+              <footer><span title="${escapeHtml(contract)}">${escapeHtml(contract ? `${contract.slice(0, 8)}…${contract.slice(-6)}` : "GMGN 未返回 CA")}</span><em>CA · GMGN API</em>${href ? `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener">币安钱包 ↗</a>` : ""}${monitorBuyButton(row)}</footer>
             </article>`;
           }).join("") : payload?.rateLimited
             ? `<div class="chain-section-empty"><b>GMGN API 正在限流冷却</b><span>不会继续重复请求当前 IP；${retryAfter ? `约 ${retryAfter} 秒后自动重试。` : "稍后自动重试。"}未使用本地旧数据。</span></div>`
