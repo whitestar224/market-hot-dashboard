@@ -11928,7 +11928,6 @@ def gmgn_trench_history_record(row: dict[str, Any], *, observed_at: int) -> dict
     return {
         "network": clean_feed_text(row.get("network"), 40).lower(),
         "provider": "gmgn-trenches",
-        "providers": ["gmgn-trenches"],
         "contractAddress": clean_feed_text(row.get("contractAddress"), 180),
         "poolAddress": clean_feed_text(row.get("poolAddress"), 180),
         "dexId": clean_feed_text(row.get("dexId"), 80),
@@ -11936,6 +11935,16 @@ def gmgn_trench_history_record(row: dict[str, Any], *, observed_at: int) -> dict
         "launchStage": "migrated",
         "symbol": clean_feed_text(row.get("symbol"), 60),
         "name": clean_feed_text(row.get("name"), 180),
+        "decision": clean_feed_text(row.get("decision"), 30),
+        "selectedScore": safe_float(row.get("selectedScore")),
+        "confidence": safe_float(row.get("confidence")),
+        "candidateType": clean_feed_text(row.get("candidateType"), 30),
+        "ageMinutes": safe_float(row.get("ageMinutes")),
+        "firstSeenAt": int(safe_float(row.get("firstSeenAt"), observed_at)),
+        "observedAt": int(safe_float(row.get("observedAt"), observed_at)),
+        "providers": [clean_feed_text(value, 80) for value in (row.get("providers") or ["gmgn-trenches"]) if clean_feed_text(value, 80)],
+        "reasons": [clean_feed_text(value, 240) for value in (row.get("reasons") or []) if clean_feed_text(value, 240)][:8],
+        "risks": [clean_feed_text(value, 240) for value in (row.get("risks") or []) if clean_feed_text(value, 240)][:8],
         "imageUrl": clean_feed_text(row.get("imageUrl"), 900),
         "poolCreatedAt": int(safe_float(row.get("poolCreatedAt"), observed_at)),
         "tradeUrl": clean_feed_text(row.get("tradeUrl"), 900),
@@ -11948,6 +11957,8 @@ def gmgn_trench_history_record(row: dict[str, Any], *, observed_at: int) -> dict
         "narrativeContext": dict(row.get("narrativeContext")) if isinstance(row.get("narrativeContext"), dict) else {},
         "launchFacts": dict(row.get("launchFacts")) if isinstance(row.get("launchFacts"), dict) else {},
         "metrics": dict(row.get("metrics")) if isinstance(row.get("metrics"), dict) else {},
+        "walletProfile": dict(row.get("walletProfile")) if isinstance(row.get("walletProfile"), dict) else {},
+        "buyIdentity": dict(row.get("buyIdentity")) if isinstance(row.get("buyIdentity"), dict) else {},
     }
 
 
@@ -12269,10 +12280,270 @@ def attach_v44_research_marks_to_gmgn_trenches(source: dict[str, Any]) -> dict[s
     return result
 
 
+def gmgn_trench_daily_research_payload(
+    research: dict[str, Any],
+    *,
+    research_day: str | None = None,
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    """Make Today's Research strictly follow GMGN Trenches' new-token tape.
+
+    The ecosystem database is still useful for long-lived research history, but
+    it is not a valid source for the daily new-token desk.  Use the real pool
+    open timestamp from the GMGN tape for the requested local day, then retain
+    only rows that GMGN did not filter out.  This prevents an old, already-
+    researched token from resurfacing as today's new coin.
+    """
+    current_ms = int(now_ms or time.time() * 1000)
+    requested = clean_feed_text(research_day, 10)
+    day = requested if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", requested) else time.strftime("%Y-%m-%d")
+    try:
+        day_start = int(time.mktime(time.strptime(day, "%Y-%m-%d")) * 1000)
+    except (TypeError, ValueError, OverflowError):
+        day = time.strftime("%Y-%m-%d")
+        day_start = int(time.mktime(time.strptime(day, "%Y-%m-%d")) * 1000)
+    day_end = day_start + 86_400_000
+    try:
+        source = fetch_gmgn_trenches_hot_board()
+    except Exception as exc:
+        source = {"rows": [], "errors": [safe_monitor_error(exc)], "sourceStatus": {}}
+
+    decision_rank = {"shortlisted": 0, "watch": 1, "warming": 2}
+    candidates: list[dict[str, Any]] = []
+    for raw in source.get("rows") if isinstance(source.get("rows"), list) else []:
+        if not isinstance(raw, dict):
+            continue
+        created_at = int(safe_float(raw.get("poolCreatedAt"), 0))
+        if created_at < 10_000_000_000:
+            created_at *= 1000
+        if not day_start <= created_at < day_end:
+            continue
+        contract = clean_feed_text(raw.get("contractAddress"), 160)
+        network = clean_feed_text(raw.get("network") or raw.get("chain"), 40).lower()
+        if not contract or not network:
+            continue
+        decision = clean_feed_text(raw.get("decision"), 30).lower() or "warming"
+        if decision == "filtered":
+            continue
+        row = dict(raw)
+        row.update({
+            "network": network,
+            "poolCreatedAt": created_at,
+            "firstSeenAt": int(safe_float(raw.get("firstSeenAt") or raw.get("receivedAt"), created_at)),
+            "observedAt": int(safe_float(raw.get("observedAt") or raw.get("lastSeenAt") or raw.get("receivedAt"), current_ms)),
+            "providers": list(dict.fromkeys(["gmgn-trenches", *(raw.get("providers") or [])])),
+            "decision": decision,
+            "researchTier": "gmgn-trench-new",
+            "researchSource": "GMGN 战壕",
+            "researchSourceLabel": "GMGN 战壕今日新币",
+            "reasons": list(dict.fromkeys([
+                f"GMGN 战壕 {day} 新币 · {decision}",
+                *(raw.get("reasons") or []),
+            ]))[:6],
+            "risks": list(raw.get("risks") or [])[:6],
+        })
+        candidates.append(row)
+
+    candidates.sort(key=lambda row: (
+        decision_rank.get(str(row.get("decision") or "warming"), 3),
+        -safe_float(row.get("selectedScore"), 0),
+        -safe_float((row.get("metrics") or {}).get("liquidityUsd"), 0),
+        -int(safe_float(row.get("poolCreatedAt"), 0)),
+        onchain_candidate_key(row),
+    ))
+    selected = candidates[:24]
+    # Feed the complete, chain-filtered GMGN tape into the durable V4.4
+    # research lane.  The 24-row slice above is only a bounded hand-off for
+    # the response; final selection is made by FastResearch after its own
+    # quantitative screen and AI/framework review.
+    research_ingested_at = 0
+    ingest_errors: list[str] = []
+    fast_research = globals().get("ONCHAIN_FAST_RESEARCH")
+    if candidates and fast_research is not None:
+        try:
+            fast_research.ingest(candidates, match_recent_news=False)
+            research_ingested_at = current_ms
+        except Exception as exc:
+            ingest_errors.append(f"GMGN 新币投研入队失败：{safe_monitor_error(exc)}")
+    previous = dict(research or {})
+    funnel = dict(previous.get("funnel") or {})
+    funnel.update({
+        "discovered": len(candidates),
+        "filtered": 0,
+        "warming": sum(1 for row in candidates if row.get("decision") == "warming"),
+        "quantified": len(candidates),
+        "selected": len(selected),
+        "provisional": 0,
+    })
+    queue = dict(previous.get("reviewQueue") or {})
+    queue.update({
+        "eligible": len(selected),
+        "pending": len(selected),
+        "provisional": 0,
+        "newsTriggered": 0,
+        "sameSymbolSuppressed": 0,
+    })
+    return {
+        **previous,
+        "day": day,
+        "currentDay": time.strftime("%Y-%m-%d"),
+        "selected": selected,
+        "selectedTotal": len(selected),
+        "provisional": [],
+        "provisionalTotal": 0,
+        "watching": [],
+        "watchingCount": 0,
+        "recommendationHistory": [],
+        "funnel": funnel,
+        "reviewQueue": queue,
+        "fastResearchManaged": False,
+        "gmgnTrenchOnly": True,
+        "researchSource": "gmgn-trenches",
+        "researchSourceLabel": "GMGN 战壕今日新币 · V4.4精选",
+        "researchSourceCount": len(candidates),
+        "trenchCandidatePool": candidates,
+        "trenchResearchIngestedAt": research_ingested_at,
+        "researchSourceStatus": source.get("sourceStatus") if isinstance(source.get("sourceStatus"), dict) else {},
+        "updatedAt": int(safe_float(source.get("updatedAt"), current_ms)),
+        "errors": [*(list(source.get("errors") or [])[:10]), *ingest_errors][:12],
+    }
+
+
+def attach_gmgn_trench_research(research: dict[str, Any]) -> dict[str, Any]:
+    """Expose only GMGN trench coins that passed the durable V4.4 lane.
+
+    ``gmgn_trench_daily_research_payload`` deliberately returns a private
+    candidate pool so the background lane can screen every current-day row.
+    This function is the public boundary: old local candidates, unreviewed
+    trench rows and event-first shortcuts are not allowed into Today's
+    Research.  Quantitative structure confirmations remain in the separate
+    provisional lane without becoming formal recommendations.
+    """
+    if not isinstance(research, dict) or not research.get("gmgnTrenchOnly"):
+        return research
+
+    pool = [
+        row for row in (research.get("trenchCandidatePool") or research.get("selected") or [])
+        if isinstance(row, dict) and clean_feed_text(row.get("contractAddress"), 180)
+    ]
+    pool_keys = {
+        onchain_candidate_key(row)
+        for row in pool
+        if onchain_candidate_key(row)
+    }
+    base = dict(research)
+    base["selected"] = pool
+    base["provisional"] = []
+    base["watching"] = []
+    base["fastResearchManaged"] = False
+
+    fast_research = globals().get("ONCHAIN_FAST_RESEARCH")
+    if fast_research is None:
+        return {
+            **base,
+            "selected": [],
+            "selectedTotal": 0,
+            "provisional": [],
+            "provisionalTotal": 0,
+            "fastResearchManaged": True,
+            "researchAnalysisStatus": "unavailable",
+            "researchSourceLabel": "GMGN 战壕今日新币 · V4.4精选",
+            "trenchCandidatePool": None,
+            "errors": [*(base.get("errors") or []), "V4.4 投研服务尚未启动"][:12],
+        }
+
+    # A cached source can predate the ingest marker after a process restart.
+    # The write is idempotent and does not call any external provider.
+    if pool and not int(safe_float(research.get("trenchResearchIngestedAt"), 0)):
+        try:
+            fast_research.ingest(pool, match_recent_news=False)
+        except Exception as exc:
+            base["errors"] = [*(base.get("errors") or []), f"GMGN 新币投研入队失败：{safe_monitor_error(exc)}"][:12]
+
+    try:
+        evaluated = fast_research.attach(base)
+    except Exception as exc:
+        return {
+            **base,
+            "selected": [],
+            "selectedTotal": 0,
+            "provisional": [],
+            "provisionalTotal": 0,
+            "fastResearchManaged": True,
+            "researchAnalysisStatus": "unavailable",
+            "researchSourceLabel": "GMGN 战壕今日新币 · V4.4精选",
+            "trenchCandidatePool": None,
+            "errors": [*(base.get("errors") or []), f"V4.4 投研读取失败：{safe_monitor_error(exc)}"][:12],
+        }
+
+    # Only formal V4.4 recommendations enter the main list.  Keep the
+    # quantitative breakout lane visible as structure confirmation, but never
+    # treat it as an AI-selected recommendation or popup trigger.
+    formal = [
+        row for row in (evaluated.get("selected") if isinstance(evaluated, dict) else [])
+        if isinstance(row, dict)
+        and onchain_candidate_key(row) in pool_keys
+        and row.get("researchTier") == "ai-recommended"
+    ]
+    provisional = [
+        row for row in (evaluated.get("provisional") if isinstance(evaluated, dict) else [])
+        if isinstance(row, dict) and onchain_candidate_key(row) in pool_keys
+    ]
+    formal.sort(key=lambda row: (
+        -safe_float((row.get("aiAnalysis") or {}).get("frameworkAssessment", {}).get("opportunityScore"), 0),
+        -safe_float(row.get("selectedScore"), 0),
+        -safe_float(row.get("poolCreatedAt"), 0),
+        onchain_candidate_key(row),
+    ))
+    eligible_quantified = sum(
+        1 for row in pool if str(row.get("decision") or "").lower() == "shortlisted"
+    )
+    review = dict(evaluated.get("reviewQueue") or {}) if isinstance(evaluated, dict) else {}
+    review.update({
+        "eligible": len(pool),
+        "quantified": eligible_quantified,
+        "selected": len(formal),
+        "provisional": len(provisional),
+        "pending": max(0, eligible_quantified - len(formal) - len(provisional)),
+    })
+    funnel = dict(research.get("funnel") or {})
+    funnel.update({
+        "discovered": len(pool),
+        "filtered": 0,
+        "warming": sum(1 for row in pool if row.get("decision") == "warming"),
+        "quantified": eligible_quantified,
+        "selected": len(formal),
+        "provisional": len(provisional),
+    })
+    errors = list(research.get("errors") or [])[:12]
+    return {
+        **evaluated,
+        "selected": formal,
+        "selectedTotal": len(formal),
+        "provisional": provisional,
+        "provisionalTotal": len(provisional),
+        "watching": [],
+        "watchingCount": max(0, len(pool) - len(formal) - len(provisional)),
+        "recommendationHistory": [],
+        "funnel": funnel,
+        "reviewQueue": review,
+        "fastResearchManaged": True,
+        "gmgnTrenchOnly": True,
+        "researchSystem": "onchain-fast-v4.4",
+        "researchAnalysisStatus": "ready" if formal else "pending" if eligible_quantified else "screened",
+        "researchSource": "gmgn-trenches",
+        "researchSourceLabel": "GMGN 战壕今日新币 · V4.4精选",
+        "researchSourceCount": len(pool),
+        "trenchCandidateCount": len(pool),
+        "trenchCandidatePool": None,
+        "errors": errors,
+    }
+
+
 def fetch_gmgn_trenches_hot_board() -> dict[str, Any]:
     """Serve one persisted tape and refresh it at most once per protected window."""
     source = cached_api_payload(
-        "gmgn-trenches-hot-board-v7",
+        "gmgn-trenches-hot-board-v8",
         refresh_gmgn_trenches_hot_board,
         GMGN_TRENCH_BOARD_REFRESH_SECONDS,
     )
@@ -44777,7 +45048,15 @@ def chain_ecosystem_attach_ai(
 ) -> dict[str, Any]:
     """Attach cached AI judgements and schedule missing subjects without blocking the page."""
     payload = dict(source_payload)
-    payload["dailyResearch"] = ONCHAIN_FAST_RESEARCH.attach(payload.get("dailyResearch") or {})
+    daily_research = payload.get("dailyResearch") if isinstance(payload.get("dailyResearch"), dict) else {}
+    # GMGN Trenches owns the daily new-token desk.  Its private candidate pool
+    # is evaluated by the same durable V4.4 lane as the rest of the project;
+    # only formal AI-selected rows cross the public research boundary.
+    payload["dailyResearch"] = (
+        attach_gmgn_trench_research(daily_research)
+        if daily_research.get("gmgnTrenchOnly")
+        else ONCHAIN_FAST_RESEARCH.attach(daily_research)
+    )
     resolved_settings = settings or system_llm_settings()
     subjects = chain_ecosystem_ai_subjects(payload, resolved_settings)
     if not subjects:
@@ -48746,11 +49025,16 @@ class Handler(SimpleHTTPRequestHandler):
                     ).encode("utf-8")
                 ).hexdigest()[:10]
                 cache_day = research_day or time.strftime("%Y-%m-%d")
-                source_cache_key = f"chain-ecosystem-source-v3-{chain_identifier}-{cache_day}"
-                view_cache_key = f"chain-ecosystem-view-v3-{chain_identifier}-{cache_day}-{settings_cache_stamp}"
+                source_cache_key = f"chain-ecosystem-source-v4-{chain_identifier}-{cache_day}"
+                view_cache_key = f"chain-ecosystem-view-v4-{chain_identifier}-{cache_day}-{settings_cache_stamp}"
 
                 def build_chain_ecosystem_source() -> dict[str, Any]:
-                    return CHAIN_ECOSYSTEM_MONITOR.payload(chain_identifier, research_day=research_day)
+                    source_payload = CHAIN_ECOSYSTEM_MONITOR.payload(chain_identifier, research_day=research_day)
+                    source_payload["dailyResearch"] = gmgn_trench_daily_research_payload(
+                        source_payload.get("dailyResearch") or {},
+                        research_day=research_day,
+                    )
+                    return source_payload
 
                 if force_refresh and read_json_cache(api_cache_path(source_cache_key)):
                     trigger_api_refresh(source_cache_key, build_chain_ecosystem_source)
@@ -48789,6 +49073,10 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 fallback = CHAIN_ECOSYSTEM_MONITOR.payload(
                     (query.get("chain") or [None])[0],
+                    research_day=clean_feed_text((query.get("researchDay") or [""])[0], 10),
+                )
+                fallback["dailyResearch"] = gmgn_trench_daily_research_payload(
+                    fallback.get("dailyResearch") or {},
                     research_day=clean_feed_text((query.get("researchDay") or [""])[0], 10),
                 )
                 fallback["ok"] = False

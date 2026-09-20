@@ -1761,7 +1761,7 @@
     return `
       <section class="onchain-research-board chain-research-view is-today">
         <header class="onchain-research-head">
-          <span><p class="section-label">TODAY'S RESEARCH DESK</p><h3>今日最值得研究的项目（推荐）</h3><em>${escapeHtml(research?.day || "今日")} · 新闻先触发，AI 随后补全起因、叙事和机会</em></span>
+          <span><p class="section-label">TODAY'S RESEARCH DESK</p><h3>今日最值得研究的项目（推荐）</h3><em>${escapeHtml(research?.day || "今日")} · ${escapeHtml(research?.researchSourceLabel || "GMGN 战壕今日新币")} · AI 随后补全起因、叙事和机会</em></span>
           <div><b>${selectedTotal}</b><em>精选视野</em></div>
           <div><b>${provisionalTotal}</b><em>爆发待核验</em></div>
           <div><b>${relativeTime(research?.updatedAt)}</b><em>最近更新</em></div>
@@ -1772,7 +1772,7 @@
         </section>` : ""}
         <section class="onchain-research-selected">
           <header><b>优先研究清单</b><em>已按 AI 结论、证据完整度、叙事强度与置信度从优到次排序</em></header>
-          <div>${selected.length ? selected.map((row) => onchainResearchCandidateTemplate(row)).join("") : `<div class="chain-section-empty"><b>暂未筛出高质量候选</b><span>系统仍在后台记录全部新池；达到门槛后才会出现在这里。</span></div>`}</div>
+          <div>${selected.length ? selected.map((row) => onchainResearchCandidateTemplate(row)).join("") : `<div class="chain-section-empty"><b>暂未筛出 V4.4 精选</b><span>${research?.gmgnTrenchOnly ? "当天 GMGN 战壕新币正在等待新投研体系完成分析；未通过精选的旧币和新币都不会混入这里。" : "系统仍在后台记录全部新池；达到门槛后才会出现在这里。"}</span></div>`}</div>
           ${onchainResearchPaginationTemplate(research?.pagination)}
         </section>
         <p class="onchain-research-queue">${queueNote}</p>${historyTemplate}

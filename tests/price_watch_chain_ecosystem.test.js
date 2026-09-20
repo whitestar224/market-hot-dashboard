@@ -70,6 +70,7 @@ test("price watch exposes chain ecosystem mode and API", () => {
   assert.match(js, /当前扫盘网络/);
   assert.match(js, /robinhood:\s*"Robinhood Chain"/);
   assert.match(js, /今日最值得研究/);
+  assert.match(js, /research\?\.researchSourceLabel \|\| \"GMGN 战壕今日新币\"/);
   assert.match(js, /动态增量扫盘/);
   assert.match(js, /战壕 · 已开盘/);
   assert.match(js, /\/api\/onchain-trenches/);

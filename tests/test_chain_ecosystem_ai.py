@@ -248,6 +248,73 @@ class ChainEcosystemAiTests(unittest.TestCase):
         self.assertEqual(research["facts"]["crossValidation"]["independentSourceCount"], 2)
         self.assertEqual(research["facts"]["sameSymbolRole"], "leader-candidate")
 
+    def test_daily_research_is_replaced_by_gmgn_trench_coins_for_the_requested_day(self):
+        day = "2026-09-20"
+        day_start = int(server.time.mktime(server.time.strptime(day, "%Y-%m-%d")) * 1000)
+        fresh = {
+            "network": "solana",
+            "contractAddress": "FreshTrench111111111111111111111111111111111",
+            "symbol": "FRESH",
+            "name": "Fresh Trench",
+            "poolCreatedAt": day_start + 60_000,
+            "decision": "warming",
+            "selectedScore": 78,
+            "metrics": {"liquidityUsd": 35_000},
+        }
+        stale = {**fresh, "contractAddress": "OldResearch111111111111111111111111111111", "symbol": "OLD", "poolCreatedAt": day_start - 86_400_000}
+        filtered = {**fresh, "contractAddress": "FilteredTrench111111111111111111111111111", "symbol": "FILTERED", "decision": "filtered", "poolCreatedAt": day_start + 120_000}
+        base = {
+            "day": day,
+            "selected": [stale],
+            "funnel": {"discovered": 99, "selected": 1},
+            "reviewQueue": {"pending": 4},
+        }
+        with patch.object(server, "fetch_gmgn_trenches_hot_board", return_value={
+            "rows": [fresh, stale, filtered],
+            "updatedAt": day_start + 300_000,
+            "sourceStatus": {"solana": "ok"},
+        }), patch.object(server.ONCHAIN_FAST_RESEARCH, "ingest"):
+            result = server.gmgn_trench_daily_research_payload(base, research_day=day, now_ms=day_start + 600_000)
+
+        self.assertEqual([row["symbol"] for row in result["selected"]], ["FRESH"])
+        self.assertTrue(result["gmgnTrenchOnly"])
+        self.assertEqual(result["researchSourceLabel"], "GMGN 战壕今日新币 · V4.4精选")
+        self.assertEqual(result["funnel"]["discovered"], 1)
+        self.assertEqual(result["selectedTotal"], 1)
+
+    def test_gmgn_trench_research_public_list_requires_v44_selection(self):
+        day = "2026-09-20"
+        day_start = int(server.time.mktime(server.time.strptime(day, "%Y-%m-%d")) * 1000)
+        fresh = {
+            "network": "solana",
+            "contractAddress": "FreshTrench222222222222222222222222222222222",
+            "symbol": "FRESH",
+            "name": "Fresh Trench",
+            "poolCreatedAt": day_start + 60_000,
+            "decision": "shortlisted",
+            "selectedScore": 88,
+            "metrics": {"liquidityUsd": 35_000},
+        }
+        with patch.object(server, "fetch_gmgn_trenches_hot_board", return_value={
+            "rows": [fresh],
+            "updatedAt": day_start + 300_000,
+            "sourceStatus": {"solana": "ok"},
+        }), patch.object(server.ONCHAIN_FAST_RESEARCH, "ingest"), patch.object(
+            server.ONCHAIN_FAST_RESEARCH,
+            "attach",
+            return_value={
+                "selected": [{**fresh, "fastResearch": True, "researchTier": "ai-recommended"}],
+                "provisional": [],
+                "reviewQueue": {},
+            },
+        ):
+            raw = server.gmgn_trench_daily_research_payload({}, research_day=day, now_ms=day_start + 600_000)
+            result = server.attach_gmgn_trench_research(raw)
+
+        self.assertEqual([row["symbol"] for row in result["selected"]], ["FRESH"])
+        self.assertEqual(result["researchSystem"], "onchain-fast-v4.4")
+        self.assertTrue(result["fastResearchManaged"])
+
     def test_chain_research_prompt_uses_evidence_chain_instead_of_price_chasing(self):
         prompt = server.chain_ecosystem_ai_prompt([{"index": 1, "key": "research:solana:abc", "type": "research_candidate", "facts": {}}])
         content = "\n".join(row["content"] for row in prompt)
