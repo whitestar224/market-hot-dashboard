@@ -48665,6 +48665,11 @@ class Handler(SimpleHTTPRequestHandler):
                     networks=[network] if network else None,
                     source="gmgn",
                     query=(query.get("q") or [""])[0],
+                    # Keep the live Trenches tab aligned with the saved GMGN
+                    # profile.  The predicate runs after normalization, so a
+                    # high-performing non-OG exception can still pass while
+                    # ordinary non-OG rows remain hidden.
+                    item_filter=gmgn_trench_passes_chain_filters,
                 )
                 self.send_json(attach_gmgn_native_trench_narrative(trench_payload))
             except (TypeError, ValueError) as exc:
