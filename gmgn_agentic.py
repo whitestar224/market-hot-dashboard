@@ -498,6 +498,43 @@ def gmgn_trench_performance_score(row: Mapping[str, Any]) -> float:
     )
 
 
+def annotate_gmgn_non_og_exceptions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compare non-OG candidates with the best OG in their own chain batch."""
+    by_network: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        network = str(row.get("network") or row.get("chain") or "").strip().casefold()
+        if network == "sol":
+            network = "solana"
+        by_network.setdefault(network, []).append(row)
+    for grouped_rows in by_network.values():
+        og_scores = [
+            gmgn_trench_performance_score(row)
+            for row in grouped_rows
+            if isinstance(row.get("filterSignals"), Mapping)
+            and row["filterSignals"].get("isOg") is True
+        ]
+        og_baseline = max(og_scores) if og_scores else None
+        for row in grouped_rows:
+            signals = row.get("filterSignals")
+            if not isinstance(signals, dict) or signals.get("isOg") is not False:
+                continue
+            score = gmgn_trench_performance_score(row)
+            stronger_than_og = og_baseline is None or score >= og_baseline + GMGN_NON_OG_EXCEPTION_MARGIN
+            exception = score >= GMGN_NON_OG_EXCEPTION_MIN_SCORE and stronger_than_og
+            signals["nonOgException"] = exception
+            if exception:
+                warnings = row.get("filterWarnings")
+                if not isinstance(warnings, list):
+                    warnings = []
+                    row["filterWarnings"] = warnings
+                warning = "非 OG · 市场数据强于当前 OG 基准"
+                if warning not in warnings:
+                    warnings.append(warning)
+    return rows
+
+
 def _gmgn_non_og_exception(row: Mapping[str, Any]) -> bool:
     signals = row.get("filterSignals")
     if not isinstance(signals, Mapping):
@@ -1069,6 +1106,90 @@ def fetch_gmgn_migrated_trenches(
     return result
 
 
+def fetch_gmgn_non_og_market_rank(
+    network: str,
+    *,
+    limit: int = 100,
+    session: Any = None,
+) -> dict[str, Any]:
+    """Read a small market-rank supplement for strong non-OG exceptions.
+
+    The native Trenches request correctly returns the full OG page, but that
+    predicate also hides a genuinely stronger non-OG launch before the local
+    exception rule can compare it.  GMGN's market-rank route is used only as a
+    supplemental candidate window; the same local social/risk/profile checks
+    still decide whether a row enters the board.
+    """
+    network_key = str(network or "").strip().lower()
+    chain = GMGN_TRENCHES_NETWORKS.get(network_key)
+    if not chain or network_key == "arc":
+        return {"code": 0, "data": {"completed": []}, "network": network_key}
+    request_limit = max(1, min(100, int(limit)))
+    result = gmgn_readonly_get(
+        "/v1/market/rank",
+        cache_key=f"trenches:non-og-rank:{chain}:{request_limit}",
+        params={
+            "chain": chain,
+            "interval": "24h",
+            "limit": request_limit,
+            "order_by": "creation_timestamp",
+            "direction": "desc",
+            "filters": ["has_social"],
+        },
+        cache_ttl_seconds=max(30.0, float(os.getenv("GMGN_TRENCHES_CACHE_TTL_SECONDS", "60") or 60)),
+        session=session,
+    )
+    inner = result.get("data")
+    api_payload = (
+        dict(inner)
+        if isinstance(inner, Mapping)
+        and "code" in inner
+        and isinstance(inner.get("data"), Mapping)
+        else result
+    )
+    code = api_payload.get("code", 0)
+    if code not in (0, "0", None):
+        message = str(api_payload.get("message") or api_payload.get("reason") or code)
+        raise RuntimeError(f"GMGN {network_key} 非 OG 补充请求失败：{message[:180]}")
+    data = api_payload.get("data") if isinstance(api_payload.get("data"), Mapping) else {}
+    rank_rows = data.get("rank") if isinstance(data, Mapping) else []
+    completed: list[dict[str, Any]] = []
+    for raw in rank_rows if isinstance(rank_rows, list) else []:
+        if not isinstance(raw, Mapping) or _optional_flag(raw.get("is_og")) is not False:
+            continue
+        if not _flag(raw.get("launchpad_status")):
+            continue
+        timestamp = 0
+        for key in ("open_timestamp", "creation_timestamp", "created_timestamp"):
+            parsed_timestamp = _number(raw.get(key))
+            if parsed_timestamp and parsed_timestamp > 0:
+                timestamp = int(parsed_timestamp)
+                break
+        if timestamp <= 0:
+            continue
+        mapped = dict(raw)
+        mapped["created_timestamp"] = timestamp
+        mapped["open_timestamp"] = timestamp
+        mapped.setdefault("usd_market_cap", raw.get("market_cap"))
+        mapped.setdefault("volume_24h", raw.get("volume"))
+        mapped.setdefault("swaps_24h", raw.get("swaps"))
+        mapped.setdefault("buys_24h", raw.get("buys"))
+        mapped.setdefault("sells_24h", raw.get("sells"))
+        mapped.setdefault("bundler_trader_amount_rate", raw.get("bundler_rate"))
+        mapped.setdefault("twitter", raw.get("twitter_username"))
+        completed.append(mapped)
+    return {
+        "code": 0,
+        "data": {"completed": completed, "near_completion": [], "new_creation": []},
+        "message": api_payload.get("message") or "success",
+        "reason": api_payload.get("reason") or "",
+        "_gmgnMeta": {
+            **(result.get("_gmgnMeta") if isinstance(result.get("_gmgnMeta"), Mapping) else {}),
+            "sourceRoute": "market-rank-non-og",
+        },
+    }
+
+
 def normalize_gmgn_migrated_trenches(
     payload: Any,
     network: str,
@@ -1374,29 +1495,4 @@ def normalize_gmgn_migrated_trenches(
             warning = f"名称重复 {duplicate_count}"
             if warning not in warnings:
                 warnings.append(warning)
-    # The saved profile is still OG-first, but a genuinely stronger non-OG
-    # token should not disappear merely because the checkbox is enabled.  Use
-    # a within-batch OG baseline so the exception adapts to current market
-    # conditions instead of becoming a fixed symbol whitelist.
-    og_scores = [
-        gmgn_trench_performance_score(row)
-        for row in rows
-        if isinstance(row.get("filterSignals"), Mapping)
-        and row["filterSignals"].get("isOg") is True
-    ]
-    og_baseline = max(og_scores) if og_scores else None
-    for row in rows:
-        signals = row.get("filterSignals")
-        if not isinstance(signals, dict) or signals.get("isOg") is not False:
-            continue
-        score = gmgn_trench_performance_score(row)
-        stronger_than_og = og_baseline is None or score >= og_baseline + GMGN_NON_OG_EXCEPTION_MARGIN
-        exception = score >= GMGN_NON_OG_EXCEPTION_MIN_SCORE and stronger_than_og
-        signals["nonOgException"] = exception
-        if exception:
-            warnings = row.get("filterWarnings")
-            if not isinstance(warnings, list):
-                warnings = []
-                row["filterWarnings"] = warnings
-            warnings.append("非 OG · 市场数据强于当前 OG 基准")
-    return rows
+    return annotate_gmgn_non_og_exceptions(rows)

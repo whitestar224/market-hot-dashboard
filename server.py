@@ -12097,6 +12097,7 @@ def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
             observed_at=observed_at,
             item_filter=gmgn_trench_passes_chain_filters,
             per_network_limit=None,
+            include_non_og_exceptions=True,
         )
     except Exception as exc:
         live_payload = {
@@ -48713,6 +48714,7 @@ class Handler(SimpleHTTPRequestHandler):
                     # high-performing non-OG exception can still pass while
                     # ordinary non-OG rows remain hidden.
                     item_filter=gmgn_trench_passes_chain_filters,
+                    include_non_og_exceptions=True,
                 )
                 self.send_json(attach_gmgn_native_trench_narrative(trench_payload))
             except (TypeError, ValueError) as exc:

@@ -24,7 +24,9 @@ from binance_agentic import (
 from gmgn_agentic import (
     GmgnRateLimitError,
     GmgnUnsupportedNetworkError,
+    annotate_gmgn_non_og_exceptions,
     fetch_gmgn_migrated_trenches,
+    fetch_gmgn_non_og_market_rank,
     gmgn_api_key_status,
     gmgn_cooldown_status,
     gmgn_trench_passes_chain_filters,
@@ -1147,6 +1149,7 @@ def fetch_live_onchain_trenches(
     observed_at: int | None = None,
     item_filter: Callable[[Mapping[str, Any]], bool] | None = None,
     per_network_limit: int | None = None,
+    include_non_og_exceptions: bool = False,
 ) -> dict[str, Any]:
     """Read the current opened/migrated tape directly from GMGN and Binance."""
     observed = int(observed_at or _now_ms())
@@ -1163,34 +1166,40 @@ def fetch_live_onchain_trenches(
     source_status: dict[str, str] = {}
     errors: list[str] = []
     retry_after_seconds = 0
-    job_count = len(selected_networks) + sum(
+    rank_networks = [network for network in selected_networks if network != "arc"] if include_non_og_exceptions else []
+    job_count = len(selected_networks) + len(rank_networks) + sum(
         1 for network in selected_networks if network in MEME_RUSH_CHAIN_IDS
     )
     with ThreadPoolExecutor(max_workers=max(1, min(9, job_count))) as executor:
         for network in selected_networks:
             if source_key != "binance":
                 jobs[executor.submit(fetch_gmgn_migrated_trenches, network)] = (network, "gmgn")
+                if network in rank_networks:
+                    jobs[executor.submit(fetch_gmgn_non_og_market_rank, network)] = (network, "gmgn-rank")
             if source_key != "gmgn" and network in MEME_RUSH_CHAIN_IDS:
                 jobs[executor.submit(fetch_binance_meme_rush, network, rank_types=(30,))] = (network, "binance")
             elif source_key == "binance" and network not in MEME_RUSH_CHAIN_IDS:
                 source_status[f"{network}/binance-meme-rush"] = "unsupported"
         for future in as_completed(jobs):
             network, provider = jobs[future]
-            provider_name = "gmgn-trenches" if provider == "gmgn" else "binance-meme-rush"
+            provider_name = "gmgn-trenches" if provider in {"gmgn", "gmgn-rank"} else "binance-meme-rush"
             status_key = f"{network}/{provider_name}"
             try:
                 payload = future.result()
-                gmgn_meta = payload.get("_gmgnMeta") if provider == "gmgn" and isinstance(payload, Mapping) else {}
+                gmgn_meta = payload.get("_gmgnMeta") if provider in {"gmgn", "gmgn-rank"} and isinstance(payload, Mapping) else {}
                 if not isinstance(gmgn_meta, Mapping):
                     gmgn_meta = {}
                 normalized = (
                     normalize_gmgn_migrated_trenches(payload, network, observed_at=observed)
-                    if provider == "gmgn"
+                    if provider in {"gmgn", "gmgn-rank"}
                     else normalize_binance_meme_rush(payload, network, observed_at=observed)
                 )
                 if provider == "binance":
                     normalized = [row for row in normalized if row.get("launchStage") == "migrated"]
                 rows.extend(normalized)
+                # The rank supplement is part of the same GMGN chain source;
+                # keep the public status at six chains instead of exposing a
+                # second pseudo-provider in the UI.
                 source_status[status_key] = "ok"
                 retry_after_seconds = max(
                     retry_after_seconds,
@@ -1208,6 +1217,8 @@ def fetch_live_onchain_trenches(
                 errors.append(f"{status_key}: {str(exc)[:180]}")
 
     merged = merge_onchain_research_rows(rows)
+    if include_non_og_exceptions:
+        annotate_gmgn_non_og_exceptions(merged)
     search_text = str(query or "").strip().casefold()[:80]
     items: list[dict[str, Any]] = []
     for row in merged:
