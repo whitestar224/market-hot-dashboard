@@ -234,9 +234,8 @@ class GmgnTrenchHotBoardTests(unittest.TestCase):
 
         rows = server.gmgn_trench_board_rows(history, current_rows=current)
 
-        self.assertEqual([row["symbol"] for row in rows], ["STACK", "STACK", "SOL2", "BSCX", "HOODX"])
-        self.assertEqual(sum(1 for row in rows if row["symbol"] == "STACK"), 2)
-        self.assertFalse(any(row["symbol"] == "COPY" for row in rows))
+        self.assertEqual([row["symbol"] for row in rows], ["STACK", "STACK", "COPY", "SOL2", "BSCX", "HOODX"])
+        self.assertEqual(sum(1 for row in rows if row["symbol"] in {"STACK", "COPY"}), 3)
         self.assertTrue(all(row["isCurrent"] for row in rows))
 
     def test_small_rat_ratio_stays_visible_as_risk_instead_of_being_filtered(self):

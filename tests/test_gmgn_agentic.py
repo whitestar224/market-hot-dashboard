@@ -184,10 +184,9 @@ class GmgnAgenticTests(unittest.TestCase):
         self.assertNotIn("quote_address_type", params)
         self.assertNotIn("launchpad_platform", params)
         self.assertIn("has_social", params["filters"])
-        # is_og is evaluated locally so a stronger non-OG token can be
-        # compared with the live OG baseline before the saved profile rejects
-        # it. Sending it upstream would make that exception impossible.
-        self.assertNotIn("is_og", params["filters"])
+        # Keep the native OG predicate in the request.  Arc deployments that
+        # ignore it are still protected by the local profile check.
+        self.assertIn("is_og", params["filters"])
 
         rows = normalize_gmgn_migrated_trenches(payload, "arc", observed_at=NOW)
         self.assertEqual([row["contractAddress"] for row in rows], [ARC_TIGRINO])
@@ -207,6 +206,28 @@ class GmgnAgenticTests(unittest.TestCase):
             payload = fetch_gmgn_migrated_trenches("arc", session=session)
 
         self.assertEqual(payload["data"]["completed"], [])
+
+    def test_arc_rank_drops_unknown_age_rows_instead_of_stamping_poll_time(self):
+        response = Mock(status_code=200)
+        response.raise_for_status.return_value = None
+        payload = arc_rank_payload()
+        unknown_age = dict(payload["data"]["rank"][0])
+        unknown_age.update({
+            "address": "0x" + "9" * 40,
+            "symbol": "OLDARC",
+            "creation_timestamp": 0,
+            "open_timestamp": 0,
+            "created_timestamp": 0,
+        })
+        payload["data"]["rank"].append(unknown_age)
+        response.json.return_value = payload
+        session = Mock()
+        session.get.return_value = response
+
+        with patch("gmgn_agentic._wait_for_readonly_slot"):
+            result = fetch_gmgn_migrated_trenches("arc", session=session)
+
+        self.assertEqual([row["symbol"] for row in result["data"]["completed"]], ["TIGRINO"])
 
     def test_rate_limit_stops_followup_requests_during_cooldown(self):
         response = Mock()
@@ -382,9 +403,14 @@ class GmgnAgenticTests(unittest.TestCase):
         rows = normalize_gmgn_migrated_trenches(payload, "solana", observed_at=NOW)
 
         self.assertEqual([row["filterSignals"]["imageDuplicateCount"] for row in rows], [2, 2, 1])
-        self.assertFalse(gmgn_trench_passes_chain_filters(rows[0]))
-        self.assertFalse(gmgn_trench_passes_chain_filters(rows[1]))
-        # Native GMGN allows the first occurrence (image_dup == 1).
+        self.assertTrue(gmgn_trench_passes_chain_filters(rows[0]))
+        self.assertTrue(gmgn_trench_passes_chain_filters(rows[1]))
+        # A small same-avatar family is allowed; the fourth occurrence is
+        # still filtered to prevent a clone flood.
+        self.assertFalse(gmgn_trench_passes_chain_filters({
+            **rows[0],
+            "filterSignals": {**rows[0]["filterSignals"], "imageDuplicateCount": 4},
+        }))
         self.assertTrue(gmgn_trench_passes_chain_filters(rows[2]))
         self.assertIn("图片重复 2", rows[1]["filterWarnings"])
 
@@ -439,12 +465,16 @@ class GmgnAgenticTests(unittest.TestCase):
         for network in ("solana", "bsc", "robinhood", "base", "eth", "arc"):
             self.assertTrue(gmgn_trench_passes_chain_filters(row(network)), network)
 
-        self.assertFalse(gmgn_trench_passes_chain_filters(row("solana", imageDuplicateCount=2)))
+        self.assertTrue(gmgn_trench_passes_chain_filters(row("solana", imageDuplicateCount=2)))
+        self.assertFalse(gmgn_trench_passes_chain_filters(row("solana", imageDuplicateCount=4)))
         self.assertFalse(gmgn_trench_passes_chain_filters(row("bsc", washTrading=True)))
         self.assertFalse(gmgn_trench_passes_chain_filters(row("robinhood", honeypot=True)))
-        self.assertFalse(gmgn_trench_passes_chain_filters(row("base", openSource=None)))
-        self.assertFalse(gmgn_trench_passes_chain_filters(row("base", ownerRenounced=False)))
-        self.assertFalse(gmgn_trench_passes_chain_filters(row("base", burnStatus="none")))
+        # These Base security switches are optional in the native profile;
+        # missing/negative values do not hide a row unless the user enables
+        # the corresponding checkbox.
+        self.assertTrue(gmgn_trench_passes_chain_filters(row("base", openSource=None)))
+        self.assertTrue(gmgn_trench_passes_chain_filters(row("base", ownerRenounced=False)))
+        self.assertTrue(gmgn_trench_passes_chain_filters(row("base", burnStatus="none")))
         self.assertTrue(gmgn_trench_passes_chain_filters(row("eth", washTrading=True, honeypot=True)))
         # A non-zero reported ratio is a risk metric, not proof that GMGN
         # classified the token as rat trading. BPACK is visible in the source

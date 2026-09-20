@@ -61,6 +61,7 @@ from chain_ecosystem_monitor import (
     safe_monitor_error,
 )
 from gmgn_agentic import (
+    GMGN_MAX_DUPLICATE_FAMILY_SIZE,
     GMGN_TRENCH_CHAIN_FILTERS,
     GmgnRateLimitError,
     gmgn_readonly_post,
@@ -1019,6 +1020,7 @@ BINANCE_WALLET_4H_STRUCTURE_PATH = PERSIST_CACHE_DIR / "binance_wallet_4h_struct
 OKX_FUTURES_CACHE_PATH = PERSIST_CACHE_DIR / "okx_futures_hot.json"
 OKX_DEX_SOURCE_CACHE_PATH = PERSIST_CACHE_DIR / "okx_dex_source.json"
 GMGN_TRENCH_HISTORY_PATH = PERSIST_CACHE_DIR / "gmgn_trenches_received_history.json"
+GMGN_TRENCH_HISTORY_VERSION = 3
 THS_SOURCE_CACHE_PATH = PERSIST_CACHE_DIR / "ths_hot_source.json"
 WECHAT_ACCOUNT_CACHE_PATH = PERSIST_CACHE_DIR / "wechat_accounts.json"
 WECHAT_SOURCE_ALIAS_CACHE_PATH = PERSIST_CACHE_DIR / "wechat_source_aliases.json"
@@ -11860,17 +11862,22 @@ def gmgn_trench_unique_rows(
     seen_contracts: set[str] | None = None,
     seen_clones: set[str] | None = None,
     seen_images: set[str] | None = None,
+    seen_clone_counts: dict[str, int] | None = None,
+    seen_image_counts: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     """Apply the display-side identity rules used by GMGN's Trenches view.
 
-    Contracts remain the primary identity, while ``头像不重复`` removes later
-    rows that reuse the same explicit artwork.  Generic placeholder images are
-    excluded from ``image_key`` so missing artwork does not collapse a whole
-    chain into one row.
+    Contracts remain the primary identity.  The native “头像不重复” control is
+    treated as a small-family guard: the first three rows sharing an explicit
+    image or exact symbol/name are retained, while the fourth and later clone
+    is removed.  Generic placeholder images are excluded from ``image_key`` so
+    missing artwork does not collapse a whole chain into one row.
     """
     contract_keys = seen_contracts if seen_contracts is not None else set()
     clone_keys = seen_clones if seen_clones is not None else set()
     image_keys = seen_images if seen_images is not None else set()
+    clone_counts = seen_clone_counts if seen_clone_counts is not None else {}
+    image_counts = seen_image_counts if seen_image_counts is not None else {}
     unique: list[dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -11878,14 +11885,22 @@ def gmgn_trench_unique_rows(
         contract_key, clone_key, image_key = gmgn_trench_display_keys(row)
         if contract_key and contract_key in contract_keys:
             continue
-        if image_key and image_key in image_keys:
-            continue
+        if clone_key:
+            clone_count = clone_counts.get(clone_key, 1 if clone_key in clone_keys else 0)
+            if clone_count >= GMGN_MAX_DUPLICATE_FAMILY_SIZE:
+                continue
+        if image_key:
+            image_count = image_counts.get(image_key, 1 if image_key in image_keys else 0)
+            if image_count >= GMGN_MAX_DUPLICATE_FAMILY_SIZE:
+                continue
         if contract_key:
             contract_keys.add(contract_key)
         if clone_key:
             clone_keys.add(clone_key)
+            clone_counts[clone_key] = clone_counts.get(clone_key, 0) + 1
         if image_key:
             image_keys.add(image_key)
+            image_counts[image_key] = image_counts.get(image_key, 0) + 1
         unique.append(row)
     return unique
 
@@ -11984,6 +11999,8 @@ def gmgn_trench_board_rows(
     seen_contracts: set[str] = set()
     seen_clones: set[str] = set()
     seen_images: set[str] = set()
+    seen_clone_counts: dict[str, int] = {}
+    seen_image_counts: dict[str, int] = {}
     history_by_contract = {
         identity: row
         for row in filtered_history
@@ -12005,12 +12022,16 @@ def gmgn_trench_board_rows(
             seen_contracts=seen_contracts,
             seen_clones=seen_clones,
             seen_images=seen_images,
+            seen_clone_counts=seen_clone_counts,
+            seen_image_counts=seen_image_counts,
         ))
     ordered_history.extend(gmgn_trench_unique_rows(
         filtered_history,
         seen_contracts=seen_contracts,
         seen_clones=seen_clones,
         seen_images=seen_images,
+        seen_clone_counts=seen_clone_counts,
+        seen_image_counts=seen_image_counts,
     ))
     # Current-vs-history is only a freshness label. It must not override the
     # user's requested chronological order: the whole tape is newest open time
@@ -12080,11 +12101,20 @@ def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
     live_rows = [row for row in raw_live_rows if gmgn_trench_passes_chain_filters(row)]
     with GMGN_TRENCH_HISTORY_LOCK:
         stored = read_json_cache(GMGN_TRENCH_HISTORY_PATH)
-        previous_rows = stored.get("items") if isinstance(stored.get("items"), list) else []
+        # Version 3 changes Arc chronology to require a real creation/open
+        # timestamp.  Do not carry version-2 rows forward: they may have been
+        # stamped with the poll time when Arc returned timestamp=0, which
+        # would make an old token look like a fresh launch forever.
+        previous_rows = (
+            stored.get("items")
+            if stored.get("version") == GMGN_TRENCH_HISTORY_VERSION
+            and isinstance(stored.get("items"), list)
+            else []
+        )
         history_rows = merge_gmgn_trench_history(previous_rows, live_rows, observed_at=observed_at)
         history_rows = [row for row in history_rows if gmgn_trench_passes_chain_filters(row)]
         write_json_cache(GMGN_TRENCH_HISTORY_PATH, {
-            "version": 2,
+            "version": GMGN_TRENCH_HISTORY_VERSION,
             "updatedAt": observed_at,
             "lastLiveOkAt": observed_at if live_payload.get("ok") else int(safe_float(stored.get("lastLiveOkAt"))),
             "items": history_rows,
@@ -12098,7 +12128,7 @@ def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
         id="gmgn-trenches",
         group="crypto",
         title="GMGN 战壕新币榜",
-        subtitle="六链按真实开盘时间倒序 · OG优先（强数据非OG例外） · 原生刷量标记过滤",
+        subtitle="六链按真实开盘时间倒序 · 同步 GMGN 仅看 OG · 原生刷量标记过滤",
         accent="#9cff57",
         source_label="GMGN",
         source_name="GMGN Agent API · trenches/completed",
@@ -12228,7 +12258,7 @@ def attach_v44_research_marks_to_gmgn_trenches(source: dict[str, Any]) -> dict[s
 def fetch_gmgn_trenches_hot_board() -> dict[str, Any]:
     """Serve one persisted tape and refresh it at most once per protected window."""
     source = cached_api_payload(
-        "gmgn-trenches-hot-board-v6",
+        "gmgn-trenches-hot-board-v7",
         refresh_gmgn_trenches_hot_board,
         GMGN_TRENCH_BOARD_REFRESH_SECONDS,
     )

@@ -44,11 +44,12 @@ GMGN_TRENCH_FILTER_PROFILE_VERSION = 2
 # Keep them shared by all six monitored chains so API results and historical
 # rows cannot bypass the saved Trenches profile.
 GMGN_REQUIRED_TRENCH_FILTERS = ("has_social", "is_og")
-# ``is_og`` stays a local profile gate so a materially stronger non-OG token
-# can be compared with the OG baseline before it is rejected.  If it is sent
-# to GMGN upstream, the exception can never run because those rows disappear
-# before normalization.  Social presence remains an upstream hard filter.
-GMGN_UPSTREAM_TRENCH_FILTERS = ("has_social",)
+# Keep the upstream request aligned with the native GMGN checkbox.  Omitting
+# ``is_og`` here is not equivalent to “only OG locally”: the API returns the
+# newest mixed rows first, so an 80-row page can contain only a handful of OG
+# projects and the local board then incorrectly shrinks to a few dozen.  The
+# native filter must be applied at the source to receive the full OG page.
+GMGN_UPSTREAM_TRENCH_FILTERS = ("has_social", "is_og")
 # A non-OG token may override the saved checkbox only when its live market
 # data is materially stronger than the OG baseline in the same GMGN batch.
 # These are adaptive thresholds, not a symbol/contract allow-list.
@@ -57,6 +58,11 @@ GMGN_NON_OG_EXCEPTION_MIN_SCORE = 72.0
 # small rounding cushion. The absolute floor above still prevents ordinary
 # non-OG rows from entering solely because the batch has a weak OG sample.
 GMGN_NON_OG_EXCEPTION_MARGIN = 0.5
+# GMGN's “头像不重复” switch is useful for suppressing clone floods, but a
+# single popular artwork can legitimately be reused by a small launch wave.
+# Keep the first three same-image/name entries and only filter the fourth and
+# later occurrence.  This is deliberately a count, not a symbol whitelist.
+GMGN_MAX_DUPLICATE_FAMILY_SIZE = 3
 GMGN_TRENCH_CHAIN_FILTERS: dict[str, dict[str, Any]] = {
     "solana": {
         "imageNotDuplicate": True,
@@ -83,12 +89,13 @@ GMGN_TRENCH_CHAIN_FILTERS: dict[str, dict[str, Any]] = {
         "onlyOG": True,
         "excludeLaunchpads": ("uxento", "rapidlaunch"),
     },
+    # The native saved profile only enables “not honeypot” here.  The UI's
+    # “not open source”, “not renounced”, and “burn pool” switches are
+    # independent optional controls; treating them as mandatory made the
+    # Base chain disappear even when GMGN returned valid OG rows.
     "base": {
         "imageNotDuplicate": True,
         "notHoneypot": True,
-        "openSource": True,
-        "ownerRenounced": True,
-        "burnedPool": True,
         "requireSocial": True,
         "onlyOG": True,
     },
@@ -118,9 +125,10 @@ GMGN_ARC_RANK_FILTERS = (
     "has_social",
     "is_og",
 )
-GMGN_ARC_UPSTREAM_RANK_FILTERS = tuple(
-    value for value in GMGN_ARC_RANK_FILTERS if value != "is_og"
-)
+# Send the complete native profile to the rank route as well.  Some Arc
+# deployments currently ignore ``is_og`` server-side; normalize the returned
+# rows locally as a safety net, but do not omit the predicate from requests.
+GMGN_ARC_UPSTREAM_RANK_FILTERS = GMGN_ARC_RANK_FILTERS
 GMGN_READONLY_HEADERS = {
     "Accept": "application/json",
     "Content-Type": "application/json",
@@ -530,7 +538,10 @@ def gmgn_trench_passes_chain_filters(row: Mapping[str, Any]) -> bool:
         # Native GMGN's ``img_not_duplicate`` predicate is
         # ``Number(image_dup) <= 1``: the first occurrence is allowed, while
         # the second and later tokens sharing the artwork are filtered.
-        if duplicate_count is not None and duplicate_count > 1:
+        if duplicate_count is not None and duplicate_count > GMGN_MAX_DUPLICATE_FAMILY_SIZE:
+            return False
+        name_duplicate_count = _number(signals.get("nameDuplicateCount"))
+        if name_duplicate_count is not None and name_duplicate_count > GMGN_MAX_DUPLICATE_FAMILY_SIZE:
             return False
     if profile.get("excludeDeveloperWashTrading") and signals.get("washTrading") is True:
         return False
@@ -983,8 +994,23 @@ def fetch_gmgn_arc_opened_rank(
     for raw in rank_rows if isinstance(rank_rows, list) else []:
         if not isinstance(raw, Mapping) or not _flag(raw.get("launchpad_status")):
             continue
+        # Arc's rank endpoint sometimes appends long-lived tokens whose
+        # creation/open timestamps are both zero.  Treating that zero as the
+        # poll time makes an old token look like a fresh launch (for example,
+        # ARGUS appeared as “4m” despite being much older).  The new-coin tape
+        # must require a real timestamp; unknown-age rows belong in market
+        # discovery, not in the Trenches chronology.
+        timestamp = 0
+        for key in ("open_timestamp", "creation_timestamp", "created_timestamp"):
+            parsed_timestamp = _number(raw.get(key))
+            if parsed_timestamp and parsed_timestamp > 0:
+                timestamp = int(parsed_timestamp)
+                break
+        if timestamp <= 0:
+            continue
         mapped = dict(raw)
-        mapped.setdefault("created_timestamp", raw.get("creation_timestamp"))
+        mapped["created_timestamp"] = timestamp
+        mapped["open_timestamp"] = timestamp
         mapped.setdefault("usd_market_cap", raw.get("market_cap"))
         mapped.setdefault("volume_24h", raw.get("volume"))
         mapped.setdefault("swaps_24h", raw.get("swaps"))
@@ -1020,8 +1046,8 @@ def fetch_gmgn_migrated_trenches(
         return fetch_gmgn_arc_opened_rank(limit=limit, session=session)
 
     section: dict[str, Any] = {
-        # Match the native saved filter: retain both market origins but require
-        # at least one project social channel on every monitored chain.
+        # Match the native saved filter: retain both market origins, require at
+        # least one project social channel, and request the complete OG page.
         "filters": ["offchain", "onchain", *GMGN_UPSTREAM_TRENCH_FILTERS],
         "launchpad_platform_v2": True,
         "limit": max(1, min(80, int(limit))),
@@ -1136,14 +1162,31 @@ def normalize_gmgn_migrated_trenches(
                 "imageDup",
                 "imageDuplicateCount",
             )
+        name_duplicate_count = _first_number(
+            raw,
+            "name_dup",
+            "name_duplicate_count",
+            "nameDup",
+            "nameDuplicateCount",
+        )
+        if name_duplicate_count is None:
+            name_duplicate_count = _first_number(
+                nested_filter_signals,
+                "name_dup",
+                "name_duplicate_count",
+                "nameDup",
+                "nameDuplicateCount",
+            )
         is_og = _optional_flag(raw.get("is_og") if "is_og" in raw else raw.get("isOg"))
         if is_og is None:
             is_og = _optional_flag(nested_filter_signals.get("is_og") if "is_og" in nested_filter_signals else nested_filter_signals.get("isOg"))
         rat_trader_rate = _number(raw.get("rat_trader_amount_rate"))
         rat_trading_filter = _optional_flag(raw.get("is_rat_trading"))
         filter_warnings: list[str] = []
-        if image_duplicate_count is not None and image_duplicate_count > 1:
+        if image_duplicate_count is not None and image_duplicate_count > GMGN_MAX_DUPLICATE_FAMILY_SIZE:
             filter_warnings.append(f"图片重复 {int(image_duplicate_count)}")
+        if name_duplicate_count is not None and name_duplicate_count > GMGN_MAX_DUPLICATE_FAMILY_SIZE:
+            filter_warnings.append(f"名称重复 {int(name_duplicate_count)}")
         if wash_trading_filter is True:
             filter_warnings.append("GMGN 标记疑似刷量")
         if rat_trader_rate is not None and rat_trader_rate > 0:
@@ -1183,6 +1226,7 @@ def normalize_gmgn_migrated_trenches(
                 "isOg": is_og,
                 "nonOgException": False,
                 "imageDuplicateCount": image_duplicate_count,
+                "nameDuplicateCount": name_duplicate_count,
                 "washTrading": wash_trading_filter,
                 "ratTraderRate": rat_trader_rate,
                 "ratWashTrading": rat_trading_filter,
@@ -1279,10 +1323,21 @@ def normalize_gmgn_migrated_trenches(
     # without hard-coding symbols or contract addresses.  Query-string cache
     # busters are ignored by ``_image_identity``.
     image_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    name_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for row in rows:
         identity = _image_identity(row.get("imageUrl"))
         if identity:
             image_groups.setdefault((network_key, identity), []).append(row)
+        # Count exact symbol/name clones independently of the artwork URL.
+        # Some launchpads return a different CDN URL for the same meme, while
+        # others reuse one image across a small family of related tickers.
+        def _name_identity(value: Any) -> str:
+            text = _text(value, 180).casefold()
+            return re.sub(r"[^\w]+", "", text, flags=re.UNICODE)
+        symbol_identity = _name_identity(row.get("symbol"))
+        name_identity = _name_identity(row.get("name"))
+        if symbol_identity and name_identity:
+            name_groups.setdefault((network_key, symbol_identity, name_identity), []).append(row)
     for grouped_rows in image_groups.values():
         if len(grouped_rows) < 2:
             continue
@@ -1299,6 +1354,24 @@ def normalize_gmgn_migrated_trenches(
                 warnings = []
                 row["filterWarnings"] = warnings
             warning = f"图片重复 {duplicate_count}"
+            if warning not in warnings:
+                warnings.append(warning)
+    for grouped_rows in name_groups.values():
+        if len(grouped_rows) < 2:
+            continue
+        duplicate_count = len(grouped_rows)
+        for row in grouped_rows:
+            signals = row.get("filterSignals")
+            if not isinstance(signals, dict):
+                continue
+            reported = _number(signals.get("nameDuplicateCount"))
+            if reported is None or reported < duplicate_count:
+                signals["nameDuplicateCount"] = duplicate_count
+            warnings = row.get("filterWarnings")
+            if not isinstance(warnings, list):
+                warnings = []
+                row["filterWarnings"] = warnings
+            warning = f"名称重复 {duplicate_count}"
             if warning not in warnings:
                 warnings.append(warning)
     # The saved profile is still OG-first, but a genuinely stronger non-OG
