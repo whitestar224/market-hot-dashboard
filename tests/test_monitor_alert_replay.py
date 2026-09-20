@@ -79,7 +79,7 @@ class MonitorAlertReplayTests(unittest.TestCase):
             self.assertEqual(server.launch_price_structure_strategy_alerts(new_item), 1)
             launch.assert_called_once()
 
-    def test_stale_prior_high_scan_seeds_zone_silently_then_live_reentry_alerts(self):
+    def test_stale_prior_high_scan_alerts_once_when_the_detected_zone_was_never_delivered(self):
         now_ms = int(time.time() * 1000)
         old_checked_at = now_ms - server.MONITOR_ALERT_REPLAY_MAX_GAP_MS - 1
         with server.auth_db() as conn:
@@ -96,7 +96,7 @@ class MonitorAlertReplayTests(unittest.TestCase):
         def snapshot(status, checked_at, distance):
             return {
                 "symbol": "TEST",
-                "currentPrice": 9.8,
+                "currentPrice": 10.0 * (1 - distance / 100),
                 "weekHigh": 10.0,
                 "distancePct": distance,
                 "provider": "Test Futures",
@@ -111,16 +111,86 @@ class MonitorAlertReplayTests(unittest.TestCase):
                 "error": "",
             }
 
-        self.assertEqual(server.update_price_watch_snapshot(snapshot("near", now_ms, 2.0)), [])
+        events = server.update_price_watch_snapshot(snapshot("near", now_ms, 2.0))
+        self.assertEqual([event["eventType"] for event in events], ["prior_high"])
         with server.auth_db() as conn:
             seeded = conn.execute(
                 "SELECT in_zone, last_alert_at FROM price_watch_alert_state WHERE symbol = 'TEST'"
             ).fetchone()
-        self.assertEqual(dict(seeded), {"in_zone": 1, "last_alert_at": 0})
+        self.assertEqual(dict(seeded), {"in_zone": 1, "last_alert_at": now_ms})
 
-        server.update_price_watch_snapshot(snapshot("normal", now_ms + 1, 8.0))
-        events = server.update_price_watch_snapshot(snapshot("near", now_ms + 2, 2.0))
-        self.assertEqual([event["eventType"] for event in events], ["prior_high"])
+        self.assertEqual(server.update_price_watch_snapshot(snapshot("near", now_ms + 1, 2.0)), [])
+
+    def test_pending_structure_alerts_once_even_when_the_first_snapshot_was_already_structured(self):
+        now_ms = int(time.time() * 1000)
+        pending = {
+            "id": "zhongji-5m-pending",
+            "interval": "5m",
+            "pattern": "盘整突破 + 横盘起飞",
+            "certainty": 99,
+            "grade": "A+",
+            "triggerPrice": 151.5,
+        }
+        current = {
+            "symbol": "ZHONGJI",
+            "monitorPool": "aicoin-x-wallet",
+            "structureMembershipSources": [],
+            "provider": "Binance Futures",
+            "checkedAt": now_ms,
+            "broadcastEligibility": {
+                "eligible": False,
+                "reason": "deep-legacy-no-new-wave",
+                "allowedIntervals": [],
+            },
+            "frames": [{
+                "key": "5m",
+                "label": "5分钟",
+                "pattern": "盘整突破 + 横盘起飞",
+                "stage": "预备起爆",
+                "confidence": 99,
+                "pending": pending,
+                "signal": None,
+            }],
+        }
+        previous = {**current, "checkedAt": now_ms - server.MONITOR_ALERT_REPLAY_MAX_GAP_MS - 1}
+
+        with patch.object(server, "price_structure_symbol_excluded", return_value=False), patch.object(
+            server, "launch_desktop_alert", return_value={"queued": True}
+        ) as launch:
+            first = server.launch_price_structure_first_observation_alerts(current, previous)
+            repeated = server.launch_price_structure_first_observation_alerts(current, current)
+
+        self.assertEqual(first, 1)
+        self.assertEqual(repeated, 0)
+        self.assertEqual(launch.call_count, 1)
+        self.assertIn("首次结构观察", launch.call_args.args[0]["title"])
+
+    def test_failed_popup_queue_does_not_consume_the_structure_observation(self):
+        now_ms = int(time.time() * 1000)
+        item = {
+            "symbol": "RETRY",
+            "monitorPool": "aicoin-x-wallet",
+            "provider": "Binance Futures",
+            "checkedAt": now_ms,
+            "frames": [{
+                "key": "15m",
+                "label": "15分钟",
+                "pattern": "盘整突破",
+                "stage": "预备起爆",
+                "confidence": 95,
+                "pending": {"id": "retry-pending"},
+                "signal": None,
+            }],
+        }
+        with patch.object(server, "price_structure_symbol_excluded", return_value=False), patch.object(
+            server, "launch_desktop_alert", side_effect=[{"queued": False}, {"queued": True}]
+        ) as launch:
+            rejected = server.launch_price_structure_first_observation_alerts(item, None)
+            retried = server.launch_price_structure_first_observation_alerts(item, item)
+
+        self.assertEqual(rejected, 0)
+        self.assertEqual(retried, 1)
+        self.assertEqual(launch.call_count, 2)
 
 
 if __name__ == "__main__":

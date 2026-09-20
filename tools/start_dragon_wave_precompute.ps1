@@ -1,5 +1,5 @@
 param(
-  [string]$Version = "v89"
+  [string]$Version = "v91"
 )
 
 $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
@@ -13,11 +13,12 @@ if ($existing) { return }
 
 $logRoot = Join-Path $workspace ".runtime-cache\dragon-wave-precomputed"
 New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
-$stdoutLog = Join-Path $logRoot "$Version.stdout.log"
-$stderrLog = Join-Path $logRoot "$Version.stderr.log"
+$precomputeRunId = "$Version-$(Get-Date -Format 'yyyyMMdd-HHmmss')-$PID"
+$stdoutLog = Join-Path $logRoot "$precomputeRunId.stdout.log"
+$stderrLog = Join-Path $logRoot "$precomputeRunId.stderr.log"
 $process = Start-Process `
   -FilePath $nodeCommand.Source `
-  -ArgumentList @("tools/precompute_dragon_wave_cases.js", "--version=$Version") `
+  -ArgumentList @("tools/precompute_dragon_wave_cases.js", "--version=$Version", "--full-batch", "--local-only") `
   -WorkingDirectory $workspace `
   -WindowStyle Hidden `
   -RedirectStandardOutput $stdoutLog `

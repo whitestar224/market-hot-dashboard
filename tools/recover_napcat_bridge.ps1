@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$RuntimeDir,
     [Parameter(Mandatory = $true)][string]$QqPath,
-    [Parameter(Mandatory = $true)][string]$Account
+    [Parameter(Mandatory = $true)][string]$Account,
+    [switch]$AllowParallelManualQq
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,13 +38,22 @@ if (-not (Test-Path -LiteralPath $napcatExecutable -PathType Leaf)) {
 if ($Account -notmatch '^\d+$') {
     throw 'QQ account must contain digits only'
 }
-if (Test-OneBotPorts) {
-    @{ ok = $true; status = 'healthy'; changed = $false } | ConvertTo-Json -Compress
+$processSnapshot = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+$accountPattern = '(?i)(?:^|\s)-q\s+' + [regex]::Escape($Account) + '(?:\s|$)'
+$positionalAccountPattern = '(?i)(?:^|\s)' + [regex]::Escape($Account) + '(?:\s|$)'
+$targetSession = @(
+    $processSnapshot | Where-Object {
+        $path = [string]$_.ExecutablePath
+        $command = [string]$_.CommandLine
+        ($path -and $path.Equals($qqExecutable, [System.StringComparison]::OrdinalIgnoreCase) -and $command -match $accountPattern) -or
+        ($path -and $path.Equals($napcatExecutable, [System.StringComparison]::OrdinalIgnoreCase) -and $command -match $positionalAccountPattern)
+    }
+)
+if ((Test-OneBotPorts) -and $targetSession) {
+    @{ ok = $true; status = 'healthy'; changed = $false; account = $Account } | ConvertTo-Json -Compress
     exit 0
 }
 
-$processSnapshot = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
-$accountPattern = '(?i)(?:^|\s)-q\s+' + [regex]::Escape($Account) + '(?:\s|$)'
 $managedRoots = @(
     $processSnapshot | Where-Object {
         $path = [string]$_.ExecutablePath
@@ -67,10 +77,13 @@ while ($queue.Count -gt 0) {
     }
 }
 
-$managed = @(
-    Get-Process -Id @($managedIds) -ErrorAction SilentlyContinue |
-        Where-Object { -not $_.HasExited }
-)
+$managed = @()
+if ($managedIds.Count -gt 0) {
+    $managed = @(
+        Get-Process -Id @($managedIds) -ErrorAction SilentlyContinue |
+            Where-Object { -not $_.HasExited }
+    )
+}
 $napcatRootIds = @($managedRoots | Where-Object { ([string]$_.ExecutablePath) -ieq $napcatExecutable } | ForEach-Object { [int]$_.ProcessId })
 $ordered = @($managed | Sort-Object @{ Expression = { if ($napcatRootIds -contains $_.Id) { 1 } else { 0 } } })
 foreach ($process in $ordered) {
@@ -105,7 +118,7 @@ $manualQq = @(
                 $command -notmatch $accountPattern
         }
 )
-if ($manualQq) {
+if ($manualQq -and -not $AllowParallelManualQq) {
     @{
         ok = $true
         status = 'manual_qq_active'

@@ -10,10 +10,15 @@ import server
 
 class XKolRealtimeTests(unittest.TestCase):
     def setUp(self):
+        # Legacy transport tests explicitly simulate prior user approval; the
+        # separate policy tests assert the real production default is denied.
+        self.cost_approval = patch.object(server, 'X_OFFICIAL_API_USER_APPROVED', True)
+        self.cost_approval.start()
         self.read_cache_patcher = patch.object(server, "read_json_cache", return_value={})
         self.read_cache_patcher.start()
 
     def tearDown(self):
+        self.cost_approval.stop()
         self.read_cache_patcher.stop()
         with server.X_KOL_REALTIME_CONDITION:
             server.X_KOL_REALTIME_SNAPSHOTS.clear()
@@ -547,9 +552,9 @@ class XKolRealtimeTests(unittest.TestCase):
         thread_class.assert_called_once()
         thread_class.return_value.start.assert_called_once()
 
-    def test_global_stream_targets_all_enabled_accounts_when_opted_in(self):
+    def test_environment_flag_cannot_expand_paid_stream_beyond_owner_account(self):
         sources = [
-            {"id": "x-alpha", "handle": "alpha", "enabled": True},
+            {"id": "x-owner", "handle": "whitestar224", "enabled": True},
             {"id": "x-beta", "handle": "beta", "enabled": True},
             {"id": "x-off", "handle": "disabled", "enabled": False},
         ]
@@ -563,7 +568,7 @@ class XKolRealtimeTests(unittest.TestCase):
         ):
             targets = server.x_kol_official_stream_targets()
 
-        self.assertEqual(set(targets), {"alpha", "beta"})
+        self.assertEqual(set(targets), {"whitestar224"})
 
     def test_registering_user_with_existing_handles_does_not_restart_stream(self):
         source = {"id": "x-alpha", "handle": "alpha", "enabled": True}
@@ -574,6 +579,7 @@ class XKolRealtimeTests(unittest.TestCase):
 
         with (
             patch.object(server, "x_kol_official_stream_available", return_value=True),
+            patch.object(server, "X_OFFICIAL_API_ALL_ACCOUNTS_USER_APPROVED", True),
             patch.dict(server.os.environ, {"X_KOL_STREAM_ALL_TRACKED_ACCOUNTS": "1"}),
             patch.object(server, "x_kol_official_stream_targets", return_value=targets),
             patch.object(server, "wake_x_kol_official_stream") as wake,
@@ -613,6 +619,7 @@ class XKolRealtimeTests(unittest.TestCase):
         with (
             patch.object(server, "ensure_x_kol_realtime_worker"),
             patch.object(server, "x_kol_token", return_value="test-token"),
+            patch.object(server, "X_OFFICIAL_API_ALL_ACCOUNTS_USER_APPROVED", True),
             patch.dict(
                 server.os.environ,
                 {
@@ -647,6 +654,7 @@ class XKolRealtimeTests(unittest.TestCase):
         with (
             patch.object(server, "load_x_kol_sources", return_value=[source]),
             patch.object(server, "x_kol_token", return_value="test-token"),
+            patch.object(server, "X_OFFICIAL_API_ALL_ACCOUNTS_USER_APPROVED", True),
             patch.dict(
                 server.os.environ,
                 {
@@ -722,6 +730,7 @@ class XKolRealtimeTests(unittest.TestCase):
         }
         with (
             patch.object(server, "x_kol_token", return_value="test-token"),
+            patch.object(server, "X_OFFICIAL_API_REST_POLL_USER_APPROVED", True),
             patch.dict(server.os.environ, {"X_KOL_OFFICIAL_API_ENABLED": "0"}),
             patch.object(server, "x_kol_priority_sources", return_value=[source]),
             patch.object(server, "x_kol_fetch_api_source") as fetch_api,
@@ -748,6 +757,7 @@ class XKolRealtimeTests(unittest.TestCase):
         }
         with (
             patch.object(server, "x_kol_token", return_value="test-token"),
+            patch.object(server, "X_OFFICIAL_API_REST_POLL_USER_APPROVED", True),
             patch.dict(
                 server.os.environ,
                 {
@@ -781,6 +791,7 @@ class XKolRealtimeTests(unittest.TestCase):
         }
         with (
             patch.object(server, "x_kol_token", return_value="test-token"),
+            patch.object(server, "X_OFFICIAL_API_HISTORY_USER_APPROVED", True),
             patch.dict(
                 server.os.environ,
                 {
@@ -814,6 +825,7 @@ class XKolRealtimeTests(unittest.TestCase):
         }
         with (
             patch.object(server, "x_kol_token", return_value="test-token"),
+            patch.object(server, "X_OFFICIAL_API_HISTORY_USER_APPROVED", True),
             patch.dict(
                 server.os.environ,
                 {
@@ -828,7 +840,7 @@ class XKolRealtimeTests(unittest.TestCase):
         ):
             payload = server.x_kol_priority_payload(history_recovery=True)
 
-        fetch_api.assert_called_once_with(source, "test-token")
+        fetch_api.assert_called_once_with(source, "test-token", history_recovery=True)
         fetch_rss.assert_not_called()
         self.assertEqual(payload["provider"], "x-api")
         self.assertTrue(payload["startupHistoryRecovery"])
@@ -838,6 +850,7 @@ class XKolRealtimeTests(unittest.TestCase):
     def test_official_rest_polling_requires_its_own_opt_in(self):
         with (
             patch.object(server, "x_kol_token", return_value="test-token"),
+            patch.object(server, "X_OFFICIAL_API_REST_POLL_USER_APPROVED", True),
             patch.dict(
                 server.os.environ,
                 {
@@ -850,6 +863,7 @@ class XKolRealtimeTests(unittest.TestCase):
 
         with (
             patch.object(server, "x_kol_token", return_value="test-token"),
+            patch.object(server, "X_OFFICIAL_API_REST_POLL_USER_APPROVED", True),
             patch.dict(
                 server.os.environ,
                 {

@@ -146,6 +146,7 @@ button, select { cursor: pointer; }
 .stage-head h2, .intel-column h2 { margin: 0; font: 650 16px/1.1 var(--display); letter-spacing: .035em; }
 .chart-legend { flex-wrap: wrap; justify-content: flex-end; gap: 13px; color: var(--muted); font: 500 9px/1 var(--mono); }
 .chart-legend span { display: inline-flex; align-items: center; }
+.chart-legend b { color: inherit; font: inherit; }
 .chart-legend i { width: 12px; height: 2px; margin-right: 5px; background: currentColor; }
 .chart-legend .is-buy { color: var(--cyan); }
 .chart-legend .is-secondary-hint { color: #ff5d6c; }
@@ -157,6 +158,12 @@ button, select { cursor: pointer; }
 .signal-policy { margin: 0 0 9px; padding: 7px 9px; color: var(--muted); border-left: 2px solid rgba(248, 184, 78, .72); background: rgba(248, 184, 78, .055); font: 500 9px/1.5 var(--mono); }
 .signal-policy b:first-child { color: var(--cyan); }
 .signal-policy b:last-child { color: var(--amber); }
+.strategy-page-tabs { display: inline-flex; align-items: center; gap: 4px; margin: -2px 0 10px; padding: 4px; border: 1px solid rgba(56, 246, 199, .24); background: rgba(5, 17, 14, .72); }
+.strategy-page-tabs button { min-width: 94px; padding: 8px 14px; color: var(--muted); border: 1px solid transparent; background: transparent; font: 700 11px/1 var(--mono); }
+.strategy-page-tabs button:hover { color: var(--text); border-color: rgba(56, 246, 199, .22); }
+.strategy-page-tabs button.is-active { color: #04110e; border-color: var(--cyan); background: var(--cyan); }
+.prior-high-policy { border-left-color: rgba(83, 200, 255, .82); background: rgba(83, 200, 255, .055); }
+.prior-high-policy b:first-child { color: #53c8ff; }
 .timeframe-tabs { display: flex; align-items: center; gap: 3px; margin: -2px 0 9px; padding: 4px; border: 1px solid var(--line); background: #080c0d; overflow-x: auto; }
 .timeframe-tabs button { flex: none; min-width: 48px; padding: 8px 11px; color: #b2c0bd; border: 1px solid transparent; background: transparent; font: 680 12px/1 var(--display); }
 .timeframe-tabs button:hover { color: var(--text); background: rgba(255,255,255,.035); }

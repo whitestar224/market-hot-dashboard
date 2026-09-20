@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import gmgn_agentic
 
 from chain_ecosystem_monitor import (
     ChainEcosystemStore,
@@ -25,10 +26,74 @@ from chain_ecosystem_monitor import (
     seed_robinhood_chain,
     score_potential_project,
     score_traded_project,
+    evaluate_onchain_candidate,
+    fetch_live_onchain_trenches,
+    merge_onchain_research_rows,
+    normalize_onchain_new_pools,
+    normalize_onchain_dexscreener,
+    scan_onchain_research,
+    scan_onchain_research_contract,
 )
 
 
 class ChainEcosystemScoringTests(unittest.TestCase):
+    def test_research_scope_is_gmgn_trenches_only_by_default(self):
+        class Store:
+            def __init__(self):
+                self.calls = []
+
+            def save_onchain_research_scan(self, rows, **metadata):
+                self.calls.append((list(rows), metadata))
+
+        row = {
+            "network": "bsc",
+            "contractAddress": "0x" + "a" * 40,
+            "symbol": "TRENCH",
+            "name": "Trench token",
+            "provider": "gmgn-trenches",
+            "providers": ["gmgn-trenches"],
+            "poolCreatedAt": 1_788_768_000_000,
+            "observedAt": 1_788_768_000_000,
+            "filterSignals": {
+                "profileVersion": gmgn_agentic.GMGN_TRENCH_FILTER_PROFILE_VERSION,
+                "isOg": True,
+                "imageDuplicateCount": 0,
+                "socialCount": 1,
+                "washTrading": False,
+                "ratWashTrading": False,
+                "honeypot": False,
+            },
+            "metrics": {
+                "liquidityUsd": 35_000,
+                "volumeH1Usd": 20_000,
+                "transactionsH1": 60,
+                "buysH1": 40,
+                "sellsH1": 20,
+            },
+        }
+        store = Store()
+        binance_called = []
+
+        def should_not_run(*_args, **_kwargs):
+            binance_called.append(True)
+            raise AssertionError("Binance launch feed must not enter trench research by default")
+
+        with patch("chain_ecosystem_monitor.normalize_gmgn_migrated_trenches", return_value=[row]):
+            result = scan_onchain_research(
+                store,
+                networks=["bsc"],
+                observed_at=1_788_768_000_000,
+                gmgn_trenches_fetcher=lambda _network: {"code": 0, "data": {"completed": []}},
+                binance_launch_fetcher=should_not_run,
+                dexscreener_fetcher=lambda *_args, **_kwargs: {"pairs": []},
+            )
+
+        # The normalizer is patched because this test is about the scope gate,
+        # not the upstream wire shape.
+        self.assertFalse(binance_called)
+        self.assertEqual(result["candidateScope"], "gmgn-trenches")
+        self.assertEqual(result["discovered"], 1)
+        self.assertTrue(any(item["symbol"] == "TRENCH" for item in store.calls[-1][0]))
     def test_taxonomy_contains_all_confirmed_l0_to_l3_markets(self):
         keys = {row["key"] for row in DEFAULT_MARKETS}
         self.assertTrue(
@@ -87,6 +152,244 @@ class ChainEcosystemScoringTests(unittest.TestCase):
             [row["projectId"] for row in rank_market_projects(rows)],
             ["a", "b", "z"],
         )
+
+
+class OnchainGoldenDogResearchTests(unittest.TestCase):
+    def new_pool_payload(self, *, liquidity=25_000, buys=42, sells=18, created_at="2026-09-07T01:00:00Z"):
+        return {
+            "data": [{
+                "id": "solana_pool1111111111111111111111111111111111",
+                "type": "pool",
+                "attributes": {
+                    "address": "pool1111111111111111111111111111111111",
+                    "name": "DOGMOM / SOL",
+                    "pool_created_at": created_at,
+                    "base_token_price_usd": "0.00042",
+                    "reserve_in_usd": str(liquidity),
+                    "fdv_usd": "900000",
+                    "volume_usd": {"m5": "4200", "h1": "31000", "h6": "80000", "h24": "80000"},
+                    "price_change_percentage": {"m5": "12", "h1": "44"},
+                    "transactions": {
+                        "m5": {"buys": 8, "sells": 2, "buyers": 7, "sellers": 2},
+                        "h1": {"buys": buys, "sells": sells, "buyers": 31, "sellers": 14},
+                    },
+                },
+                "relationships": {
+                    "base_token": {"data": {"id": "solana_DezXAZ8z7PnrnRJjz3wXBoRgixCa6QXEk9dWQFwe"}},
+                    "dex": {"data": {"id": "raydium"}},
+                },
+            }],
+            "included": [{
+                "id": "solana_DezXAZ8z7PnrnRJjz3wXBoRgixCa6QXEk9dWQFwe",
+                "type": "token",
+                "attributes": {"name": "Dog Mom", "symbol": "DOGMOM"},
+            }],
+        }
+
+    def test_live_trenches_read_providers_directly_without_store(self):
+        gmgn_row = {
+            "network": "eth",
+            "contractAddress": "0x0000000000000000000000000000000000001111",
+            "symbol": "LIVEG",
+            "name": "Live GMGN",
+            "providers": ["gmgn-trenches"],
+            "launchStage": "migrated",
+            "poolCreatedAt": 1_788_767_990_000,
+            "observedAt": 1_788_768_000_000,
+            "metrics": {"liquidityUsd": 30_000, "volumeH1Usd": 20_000, "transactionsH1": 60},
+        }
+        binance_row = {
+            "network": "bsc",
+            "contractAddress": "0x0000000000000000000000000000000000002222",
+            "symbol": "LIVEB",
+            "name": "Live Binance",
+            "providers": ["binance-meme-rush"],
+            "launchStage": "migrated",
+            "poolCreatedAt": 1_788_767_980_000,
+            "observedAt": 1_788_768_000_000,
+            "metrics": {"liquidityUsd": 40_000, "volumeH24Usd": 80_000, "transactionsH24": 120},
+        }
+        with patch("chain_ecosystem_monitor.fetch_gmgn_migrated_trenches", return_value={}), patch(
+            "chain_ecosystem_monitor.normalize_gmgn_migrated_trenches", return_value=[gmgn_row]
+        ) as gmgn_normalizer, patch(
+            "chain_ecosystem_monitor.fetch_binance_meme_rush", return_value={"data": []}
+        ), patch(
+            "chain_ecosystem_monitor.normalize_binance_meme_rush", return_value=[binance_row]
+        ) as binance_normalizer:
+            payload = fetch_live_onchain_trenches(
+                networks=["eth", "bsc"],
+                observed_at=1_788_768_000_000,
+            )
+
+        self.assertTrue(payload["live"])
+        self.assertEqual(payload["total"], 2)
+        self.assertEqual(payload["counts"], {"gmgn": 1, "binance": 1})
+        self.assertEqual({row["symbol"] for row in payload["items"]}, {"LIVEG", "LIVEB"})
+        gmgn_item = next(row for row in payload["items"] if row["symbol"] == "LIVEG")
+        self.assertEqual(gmgn_item["buyIdentity"]["source"], "gmgn-api")
+        self.assertEqual(gmgn_item["buyIdentity"]["target"]["address"], gmgn_row["contractAddress"])
+        self.assertTrue(gmgn_normalizer.called)
+        self.assertTrue(binance_normalizer.called)
+
+    def test_live_trenches_filters_before_balanced_chain_cap(self):
+        def normalized(_payload, network, *, observed_at):
+            return [
+                {
+                    "network": network,
+                    "contractAddress": f"0x{index + 1:040x}",
+                    "symbol": f"{network.upper()}{index}",
+                    "name": "Filtered trench",
+                    "providers": ["gmgn-trenches"],
+                    "launchStage": "migrated",
+                    "poolCreatedAt": observed_at - index,
+                    "observedAt": observed_at,
+                    "metrics": {},
+                    "keep": index != 1,
+                }
+                for index in range(3)
+            ]
+
+        with patch("chain_ecosystem_monitor.fetch_gmgn_migrated_trenches", return_value={}), patch(
+            "chain_ecosystem_monitor.normalize_gmgn_migrated_trenches", side_effect=normalized
+        ):
+            payload = fetch_live_onchain_trenches(
+                networks=["eth", "bsc"],
+                source="gmgn",
+                observed_at=1_788_768_000_000,
+                item_filter=lambda row: bool(row.get("keep")),
+                per_network_limit=1,
+                page_size=60,
+            )
+
+        self.assertEqual(payload["unfilteredTotal"], 6)
+        self.assertEqual(payload["total"], 2)
+        self.assertEqual({row["network"] for row in payload["items"]}, {"eth", "bsc"})
+
+    def test_new_pool_parser_preserves_solana_address_and_early_metrics(self):
+        rows = normalize_onchain_new_pools(
+            self.new_pool_payload(),
+            "solana",
+            observed_at=1_788_739_200_000,
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["contractAddress"], "DezXAZ8z7PnrnRJjz3wXBoRgixCa6QXEk9dWQFwe")
+        self.assertEqual(rows[0]["metrics"]["transactionsH1"], 60)
+        self.assertEqual(rows[0]["metrics"]["buyersM5"], 7)
+        self.assertEqual(rows[0]["dexId"], "raydium")
+
+    def test_cross_provider_merge_uses_chain_and_contract_not_symbol(self):
+        primary = normalize_onchain_new_pools(self.new_pool_payload(), "solana", observed_at=100)[0]
+        secondary = {
+            **primary,
+            "provider": "dexscreener",
+            "providers": ["dexscreener"],
+            "poolAddress": "a-better-pool",
+            "metrics": {**primary["metrics"], "liquidityUsd": 50_000},
+        }
+
+        merged = merge_onchain_research_rows([primary, secondary])
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(set(merged[0]["providers"]), {"geckoterminal", "dexscreener"})
+        self.assertEqual(merged[0]["metrics"]["liquidityUsd"], 50_000)
+
+    def test_filter_keeps_very_early_thin_pool_warming_but_rejects_stale_noise(self):
+        now = 1_788_768_000_000
+        fresh = normalize_onchain_new_pools(
+            self.new_pool_payload(liquidity=600, buys=1, sells=0, created_at="2026-09-07T07:55:00Z"),
+            "solana",
+            observed_at=now,
+        )[0]
+        stale = normalize_onchain_new_pools(
+            self.new_pool_payload(liquidity=600, buys=1, sells=0, created_at="2026-09-07T01:00:00Z"),
+            "solana",
+            observed_at=now,
+        )[0]
+
+        self.assertEqual(evaluate_onchain_candidate(fresh, now_ms=now)["decision"], "warming")
+        self.assertEqual(evaluate_onchain_candidate(stale, now_ms=now)["decision"], "filtered")
+
+    def test_meme_and_project_scores_are_both_kept_before_final_classification(self):
+        row = normalize_onchain_new_pools(
+            self.new_pool_payload(),
+            "solana",
+            observed_at=1_788_739_200_000,
+        )[0]
+
+        result = evaluate_onchain_candidate(row, now_ms=1_788_739_200_000)
+
+        self.assertIn("memeScore", result)
+        self.assertIn("projectScore", result)
+        self.assertIn(result["candidateType"], {"meme", "project"})
+        self.assertGreater(result["selectedScore"], 0)
+
+    def test_wallet_types_help_validation_but_promotional_or_wash_clusters_are_penalized(self):
+        base = {
+            "network": "bsc", "contractAddress": "0x" + "a" * 40,
+            "symbol": "STORY", "name": "Story Meme", "providers": ["binance-meme-rush", "dexscreener"],
+            "firstSeenAt": 1_788_739_200_000, "poolCreatedAt": 1_788_739_140_000,
+            "observedAt": 1_788_739_200_000, "dexId": "pancakeswap",
+            "metrics": {"liquidityUsd": 35_000, "volumeH1Usd": 60_000, "volumeH6Usd": 90_000,
+                        "transactionsH1": 120, "buysH1": 78, "sellsH1": 42, "buyersM5": 22,
+                        "marketCapUsd": 650_000},
+        }
+        validated = evaluate_onchain_candidate({**base, "launchFacts": {
+            "holders": 420, "smartMoneyHolders": 5, "smartMoneyHoldingPercent": 3.5,
+            "proHolders": 8, "proHoldingPercent": 5.0, "kolHolders": 1,
+            "kolHoldingPercent": 0.6, "newWalletHoldingPercent": 8,
+            "bundlerHoldingPercent": 1, "top10Percent": 24,
+        }}, now_ms=base["observedAt"])
+        promotional = evaluate_onchain_candidate({**base, "contractAddress": "0x" + "b" * 40, "launchFacts": {
+            "holders": 420, "smartMoneyHolders": 0, "proHolders": 0, "kolHolders": 14,
+            "kolHoldingPercent": 31, "newWalletHoldingPercent": 48,
+            "bundlerHoldingPercent": 22, "top10Percent": 78, "washTrading": True,
+        }}, now_ms=base["observedAt"])
+
+        self.assertEqual(validated["walletProfile"]["classification"], "independent-validation")
+        self.assertEqual(promotional["walletProfile"]["classification"], "promotional-cluster-risk")
+        self.assertGreater(validated["selectedScore"], promotional["selectedScore"])
+        self.assertIn("疑似刷量或关联钱包聚集", promotional["risks"])
+        self.assertNotIn("聪明钱数量直接等于买入信号", validated["reasons"])
+
+    def test_contract_mention_enters_incremental_scan_without_chain_guess(self):
+        contract = "0xee132e984cafa9525a511e2033a1ec53b9f87777"
+        payload = {
+            "pairs": [{
+                "chainId": "bsc",
+                "dexId": "pancakeswap",
+                "pairAddress": "0x869B62bb396B7b9fedf52790B1427FeD71a2C642",
+                "url": "https://dexscreener.com/bsc/luna",
+                "baseToken": {"address": contract, "symbol": "LUNA", "name": "LUNA"},
+                "priceUsd": "0.001",
+                "liquidity": {"usd": 25000},
+                "volume": {"h1": 33000, "h6": 80000, "h24": 90000},
+                "txns": {"h1": {"buys": 45, "sells": 15}},
+            }],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ChainEcosystemStore(Path(temp_dir) / "research.db")
+            store.initialize()
+            with patch("chain_ecosystem_monitor._now_ms", return_value=1_788_793_718_413):
+                result = scan_onchain_research_contract(
+                    store,
+                    contract,
+                    source="qq-pg-one",
+                    source_text=f"{contract} luna来了",
+                    observed_at=1_788_700_000_000,
+                    fetcher=lambda _contract: payload,
+                )
+            previous = store.onchain_research_payload(
+                now_ms=1_788_800_000_000,
+                research_day="2026-09-07",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["discovered"], 1)
+        self.assertEqual(previous["selected"][0]["symbol"], "LUNA")
+        self.assertEqual(previous["selected"][0]["firstSeenAt"], 1_788_793_718_413)
+        self.assertIn("qq-pg-one", previous["selected"][0]["providers"])
+        self.assertIn("luna来了", previous["selected"][0]["reasons"][0])
 
 
 class ChainEcosystemStoreTests(unittest.TestCase):
@@ -201,6 +504,98 @@ class ChainEcosystemStoreTests(unittest.TestCase):
         self.assertEqual(latest["observedAt"], 100)
         self.assertEqual(latest["rows"][0]["score"], 72)
 
+    def test_batch_ranking_reads_preserve_latest_rows_and_leader_history(self):
+        chain = self.add_chain()
+        first = self.store.upsert_project(
+            chain["id"], {"slug": "first-dex", "name": "First DEX", "tokenStage": "trading"}
+        )
+        second = self.store.upsert_project(
+            chain["id"], {"slug": "second-dex", "name": "Second DEX", "tokenStage": "trading"}
+        )
+        self.store.save_ranking_snapshot(
+            chain["id"], "dex", first["id"], observed_at=100, rank=1, score=72, confidence=80
+        )
+        self.store.save_ranking_snapshot(
+            chain["id"], "dex", second["id"], observed_at=200, rank=1, score=91, confidence=95
+        )
+        self.store.save_ranking_snapshot(
+            chain["id"], "dex", first["id"], observed_at=200, rank=2, score=70, confidence=82
+        )
+
+        latest = self.store.latest_rankings(chain["id"])["dex"]
+        leaders = self.store.recent_market_leaders_for_chain(chain["id"], limit_per_market=8)["dex"]
+
+        self.assertEqual(latest["observedAt"], 200)
+        self.assertEqual([row["projectId"] for row in latest["rows"]], [second["id"], first["id"]])
+        self.assertEqual([row["projectId"] for row in leaders], [second["id"], first["id"]])
+
+    def test_onchain_research_scan_is_persistent_deduplicated_and_bounded(self):
+        observed = 1_788_768_000_000
+        base = {
+            "network": "solana",
+            "contractAddress": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6QXEk9dWQFwe",
+            "poolAddress": "pool-one",
+            "symbol": "DOGMOM",
+            "name": "Dog Mom",
+            "providers": ["geckoterminal"],
+            "firstSeenAt": observed - 60_000,
+            "observedAt": observed,
+            "poolCreatedAt": observed - 120_000,
+            "decision": "shortlisted",
+            "candidateType": "meme",
+            "memeScore": 78,
+            "projectScore": 56,
+            "selectedScore": 78,
+            "confidence": 82,
+            "scoreVersion": "golden-dog-v2-cryptod",
+            "reasons": ["买方扩散"],
+            "risks": ["单一来源"],
+            "metrics": {"liquidityUsd": 25_000, "volumeH1Usd": 31_000},
+        }
+
+        self.store.save_onchain_research_scan([base], observed_at=observed, source_status={"solana": "ok"})
+        self.store.save_onchain_research_scan(
+            [{**base, "observedAt": observed + 300_000, "selectedScore": 81}],
+            observed_at=observed + 300_000,
+            source_status={"solana": "ok"},
+        )
+        filtered = {
+            **base,
+            "contractAddress": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6QXEk9dWQFwf",
+            "poolAddress": "pool-filtered",
+            "symbol": "NOISE",
+            "name": "Filtered Noise",
+            "decision": "filtered",
+            "selectedScore": 24,
+            "reasons": ["综合质量未达到研究门槛"],
+            "risks": ["流动性不足"],
+        }
+        self.store.save_onchain_research_scan(
+            [filtered],
+            observed_at=observed + 300_000,
+            source_status={"solana": "ok"},
+        )
+        payload = self.store.onchain_research_payload(now_ms=observed + 300_000, limit=5)
+
+        self.assertEqual(payload["funnel"]["discovered"], 2)
+        self.assertEqual(len(payload["selected"]), 1)
+        self.assertEqual(payload["selected"][0]["selectedScore"], 81)
+        self.assertEqual(payload["selected"][0]["firstSeenAt"], observed - 60_000)
+        self.assertEqual(payload["filtered"], [])
+        self.assertEqual(payload["hiddenNoiseCount"], 1)
+        self.assertEqual(payload["funnel"]["filtered"], 1)
+        self.assertIn("2026-09-07", payload["availableDays"])
+        self.assertIsNone(payload["benchmark"]["recallPct"])
+        self.assertGreater(payload["benchmark"]["caseCount"], 0)
+
+        previous = self.store.onchain_research_payload(
+            now_ms=observed + 86_400_000,
+            research_day="2026-09-07",
+            limit=5,
+        )
+        self.assertEqual(previous["day"], "2026-09-07")
+        self.assertEqual(previous["selected"][0]["symbol"], "DOGMOM")
+
 
 class FakeResponse:
     def __init__(self, payload):
@@ -252,6 +647,16 @@ class ChainEcosystemProviderTests(unittest.TestCase):
         self.assertEqual(shared["contractAddress"], "0x0000000000000000000000000000000000000011")
         self.assertEqual(set(shared["providers"]), {"geckoterminal", "dexscreener"})
         self.assertEqual(shared["metrics"]["liquidityUsd"], 255000)
+
+    def test_onchain_dexscreener_preserves_quote_asset_for_framework_analysis(self):
+        rows = normalize_onchain_dexscreener(
+            self.fixture("chain_ecosystem_dexscreener.json"),
+            "robinhood",
+            observed_at=110,
+        )
+
+        self.assertEqual(rows[0]["quoteAsset"]["symbol"], "WETH")
+        self.assertEqual(rows[0]["quoteAsset"]["address"], "0x0000000000000000000000000000000000000022")
 
     def test_defillama_categories_map_to_confirmed_markets(self):
         rows = normalize_provider_rows(
@@ -786,6 +1191,35 @@ class ChainEcosystemMonitorTests(unittest.TestCase):
         self.assertTrue(result["refreshScheduled"])
         self.assertNotIn("payload", result)
         self.assertEqual(len(self.scheduled), 1)
+
+    def test_research_schedules_each_network_independently_and_bounds_inflight(self):
+        self.assertTrue(self.monitor.schedule_research_refresh(now_ms=100_000))
+        self.assertEqual(
+            {args[0] for _, args in self.scheduled},
+            {"eth", "solana", "robinhood", "arc", "base", "bsc"},
+        )
+        self.assertFalse(self.monitor.schedule_research_refresh(now_ms=160_000))
+        with patch("chain_ecosystem_monitor.scan_onchain_research", return_value={"ok": True}), patch("chain_ecosystem_monitor._now_ms", return_value=100_000):
+            self.monitor._research_refresh_worker("bsc")
+        self.assertFalse(self.monitor.schedule_research_refresh(now_ms=159_999))
+        self.assertTrue(self.monitor.schedule_research_refresh(now_ms=160_000))
+        self.assertEqual(self.scheduled[-1][1], ("bsc",))
+
+    def test_research_failure_backs_off_only_the_failed_network(self):
+        calls = []
+
+        def scan(_store, *, networks, candidate_sink=None):
+            calls.append(networks)
+            return {"ok": networks != ["eth"]}
+
+        with patch("chain_ecosystem_monitor.scan_onchain_research", side_effect=scan):
+            self.monitor._research_refresh_worker()
+            self.monitor._research_refresh_worker()
+
+        self.assertEqual(calls, [["eth"], ["solana"]])
+        self.assertGreater(self.monitor._research_network_next_due_at["eth"], 0)
+        self.assertGreater(self.monitor._research_network_next_due_at.get("solana", 0), 0)
+        self.assertGreater(self.monitor._research_network_next_due_at["eth"], self.monitor._research_network_next_due_at["solana"])
 
     def test_manual_chain_validation_rejects_unsafe_url_and_bad_chain_id(self):
         with self.assertRaises(ValueError):

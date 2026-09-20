@@ -1,16 +1,88 @@
 (() => {
   const API_URL = "/api/ai/rank-insights";
   const CACHE_KEY = "xingyun:deepseek-rank-insights:v6";
+  const ENABLED_KEY = "xingyun:rank-ai-enabled:v1";
   const CACHE_TTL_MS = 12 * 60 * 60 * 1000;
   const CACHE_LIMIT = 700;
   const REQUEST_BATCH_ROWS = 24;
+  let enabledByPreference = false;
+  try {
+    enabledByPreference = localStorage.getItem(ENABLED_KEY) === "1";
+  } catch (error) {
+    enabledByPreference = false;
+  }
   const state = {
+    enabled: enabledByPreference,
+    generation: 0,
     insights: new Map(),
     pendingKeys: new Set(),
     pending: false,
     lastSignature: "",
-    disabledUntil: 0
+    disabledUntil: 0,
+    servicePid: 0,
+    failureServicePid: 0,
+    failureDuringStartup: false,
+    recoveryTimer: 0,
+    lastRequest: null
   };
+
+  function isEnabled() {
+    return state.enabled;
+  }
+
+  function syncToggle() {
+    if (typeof document?.getElementById !== "function") return;
+    const toggle = document.getElementById("rankAiToggle");
+    const status = document.getElementById("rankAiToggleStatus");
+    if (toggle) {
+      toggle.checked = state.enabled;
+      toggle.setAttribute("aria-checked", state.enabled ? "true" : "false");
+    }
+    if (status) status.textContent = state.enabled ? "开启" : "关闭";
+  }
+
+  function emitToggleChange() {
+    if (typeof window?.dispatchEvent !== "function" || typeof CustomEvent !== "function") return;
+    window.dispatchEvent(new CustomEvent("xingyun:rank-ai-toggle", { detail: { enabled: state.enabled } }));
+  }
+
+  function setEnabled(value) {
+    const next = Boolean(value);
+    if (next === state.enabled) {
+      syncToggle();
+      return state.enabled;
+    }
+    state.enabled = next;
+    state.generation += 1;
+    state.lastSignature = "";
+    state.pending = false;
+    state.pendingKeys.clear();
+    if (!next && state.recoveryTimer && typeof window.clearTimeout === "function") {
+      window.clearTimeout(state.recoveryTimer);
+      state.recoveryTimer = 0;
+    }
+    if (!next) document.getElementById("ai-unavailable-notice")?.remove();
+    try {
+      localStorage.setItem(ENABLED_KEY, next ? "1" : "0");
+    } catch (error) {
+      console.warn("Persist rank AI toggle failed", error);
+    }
+    syncToggle();
+    emitToggleChange();
+    return state.enabled;
+  }
+
+  function bindToggle() {
+    if (typeof document?.getElementById !== "function") return;
+    const toggle = document.getElementById("rankAiToggle");
+    if (!toggle || toggle.dataset?.rankAiBound === "1") {
+      syncToggle();
+      return;
+    }
+    if (toggle.dataset) toggle.dataset.rankAiBound = "1";
+    toggle.addEventListener("change", () => setEnabled(toggle.checked));
+    syncToggle();
+  }
 
   function stableText(value, limit = 120) {
     return String(value ?? "").replace(/\s+/g, " ").trim().slice(0, limit);
@@ -138,7 +210,63 @@
     }
   }
 
+  function rememberService(data) {
+    const pid = Number(data?.servicePid || data?.pid || 0);
+    if (pid > 0) state.servicePid = pid;
+    return pid;
+  }
+
+  function rememberFailureService(data = {}) {
+    const pid = rememberService(data);
+    state.failureServicePid = pid || state.servicePid;
+    state.failureDuringStartup = ["waiting", "checking"].includes(data?.aiStartup?.status);
+  }
+
+  function scheduleStartupRecoveryCheck() {
+    if (!state.enabled) return;
+    if (state.recoveryTimer || typeof window.setTimeout !== "function") return;
+    state.recoveryTimer = window.setTimeout(async () => {
+      state.recoveryTimer = 0;
+      if (!state.enabled) return;
+      try {
+        const response = await fetch("/api/service-liveness", { cache: "no-store" });
+        const data = await response.json().catch(() => ({}));
+        const pid = rememberService(data);
+        const startupStatus = data?.aiStartup?.status || "";
+        const newService = pid > 0 && (!state.failureServicePid || pid !== state.failureServicePid);
+        if (response.ok && startupStatus === "ready" && (newService || state.failureDuringStartup)) {
+          state.disabledUntil = 0;
+          state.lastSignature = "";
+          state.failureServicePid = 0;
+          state.failureDuringStartup = false;
+          document.getElementById("ai-unavailable-notice")?.remove();
+          const retry = state.lastRequest;
+          if (retry) await requestForSources(retry.sources, retry.options);
+          return;
+        }
+        if (startupStatus === "checking" || Date.now() < state.disabledUntil) scheduleStartupRecoveryCheck();
+      } catch (error) {
+        scheduleStartupRecoveryCheck();
+      }
+    }, 5_000);
+  }
+
+  function showUnavailable() {
+    if (!state.enabled) return;
+    let notice = document.getElementById("ai-unavailable-notice");
+    if (!notice) {
+      notice = document.createElement("div");
+      notice.id = "ai-unavailable-notice";
+      notice.setAttribute("role", "status");
+      document.body.prepend(notice);
+    }
+    notice.textContent = "AI暂不可用，使用本地规则结果";
+    state.lastSignature = "";
+  }
+
   function shouldDeferFallback(row, context = {}) {
+    if (!state.enabled) return false;
+    if (Date.now() < state.disabledUntil) return false;
     const source = context.source || row?.source || {};
     const mode = context.mode || "hot";
     const text = [
@@ -156,7 +284,12 @@
   }
 
   async function requestForSources(sources, options = {}) {
-    if (Date.now() < state.disabledUntil || state.pending) return;
+    if (!state.enabled) return;
+    state.lastRequest = { sources, options };
+    if (Date.now() < state.disabledUntil || state.pending) {
+      if (Date.now() < state.disabledUntil) scheduleStartupRecoveryCheck();
+      return;
+    }
     const mode = options.mode || "hot";
     const compact = compactSources(sources, mode);
     if (!compact.length) return;
@@ -164,29 +297,36 @@
     const signature = signatureFor(payload);
     if (signature === state.lastSignature) return;
     state.pending = true;
+    const requestGeneration = state.generation;
     state.lastSignature = signature;
     compact.forEach((source) => source.rows.forEach((row) => state.pendingKeys.add(row.key)));
     if (typeof options.onUpdate === "function") options.onUpdate();
     try {
       let changed = false;
       for (const batch of sourceBatches(compact)) {
+        if (!state.enabled || state.generation !== requestGeneration) break;
         const response = await fetch(API_URL, {
           method: "POST",
           cache: "no-store",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ mode, sources: batch })
         });
+        if (!state.enabled || state.generation !== requestGeneration) break;
         const data = await response.json().catch(() => ({}));
+        rememberService(data);
         const batchKeys = batch.flatMap((source) => source.rows.map((row) => row.key));
         batchKeys.forEach((key) => state.pendingKeys.delete(key));
         if (!response.ok || data.ok === false || data.enabled === false) {
           state.disabledUntil = Date.now() + 5 * 60 * 1000;
+          rememberFailureService(data);
+          showUnavailable();
+          scheduleStartupRecoveryCheck();
           if (typeof options.onUpdate === "function") options.onUpdate();
           break;
         }
         const insights = data.insights && typeof data.insights === "object" ? data.insights : {};
         batchKeys.forEach((key) => {
-          if (state.insights.delete(key)) changed = true;
+          if (!data.degraded && state.insights.delete(key)) changed = true;
         });
         Object.entries(insights).forEach(([key, value]) => {
           const insight = normalizeInsight(value);
@@ -195,19 +335,36 @@
           changed = true;
         });
         if (changed) persistInsights();
+        if (data.degraded) {
+          state.disabledUntil = Date.now() + Math.max(1, Math.min(300, Number(data.retryAfterSeconds) || 60)) * 1000;
+          rememberFailureService(data);
+          showUnavailable();
+          scheduleStartupRecoveryCheck();
+          break;
+        }
+        state.failureServicePid = 0;
+        state.failureDuringStartup = false;
+        document.getElementById("ai-unavailable-notice")?.remove();
         if (typeof options.onUpdate === "function") options.onUpdate();
       }
     } catch (error) {
+      if (!state.enabled || state.generation !== requestGeneration) return;
       state.disabledUntil = Date.now() + 90_000;
+      rememberFailureService();
+      showUnavailable();
+      scheduleStartupRecoveryCheck();
       console.warn("DeepSeek rank insights failed", error);
     } finally {
-      compact.forEach((source) => source.rows.forEach((row) => state.pendingKeys.delete(row.key)));
-      state.pending = false;
-      if (typeof options.onUpdate === "function") options.onUpdate();
+      if (state.generation === requestGeneration) {
+        compact.forEach((source) => source.rows.forEach((row) => state.pendingKeys.delete(row.key)));
+        state.pending = false;
+        if (typeof options.onUpdate === "function") options.onUpdate();
+      }
     }
   }
 
   function getRowInsight(row, context = {}) {
+    if (!state.enabled) return null;
     const key = rowKey(row, context.source || row?.source || {}, context.mode || "hot");
     const insight = normalizeInsight(state.insights.get(key));
     if (!insight) {
@@ -218,10 +375,21 @@
   }
 
   function isPending(row, context = {}) {
+    if (!state.enabled) return false;
     return state.pendingKeys.has(rowKey(row, context.source || row?.source || {}, context.mode || "hot"));
   }
 
   loadPersistedInsights();
+  bindToggle();
 
-  window.XingyunAiInsights = { requestForSources, getRowInsight, isPending, rowKey, shouldDeferFallback, providerLabel };
+  window.XingyunAiInsights = {
+    requestForSources,
+    getRowInsight,
+    isPending,
+    isEnabled,
+    setEnabled,
+    rowKey,
+    shouldDeferFallback,
+    providerLabel
+  };
 })();

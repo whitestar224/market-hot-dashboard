@@ -3,13 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>星云社 · 律动快讯</title>
+    <title>星云社 · 聚合快讯</title>
     <link rel="icon" href="./favicon.ico?v=2" sizes="any" />
     <link rel="icon" type="image/png" sizes="32x32" href="./assets/favicon-32.png?v=2" />
     <link rel="apple-touch-icon" sizes="180x180" href="./assets/apple-touch-icon.png?v=2" />
     <link rel="manifest" href="./site.webmanifest" />
     <script src="./desktop_adapter.js?v=1"></script>
-    <link rel="stylesheet" href="./styles.css?v=53" />
+    <link rel="stylesheet" href="./styles.css?v=103" />
   </head>
   <body>
     <main class="app-shell flash-shell">
@@ -22,7 +22,7 @@
             <div>
               <p class="eyebrow">XINGYUN SOCIETY</p>
               <h1>星云社</h1>
-              <span class="brand-subtitle">律动快讯</span>
+              <span class="brand-subtitle">多源聚合快讯</span>
             </div>
           </div>
           <nav class="page-nav" aria-label="页面导航">
@@ -31,11 +31,12 @@
             <a class="nav-link" href="./turnover.html">成交额榜</a>
             <a class="nav-link" href="./newboards.html">新币新股</a>
             <a class="nav-link" href="./listings.html">上新IPO</a>
-            <a class="nav-link active" href="./newsflash.html">律动快讯</a>
+            <a class="nav-link active" href="./newsflash.html">聚合快讯</a>
             <a class="nav-link" href="./briefs.html">自动简报</a>
             <a class="nav-link" href="./rss.html">RSS订阅</a>
             <a class="nav-link" href="./xwatch.html">X追踪</a>
             <a class="nav-link" href="./price-watch.html">监控</a>
+            <a class="nav-link" href="./event-flow.html">事件流</a>
             <a class="nav-link" href="./strategy.html">策略看盘</a>
             <a class="nav-link" href="./todo.html">TodoList</a>
            <a class="nav-link nav-discord" href="https://discord.gg/mKyCwtHW" target="_blank" rel="noreferrer noopener" aria-label="打开星云社 Discord 社区">Discord</a>
@@ -48,7 +49,7 @@
         </div>
 
         <section class="flash-hero flash-hero-compact">
-          <p class="section-label">THEBLOCKBEATS.INFO / NEWSFLASH</p>
+          <p class="section-label">BLOCKBEATS / BWE / WUBLOCK / EXTENDED FEEDS · CROSS-SOURCE DEDUPLICATION</p>
         </section>
       </header>
 
@@ -58,17 +59,18 @@
           <input id="flashSearch" type="search" placeholder="ETF / 非农 / LayerZero / Binance" />
         </label>
         <button id="refreshFlash" class="action-button" type="button">刷新快讯</button>
-        <a class="action-link" href="https://www.theblockbeats.info/newsflash" target="_blank" rel="noreferrer">打开原站</a>
+        <span id="flashSourceSummary" class="flash-source-summary">公共源已接入 BB · BWE · 吴说</span>
       </section>
 
-      <section id="flashList" class="flash-list" aria-label="律动快讯列表">
+      <section id="flashList" class="flash-list" aria-label="聚合快讯列表">
         <div class="loading-panel">暂无快讯。</div>
       </section>
     </main>
 
-    <script src="./auth.js?v=18"></script>
-    <script src="./newsflash.js?v=3"></script>
-    <script src="./notifier.js?v=10"></script>
+    <script src="./wallets.js?v=6"></script>
+    <script src="./auth.js?v=19"></script>
+    <script src="./newsflash.js?v=6"></script>
+    <script src="./notifier.js?v=11"></script>
     <script src="./todo_reminder.js?v=1"></script>
   </body>
 </html>

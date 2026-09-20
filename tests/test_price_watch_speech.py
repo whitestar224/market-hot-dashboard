@@ -19,7 +19,7 @@ class PriceWatchSpeechTests(unittest.TestCase):
         with patch.object(server, "launch_desktop_alert", side_effect=lambda payload: payload):
             payload = server.launch_price_watch_alert(event)
 
-        self.assertEqual(payload["speech"], "前高预警，HYPE 已接近最近七日前高，距离 2.5%。")
+        self.assertEqual(payload["speech"], "前高预警，HYPE 已接近主升浪阶段高点，距离 2.5%。")
         self.assertTrue(payload.get("sound", True))
 
     def test_oversold_alert_includes_spoken_summary(self):

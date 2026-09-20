@@ -9,6 +9,9 @@ import server
 
 class DesktopAlertPriorityTests(unittest.TestCase):
     def setUp(self):
+        journal = patch.object(server, "record_event_flow_popup")
+        journal.start()
+        self.addCleanup(journal.stop)
         self.original_queue = server.DESKTOP_ALERT_QUEUE
         server.DESKTOP_ALERT_QUEUE = deque()
 
@@ -71,6 +74,29 @@ class DesktopAlertPriorityTests(unittest.TestCase):
 
         self.assertIn("alert-x-status:crypto-koryo|2096555530281959754", shared)
 
+    def test_newsflash_source_id_dedupes_minor_title_edits(self):
+        first = server.normalize_desktop_alert({
+            "key": "flash:215217|美债收益率逼近高点，沃什面临考验：一句话或许能稳住债市|1788928663",
+            "kind": "聚合快讯",
+            "source": "BlockBeats 律动",
+        })
+        edited = server.normalize_desktop_alert({
+            "key": "flash:215217|美债收益率逼近高点，沃什面临考验：一句话或能稳住债市|1788928663",
+            "kind": "聚合快讯",
+            "source": "BlockBeats 律动",
+        })
+
+        shared = set(server.alert_dedupe_keys(first)) & set(server.alert_dedupe_keys(edited))
+
+        self.assertIn("alert-newsflash-id:215217|1788928663", shared)
+
+    def test_legacy_seen_newsflash_keys_gain_stable_identity_on_load(self):
+        old_key = "flash:215217|旧标题|1788928663"
+
+        expanded = server.expand_legacy_desktop_alert_seen_keys({old_key: 123.0})
+
+        self.assertEqual(expanded["alert-newsflash-id:215217|1788928663"], 123.0)
+
     def test_dragon_wave_signals_are_critical_but_serialized_for_popup_and_tts(self):
         signal = server.normalize_desktop_alert(
             {
@@ -99,6 +125,120 @@ class DesktopAlertPriorityTests(unittest.TestCase):
             server.desktop_alert_political_military_reason(item),
             "whale profit/loss update filtered",
         )
+
+    def test_personal_profit_scorecards_never_create_popups_or_speech(self):
+        examples = (
+            {
+                "title": "淡出交易近一年的地址异常回归，提前交易VVV拉升",
+                "body": (
+                    "据 TradingBeats 监测地址，0xc1e7 昨晚入金并重仓 VVV。"
+                    "VVV 随后大幅上涨，该地址一度浮盈约91.4万美元，"
+                    "截至发稿当前浮盈59.92万美元。"
+                ),
+            },
+            {
+                "title": "数据：FOMO平台上95%交易者亏损或盈利不足100美元，"
+                         "仅0.06%用户盈利超1万美元",
+            },
+            {
+                "title": "加密KOL Unipcs晒战绩：近30日在Robinhood链上浮盈300万美元",
+            },
+            {
+                "title": "ZCAT百倍赢家看涨Meme币AGI，腰斩处买入6笔浮盈升至71.5%",
+            },
+            {
+                "title": "jew.sol持有USELESS超9个月，由浮亏500万美元转为浮盈500万美元",
+            },
+        )
+
+        for index, example in enumerate(examples):
+            with self.subTest(title=example["title"]):
+                result = server.launch_desktop_alert({
+                    "key": f"flash:personal-pnl-{index}",
+                    "kind": "聚合快讯",
+                    "source": "BlockBeats 律动",
+                    "speech": example["title"],
+                    **example,
+                })
+                self.assertTrue(result["skipped"])
+                self.assertEqual(result["reason"], "personal profit/loss update filtered")
+                self.assertEqual(result["category"], "position-change")
+        self.assertEqual(len(server.DESKTOP_ALERT_QUEUE), 0)
+
+    def test_market_profitability_analysis_is_not_mistaken_for_a_personal_scorecard(self):
+        examples = (
+            "分析：比特币链上盈利结构接近牛市早期，但仍存下行风险",
+            "Tether季度净利润增长，储备资产保持充足",
+            "协议升级后为用户提供新的质押收益方案",
+            "德国计划调整加密资产收益税规则",
+        )
+
+        for title in examples:
+            with self.subTest(title=title):
+                item = server.normalize_desktop_alert({
+                    "kind": "聚合快讯",
+                    "source": "BlockBeats 律动",
+                    "title": title,
+                })
+                self.assertEqual(server.desktop_alert_political_military_reason(item), "")
+
+    def test_whale_and_corporate_holding_changes_are_filtered_globally(self):
+        examples = (
+            {
+                "title": "CleanSpark减持228枚比特币，总持仓降至1,703枚",
+                "body": "据BitcoinTreasuries数据更新。",
+            },
+            {
+                "title": "某巨鲸增持2,000枚ETH",
+                "body": "该地址持仓量升至12,000枚ETH。",
+            },
+            {
+                "title": "Large holder update",
+                "body": "A whale reduced its BTC holdings after selling 228 BTC.",
+            },
+        )
+
+        for example in examples:
+            with self.subTest(title=example["title"]):
+                item = server.normalize_desktop_alert({
+                    "kind": "聚合快讯",
+                    "source": "BlockBeats 律动",
+                    **example,
+                })
+                self.assertEqual(
+                    server.desktop_alert_political_military_reason(item),
+                    "position/holding change filtered",
+                )
+
+    def test_holding_change_filter_does_not_hide_price_signals_or_real_project_catalysts(self):
+        price_signal = server.normalize_desktop_alert({
+            "key": "price-watch:BTC:episode:1",
+            "kind": "价格监控",
+            "source": "币种价格监控",
+            "title": "BTC 买点",
+            "body": "巨鲸增持后价格结构突破。",
+        })
+        project_catalyst = server.normalize_desktop_alert({
+            "kind": "项目公告",
+            "source": "Project ABC",
+            "title": "项目方宣布回购并销毁代币",
+        })
+
+        self.assertEqual(server.desktop_alert_political_military_reason(price_signal), "")
+        self.assertEqual(server.desktop_alert_political_military_reason(project_catalyst), "")
+
+    def test_whale_holding_change_is_rejected_before_windows_queue(self):
+        result = server.launch_desktop_alert({
+            "key": "flash:cleanspark-holdings",
+            "kind": "聚合快讯",
+            "source": "BlockBeats 律动",
+            "title": "CleanSpark减持228枚比特币，总持仓降至1,703枚",
+        })
+
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["reason"], "position/holding change filtered")
+        self.assertEqual(result["category"], "position-change")
+        self.assertEqual(len(server.DESKTOP_ALERT_QUEUE), 0)
 
     def test_only_news_like_popups_enter_news_trade_intake(self):
         self.assertTrue(server.desktop_alert_is_news_trade_intake(server.normalize_desktop_alert({
@@ -253,6 +393,31 @@ class DesktopAlertPriorityTests(unittest.TestCase):
         self.assertEqual(
             json.loads(request.data.decode("utf-8")),
             {"action": "exclude_structure", "symbol": "CHIP"},
+        )
+
+    def test_desktop_exclusion_posts_temporary_mode_without_downgrading_it(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return b'{"ok": true, "mode": "temporary"}'
+
+        with patch.object(desktop_alert.urllib.request, "urlopen", return_value=Response()) as urlopen:
+            result = desktop_alert.post_price_watch_exclusion(
+                "http://127.0.0.1:8765/api/price-watch",
+                "CHIP",
+                "temporary_exclude",
+            )
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(result["mode"], "temporary")
+        self.assertEqual(
+            json.loads(request.data.decode("utf-8")),
+            {"action": "temporary_exclude", "symbol": "CHIP"},
         )
 
 

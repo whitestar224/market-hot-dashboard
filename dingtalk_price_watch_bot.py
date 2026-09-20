@@ -127,14 +127,14 @@ def build_markdown_payload(event: dict[str, Any], dashboard_url: str = "") -> di
     signal_label = "首次有效突破待确认" if event.get("isFirstCandidate") else "非首次突破信号"
     checked_at = int(event.get("latestAlertAt") or event.get("checkedAt") or time.time() * 1000)
     checked_text = datetime.fromtimestamp(checked_at / 1000, CHINA_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
-    title = f"币种监控｜{symbol} 接近最近 7 日前高"
+    title = f"币种监控｜{symbol} 接近主升浪阶段高点"
     lines = [
         f"### 🚨 {title}",
         "",
         f"- **信号**：{signal_label}",
         f"- **结构**：{setup_label}",
         f"- **当前价**：{format_price(event.get('currentPrice'))} USDT",
-        f"- **最近 7 日前高**：{format_price(event.get('weekHigh'))} USDT",
+        f"- **主升浪阶段高点**：{format_price(event.get('weekHigh'))} USDT",
         f"- **距离前高**：**{distance:.2f}%**",
         f"- **行情来源**：{str(event.get('provider') or '市场行情')[:80]}",
         f"- **触发时间**：{checked_text}",

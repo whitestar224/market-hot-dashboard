@@ -410,10 +410,36 @@
     return Number.parseFloat(String(value || "0").replace("%", "").replace("+", "")) || 0;
   }
 
+  const ONCHAIN_RANK_SOURCE_IDS = new Set([
+    "okx-dex",
+    "okx-dex-gainers",
+    "binance-wallet-hot",
+    "ave",
+    "gmgn-hot-search"
+  ]);
+  const SECONDARY_RANK_LEADER_ALLOWED_SOURCE_IDS = new Set([
+    "binance",
+    "binance-gainers",
+    "okx",
+    "okx-gainers",
+    "okx-turnover"
+  ]);
+
+  function isOnchainRankSource(source) {
+    const id = String(source?.id || "").trim().toLowerCase();
+    const label = [source?.sourceLabel, source?.title, source?.sourceName].filter(Boolean).join(" ");
+    return ONCHAIN_RANK_SOURCE_IDS.has(id) || /\bDEX\b|链上|币安钱包|Binance\s+Wallet|AVE(?:\.ai)?|GMGN/i.test(label);
+  }
+
+  function allowsRankLeaderAlert(source) {
+    const id = String(source?.id || "").trim().toLowerCase();
+    return SECONDARY_RANK_LEADER_ALLOWED_SOURCE_IDS.has(id) && !isOnchainRankSource(source);
+  }
+
   function parseMarketSignals(payload) {
     const sources = Array.isArray(payload?.sources) ? payload.sources : [];
     return sources
-      .filter((source) => source?.status !== "unavailable")
+      .filter((source) => source?.status !== "unavailable" && allowsRankLeaderAlert(source))
       .map((source) => {
         const rows = Array.isArray(source.rows) ? source.rows : [];
         const leader = rows[0];

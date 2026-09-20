@@ -14,7 +14,6 @@ $allowPrefixes = @(
   "BINANCE_",
   "BITGET_",
   "DEEPSEEK_",
-  "DISCORD_",
   "EMAIL_",
   "FUTU_",
   "GITHUB_",

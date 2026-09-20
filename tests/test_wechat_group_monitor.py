@@ -93,6 +93,34 @@ class WechatGroupMonitorParsingTests(unittest.TestCase):
         self.assertEqual(actual, expected)
         ui_collector.assert_not_called()
 
+    def test_qq_collection_uses_safe_window_fallback_when_onebot_is_waiting(self):
+        waiting = {
+            "ok": False,
+            "status": "onebot_waiting",
+            "messages": [],
+            "error": "QQ 后台通道未连接，正在自动重试",
+            "collectorMode": "onebot",
+            "platform": "qq",
+        }
+        fallback = {
+            "ok": True,
+            "status": "connected",
+            "messages": [{"sender": "鲸鱼🐳PP", "content": "$PONS"}],
+            "collectorMode": "ui_automation",
+            "platform": "qq",
+        }
+        with patch.object(qq_onebot_bridge, "onebot_enabled", return_value=True), \
+                patch.object(qq_onebot_bridge, "collect_qq_onebot_messages", return_value=waiting), \
+                patch.object(wechat_group_monitor, "_collect_with_ui_automation", return_value=fallback), \
+                patch.object(wechat_group_monitor, "_collect_with_window_ocr") as ocr_collector, \
+                patch.dict(os.environ, {"QQ_UI_FALLBACK_ENABLED": "1"}):
+            actual = wechat_group_monitor.collect_visible_group_messages(
+                "地表最强bsc eth", platform="qq", sender_filter="鲸鱼🐳PP",
+            )
+
+        self.assertEqual(actual, fallback)
+        ocr_collector.assert_not_called()
+
     def test_group_member_count_is_removed_from_name(self):
         self.assertEqual(normalize_group_name("梦之队🌙 (12)"), "梦之队🌙")
         self.assertEqual(normalize_group_name("梦之队🌙（88）"), "梦之队🌙")
@@ -157,6 +185,13 @@ class WechatGroupMonitorParsingTests(unittest.TestCase):
 
         self.assertGreaterEqual(opportunity, 50)
         self.assertEqual(greeting, 0)
+
+    def test_valid_contract_address_alone_is_sent_to_ai_review(self):
+        score = candidate_rule_score(
+            "CA: 0x1234567890abcdef1234567890abcdef12345678"
+        )
+
+        self.assertGreaterEqual(score, 35)
 
     def test_ocr_rows_require_group_title_and_ignore_sidebar(self):
         rows = [

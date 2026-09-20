@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="dark" />
     <title>龙头起爆台 · 策略预览</title>
     <link rel="icon" href="./favicon.ico?v=2" sizes="any" />
-    <link rel="stylesheet" href="./dragon-wave.css?v=73" />
+    <link rel="stylesheet" href="./dragon-wave.css?v=74" />
   </head>
   <body>
     <div class="wave-shell">
@@ -119,15 +119,19 @@
               <h2 id="chartsTitle">龙头主升盘面</h2>
             </div>
             <div class="chart-legend" aria-label="图例">
-              <span class="is-buy"><i></i>因果买点</span>
-              <span class="is-secondary-hint"><i></i>防洗二次突破</span>
-              <span class="is-pending"><i></i>预备触发</span>
-              <span class="is-visual"><i></i>V · 视觉预确认</span>
-              <span class="is-filtered"><i></i>过滤点</span>
-              <span class="is-structure"><i></i>结构预确认</span>
-              <span class="is-ema90"><i></i>EMA90</span>
+              <span class="is-buy" data-legend="buy"><i></i><b>因果买点</b></span>
+              <span class="is-secondary-hint" data-legend="secondary"><i></i><b>防洗二次突破</b></span>
+              <span class="is-pending" data-legend="pending"><i></i><b>预备触发</b></span>
+              <span class="is-visual" data-legend="visual"><i></i><b>V · 视觉预确认</b></span>
+              <span class="is-filtered" data-legend="filtered"><i></i><b>过滤点</b></span>
+              <span class="is-structure" data-legend="structure"><i></i><b>结构预确认</b></span>
+              <span class="is-ema90" data-legend="ema90"><i></i><b>EMA90</b></span>
             </div>
           </header>
+          <nav class="strategy-page-tabs" aria-label="切换监控策略">
+            <button type="button" class="is-active" data-strategy-page="ignition">起爆策略</button>
+            <button type="button" data-strategy-page="prior-high">前高监控</button>
+          </nav>
           <nav class="timeframe-tabs" aria-label="切换K线周期">
             <button type="button" data-timeframe="5m">5分</button>
             <button type="button" class="is-active" data-timeframe="15m">15分</button>
@@ -136,6 +140,7 @@
             <button type="button" data-timeframe="1d">日线</button>
           </nav>
           <p id="signalPolicyNote" class="signal-policy"><b>绿色只显示高确定性、严格因果买点</b>：盘整母平台的最高外沿会被独立预设，突破盘整前高即触发，不要求用趋势线或附近阳线凑条件；附近阳线无效，试错后重新形成的平台外沿可再次武装。<b>所有周期都先做母结构审查</b>：局部形态若仍处在更大无序箱体中部、上方保留大量未突破空间，就只是箱体内波动，不算起爆；只有真正母结构外沿、主升中继、新币不跌，或4小时/日线长期低位止跌例外可以保留。趋势线只作成熟箱体、收敛三角或下降楔形的低权重辅助，单独穿线绝不开仓；上下轨必须取自同一段拉升后的盘整或回调窗口，下轨绝不借用拉升前低点，同一盘整只保留一组稳定边界。结构线要求接近 95% 的主体包络，少量异常影线可容忍，但实体频繁穿线或在线两侧来回切换即取消结构；自动结构线统一显示为白色实线段。<b>审美分已移除</b>，策略只核验前置拉升、完整盘整、边界触碰、包络/穿插、EMA90与真实突破等可解释事实。<b>白线只代表策略结构预确认，与是否允许在这一根成交分开判断</b>；点选对应 K 线后可校验策略预判，人工补充和去除的结构会进入下一轮对比复盘。手动画线端点会吸附并记录对应 K 线的高点、低点、开盘或收盘；上下线成组后自动预判三角、降楔、箱体或收敛结构，待人工校验后进入学习样本。高位放量大分歧、极端振幅和见顶震荡即使局部可以连线也全部隐藏。本根必须从触发线下方开盘，盘中首次向上穿越就成交。前高突破使用更小周期重建“首次上穿前的突破 K 最低点”，该低点到前高涨幅超过 7% 不做；不读取突破后的整根 K 线最低价。<b>琥珀色是尚未穿越的预备单</b>。成交瞬间价格高于本根开盘，不在阴线状态追入，也不读取本根最终收盘颜色。突破前订单流评分仅使用已完成 K 线的大单代理、主动买量与推进速度；接入交易所后再用逐笔成交确认真实 Big Trade。<b>一旦确认主升浪或给出主升浪预期</b>，主升启动前由4小时/日线下跌留下的旧压力、高点和低点只作背景，不再否决当前周期的成熟突破；主升后新形成的急杀母箱体、高位大分歧与当前结构风险仍继续过滤。BTC 只作背景备注，不否决已筛选龙头的独立起爆结构。5分 / 15分 / 1小时为主操作周期；5分和15分若在主升中短暂失守EMA90，重新站回上行均线并稳定蓄力，可由横盘、箱体、三角、降楔或前高附近盘整的真实外沿重新触发；纯4小时长收敛先作为母结构许可，实际执行下沉到1小时精确突破。<b>1分钟暂不参与默认读取和策略计算</b>，需要复盘时按需生成静态 K 线图片，避免长历史数据持续拖慢看板；独立4小时仍只保留 A+ 买点。<b>安静候选</b>只保留已真实突破母平台边界、但尚未通过执行层的结构，集中放在右侧复盘账本供人工确认；它们不在K线上显示B，也不弹窗或语音播报。</p>
+          <p id="priorHighPolicyNote" class="signal-policy prior-high-policy" hidden><b>新版前高监控只保留母盘整最高外沿</b>：高点先经过因果枢轴确认，附近高点锁定为同一压力区并以区间最高价作为触发线；同一近期箱体中若上方仍有更高的已确认压力位，较低枢轴只算盘整内部波动，不标 B、也不提醒。价格完成空间分离或时间分离后，只有从下方真正穿越最高外沿才标记绿色 B；同一根 K 同时穿越多个旧前高时只保留最高的一次。持续停留在压力线上方不会重复刷点，真实回落后可重新武装。<b>不套用 BTC、大周期共振或主升环境许可</b>；琥珀色菱形只表示已武装的母区间最高外沿首次进入接近区，尚未突破。</p>
           <p class="signal-policy secondary-hint-policy"><b>红色B是防洗二次突破提示</b>：第一次缩量试突破后回到母平台边界、结构未破坏，随后量能、订单流或推进速度改善并再次突破时提示；可弹窗和语音，但不属于绿色正式买点，也不进入自动执行。</p>
           <div id="drawingToolbar" class="drawing-toolbar" aria-label="K线画线工具">
             <span>MARKUP / 画线</span>
@@ -206,11 +211,12 @@
       </footer>
     </div>
 
-    <script src="./dragon-wave-cases.js?v=89"></script>
-    <script src="./dragon-wave-data.js?v=89"></script>
+    <script src="./dragon-wave-cases.js?v=91"></script>
+    <script src="./dragon-wave-data.js?v=91"></script>
     <script src="./dragon-wave-vision.js?v=66"></script>
-    <script src="./dragon-wave-engine.js?v=89"></script>
+    <script src="./dragon-wave-engine.js?v=91"></script>
+    <script src="./prior-high-engine.js?v=2-mother-range-outer-edge"></script>
     <script src="./dragon-wave-feedback.js?v=74"></script>
-    <script src="./dragon-wave.js?v=89-local-display-2"></script>
+    <script src="./dragon-wave.js?v=91-prior-high-3"></script>
   </body>
 </html>

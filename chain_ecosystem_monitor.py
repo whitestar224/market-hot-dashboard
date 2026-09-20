@@ -8,11 +8,28 @@ import re
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import requests
+
+from binance_agentic import (
+    MEME_RUSH_CHAIN_IDS,
+    fetch_binance_meme_rush,
+    normalize_binance_meme_rush,
+)
+from gmgn_agentic import (
+    GmgnRateLimitError,
+    GmgnUnsupportedNetworkError,
+    fetch_gmgn_migrated_trenches,
+    gmgn_api_key_status,
+    gmgn_cooldown_status,
+    gmgn_trench_passes_chain_filters,
+    normalize_gmgn_migrated_trenches,
+)
 
 
 CHAIN_STAGES = ("early_watch", "mainnet_focus", "tradable_ecosystem")
@@ -63,10 +80,49 @@ TRADED_WEIGHTS = {
     "evidenceConfidence": 0.05,
 }
 
+ONCHAIN_RESEARCH_SCORE_VERSION = "golden-dog-v3-cryptod-evidence"
+ONCHAIN_RESEARCH_DEFAULT_NETWORKS = ("eth", "solana", "robinhood", "arc", "base", "bsc")
+ONCHAIN_RESEARCH_MEME_HINTS = frozenset(
+    {
+        "meme", "dog", "doge", "cat", "frog", "pepe", "inu", "shib", "baby",
+        "mom", "mother", "dad", "father", "bro", "sister", "wife", "goat",
+        "monkey", "ape", "penguin", "chad", "wojak", "mascot", "pump",
+        "bonk", "wif", "币", "狗", "猫", "蛙", "吉祥物", "妈妈", "爸爸",
+    }
+)
+DEFAULT_ONCHAIN_LEADER_CASES: tuple[dict[str, Any], ...] = (
+    {"key": "meme:eth:shib", "network": "eth", "contractAddress": "0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce", "symbol": "SHIB", "name": "Shiba Inu", "category": "meme", "launchDate": "2020-08-01", "reason": "全球共识动物 Meme 龙头"},
+    {"key": "meme:eth:pepe", "network": "eth", "contractAddress": "0x6982508145454ce325ddbe47a25d4ec3d2311933", "symbol": "PEPE", "name": "Pepe", "category": "meme", "launchDate": "2023-04-14", "reason": "以太坊 Meme 周期核心龙头"},
+    {"key": "meme:eth:floki", "network": "eth", "contractAddress": "0xcf0c122c6b73ff809c693db761e7baebe62b6a2e", "symbol": "FLOKI", "name": "Floki", "category": "meme", "launchDate": "2021-07-01", "reason": "跨周期动物 Meme 龙头"},
+    {"key": "meme:solana:bonk", "network": "solana", "contractAddress": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6QXEk9dWQFwe", "symbol": "BONK", "name": "Bonk", "category": "meme", "launchDate": "2022-12-25", "reason": "Solana 复兴周期代表 Meme"},
+    {"key": "meme:solana:wif", "network": "solana", "contractAddress": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzL4f8cANM7c", "symbol": "WIF", "name": "dogwifhat", "category": "meme", "launchDate": "2023-11-20", "reason": "Solana 动物 Meme 周期龙头"},
+    {"key": "meme:solana:bome", "network": "solana", "contractAddress": "ukHH6c7mMyiWCf1b9pnWe25TSpkDDt3H5pQZgZ74J82", "symbol": "BOME", "name": "BOOK OF MEME", "category": "meme", "launchDate": "2024-03-14", "reason": "Solana 高速发行周期代表龙头"},
+    {"key": "project:eth:uni", "network": "eth", "contractAddress": "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984", "symbol": "UNI", "name": "Uniswap", "category": "project", "launchDate": "2020-09-17", "reason": "DEX 项目型链上龙头"},
+    {"key": "project:eth:aave", "network": "eth", "contractAddress": "0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9", "symbol": "AAVE", "name": "Aave", "category": "project", "launchDate": "2020-10-02", "reason": "借贷协议项目型龙头"},
+    {"key": "project:eth:pendle", "network": "eth", "contractAddress": "0x808507121b80c02388fad14726482e061b8da827", "symbol": "PENDLE", "name": "Pendle", "category": "project", "launchDate": "2021-04-28", "reason": "收益交易赛道项目型龙头"},
+    {"key": "project:solana:jup", "network": "solana", "contractAddress": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN", "symbol": "JUP", "name": "Jupiter", "category": "project", "launchDate": "2024-01-31", "reason": "Solana 聚合交易项目型龙头"},
+)
+
 PROVIDER_HEADERS = {
     "User-Agent": "XingyunShe-Chain-Ecosystem/1.0",
     "Accept": "application/json",
 }
+
+# GeckoTerminal's free public API is capped at 30 calls/minute. New-pool scans
+# run per chain, so coordinate their request starts instead of letting all
+# chains burst at the provider together.
+_GECKOTERMINAL_RESEARCH_GATE_LOCK = threading.Lock()
+_GECKOTERMINAL_RESEARCH_NEXT_AT = 0.0
+
+
+def _wait_for_geckoterminal_research_slot() -> None:
+    global _GECKOTERMINAL_RESEARCH_NEXT_AT
+    interval = max(2.05, float(_safe_float(os.environ.get("ONCHAIN_RESEARCH_GECKO_INTERVAL_SECONDS")) or 2.05))
+    with _GECKOTERMINAL_RESEARCH_GATE_LOCK:
+        delay = _GECKOTERMINAL_RESEARCH_NEXT_AT - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        _GECKOTERMINAL_RESEARCH_NEXT_AT = time.monotonic() + interval
 
 DEFILLAMA_CATEGORY_MARKETS = {
     "dexes": "dex",
@@ -134,9 +190,66 @@ def _relationship_address(value: Any) -> str:
     return _address(text[marker:]) if marker >= 0 else ""
 
 
+def _onchain_address(value: Any, network: Any = "") -> str:
+    """Normalize EVM addresses without destroying case-sensitive Solana mints."""
+    text = str(value or "").strip()
+    network_key = _chain_key(network)
+    prefix_candidates = {
+        f"{network_key}_",
+        f"{network_key.replace('-', '_')}_",
+    } - {"_"}
+    lowered = text.lower()
+    for prefix in prefix_candidates:
+        if lowered.startswith(prefix.lower()):
+            text = text[len(prefix):]
+            break
+    if text.lower().startswith("0x"):
+        return _address(text)
+    if 20 <= len(text) <= 80 and re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]+", text):
+        return text
+    return ""
+
+
+def _timestamp_ms(value: Any) -> int:
+    parsed = _safe_float(value)
+    if parsed is not None:
+        return int(parsed * 1000) if parsed < 10_000_000_000 else int(parsed)
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    try:
+        return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp() * 1000)
+    except ValueError:
+        return 0
+
+
+def _research_day(value: Any) -> str:
+    timestamp = int(_safe_float(value) or _now_ms()) / 1000
+    return time.strftime("%Y-%m-%d", time.localtime(timestamp))
+
+
+def _json_value(value: Any, fallback: Any) -> Any:
+    try:
+        parsed = json.loads(str(value or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return fallback
+    return parsed
+
+
 def _chain_key(value: Any) -> str:
     text = str(value or "").strip().lower().replace("_", "-")
     return "-".join(part for part in text.replace(" ", "-").split("-") if part)
+
+
+def _research_network_key(value: Any) -> str:
+    key = _chain_key(value)
+    return {
+        "ethereum": "eth",
+        "bnb-chain": "bsc",
+        "binance-smart-chain": "bsc",
+        "sol": "solana",
+        "robinhood-chain": "robinhood",
+    }.get(key, key)
 
 
 def _clean_number(value: float, digits: int = 2) -> int | float:
@@ -215,6 +328,12 @@ def _get_json(
             return response.json()
         except (requests.RequestException, TimeoutError, ValueError) as exc:
             last_error = exc
+            response = getattr(exc, "response", None)
+            # Retrying a provider throttle immediately only amplifies the
+            # outage. The monitor scheduler applies a longer bounded backoff
+            # and the 48-hour new-pool feed is picked up on the next pass.
+            if int(getattr(response, "status_code", 0) or 0) == 429:
+                break
     if last_error:
         raise last_error
     raise RuntimeError("provider request failed")
@@ -271,6 +390,59 @@ def fetch_geckoterminal_pools(
     return {"data": combined}
 
 
+def fetch_geckoterminal_new_pools(
+    network: str,
+    *,
+    session: Any = None,
+    pages: int = 3,
+    known_pool_ids: Iterable[str] = (),
+    request_gate: Any = None,
+) -> Mapping[str, Any]:
+    """Read the provider's recent-pool feed, retaining included token metadata."""
+    network_id = str(network or "").strip()
+    if not network_id:
+        raise ValueError("GeckoTerminal network is required")
+    combined: list[dict[str, Any]] = []
+    included: dict[str, dict[str, Any]] = {}
+    seen: set[str] = set()
+    known = set(known_pool_ids)
+    for page in range(1, max(1, min(10, int(pages))) + 1):
+        try:
+            if request_gate:
+                request_gate()
+            payload = _get_json(
+                f"https://api.geckoterminal.com/api/v2/networks/{network_id}/new_pools",
+                session=session,
+                params={"page": page, "include": "base_token,dex"},
+                headers={"Accept": "application/vnd.api+json;version=20230203"},
+                timeout=8,
+                attempts=1,
+            )
+        except Exception:
+            if combined:
+                break
+            raise
+        rows = payload.get("data") if isinstance(payload, Mapping) else []
+        if not isinstance(rows, list) or not rows:
+            break
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            identity = str(row.get("id") or "")
+            if identity and identity in seen:
+                continue
+            if identity:
+                seen.add(identity)
+            combined.append(dict(row))
+        for row in payload.get("included") if isinstance(payload, Mapping) and isinstance(payload.get("included"), list) else []:
+            if isinstance(row, Mapping) and row.get("id"):
+                included[str(row["id"])] = dict(row)
+        # This endpoint normally omits links; absence does not end pagination.
+        if known and any(str(row.get("id") or "") in known for row in rows if isinstance(row, Mapping)):
+            break
+    return {"data": combined, "included": list(included.values())}
+
+
 def fetch_dexscreener_assets(
     chain_id: str,
     token_addresses: Iterable[str],
@@ -283,7 +455,7 @@ def fetch_dexscreener_assets(
     seen: set[str] = set()
     addresses: list[str] = []
     for raw_address in list(token_addresses)[:30]:
-        address = _address(raw_address)
+        address = _onchain_address(raw_address, chain)
         if not address or address in seen:
             continue
         seen.add(address)
@@ -293,10 +465,879 @@ def fetch_dexscreener_assets(
     payload = _get_json(
         f"https://api.dexscreener.com/tokens/v1/{chain}/{','.join(addresses)}",
         session=session,
+        timeout=8,
+        attempts=1,
     )
     rows = payload.get("pairs") if isinstance(payload, Mapping) else payload
     pairs = [dict(row) for row in rows if isinstance(row, Mapping)] if isinstance(rows, list) else []
     return {"pairs": pairs}
+
+
+def fetch_dexscreener_token(token_address: str, *, session: Any = None) -> dict[str, Any]:
+    """Resolve one externally discovered contract without requiring a chain guess."""
+    address = _onchain_address(token_address)
+    if not address:
+        return {"pairs": []}
+    payload = _get_json(
+        f"https://api.dexscreener.com/latest/dex/tokens/{address}",
+        session=session,
+        timeout=8,
+        attempts=1,
+    )
+    rows = payload.get("pairs") if isinstance(payload, Mapping) else []
+    return {"pairs": [dict(row) for row in rows if isinstance(row, Mapping)] if isinstance(rows, list) else []}
+
+
+def normalize_onchain_new_pools(
+    payload: Any,
+    network: str,
+    *,
+    observed_at: int | None = None,
+) -> list[dict[str, Any]]:
+    """Normalize one new-pool page into immutable as-observed candidate facts."""
+    observed = int(observed_at or _now_ms())
+    network_key = _chain_key(network)
+    if not network_key:
+        return []
+    included_rows = payload.get("included") if isinstance(payload, Mapping) else []
+    included = {
+        str(row.get("id")): row
+        for row in included_rows if isinstance(included_rows, list) and isinstance(row, Mapping) and row.get("id")
+    }
+    rows: list[dict[str, Any]] = []
+    for item in payload.get("data") if isinstance(payload, Mapping) and isinstance(payload.get("data"), list) else []:
+        if not isinstance(item, Mapping):
+            continue
+        attributes = item.get("attributes") if isinstance(item.get("attributes"), Mapping) else {}
+        relationships = item.get("relationships") if isinstance(item.get("relationships"), Mapping) else {}
+        base_relation = relationships.get("base_token") if isinstance(relationships.get("base_token"), Mapping) else {}
+        base_data = base_relation.get("data") if isinstance(base_relation.get("data"), Mapping) else {}
+        base_id = str(base_data.get("id") or "")
+        token_row = included.get(base_id) if isinstance(included.get(base_id), Mapping) else {}
+        token_attributes = token_row.get("attributes") if isinstance(token_row.get("attributes"), Mapping) else {}
+        dex_relation = relationships.get("dex") if isinstance(relationships.get("dex"), Mapping) else {}
+        dex_data = dex_relation.get("data") if isinstance(dex_relation.get("data"), Mapping) else {}
+        contract_address = _onchain_address(base_id, network_key)
+        pool_address = _onchain_address(attributes.get("address"), network_key)
+        # Pool addresses may use formats outside token-address validation. They
+        # remain display-only and never participate in token identity.
+        if not pool_address:
+            pool_address = str(attributes.get("address") or "").strip()[:120]
+        if not contract_address or not pool_address:
+            continue
+        name_parts = [part.strip() for part in str(attributes.get("name") or "").split("/")]
+        symbol = str(token_attributes.get("symbol") or (name_parts[0] if name_parts else "")).strip().upper()[:40]
+        name = str(token_attributes.get("name") or (name_parts[0] if name_parts else symbol)).strip()[:160]
+        volume = attributes.get("volume_usd") if isinstance(attributes.get("volume_usd"), Mapping) else {}
+        price_change = attributes.get("price_change_percentage") if isinstance(attributes.get("price_change_percentage"), Mapping) else {}
+        transactions = attributes.get("transactions") if isinstance(attributes.get("transactions"), Mapping) else {}
+
+        def window(name: str) -> Mapping[str, Any]:
+            value = transactions.get(name)
+            return value if isinstance(value, Mapping) else {}
+
+        m5 = window("m5")
+        h1 = window("h1")
+        h6 = window("h6")
+        h24 = window("h24")
+        created_ms = _timestamp_ms(attributes.get("pool_created_at"))
+        rows.append(
+            {
+                "network": network_key,
+                "provider": "geckoterminal",
+                "providers": ["geckoterminal"],
+                "contractAddress": contract_address,
+                "poolAddress": pool_address,
+                "dexId": str(dex_data.get("id") or "")[:80],
+                "symbol": symbol,
+                "name": name or symbol or contract_address,
+                "firstSeenAt": observed,
+                "observedAt": observed,
+                "poolCreatedAt": created_ms,
+                "tradeUrl": f"https://www.geckoterminal.com/{network_key}/pools/{pool_address}",
+                "metrics": {
+                    "priceUsd": _safe_float(attributes.get("base_token_price_usd")),
+                    "liquidityUsd": _safe_float(attributes.get("reserve_in_usd")),
+                    "fdvUsd": _safe_float(attributes.get("fdv_usd")),
+                    "marketCapUsd": _safe_float(attributes.get("market_cap_usd")),
+                    "volumeM5Usd": _safe_float(volume.get("m5")),
+                    "volumeH1Usd": _safe_float(volume.get("h1")),
+                    "volumeH6Usd": _safe_float(volume.get("h6")),
+                    "volumeH24Usd": _safe_float(volume.get("h24")),
+                    "priceChangeM5": _safe_float(price_change.get("m5")),
+                    "priceChangeH1": _safe_float(price_change.get("h1")),
+                    "buysM5": _safe_int(m5.get("buys")),
+                    "sellsM5": _safe_int(m5.get("sells")),
+                    "buyersM5": _safe_int(m5.get("buyers")),
+                    "sellersM5": _safe_int(m5.get("sellers")),
+                    "buysH1": _safe_int(h1.get("buys")),
+                    "sellsH1": _safe_int(h1.get("sells")),
+                    "buyersH1": _safe_int(h1.get("buyers")),
+                    "sellersH1": _safe_int(h1.get("sellers")),
+                    "transactionsH1": _safe_int(h1.get("buys")) + _safe_int(h1.get("sells")),
+                    "transactionsH6": _safe_int(h6.get("buys")) + _safe_int(h6.get("sells")),
+                    "transactionsH24": _safe_int(h24.get("buys")) + _safe_int(h24.get("sells")),
+                },
+            }
+        )
+    return rows
+
+
+def normalize_onchain_dexscreener(payload: Any, network: str, *, observed_at: int | None = None) -> list[dict[str, Any]]:
+    observed = int(observed_at or _now_ms())
+    rows: list[dict[str, Any]] = []
+    data = payload.get("pairs") if isinstance(payload, Mapping) else payload
+    for item in data if isinstance(data, list) else []:
+        if not isinstance(item, Mapping):
+            continue
+        item_network = _research_network_key(item.get("chainId") or network)
+        expected_network = _research_network_key(network)
+        if not item_network or (expected_network and item_network != expected_network):
+            continue
+        base = item.get("baseToken") if isinstance(item.get("baseToken"), Mapping) else {}
+        quote = item.get("quoteToken") if isinstance(item.get("quoteToken"), Mapping) else {}
+        address = _onchain_address(base.get("address"), item_network)
+        pool = str(item.get("pairAddress") or "").strip()[:120]
+        if not address or not pool:
+            continue
+        liquidity = item.get("liquidity") if isinstance(item.get("liquidity"), Mapping) else {}
+        volume = item.get("volume") if isinstance(item.get("volume"), Mapping) else {}
+        price_change = item.get("priceChange") if isinstance(item.get("priceChange"), Mapping) else {}
+        txns = item.get("txns") if isinstance(item.get("txns"), Mapping) else {}
+        m5 = txns.get("m5") if isinstance(txns.get("m5"), Mapping) else {}
+        h1 = txns.get("h1") if isinstance(txns.get("h1"), Mapping) else {}
+        h6 = txns.get("h6") if isinstance(txns.get("h6"), Mapping) else {}
+        h24 = txns.get("h24") if isinstance(txns.get("h24"), Mapping) else {}
+        info = item.get("info") if isinstance(item.get("info"), Mapping) else {}
+        rows.append({
+            "network": item_network,
+            "provider": "dexscreener",
+            "providers": ["dexscreener"],
+            "contractAddress": address,
+            "poolAddress": pool,
+            "dexId": str(item.get("dexId") or "")[:80],
+            "symbol": str(base.get("symbol") or "").upper()[:40],
+            "name": str(base.get("name") or base.get("symbol") or address)[:160],
+            "quoteAsset": {
+                "symbol": str(quote.get("symbol") or "").upper()[:40],
+                "name": str(quote.get("name") or quote.get("symbol") or "")[:160],
+                "address": _onchain_address(quote.get("address"), item_network) or str(quote.get("address") or "")[:160],
+            },
+            "firstSeenAt": observed,
+            "observedAt": observed,
+            "poolCreatedAt": _timestamp_ms(item.get("pairCreatedAt")),
+            "tradeUrl": str(item.get("url") or "")[:800],
+            "narrativeContext": {
+                "description": str(info.get("description") or item.get("description") or "")[:1200],
+                "websites": [str(link.get("url") or "")[:800] for link in (info.get("websites") or [])[:4] if isinstance(link, Mapping)],
+                "socials": [str(link.get("url") or "")[:800] for link in (info.get("socials") or [])[:4] if isinstance(link, Mapping)],
+            },
+            "metrics": {
+                "priceUsd": _safe_float(item.get("priceUsd")),
+                "liquidityUsd": _safe_float(liquidity.get("usd")),
+                "fdvUsd": _safe_float(item.get("fdv")),
+                "marketCapUsd": _safe_float(item.get("marketCap")),
+                "volumeM5Usd": _safe_float(volume.get("m5")),
+                "volumeH1Usd": _safe_float(volume.get("h1")),
+                "volumeH6Usd": _safe_float(volume.get("h6")),
+                "volumeH24Usd": _safe_float(volume.get("h24")),
+                "priceChangeM5": _safe_float(price_change.get("m5")),
+                "priceChangeH1": _safe_float(price_change.get("h1")),
+                "buysM5": _safe_int(m5.get("buys")),
+                "sellsM5": _safe_int(m5.get("sells")),
+                "buysH1": _safe_int(h1.get("buys")),
+                "sellsH1": _safe_int(h1.get("sells")),
+                "transactionsH1": _safe_int(h1.get("buys")) + _safe_int(h1.get("sells")),
+                "transactionsH6": _safe_int(h6.get("buys")) + _safe_int(h6.get("sells")),
+                "transactionsH24": _safe_int(h24.get("buys")) + _safe_int(h24.get("sells")),
+            },
+        })
+    return rows
+
+
+def scan_onchain_research_contract(
+    store: Any,
+    contract_address: Any,
+    *,
+    source: str = "external",
+    source_text: str = "",
+    observed_at: int | None = None,
+    fetcher: Any = None,
+    candidate_sink: Any = None,
+) -> dict[str, Any]:
+    """Immediately seed the incremental scanner from a chat/X contract mention."""
+    observed = _now_ms()  # A message timestamp cannot backdate a current quote.
+    contract = _onchain_address(contract_address)
+    if not contract:
+        return {"ok": False, "discovered": 0, "error": "invalid contract"}
+    fetch = fetcher or fetch_dexscreener_token
+    source_key = re.sub(r"[^0-9a-z_-]+", "-", str(source or "external").strip().lower()).strip("-")[:40] or "external"
+    try:
+        payload = fetch(contract)
+        normalized = normalize_onchain_dexscreener(payload, "", observed_at=observed)
+        target = contract.lower() if contract.lower().startswith("0x") else contract
+        rows = [
+            row for row in normalized
+            if _onchain_address(row.get("contractAddress"), row.get("network")) == target
+            and _research_network_key(row.get("network")) in ONCHAIN_RESEARCH_DEFAULT_NETWORKS
+        ]
+        enriched: list[dict[str, Any]] = []
+        clue = re.sub(r"\s+", " ", str(source_text or "")).strip()[:100]
+        for row in merge_onchain_research_rows(rows):
+            providers = list(dict.fromkeys([*(row.get("providers") or []), source_key]))
+            reasons = list(row.get("reasons") or [])
+            reasons.insert(0, f"外部线索：{clue}" if clue else f"外部线索：{source}")
+            enriched.append(evaluate_onchain_candidate({
+                **row,
+                "providers": providers,
+                "reasons": list(dict.fromkeys(reasons))[:4],
+            }, now_ms=observed))
+        store.save_onchain_research_scan(
+            enriched,
+            observed_at=observed,
+            source_status={f"contract-{source_key}": "ok"},
+        )
+        if candidate_sink and enriched:
+            candidate_sink(enriched)
+        return {"ok": True, "discovered": len(enriched), "items": enriched}
+    except Exception as exc:
+        store.save_onchain_research_scan(
+            [],
+            observed_at=observed,
+            source_status={f"contract-{source_key}": "error"},
+            errors=[f"contract-{source_key}: {str(exc)[:180]}"],
+        )
+        return {"ok": False, "discovered": 0, "error": str(exc)[:180]}
+
+
+def merge_onchain_research_rows(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Merge providers by chain + contract while favoring the deepest observed pool."""
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    max_metric_keys = {
+        "liquidityUsd", "fdvUsd", "marketCapUsd", "volumeM5Usd", "volumeH1Usd",
+        "volumeH6Usd", "volumeH24Usd", "buysM5", "sellsM5", "buyersM5",
+        "sellersM5", "buysH1", "sellsH1", "buyersH1", "sellersH1",
+        "transactionsH1", "transactionsH6", "transactionsH24",
+    }
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            continue
+        network = _chain_key(raw.get("network"))
+        address = _onchain_address(raw.get("contractAddress"), network)
+        if not network or not address:
+            continue
+        key = (network, address.lower() if address.lower().startswith("0x") else address)
+        item = dict(raw)
+        item["network"] = network
+        item["contractAddress"] = address
+        item["providers"] = list(dict.fromkeys(str(value) for value in (raw.get("providers") or [raw.get("provider")]) if value))
+        item["metrics"] = dict(raw.get("metrics") or {})
+        if key not in merged:
+            merged[key] = item
+            continue
+        target = merged[key]
+        old_liquidity = float(_safe_float((target.get("metrics") or {}).get("liquidityUsd")) or 0)
+        new_liquidity = float(_safe_float(item["metrics"].get("liquidityUsd")) or 0)
+        target["providers"] = list(dict.fromkeys([*(target.get("providers") or []), *(item.get("providers") or [])]))
+        if item.get("narrativeContext"):
+            target["narrativeContext"] = item["narrativeContext"]
+        for field in ("gmgnNarrative", "gmgnNarrativeSource", "xOriginal", "imageUrl"):
+            if item.get(field):
+                target[field] = item[field]
+        first_seen_values = [
+            value
+            for value in (
+                _safe_int(target.get("firstSeenAt")),
+                _safe_int(item.get("firstSeenAt")),
+                _safe_int(target.get("poolCreatedAt")),
+                _safe_int(item.get("poolCreatedAt")),
+                _safe_int(target.get("observedAt")),
+                _safe_int(item.get("observedAt")),
+            )
+            if value > 0
+        ]
+        target["firstSeenAt"] = min(first_seen_values) if first_seen_values else 0
+        target["observedAt"] = max(_safe_int(target.get("observedAt")), _safe_int(item.get("observedAt")))
+        created_values = [value for value in (_safe_int(target.get("poolCreatedAt")), _safe_int(item.get("poolCreatedAt"))) if value > 0]
+        target["poolCreatedAt"] = min(created_values) if created_values else 0
+        for metric, value in item["metrics"].items():
+            parsed = _safe_float(value)
+            current = _safe_float(target["metrics"].get(metric))
+            if parsed is None:
+                continue
+            if metric in max_metric_keys:
+                target["metrics"][metric] = max(parsed, current or 0)
+            elif current is None or new_liquidity >= old_liquidity:
+                target["metrics"][metric] = parsed
+        if new_liquidity > old_liquidity:
+            for field in ("poolAddress", "dexId", "tradeUrl"):
+                if item.get(field):
+                    target[field] = item[field]
+        for field in ("symbol", "name"):
+            if not target.get(field) and item.get(field):
+                target[field] = item[field]
+    return list(merged.values())
+
+
+def _log_score(value: Any, floor: float, ceiling: float) -> float:
+    number = float(_safe_float(value) or 0)
+    if number <= floor:
+        return 0.0
+    if number >= ceiling:
+        return 100.0
+    return (math.log1p(number) - math.log1p(floor)) / (math.log1p(ceiling) - math.log1p(floor)) * 100
+
+
+def onchain_wallet_profile(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Classify holder evidence without treating a wallet label as a buy signal."""
+    facts = row.get("launchFacts") if isinstance(row.get("launchFacts"), Mapping) else {}
+    metrics = row.get("metrics") if isinstance(row.get("metrics"), Mapping) else {}
+
+    def value(name: str, fallback: str | None = None) -> float:
+        raw = facts.get(name)
+        if raw is None:
+            raw = metrics.get(fallback or name)
+        return float(_safe_float(raw) or 0)
+
+    holders = int(value("holders"))
+    smart_holders = int(value("smartMoneyHolders"))
+    pro_holders = int(value("proHolders"))
+    kol_holders = int(value("kolHolders"))
+    independent_holders = smart_holders + pro_holders
+    smart_percent = value("smartMoneyHoldingPercent")
+    pro_percent = value("proHoldingPercent")
+    kol_percent = value("kolHoldingPercent")
+    new_wallet_percent = value("newWalletHoldingPercent")
+    bundler_percent = value("bundlerHoldingPercent")
+    top10_percent = value("top10Percent", "top10HolderPercent")
+    wash_trading = bool(facts.get("washTrading") or metrics.get("washTrading"))
+    coverage = bool(
+        holders or independent_holders or kol_holders or smart_percent or pro_percent
+        or kol_percent or new_wallet_percent or bundler_percent or top10_percent or wash_trading
+    )
+    if not coverage:
+        return {
+            "classification": "unavailable", "score": 50, "coverage": False,
+            "summary": "暂无钱包分型数据，不能用聪明钱叙事加分",
+            "independentHolders": 0, "riskSignals": [],
+        }
+
+    score = 50.0
+    score += min(20.0, independent_holders * 3.0)
+    score += min(8.0, _log_score(holders, 20, 2_000) * 0.08)
+    if independent_holders >= 3 and 0 < smart_percent + pro_percent <= 20:
+        score += 8.0
+    risk_signals: list[str] = []
+    if top10_percent >= 60:
+        score -= min(25.0, (top10_percent - 50) * 0.6)
+        risk_signals.append("头部持仓集中")
+    if kol_percent >= 20:
+        score -= min(18.0, (kol_percent - 15) * 0.7)
+        risk_signals.append("KOL持仓偏高")
+    if new_wallet_percent >= 35:
+        score -= min(18.0, (new_wallet_percent - 25) * 0.5)
+        risk_signals.append("新钱包占比偏高")
+    if bundler_percent >= 12:
+        score -= min(22.0, (bundler_percent - 8) * 0.8)
+        risk_signals.append("关联打包钱包聚集")
+    if wash_trading:
+        score -= 35.0
+        risk_signals.append("刷量标签")
+    score = max(0.0, min(100.0, score))
+    promotional_risk = wash_trading or len(risk_signals) >= 3 or (kol_percent >= 25 and independent_holders == 0)
+    if promotional_risk:
+        classification = "promotional-cluster-risk"
+        summary = "KOL/新钱包/关联钱包聚集，疑似推广或刷量结构"
+    elif independent_holders >= 3 and score >= 62:
+        classification = "independent-validation"
+        summary = f"{independent_holders}个专业/聪明钱地址参与，仅作交叉验证"
+    else:
+        classification = "mixed"
+        summary = "钱包结构有样本但独立性不足，继续观察持有行为"
+    return {
+        "classification": classification,
+        "score": round(score, 1),
+        "coverage": True,
+        "summary": summary,
+        "holders": holders,
+        "independentHolders": independent_holders,
+        "smartMoneyHolders": smart_holders,
+        "proHolders": pro_holders,
+        "kolHolders": kol_holders,
+        "top10Percent": top10_percent or None,
+        "riskSignals": risk_signals,
+    }
+
+
+def evaluate_onchain_candidate(row: Mapping[str, Any], *, now_ms: int | None = None) -> dict[str, Any]:
+    """Score only facts visible at the observation time; no future outcome fields are accepted."""
+    now = int(now_ms or row.get("observedAt") or _now_ms())
+    metrics = dict(row.get("metrics") or {})
+    wallet_profile = onchain_wallet_profile({**dict(row), "metrics": metrics})
+    created_at = int(_safe_float(row.get("poolCreatedAt")) or _safe_float(row.get("firstSeenAt")) or now)
+    age_minutes = max(0.0, (now - created_at) / 60_000)
+    liquidity = float(_safe_float(metrics.get("liquidityUsd")) or 0)
+    volume_h1 = float(_safe_float(metrics.get("volumeH1Usd")) or _safe_float(metrics.get("volumeH24Usd")) or 0)
+    volume_h6 = float(_safe_float(metrics.get("volumeH6Usd")) or _safe_float(metrics.get("volumeH24Usd")) or 0)
+    tx_h1 = int(_safe_float(metrics.get("transactionsH1")) or 0)
+    buys_h1 = int(_safe_float(metrics.get("buysH1")) or 0)
+    sells_h1 = int(_safe_float(metrics.get("sellsH1")) or 0)
+    buyers_m5 = int(_safe_float(metrics.get("buyersM5")) or 0)
+    fdv = float(_safe_float(metrics.get("marketCapUsd")) or _safe_float(metrics.get("fdvUsd")) or 0)
+    reasons: list[str] = [
+        str(value)[:140]
+        for value in (row.get("reasons") or [])
+        if str(value).startswith("外部线索：")
+    ][:2]
+    risks: list[str] = []
+    decision = "watch"
+    if age_minutes >= 30 and liquidity < 1_000:
+        decision, risks = "filtered", ["池龄超过30分钟且流动性不足$1K"]
+    elif age_minutes >= 60 and tx_h1 < 5 and volume_h1 < 1_000:
+        decision, risks = "filtered", ["一小时交易活跃度过低"]
+    elif tx_h1 >= 20 and sells_h1 > max(8, buys_h1 * 4):
+        decision, risks = "filtered", ["卖出笔数显著异常"]
+    elif fdv >= 5_000_000 and liquidity > 0 and liquidity / fdv < 0.001:
+        decision, risks = "filtered", ["流动性与估值严重失衡"]
+
+    liquidity_score = _log_score(liquidity, 750, 250_000)
+    activity_score = max(_log_score(tx_h1, 2, 250), _log_score(volume_h1, 500, 250_000))
+    total_sides = buys_h1 + sells_h1
+    buy_score = 50.0 if total_sides <= 0 else max(0.0, min(100.0, buys_h1 / total_sides * 125))
+    breadth_score = max(_log_score(buyers_m5, 1, 50), min(100.0, activity_score * 0.8))
+    turnover = volume_h1 / liquidity if liquidity > 0 else 0
+    velocity_score = min(100.0, _log_score(turnover, 0.05, 8.0))
+    persistence_score = min(100.0, _log_score(volume_h6, 2_000, 800_000))
+    freshness_score = 100.0 if age_minutes <= 120 else max(15.0, 100.0 - (age_minutes - 120) / 8)
+    provider_count = min(2, len(
+        set(row.get("providers") or [])
+        & {"dexscreener", "binance-meme-rush", "gmgn-trenches"}
+    ))
+    evidence_score = min(100.0, 35.0 + provider_count * 25.0 + (15.0 if row.get("dexId") else 0.0))
+    identity_text = f"{row.get('symbol') or ''} {row.get('name') or ''} {row.get('dexId') or ''}".lower()
+    meme_hint_count = sum(1 for hint in ONCHAIN_RESEARCH_MEME_HINTS if hint in identity_text)
+    meme_hint_score = min(100.0, 35.0 + meme_hint_count * 25.0)
+    meme_score = (
+        liquidity_score * 0.18 + activity_score * 0.22 + buy_score * 0.17
+        + breadth_score * 0.18 + velocity_score * 0.12 + freshness_score * 0.08
+        + meme_hint_score * 0.05
+    )
+    project_score = (
+        liquidity_score * 0.27 + activity_score * 0.20 + buy_score * 0.12
+        + persistence_score * 0.15 + evidence_score * 0.16 + freshness_score * 0.10
+    )
+    if wallet_profile["coverage"]:
+        # Wallet labels are secondary corroboration only.  Their bounded impact
+        # cannot rescue a weak market, while obvious clusters can demote noise.
+        wallet_adjustment = (float(wallet_profile["score"]) - 50.0) * 0.12
+        meme_score = max(0.0, min(100.0, meme_score + wallet_adjustment))
+        project_score = max(0.0, min(100.0, project_score + wallet_adjustment * 0.7))
+    candidate_type = "meme" if meme_score >= project_score else "project"
+    selected_score = max(meme_score, project_score)
+    present = sum(1 for key in ("liquidityUsd", "volumeH1Usd", "transactionsH1", "buysH1", "sellsH1") if metrics.get(key) is not None)
+    confidence = min(100, 25 + present * 11 + provider_count * 10)
+    if liquidity >= 5_000:
+        reasons.append("流动性达到早期研究门槛")
+    if tx_h1 >= 15:
+        reasons.append("一小时交易开始形成广度")
+    if total_sides and buys_h1 > sells_h1 * 1.35:
+        reasons.append("主动买入笔数占优")
+    if volume_h1 >= max(5_000, liquidity * 0.5):
+        reasons.append("早期成交扩散较快")
+    if meme_hint_count:
+        reasons.append("名称或发行场景具备 Meme 传播特征")
+    if wallet_profile["classification"] == "independent-validation":
+        reasons.append(wallet_profile["summary"])
+    elif wallet_profile["classification"] == "promotional-cluster-risk":
+        risks.insert(0, "疑似刷量或关联钱包聚集")
+    if decision != "filtered":
+        if age_minutes < 20 and (liquidity < 2_500 or tx_h1 < 5):
+            decision = "warming"
+            reasons.append("仍在最早期观察窗口")
+        elif selected_score >= 58 and liquidity >= 5_000 and tx_h1 >= 12:
+            decision = "shortlisted"
+        elif age_minutes >= 90 and selected_score < 35:
+            decision = "filtered"
+            risks.append("综合质量未达到研究门槛")
+    if provider_count < 2:
+        risks.append("目前仅有单一数据源确认")
+    return {
+        **dict(row),
+        "metrics": metrics,
+        "scoreVersion": ONCHAIN_RESEARCH_SCORE_VERSION,
+        "candidateType": candidate_type,
+        "memeScore": round(meme_score, 1),
+        "projectScore": round(project_score, 1),
+        "selectedScore": round(selected_score, 1),
+        "confidence": int(round(confidence)),
+        "walletProfile": wallet_profile,
+        "decision": decision,
+        "ageMinutes": round(age_minutes, 1),
+        "reasons": reasons[:4],
+        "risks": list(dict.fromkeys(risks))[:4],
+    }
+
+
+def scan_onchain_research(
+    store: Any,
+    *,
+    networks: Iterable[str] | None = None,
+    observed_at: int | None = None,
+    new_pool_fetcher: Any = None,
+    dexscreener_fetcher: Any = None,
+    binance_launch_fetcher: Any = None,
+    gmgn_trenches_fetcher: Any = None,
+    pages: int | None = None,
+    candidate_sink: Any = None,
+    include_non_trench_sources: bool = False,
+) -> dict[str, Any]:
+    """Run one bounded research pass over the GMGN Trenches candidate pool.
+
+    The research page and opportunity picker intentionally share the same
+    universe as the Trenches board.  Binance Meme Rush can still be requested
+    explicitly by internal callers for diagnostics, but it is excluded from
+    normal research so a separate launch feed cannot create opportunities that
+    never appeared on the board.
+    """
+    observed = int(observed_at or _now_ms())
+    selected_networks = list(dict.fromkeys(
+        _chain_key(value) for value in (networks or ONCHAIN_RESEARCH_DEFAULT_NETWORKS) if _chain_key(value)
+    ))
+    fetch_dex = dexscreener_fetcher or fetch_dexscreener_assets
+    fetch_binance = binance_launch_fetcher or fetch_binance_meme_rush
+    # new_pool_fetcher remains a compatibility alias for callers/tests written
+    # before the scanner moved from generic new pools to GMGN completed trenches.
+    fetch_gmgn = gmgn_trenches_fetcher or new_pool_fetcher or fetch_gmgn_migrated_trenches
+    enrich_limit = max(0, min(300, int(_safe_float(os.environ.get("ONCHAIN_RESEARCH_ENRICH_LIMIT")) or 90)))
+    all_rows: list[dict[str, Any]] = []
+    status: dict[str, str] = {}
+    errors: list[str] = []
+    for network in selected_networks:
+        network_rows: list[dict[str, Any]] = []
+        binance_rows: list[dict[str, Any]] = []
+        network_ok = False
+        provider_status: dict[str, str] = {}
+        if include_non_trench_sources and network in MEME_RUSH_CHAIN_IDS:
+            try:
+                binance_payload = fetch_binance(network, rank_types=(30,))
+                binance_received_at = int(observed_at or _now_ms())
+                binance_rows = normalize_binance_meme_rush(
+                    binance_payload,
+                    network,
+                    observed_at=binance_received_at,
+                )
+                binance_rows = [row for row in binance_rows if row.get("launchStage") == "migrated"]
+                network_rows.extend(binance_rows)
+                network_ok = True
+                provider_status[f"{network}/binance-meme-rush"] = "ok"
+                # Binance's launch feed is the low-latency first screen.  It is
+                # persisted before the slower multi-page provider is touched.
+                fast_screen = [
+                    evaluate_onchain_candidate(row, now_ms=binance_received_at)
+                    for row in merge_onchain_research_rows(binance_rows)
+                ]
+                store.save_onchain_research_scan(
+                    fast_screen,
+                    observed_at=binance_received_at,
+                    source_status={f"{network}/binance-meme-rush": "ok"},
+                )
+                if candidate_sink and fast_screen:
+                    candidate_sink(fast_screen)
+            except Exception as exc:
+                errors.append(f"{network}/binance-meme-rush: {str(exc)[:180]}")
+                provider_status[f"{network}/binance-meme-rush"] = "error"
+        else:
+            provider_status[f"{network}/binance-meme-rush"] = (
+                "scope-excluded" if not include_non_trench_sources else "unsupported"
+            )
+        try:
+            payload = fetch_gmgn(network)
+            received_at = int(observed_at or _now_ms())
+            normalized_primary = normalize_gmgn_migrated_trenches(payload, network, observed_at=received_at)
+            # The same profile gate used by the board is applied before any
+            # enrichment or scoring.  This prevents DexScreener/secondary
+            # evidence from creating a candidate that is not a trench item.
+            primary = [
+                row for row in normalized_primary
+                if gmgn_trench_passes_chain_filters(row)
+            ]
+            network_rows.extend(primary)
+            network_ok = True
+            provider_status[f"{network}/gmgn-trenches"] = "ok"
+            # Persist and enqueue the first screen before slower enrichment.
+            initial = [evaluate_onchain_candidate(row, now_ms=received_at) for row in merge_onchain_research_rows(primary)]
+            store.save_onchain_research_scan(
+                initial,
+                observed_at=received_at,
+                source_status={f"{network}/gmgn-trenches": "ok"},
+            )
+            if candidate_sink and initial:
+                candidate_sink(initial)
+            enriched: list[dict[str, Any]] = []
+            # Enrich only the already-filtered GMGN trench rows.  Secondary
+            # providers add evidence to a trench candidate; they never add a
+            # new candidate to the research universe.
+            binance_enrich_limit = enrich_limit // 2 if primary and binance_rows else enrich_limit
+            primary_enrich_limit = enrich_limit - binance_enrich_limit if binance_rows else enrich_limit
+            enrich_rows = [
+                *binance_rows[:binance_enrich_limit],
+                *primary[:primary_enrich_limit],
+            ]
+            addresses = list(dict.fromkeys(
+                row["contractAddress"] for row in enrich_rows if row.get("contractAddress")
+            ))
+            for offset in range(0, len(addresses), 30):
+                batch = addresses[offset: offset + 30]
+                if not batch:
+                    continue
+                try:
+                    enriched_payload = fetch_dex(network, batch)
+                    enriched.extend(normalize_onchain_dexscreener(enriched_payload, network, observed_at=observed))
+                except Exception as exc:
+                    errors.append(f"{network}/dexscreener: {str(exc)[:180]}")
+                    break
+            evaluated = [
+                evaluate_onchain_candidate(row, now_ms=received_at)
+                for row in merge_onchain_research_rows([*network_rows, *enriched])
+            ]
+            all_rows.extend(evaluated)
+            if candidate_sink and evaluated:
+                candidate_sink(evaluated)
+            status[network] = "ok"
+        except Exception as exc:
+            errors.append(f"{network}/gmgn-trenches: {str(exc)[:180]}")
+            provider_status[f"{network}/gmgn-trenches"] = "error"
+            if network_rows:
+                received_at = int(observed_at or _now_ms())
+                evaluated = [
+                    evaluate_onchain_candidate(row, now_ms=received_at)
+                    for row in merge_onchain_research_rows(network_rows)
+                ]
+                all_rows.extend(evaluated)
+                if candidate_sink and evaluated:
+                    candidate_sink(evaluated)
+            status[network] = "ok" if network_ok else "error"
+        status.update(provider_status)
+    store.save_onchain_research_scan(
+        all_rows,
+        observed_at=observed,
+        source_status=status,
+        errors=errors,
+        candidate_scope="gmgn-trenches" if not include_non_trench_sources else "",
+    )
+    return {
+        "ok": any(value == "ok" for value in status.values()),
+        "observedAt": observed,
+        "networks": selected_networks,
+        "sourceStatus": status,
+        "errors": errors,
+        "discovered": len(all_rows),
+        "shortlisted": sum(1 for row in all_rows if row.get("decision") == "shortlisted"),
+        "candidateScope": "gmgn-trenches" if not include_non_trench_sources else "gmgn-trenches+optional-launch-feed",
+    }
+
+
+def fetch_live_onchain_trenches(
+    *,
+    networks: Iterable[str] | None = None,
+    source: str = "",
+    page: int = 1,
+    page_size: int = 24,
+    query: str = "",
+    observed_at: int | None = None,
+    item_filter: Callable[[Mapping[str, Any]], bool] | None = None,
+    per_network_limit: int | None = None,
+) -> dict[str, Any]:
+    """Read the current opened/migrated tape directly from GMGN and Binance."""
+    observed = int(observed_at or _now_ms())
+    selected_networks = list(dict.fromkeys(
+        _chain_key(value)
+        for value in (networks or ONCHAIN_RESEARCH_DEFAULT_NETWORKS)
+        if _chain_key(value) in ONCHAIN_RESEARCH_DEFAULT_NETWORKS
+    )) or list(ONCHAIN_RESEARCH_DEFAULT_NETWORKS)
+    source_key = str(source or "").strip().casefold()
+    if source_key not in {"gmgn", "binance"}:
+        source_key = ""
+    jobs: dict[Any, tuple[str, str]] = {}
+    rows: list[dict[str, Any]] = []
+    source_status: dict[str, str] = {}
+    errors: list[str] = []
+    retry_after_seconds = 0
+    job_count = len(selected_networks) + sum(
+        1 for network in selected_networks if network in MEME_RUSH_CHAIN_IDS
+    )
+    with ThreadPoolExecutor(max_workers=max(1, min(9, job_count))) as executor:
+        for network in selected_networks:
+            if source_key != "binance":
+                jobs[executor.submit(fetch_gmgn_migrated_trenches, network)] = (network, "gmgn")
+            if source_key != "gmgn" and network in MEME_RUSH_CHAIN_IDS:
+                jobs[executor.submit(fetch_binance_meme_rush, network, rank_types=(30,))] = (network, "binance")
+            elif source_key == "binance" and network not in MEME_RUSH_CHAIN_IDS:
+                source_status[f"{network}/binance-meme-rush"] = "unsupported"
+        for future in as_completed(jobs):
+            network, provider = jobs[future]
+            provider_name = "gmgn-trenches" if provider == "gmgn" else "binance-meme-rush"
+            status_key = f"{network}/{provider_name}"
+            try:
+                payload = future.result()
+                gmgn_meta = payload.get("_gmgnMeta") if provider == "gmgn" and isinstance(payload, Mapping) else {}
+                if not isinstance(gmgn_meta, Mapping):
+                    gmgn_meta = {}
+                normalized = (
+                    normalize_gmgn_migrated_trenches(payload, network, observed_at=observed)
+                    if provider == "gmgn"
+                    else normalize_binance_meme_rush(payload, network, observed_at=observed)
+                )
+                if provider == "binance":
+                    normalized = [row for row in normalized if row.get("launchStage") == "migrated"]
+                rows.extend(normalized)
+                source_status[status_key] = "ok"
+                retry_after_seconds = max(
+                    retry_after_seconds,
+                    int(_safe_float(gmgn_meta.get("retryAfterSeconds")) or 0),
+                )
+            except GmgnRateLimitError as exc:
+                source_status[status_key] = "rate_limited"
+                retry_after_seconds = max(retry_after_seconds, exc.retry_after_seconds)
+                errors.append(f"{status_key}: {str(exc)[:180]}")
+            except GmgnUnsupportedNetworkError as exc:
+                source_status[status_key] = "unsupported"
+                errors.append(f"{status_key}: {str(exc)[:180]}")
+            except Exception as exc:
+                source_status[status_key] = "error"
+                errors.append(f"{status_key}: {str(exc)[:180]}")
+
+    merged = merge_onchain_research_rows(rows)
+    search_text = str(query or "").strip().casefold()[:80]
+    items: list[dict[str, Any]] = []
+    for row in merged:
+        if search_text and search_text not in " ".join((
+            str(row.get("symbol") or ""),
+            str(row.get("name") or ""),
+            str(row.get("contractAddress") or ""),
+        )).casefold():
+            continue
+        evaluated = evaluate_onchain_candidate(row, now_ms=observed)
+        providers = [str(value) for value in row.get("providers") or []]
+        contract = str(row.get("contractAddress") or "").strip()
+        network = str(row.get("network") or "").strip().lower()
+        chain_id = {
+            "eth": 1,
+            "bsc": 56,
+            "base": 8453,
+            "solana": 792703809,
+            "robinhood": 4663,
+        }.get(network)
+        address_ok = bool(
+            chain_id and contract and (
+                (chain_id == 792703809 and re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", contract))
+                or (chain_id != 792703809 and re.fullmatch(r"0x[0-9a-fA-F]{40}", contract))
+            )
+        )
+        items.append({
+            **row,
+            **evaluated,
+            "providers": providers,
+            "trenchSources": [
+                label
+                for provider, label in (
+                    ("gmgn-trenches", "GMGN"),
+                    ("binance-meme-rush", "Binance"),
+                )
+                if provider in providers
+            ],
+            "launchStage": "opened",
+            # The user chose GMGN as the contract authority for this page. No
+            # extra on-chain CA lookup is performed; syntax checking only keeps
+            # malformed/empty provider data out of the transaction builder.
+            "buyIdentity": {
+                "status": "verified" if address_ok else "unresolved",
+                "reason": "CA 直接来自 GMGN API" if address_ok else "GMGN CA 或目标链暂不支持买入",
+                "source": "gmgn-api",
+                "expiresAt": observed + 10 * 60 * 1000,
+                "target": {
+                    "symbol": str(row.get("symbol") or row.get("name") or "标的")[:80],
+                    "chainId": chain_id,
+                    "address": contract if chain_id == 792703809 else contract.lower(),
+                    "kind": "token",
+                },
+            },
+        })
+    unfiltered_total = len(items)
+    if item_filter is not None:
+        filtered_items: list[dict[str, Any]] = []
+        for row in items:
+            try:
+                if item_filter(row):
+                    filtered_items.append(row)
+            except Exception:
+                continue
+        items = filtered_items
+    items.sort(key=lambda row: (
+        int(_safe_float(row.get("poolCreatedAt")) or 0),
+        int(_safe_float(row.get("observedAt")) or observed),
+        float(_safe_float(row.get("selectedScore")) or 0),
+    ), reverse=True)
+    if per_network_limit is not None:
+        cap = max(1, int(per_network_limit))
+        network_counts: dict[str, int] = {}
+        balanced_items: list[dict[str, Any]] = []
+        for row in items:
+            network = _chain_key(row.get("network") or row.get("chain"))
+            if network_counts.get(network, 0) >= cap:
+                continue
+            network_counts[network] = network_counts.get(network, 0) + 1
+            balanced_items.append(row)
+        items = balanced_items
+    counts = {
+        "gmgn": sum(1 for row in items if "GMGN" in (row.get("trenchSources") or [])),
+        "binance": sum(1 for row in items if "Binance" in (row.get("trenchSources") or [])),
+    }
+    total = len(items)
+    # Public UI routes still clamp to 60. Internal history ingestion can retain
+    # all six GMGN batches (up to 80 per chain) without extra provider calls.
+    bounded_page_size = max(12, min(480, int(page_size or 24)))
+    pages = max(1, math.ceil(total / bounded_page_size))
+    page_number = min(max(1, int(page or 1)), pages)
+    offset = (page_number - 1) * bounded_page_size
+    supported_responses = [status for status in source_status.values() if status != "unsupported"]
+    api_status = gmgn_api_key_status()
+    cooldown = gmgn_cooldown_status()
+    retry_after_seconds = max(retry_after_seconds, int(cooldown.get("retryAfterSeconds") or 0))
+    return {
+        # An explicitly selected Binance-only chain can be unsupported without
+        # meaning that the live service failed.  Return an empty, healthy tape
+        # so the UI can explain the capability boundary instead of showing a
+        # misleading transport error.
+        "ok": any(status == "ok" for status in supported_responses) or (
+            bool(source_status) and not supported_responses
+        ),
+        "live": True,
+        "stage": "opened",
+        "items": items[offset: offset + bounded_page_size],
+        "unfilteredTotal": unfiltered_total,
+        "total": total,
+        "page": page_number,
+        "pageSize": bounded_page_size,
+        "pages": pages,
+        "updatedAt": observed,
+        "counts": counts,
+        "networks": list(ONCHAIN_RESEARCH_DEFAULT_NETWORKS),
+        "sourceStatus": source_status,
+        "errors": errors[:12],
+        "rateLimited": bool(cooldown.get("active")) or any(
+            status == "rate_limited" for status in source_status.values()
+        ),
+        "retryAfterSeconds": retry_after_seconds,
+        "cooldownUntil": int(cooldown.get("retryAt") or 0),
+        "gmgnApi": api_status,
+        "filters": {
+            "network": selected_networks[0] if len(selected_networks) == 1 else "",
+            "source": source_key,
+            "query": str(query or "").strip()[:80],
+            "personalGmgnPresetApplied": False,
+        },
+    }
 
 
 def fetch_defillama_protocols(*, session: Any = None) -> list[dict[str, Any]]:
@@ -1382,6 +2423,16 @@ class ChainEcosystemStore:
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
+    def recent_research_pool_ids(self, network: str) -> list[str]:
+        conn = self._connect()
+        try:
+            return [f"{network}_{row[0]}" for row in conn.execute(
+                "SELECT pool_address FROM onchain_research_candidates WHERE network = ? ORDER BY last_seen_at DESC LIMIT 120",
+                (network,),
+            ) if row[0]]
+        finally:
+            conn.close()
+
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
@@ -1570,15 +2621,536 @@ class ChainEcosystemStore:
                         FOREIGN KEY(chain_id) REFERENCES chains(id) ON DELETE CASCADE
                     );
 
+                    CREATE TABLE IF NOT EXISTS onchain_research_candidates (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        network TEXT NOT NULL,
+                        contract_address TEXT NOT NULL,
+                        pool_address TEXT NOT NULL DEFAULT '',
+                        dex_id TEXT NOT NULL DEFAULT '',
+                        symbol TEXT NOT NULL DEFAULT '',
+                        name TEXT NOT NULL DEFAULT '',
+                        candidate_type TEXT NOT NULL DEFAULT 'project',
+                        decision TEXT NOT NULL DEFAULT 'warming',
+                        score_version TEXT NOT NULL DEFAULT '',
+                        meme_score REAL NOT NULL DEFAULT 0,
+                        project_score REAL NOT NULL DEFAULT 0,
+                        selected_score REAL NOT NULL DEFAULT 0,
+                        confidence REAL NOT NULL DEFAULT 0,
+                        first_seen_at INTEGER NOT NULL,
+                        pool_created_at INTEGER NOT NULL DEFAULT 0,
+                        last_seen_at INTEGER NOT NULL,
+                        research_day TEXT NOT NULL,
+                        trade_url TEXT NOT NULL DEFAULT '',
+                        providers_json TEXT NOT NULL DEFAULT '[]',
+                        metrics_json TEXT NOT NULL DEFAULT '{}',
+                        reasons_json TEXT NOT NULL DEFAULT '[]',
+                        risks_json TEXT NOT NULL DEFAULT '[]',
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        UNIQUE(network, contract_address)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS onchain_research_snapshots (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        candidate_id INTEGER NOT NULL,
+                        observed_at INTEGER NOT NULL,
+                        observed_bucket INTEGER NOT NULL,
+                        decision TEXT NOT NULL,
+                        candidate_type TEXT NOT NULL,
+                        score_version TEXT NOT NULL,
+                        meme_score REAL NOT NULL DEFAULT 0,
+                        project_score REAL NOT NULL DEFAULT 0,
+                        selected_score REAL NOT NULL DEFAULT 0,
+                        confidence REAL NOT NULL DEFAULT 0,
+                        metrics_json TEXT NOT NULL DEFAULT '{}',
+                        reasons_json TEXT NOT NULL DEFAULT '[]',
+                        risks_json TEXT NOT NULL DEFAULT '[]',
+                        created_at INTEGER NOT NULL,
+                        UNIQUE(candidate_id, observed_bucket),
+                        FOREIGN KEY(candidate_id) REFERENCES onchain_research_candidates(id) ON DELETE CASCADE
+                    );
+
+                    CREATE TABLE IF NOT EXISTS onchain_research_runs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        observed_at INTEGER NOT NULL,
+                        completed_at INTEGER NOT NULL,
+                        discovered_count INTEGER NOT NULL DEFAULT 0,
+                        shortlisted_count INTEGER NOT NULL DEFAULT 0,
+                        source_status_json TEXT NOT NULL DEFAULT '{}',
+                        error_json TEXT NOT NULL DEFAULT '[]'
+                    );
+
+                    CREATE TABLE IF NOT EXISTS onchain_leader_cases (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        case_key TEXT NOT NULL UNIQUE,
+                        network TEXT NOT NULL,
+                        contract_address TEXT NOT NULL DEFAULT '',
+                        symbol TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        launch_at INTEGER NOT NULL DEFAULT 0,
+                        reason TEXT NOT NULL DEFAULT '',
+                        enabled INTEGER NOT NULL DEFAULT 1,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL
+                    );
+
                     CREATE INDEX IF NOT EXISTS idx_chain_projects_stage ON projects(chain_id, token_stage);
                     CREATE INDEX IF NOT EXISTS idx_chain_evidence_subject ON evidence(chain_id, subject_type, subject_id, observed_at);
                     CREATE INDEX IF NOT EXISTS idx_chain_rank_latest ON ranking_snapshots(chain_id, market_id, observed_at, rank);
                     CREATE INDEX IF NOT EXISTS idx_chain_alert_time ON alert_events(chain_id, observed_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_onchain_candidate_day_score ON onchain_research_candidates(research_day, decision, selected_score DESC);
+                    CREATE INDEX IF NOT EXISTS idx_onchain_snapshot_candidate_time ON onchain_research_snapshots(candidate_id, observed_at);
+                    CREATE INDEX IF NOT EXISTS idx_onchain_runs_time ON onchain_research_runs(observed_at DESC);
                     """
+                )
+                now = _now_ms()
+                conn.executemany(
+                    """
+                    INSERT INTO onchain_leader_cases (
+                        case_key, network, contract_address, symbol, name, category,
+                        launch_at, reason, enabled, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    ON CONFLICT(case_key) DO UPDATE SET
+                        network = excluded.network,
+                        contract_address = excluded.contract_address,
+                        symbol = excluded.symbol,
+                        name = excluded.name,
+                        category = excluded.category,
+                        launch_at = excluded.launch_at,
+                        reason = excluded.reason,
+                        updated_at = excluded.updated_at
+                    """,
+                    [
+                        (
+                            row["key"], row["network"], row["contractAddress"], row["symbol"],
+                            row["name"], row["category"], _timestamp_ms(f"{row['launchDate']}T00:00:00Z"),
+                            row["reason"], now, now,
+                        )
+                        for row in DEFAULT_ONCHAIN_LEADER_CASES
+                    ],
                 )
                 conn.commit()
             finally:
                 conn.close()
+
+    @staticmethod
+    def _onchain_candidate_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "network": row["network"],
+            "contractAddress": row["contract_address"],
+            "poolAddress": row["pool_address"],
+            "dexId": row["dex_id"],
+            "symbol": row["symbol"],
+            "name": row["name"],
+            "candidateType": row["candidate_type"],
+            "decision": row["decision"],
+            "scoreVersion": row["score_version"],
+            "memeScore": _clean_number(float(row["meme_score"])),
+            "projectScore": _clean_number(float(row["project_score"])),
+            "selectedScore": _clean_number(float(row["selected_score"])),
+            "confidence": _clean_number(float(row["confidence"])),
+            "firstSeenAt": int(row["first_seen_at"]),
+            "poolCreatedAt": int(row["pool_created_at"]),
+            "lastSeenAt": int(row["last_seen_at"]),
+            "ageMinutes": round(max(0, int(row["last_seen_at"]) - int(row["pool_created_at"] or row["first_seen_at"])) / 60_000, 1),
+            "researchDay": row["research_day"],
+            "tradeUrl": row["trade_url"],
+            "providers": _json_value(row["providers_json"], []),
+            "metrics": _json_value(row["metrics_json"], {}),
+            "reasons": _json_value(row["reasons_json"], []),
+            "risks": _json_value(row["risks_json"], []),
+        }
+
+    def save_onchain_research_scan(
+        self,
+        candidates: Iterable[Mapping[str, Any]],
+        *,
+        observed_at: int | None = None,
+        source_status: Mapping[str, Any] | None = None,
+        errors: Iterable[str] | None = None,
+        candidate_scope: str = "",
+    ) -> dict[str, Any]:
+        """Persist one incremental scan and its as-observed factor snapshots."""
+        observed = int(observed_at or _now_ms())
+        normalized = [dict(row) for row in candidates if isinstance(row, Mapping)]
+        with self._lock:
+            conn = self._connect()
+            try:
+                for item in normalized:
+                    network = _chain_key(item.get("network"))
+                    address = _onchain_address(item.get("contractAddress"), network)
+                    if not network or not address:
+                        continue
+                    identity_address = address.lower() if address.lower().startswith("0x") else address
+                    existing_context = conn.execute(
+                        """
+                        SELECT providers_json, reasons_json
+                        FROM onchain_research_candidates
+                        WHERE network = ? AND contract_address = ?
+                        """,
+                        (network, identity_address),
+                    ).fetchone()
+                    if existing_context:
+                        external_providers = [
+                            value for value in _json_value(existing_context["providers_json"], [])
+                            if str(value) not in {"geckoterminal", "dexscreener"}
+                        ]
+                        external_reasons = [
+                            value for value in _json_value(existing_context["reasons_json"], [])
+                            if str(value).startswith("外部线索：")
+                        ]
+                        item["providers"] = list(dict.fromkeys([
+                            *(item.get("providers") or []), *external_providers,
+                        ]))
+                        item["reasons"] = list(dict.fromkeys([
+                            *external_reasons, *(item.get("reasons") or []),
+                        ]))[:4]
+                    first_seen = int(_safe_float(item.get("firstSeenAt")) or observed)
+                    item_observed = int(_safe_float(item.get("observedAt")) or observed)
+                    pool_created = int(_safe_float(item.get("poolCreatedAt")) or 0)
+                    decision = str(item.get("decision") or "warming")[:30]
+                    values = (
+                        network, identity_address, str(item.get("poolAddress") or "")[:120],
+                        str(item.get("dexId") or "")[:80], str(item.get("symbol") or "")[:40],
+                        str(item.get("name") or "")[:160], str(item.get("candidateType") or "project")[:20],
+                        decision, str(item.get("scoreVersion") or ONCHAIN_RESEARCH_SCORE_VERSION)[:60],
+                        float(_safe_float(item.get("memeScore")) or 0),
+                        float(_safe_float(item.get("projectScore")) or 0),
+                        float(_safe_float(item.get("selectedScore")) or 0),
+                        float(_safe_float(item.get("confidence")) or 0),
+                        first_seen, pool_created, item_observed, _research_day(first_seen),
+                        str(item.get("tradeUrl") or "")[:800],
+                        json.dumps(item.get("providers") or [], ensure_ascii=False, separators=(",", ":")),
+                        json.dumps(item.get("metrics") or {}, ensure_ascii=False, separators=(",", ":")),
+                        json.dumps(item.get("reasons") or [], ensure_ascii=False, separators=(",", ":")),
+                        json.dumps(item.get("risks") or [], ensure_ascii=False, separators=(",", ":")),
+                        observed, observed,
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO onchain_research_candidates (
+                            network, contract_address, pool_address, dex_id, symbol, name,
+                            candidate_type, decision, score_version, meme_score, project_score,
+                            selected_score, confidence, first_seen_at, pool_created_at, last_seen_at,
+                            research_day, trade_url, providers_json, metrics_json, reasons_json,
+                            risks_json, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(network, contract_address) DO UPDATE SET
+                            pool_address = CASE WHEN excluded.pool_address <> '' THEN excluded.pool_address ELSE onchain_research_candidates.pool_address END,
+                            dex_id = CASE WHEN excluded.dex_id <> '' THEN excluded.dex_id ELSE onchain_research_candidates.dex_id END,
+                            symbol = CASE WHEN excluded.symbol <> '' THEN excluded.symbol ELSE onchain_research_candidates.symbol END,
+                            name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE onchain_research_candidates.name END,
+                            candidate_type = excluded.candidate_type,
+                            decision = excluded.decision,
+                            score_version = excluded.score_version,
+                            meme_score = excluded.meme_score,
+                            project_score = excluded.project_score,
+                            selected_score = excluded.selected_score,
+                            confidence = excluded.confidence,
+                            first_seen_at = MIN(onchain_research_candidates.first_seen_at, excluded.first_seen_at),
+                            pool_created_at = CASE
+                                WHEN onchain_research_candidates.pool_created_at = 0 THEN excluded.pool_created_at
+                                WHEN excluded.pool_created_at = 0 THEN onchain_research_candidates.pool_created_at
+                                ELSE MIN(onchain_research_candidates.pool_created_at, excluded.pool_created_at)
+                            END,
+                            last_seen_at = MAX(onchain_research_candidates.last_seen_at, excluded.last_seen_at),
+                            research_day = CASE WHEN excluded.first_seen_at < onchain_research_candidates.first_seen_at THEN excluded.research_day ELSE onchain_research_candidates.research_day END,
+                            trade_url = CASE WHEN excluded.trade_url <> '' THEN excluded.trade_url ELSE onchain_research_candidates.trade_url END,
+                            providers_json = excluded.providers_json,
+                            metrics_json = excluded.metrics_json,
+                            reasons_json = excluded.reasons_json,
+                            risks_json = excluded.risks_json,
+                            updated_at = excluded.updated_at
+                        WHERE excluded.last_seen_at >= onchain_research_candidates.last_seen_at
+                        """,
+                        values,
+                    )
+                    candidate_row = conn.execute(
+                        "SELECT id FROM onchain_research_candidates WHERE network = ? AND contract_address = ?",
+                        (network, identity_address),
+                    ).fetchone()
+                    if not candidate_row:
+                        continue
+                    bucket_size = 86_400_000 if decision == "filtered" else 300_000
+                    bucket = item_observed // bucket_size * bucket_size
+                    conn.execute(
+                        """
+                        INSERT INTO onchain_research_snapshots (
+                            candidate_id, observed_at, observed_bucket, decision, candidate_type,
+                            score_version, meme_score, project_score, selected_score, confidence,
+                            metrics_json, reasons_json, risks_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(candidate_id, observed_bucket) DO UPDATE SET
+                            observed_at = excluded.observed_at,
+                            decision = excluded.decision,
+                            candidate_type = excluded.candidate_type,
+                            score_version = excluded.score_version,
+                            meme_score = excluded.meme_score,
+                            project_score = excluded.project_score,
+                            selected_score = excluded.selected_score,
+                            confidence = excluded.confidence,
+                            metrics_json = excluded.metrics_json,
+                            reasons_json = excluded.reasons_json,
+                            risks_json = excluded.risks_json
+                        """,
+                        (
+                            int(candidate_row["id"]), item_observed, bucket, decision,
+                            str(item.get("candidateType") or "project")[:20],
+                            str(item.get("scoreVersion") or ONCHAIN_RESEARCH_SCORE_VERSION)[:60],
+                            float(_safe_float(item.get("memeScore")) or 0),
+                            float(_safe_float(item.get("projectScore")) or 0),
+                            float(_safe_float(item.get("selectedScore")) or 0),
+                            float(_safe_float(item.get("confidence")) or 0),
+                            json.dumps(item.get("metrics") or {}, ensure_ascii=False, separators=(",", ":")),
+                            json.dumps(item.get("reasons") or [], ensure_ascii=False, separators=(",", ":")),
+                            json.dumps(item.get("risks") or [], ensure_ascii=False, separators=(",", ":")),
+                            observed,
+                        ),
+                    )
+                # The normal research pass has a deliberately narrow universe:
+                # GMGN Trenches only.  Keep older Binance/Dex/external records
+                # for auditability, but mark them filtered when a scoped pass
+                # completes so they cannot re-enter the active opportunity set.
+                # Contract-mention and diagnostic callers omit this flag and
+                # therefore retain their independent behaviour.
+                if str(candidate_scope or "").strip().casefold() == "gmgn-trenches":
+                    conn.execute(
+                        """
+                        UPDATE onchain_research_candidates
+                        SET decision = 'filtered', updated_at = ?
+                        WHERE providers_json NOT LIKE '%\"gmgn-trenches\"%'
+                          AND decision <> 'filtered'
+                        """,
+                        (observed,),
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO onchain_research_runs (
+                        observed_at, completed_at, discovered_count, shortlisted_count,
+                        source_status_json, error_json
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        observed, _now_ms(), len(normalized),
+                        sum(1 for row in normalized if row.get("decision") == "shortlisted"),
+                        json.dumps(dict(source_status or {}), ensure_ascii=False, separators=(",", ":")),
+                        json.dumps(list(errors or []), ensure_ascii=False, separators=(",", ":")),
+                    ),
+                )
+                conn.execute(
+                    "DELETE FROM onchain_research_runs WHERE observed_at < ?",
+                    (observed - 30 * 86_400_000,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        observer = getattr(self, "identity_observer", None)
+        if observer:
+            try:
+                observer([row for row in normalized if row.get("decision") != "filtered"])
+            except Exception:
+                pass  # Identity preflight must not interrupt scan persistence.
+        return {"saved": len(normalized), "observedAt": observed}
+
+    def _onchain_benchmark(self, conn: sqlite3.Connection) -> dict[str, Any]:
+        cases = conn.execute(
+            "SELECT * FROM onchain_leader_cases WHERE enabled = 1 ORDER BY category, launch_at, id"
+        ).fetchall()
+        results: list[dict[str, Any]] = []
+        for case in cases:
+            candidate = conn.execute(
+                "SELECT id FROM onchain_research_candidates WHERE network = ? AND contract_address = ?",
+                (case["network"], case["contract_address"]),
+            ).fetchone()
+            snapshot = None
+            if candidate and int(case["launch_at"]):
+                snapshot = conn.execute(
+                    """
+                    SELECT decision, selected_score, observed_at
+                    FROM onchain_research_snapshots
+                    WHERE candidate_id = ? AND observed_at BETWEEN ? AND ?
+                    ORDER BY observed_at ASC LIMIT 1
+                    """,
+                    (int(candidate["id"]), int(case["launch_at"]), int(case["launch_at"]) + 86_400_000),
+                ).fetchone()
+            results.append({
+                "key": case["case_key"],
+                "network": case["network"],
+                "symbol": case["symbol"],
+                "name": case["name"],
+                "category": case["category"],
+                "launchAt": int(case["launch_at"]),
+                "reason": case["reason"],
+                "replayable": bool(snapshot),
+                "hit": bool(snapshot and snapshot["decision"] == "shortlisted"),
+                "firstDecision": snapshot["decision"] if snapshot else "awaiting_snapshot",
+                "firstScore": _clean_number(float(snapshot["selected_score"])) if snapshot else None,
+            })
+        replayable = [row for row in results if row["replayable"]]
+        hits = [row for row in replayable if row["hit"]]
+        category_stats = {}
+        for category in ("meme", "project"):
+            group = [row for row in replayable if row["category"] == category]
+            category_stats[category] = {
+                "caseCount": sum(1 for row in results if row["category"] == category),
+                "replayable": len(group),
+                "hits": sum(1 for row in group if row["hit"]),
+                "recallPct": round(sum(1 for row in group if row["hit"]) / len(group) * 100, 1) if group else None,
+            }
+        return {
+            "targetRecallPct": 80,
+            "caseCount": len(results),
+            "replayable": len(replayable),
+            "hits": len(hits),
+            "recallPct": round(len(hits) / len(replayable) * 100, 1) if replayable else None,
+            "status": "validated" if replayable and len(hits) / len(replayable) >= 0.8 else "collecting" if not replayable else "below_target",
+            "categories": category_stats,
+            "cases": results,
+        }
+
+    def onchain_identity_rows(self) -> list[dict[str, Any]]:
+        """Lightweight CA intake; never rebuild research scores or historical benchmarks."""
+        conn = self._connect()
+        try:
+            return [dict(row) for row in conn.execute(
+                "SELECT network, contract_address AS contractAddress, symbol FROM onchain_research_candidates "
+                "WHERE decision != 'filtered' AND last_seen_at >= ? "
+                "ORDER BY last_seen_at DESC",
+                (_now_ms() - 86_400_000,),
+            ).fetchall()]
+        finally:
+            conn.close()
+
+    def onchain_research_payload(
+        self,
+        *,
+        now_ms: int | None = None,
+        limit: int = 8,
+        research_day: str | None = None,
+    ) -> dict[str, Any]:
+        now = int(now_ms or _now_ms())
+        requested_day = str(research_day or "").strip()
+        day = requested_day if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", requested_day) else _research_day(now)
+        # `limit` is kept for older callers. The durable fast-research store
+        # supplies every AI-qualified result; this source query only needs a
+        # bounded compatibility sample instead of serializing the full day.
+        conn = self._connect()
+        try:
+            available_days = [
+                str(row["research_day"])
+                for row in conn.execute(
+                    """
+                    SELECT research_day
+                    FROM onchain_research_candidates
+                    WHERE research_day <> ''
+                    GROUP BY research_day
+                    ORDER BY research_day DESC
+                    LIMIT 30
+                    """
+                ).fetchall()
+            ]
+            decision_rows = conn.execute(
+                """SELECT decision,COUNT(*) AS count FROM onchain_research_candidates
+                WHERE research_day=?
+                GROUP BY decision""", (day,)
+            ).fetchall()
+            decisions = {name: 0 for name in ("filtered", "warming", "watch", "shortlisted")}
+            for decision_row in decision_rows:
+                if decision_row["decision"] in decisions:
+                    decisions[decision_row["decision"]] = int(decision_row["count"] or 0)
+            rows = conn.execute(
+                """
+                SELECT * FROM onchain_research_candidates
+                WHERE research_day = ? AND decision = 'shortlisted'
+                ORDER BY selected_score DESC, confidence DESC, first_seen_at ASC
+                LIMIT 200
+                """,
+                (day,),
+            ).fetchall()
+            candidates = [self._onchain_candidate_row(row) for row in rows]
+            shortlisted = candidates
+            market_providers = {"geckoterminal", "dexscreener"}
+            source_backed = [
+                row for row in shortlisted
+                if any(str(provider) not in market_providers for provider in (row.get("providers") or []))
+            ]
+            selected = []
+            selected_identities: set[tuple[str, str]] = set()
+            for row in [*source_backed, *shortlisted]:
+                identity = (str(row.get("network") or ""), str(row.get("contractAddress") or ""))
+                if identity in selected_identities:
+                    continue
+                selected_identities.add(identity)
+                selected.append(row)
+            latest_run = conn.execute(
+                "SELECT * FROM onchain_research_runs ORDER BY observed_at DESC, id DESC LIMIT 1"
+            ).fetchone()
+            recent_runs = conn.execute(
+                """
+                SELECT observed_at, source_status_json, error_json
+                FROM onchain_research_runs
+                WHERE observed_at >= ?
+                ORDER BY observed_at DESC, id DESC
+                LIMIT 64
+                """,
+                (now - 15 * 60_000,),
+            ).fetchall()
+            source_status: dict[str, str] = {}
+            source_last_success: dict[str, int] = {}
+            recent_errors: list[str] = []
+            for run in recent_runs:
+                run_status = _json_value(run["source_status_json"], {})
+                if isinstance(run_status, Mapping):
+                    for network, status in run_status.items():
+                        network_key = _chain_key(network)
+                        if network_key not in ONCHAIN_RESEARCH_DEFAULT_NETWORKS:
+                            continue
+                        if network_key and network_key not in source_status:
+                            source_status[network_key] = str(status or "error")
+                        if network_key and str(status or "") == "ok":
+                            source_last_success[network_key] = max(
+                                source_last_success.get(network_key, 0),
+                                int(run["observed_at"] or 0),
+                            )
+                for error in _json_value(run["error_json"], []):
+                    error_text = str(error or "").strip()
+                    if error_text and error_text not in recent_errors:
+                        recent_errors.append(error_text)
+            for network, status in list(source_status.items()):
+                if status == "error" and now - source_last_success.get(network, 0) <= 10 * 60_000:
+                    source_status[network] = "degraded"
+            return {
+                "scoreVersion": ONCHAIN_RESEARCH_SCORE_VERSION,
+                "day": day,
+                "currentDay": _research_day(now),
+                "availableDays": available_days,
+                "networks": list(ONCHAIN_RESEARCH_DEFAULT_NETWORKS),
+                "funnel": {
+                    "discovered": sum(decisions.values()),
+                    "filtered": decisions["filtered"],
+                    "warming": decisions["warming"],
+                    "quantified": decisions["watch"] + decisions["shortlisted"],
+                    "selected": decisions["shortlisted"],
+                },
+                "selected": selected,
+                "fastResearchManaged": True,
+                # Observation rows stay in SQLite; the attention UI only needs
+                # the aggregate and no longer serializes thousands of entries.
+                "watching": [],
+                "watchingCount": decisions["watch"] + decisions["warming"],
+                # Noise remains persisted for outcome replay and recall audits,
+                # but is intentionally not sent to the attention-facing UI.
+                "filtered": [],
+                "hiddenNoiseCount": decisions["filtered"],
+                "updatedAt": int(latest_run["completed_at"]) if latest_run else 0,
+                "sourceStatus": source_status,
+                "errors": recent_errors[:12],
+                "benchmark": self._onchain_benchmark(conn),
+            }
+        finally:
+            conn.close()
 
     def upsert_chain(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         slug = _slug(payload.get("slug") or payload.get("name"))
@@ -1961,6 +3533,67 @@ class ChainEcosystemStore:
         finally:
             conn.close()
 
+    def list_project_markets_for_chain(self, chain_id: int) -> dict[int, list[dict[str, Any]]]:
+        """Load every project/market relation for one chain in a single query."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT pm.*, m.market_key, m.level, m.name
+                FROM project_markets pm
+                JOIN markets m ON m.id = pm.market_id
+                JOIN projects p ON p.id = pm.project_id
+                WHERE p.chain_id = ?
+                ORDER BY pm.project_id, m.level, m.id
+                """,
+                (int(chain_id),),
+            ).fetchall()
+            grouped: dict[int, list[dict[str, Any]]] = {}
+            for row in rows:
+                grouped.setdefault(int(row["project_id"]), []).append({
+                    "projectId": int(row["project_id"]),
+                    "marketId": int(row["market_id"]),
+                    "marketKey": row["market_key"],
+                    "level": row["level"],
+                    "name": row["name"],
+                    "role": row["relation_role"],
+                    "confidence": row["confidence"],
+                    "source": row["source"],
+                    "reviewStatus": row["review_status"],
+                })
+            return grouped
+        finally:
+            conn.close()
+
+    def chain_summary_counts(self) -> dict[int, dict[str, int | bool]]:
+        """Return project and confirmed-market counts without N+1 project reads."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT
+                    c.id AS chain_id,
+                    COUNT(DISTINCT p.id) AS project_count,
+                    COUNT(DISTINCT CASE WHEN pm.review_status = 'confirmed' THEN pm.market_id END) AS market_count,
+                    MAX(CASE WHEN pm.review_status = 'confirmed' AND m.market_key = 'chain_token' THEN 1 ELSE 0 END) AS has_chain_token
+                FROM chains c
+                LEFT JOIN projects p ON p.chain_id = c.id
+                LEFT JOIN project_markets pm ON pm.project_id = p.id
+                LEFT JOIN markets m ON m.id = pm.market_id
+                GROUP BY c.id
+                """
+            ).fetchall()
+            return {
+                int(row["chain_id"]): {
+                    "projectCount": int(row["project_count"] or 0),
+                    "marketCount": int(row["market_count"] or 0),
+                    "hasChainToken": bool(row["has_chain_token"]),
+                }
+                for row in rows
+            }
+        finally:
+            conn.close()
+
     def upsert_asset(self, chain_id: int, project_id: int | None, payload: Mapping[str, Any]) -> dict[str, Any]:
         contract = str(payload.get("contractAddress") or "").strip().lower()[:160]
         if not contract:
@@ -2130,24 +3763,62 @@ class ChainEcosystemStore:
             sql += " ORDER BY observed_at DESC, id DESC LIMIT ?"
             params.append(max(1, min(1000, int(limit))))
             rows = conn.execute(sql, params).fetchall()
-            return [
-                {
-                    "id": int(row["id"]),
-                    "chainId": int(row["chain_id"]),
-                    "subjectType": row["subject_type"],
-                    "subjectId": row["subject_id"],
-                    "evidenceType": row["evidence_type"],
-                    "source": row["source"],
-                    "url": row["source_url"],
-                    "title": row["title"],
-                    "summary": row["summary"],
-                    "externalId": row["external_id"],
-                    "confidence": row["confidence"],
-                    "observedAt": int(row["observed_at"]),
-                    "payload": _json_value(row["payload_json"], {}),
-                }
-                for row in rows
-            ]
+            return [self._evidence_row(row) for row in rows]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _evidence_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "chainId": int(row["chain_id"]),
+            "subjectType": row["subject_type"],
+            "subjectId": row["subject_id"],
+            "evidenceType": row["evidence_type"],
+            "source": row["source"],
+            "url": row["source_url"],
+            "title": row["title"],
+            "summary": row["summary"],
+            "externalId": row["external_id"],
+            "confidence": row["confidence"],
+            "observedAt": int(row["observed_at"]),
+            "payload": _json_value(row["payload_json"], {}),
+        }
+
+    def list_project_evidence_for_chain(
+        self,
+        chain_id: int,
+        *,
+        limit_per_project: int = 40,
+    ) -> dict[int, list[dict[str, Any]]]:
+        """Load the newest evidence for every project with one window query."""
+        per_project = max(1, min(200, int(limit_per_project)))
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT * FROM (
+                    SELECT e.*,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY e.subject_id
+                               ORDER BY e.observed_at DESC, e.id DESC
+                           ) AS project_row_number
+                    FROM evidence e
+                    WHERE e.chain_id = ? AND e.subject_type = 'project'
+                )
+                WHERE project_row_number <= ?
+                ORDER BY subject_id, observed_at DESC, id DESC
+                """,
+                (int(chain_id), per_project),
+            ).fetchall()
+            grouped: dict[int, list[dict[str, Any]]] = {}
+            for row in rows:
+                try:
+                    project_id = int(row["subject_id"])
+                except (TypeError, ValueError):
+                    continue
+                grouped.setdefault(project_id, []).append(self._evidence_row(row))
+            return grouped
         finally:
             conn.close()
 
@@ -2434,12 +4105,52 @@ class ChainEcosystemStore:
             conn.close()
 
     def latest_rankings(self, chain_id: int) -> dict[str, dict[str, Any]]:
-        result: dict[str, dict[str, Any]] = {}
-        for market in self.list_markets(chain_id):
-            snapshot = self.latest_complete_snapshot(chain_id, market["key"])
-            if snapshot:
-                result[market["key"]] = snapshot
-        return result
+        """Load the latest complete snapshot for every market in one read."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                WITH latest AS (
+                    SELECT market_id, MAX(observed_at) AS observed_at
+                    FROM ranking_snapshots
+                    WHERE chain_id = ? AND complete = 1
+                    GROUP BY market_id
+                )
+                SELECT m.market_key, rs.*, p.slug, p.name, p.token_stage
+                FROM latest
+                JOIN ranking_snapshots rs
+                  ON rs.market_id = latest.market_id
+                 AND rs.observed_at = latest.observed_at
+                 AND rs.chain_id = ?
+                 AND rs.complete = 1
+                JOIN markets m ON m.id = rs.market_id
+                JOIN projects p ON p.id = rs.project_id
+                ORDER BY m.level, m.id, rs.rank, rs.score DESC, p.slug
+                """,
+                (int(chain_id), int(chain_id)),
+            ).fetchall()
+            result: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                market_key = str(row["market_key"])
+                snapshot = result.setdefault(
+                    market_key,
+                    {"marketKey": market_key, "observedAt": int(row["observed_at"]), "rows": []},
+                )
+                snapshot["rows"].append(
+                    {
+                        "projectId": int(row["project_id"]),
+                        "slug": row["slug"],
+                        "name": row["name"],
+                        "tokenStage": row["token_stage"],
+                        "rank": int(row["rank"]),
+                        "score": _clean_number(float(row["score"])),
+                        "confidence": _clean_number(float(row["confidence"])),
+                        "metrics": _json_value(row["metrics_json"], {}),
+                    }
+                )
+            return result
+        finally:
+            conn.close()
 
     def recent_market_leaders(self, chain_id: int, market_key: str, *, limit: int = 8) -> list[dict[str, Any]]:
         """Return one Top1 row per recent complete snapshot, newest first."""
@@ -2473,6 +4184,54 @@ class ChainEcosystemStore:
                 }
                 for row in rows
             ]
+        finally:
+            conn.close()
+
+    def recent_market_leaders_for_chain(self, chain_id: int, *, limit_per_market: int = 8) -> dict[str, list[dict[str, Any]]]:
+        """Load recent Top1 history for every market without an N+1 read loop."""
+        row_limit = max(2, min(30, int(limit_per_market)))
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                WITH recent AS (
+                    SELECT
+                        m.market_key,
+                        rs.project_id,
+                        rs.score,
+                        rs.confidence,
+                        rs.observed_at,
+                        rs.id,
+                        p.slug,
+                        p.name,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY rs.market_id
+                            ORDER BY rs.observed_at DESC, rs.id DESC
+                        ) AS recent_row_number
+                    FROM ranking_snapshots rs
+                    JOIN markets m ON m.id = rs.market_id
+                    JOIN projects p ON p.id = rs.project_id
+                    WHERE rs.chain_id = ? AND rs.rank = 1 AND rs.complete = 1
+                )
+                SELECT * FROM recent
+                WHERE recent_row_number <= ?
+                ORDER BY market_key, observed_at DESC, id DESC
+                """,
+                (int(chain_id), row_limit),
+            ).fetchall()
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for row in rows:
+                grouped.setdefault(str(row["market_key"]), []).append(
+                    {
+                        "projectId": int(row["project_id"]),
+                        "slug": row["slug"],
+                        "name": row["name"],
+                        "score": _clean_number(float(row["score"])),
+                        "confidence": _clean_number(float(row["confidence"])),
+                        "observedAt": int(row["observed_at"]),
+                    }
+                )
+            return grouped
         finally:
             conn.close()
 
@@ -2938,14 +4697,27 @@ class ChainEcosystemMonitor:
         self.provider_factory = provider_factory or self._default_provider_factory
         self.submitter = submitter or self._submit_thread
         self.alert_sink = alert_sink
+        self.research_candidate_sink = None
         self.stale_after_ms = max(60_000, int(stale_after_ms))
         configured_interval = refresh_interval_seconds
         if configured_interval is None:
             configured_interval = int(_safe_float(os.environ.get("CHAIN_ECOSYSTEM_REFRESH_SECONDS")) or 300)
         self.refresh_interval_ms = max(60_000, int(configured_interval) * 1000)
+        self.research_refresh_interval_ms = max(
+            60_000,
+            int(_safe_float(os.environ.get("ONCHAIN_RESEARCH_REFRESH_SECONDS")) or 60) * 1000,
+        )
         self._refresh_lock = threading.Lock()
         self._refreshing: set[int] = set()
         self._next_due_at: dict[int, int] = {}
+        self._research_refreshing = False
+        self._research_network_inflight: set[str] = set()
+        self._research_next_due_at = 0
+        self._research_network_cursor = 0
+        self._research_network_failure_streak: dict[str, int] = {}
+        self._research_network_next_due_at: dict[str, int] = {}
+        self._research_contract_inflight: set[str] = set()
+        self._research_contract_seen_at: dict[str, int] = {}
         self._stop_event = threading.Event()
         self._loop_thread: threading.Thread | None = None
 
@@ -2983,8 +4755,7 @@ class ChainEcosystemMonitor:
                 self.run_cycle()
             except Exception:
                 pass
-            wait_seconds = max(5.0, min(30.0, self.refresh_interval_ms / 4000.0))
-            self._stop_event.wait(wait_seconds)
+            self._stop_event.wait(2.0)
 
     def run_cycle(self, *, now_ms: int | None = None) -> dict[str, Any]:
         """Schedule due chains and apply bounded exponential backoff after provider failures."""
@@ -3000,7 +4771,125 @@ class ChainEcosystemMonitor:
             self._next_due_at[chain_id] = now + self.refresh_interval_ms * backoff_multiplier
             if self.schedule_refresh(chain_id):
                 scheduled.append(chain_id)
-        return {"scheduled": scheduled, "checkedAt": now}
+        research_scheduled = self.schedule_research_refresh(now_ms=now)
+        return {"scheduled": scheduled, "researchScheduled": research_scheduled, "checkedAt": now}
+
+    def _research_networks(self) -> list[str]:
+        configured = str(os.environ.get("ONCHAIN_RESEARCH_NETWORKS") or "").strip()
+        values = re.split(r"[,;\s]+", configured) if configured else list(ONCHAIN_RESEARCH_DEFAULT_NETWORKS)
+        return list(dict.fromkeys(_chain_key(value) for value in values if _chain_key(value)))
+
+    def _research_refresh_worker(self, network: str = "") -> None:
+        networks = self._research_networks()
+        if not network and networks:
+            with self._refresh_lock:
+                now = _now_ms()
+                for offset in range(len(networks)):
+                    index = (self._research_network_cursor + offset) % len(networks)
+                    candidate = networks[index]
+                    if now >= int(self._research_network_next_due_at.get(candidate, 0)):
+                        network = candidate
+                        self._research_network_cursor = (index + 1) % len(networks)
+                        break
+        try:
+            if not network:
+                return
+            result = scan_onchain_research(self.store, networks=[network], candidate_sink=self.research_candidate_sink)
+            with self._refresh_lock:
+                if result.get("ok"):
+                    self._research_network_failure_streak[network] = 0
+                    self._research_network_next_due_at[network] = _now_ms() + self.research_refresh_interval_ms
+                else:
+                    streak = min(5, int(self._research_network_failure_streak.get(network, 0)) + 1)
+                    self._research_network_failure_streak[network] = streak
+                    self._research_network_next_due_at[network] = (
+                        _now_ms() + self.research_refresh_interval_ms * (2 ** streak)
+                    )
+        finally:
+            with self._refresh_lock:
+                self._research_network_inflight.discard(network)
+                self._research_refreshing = bool(self._research_network_inflight)
+
+    def schedule_research_refresh(self, *, now_ms: int | None = None) -> bool:
+        now = int(now_ms if now_ms is not None else _now_ms())
+        scheduled = []
+        with self._refresh_lock:
+            for network in self._research_networks():
+                if network in self._research_network_inflight or now < self._research_network_next_due_at.get(network, 0):
+                    continue
+                self._research_network_inflight.add(network)
+                self._research_network_next_due_at[network] = now + self.research_refresh_interval_ms
+                scheduled.append(network)
+            self._research_refreshing = bool(self._research_network_inflight)
+        for network in scheduled:
+            try:
+                self.submitter(self._research_refresh_worker, network)
+            except Exception:
+                with self._refresh_lock:
+                    self._research_network_inflight.discard(network)
+                    self._research_refreshing = bool(self._research_network_inflight)
+                raise
+        return bool(scheduled)
+
+    def _research_contract_worker(
+        self,
+        contract_address: str,
+        source: str,
+        source_text: str,
+        observed_at: int,
+    ) -> None:
+        identity = _onchain_address(contract_address)
+        try:
+            scan_onchain_research_contract(
+                self.store,
+                contract_address,
+                source=source,
+                source_text=source_text,
+                observed_at=observed_at,
+                candidate_sink=self.research_candidate_sink,
+            )
+        finally:
+            with self._refresh_lock:
+                self._research_contract_inflight.discard(identity)
+
+    def schedule_contract_research(
+        self,
+        contract_address: Any,
+        *,
+        source: str = "external",
+        source_text: str = "",
+        observed_at: int | None = None,
+    ) -> bool:
+        """Debounce repeated mentions while allowing a new contract to scan immediately."""
+        contract = _onchain_address(contract_address)
+        if not contract:
+            return False
+        identity = contract
+        now = _now_ms()
+        with self._refresh_lock:
+            last_seen = int(self._research_contract_seen_at.get(identity, 0))
+            if identity in self._research_contract_inflight or now - last_seen < 5 * 60_000:
+                return False
+            self._research_contract_inflight.add(identity)
+            self._research_contract_seen_at[identity] = now
+            if len(self._research_contract_seen_at) > 2000:
+                cutoff = now - 24 * 60 * 60_000
+                self._research_contract_seen_at = {
+                    key: value for key, value in self._research_contract_seen_at.items() if value >= cutoff
+                }
+        try:
+            self.submitter(
+                self._research_contract_worker,
+                contract,
+                str(source or "external")[:80],
+                str(source_text or "")[:500],
+                int(observed_at or now),
+            )
+        except Exception:
+            with self._refresh_lock:
+                self._research_contract_inflight.discard(identity)
+            raise
+        return True
 
     def _default_provider_factory(self, chain: Mapping[str, Any]) -> dict[str, Any]:
         providers: dict[str, Any] = {"defillama": lambda: fetch_defillama_protocols()}
@@ -3035,9 +4924,25 @@ class ChainEcosystemMonitor:
         chains = self.store.list_chains()
         return chains[0] if chains else None
 
-    def payload(self, chain_id: int | str | None = None) -> dict[str, Any]:
-        chains = self.store.list_chains()
-        selected = self._resolve_chain(chain_id)
+    def payload(
+        self,
+        chain_id: int | str | None = None,
+        *,
+        research_day: str | None = None,
+        profile_reads: bool = False,
+    ) -> dict[str, Any]:
+        def load(label: str, callback):
+            started = time.perf_counter()
+            result = callback()
+            if profile_reads:
+                print(
+                    f"Chain ecosystem payload read: {label}={time.perf_counter() - started:.3f}s",
+                    flush=True,
+                )
+            return result
+
+        chains = load("chains", self.store.list_chains)
+        selected = load("selected", lambda: self._resolve_chain(chain_id))
         if not selected:
             return {
                 "ok": True,
@@ -3052,23 +4957,24 @@ class ChainEcosystemMonitor:
                 "updatedAt": 0,
                 "stale": False,
                 "refreshing": False,
+                "dailyResearch": self.store.onchain_research_payload(research_day=research_day),
             }
         selected_id = int(selected["id"])
-        projects = self.store.list_projects(selected_id)
-        assets = self.store.list_assets(selected_id)
+        projects = load("projects", lambda: self.store.list_projects(selected_id))
+        assets = load("assets", lambda: self.store.list_assets(selected_id))
+        relations_by_project = load("relations", lambda: self.store.list_project_markets_for_chain(selected_id))
+        evidence_by_project = load(
+            "project-evidence",
+            lambda: self.store.list_project_evidence_for_chain(selected_id, limit_per_project=40),
+        )
         assets_by_project: dict[int, list[dict[str, Any]]] = {}
         for asset in assets:
             if asset.get("projectId"):
                 assets_by_project.setdefault(int(asset["projectId"]), []).append(asset)
         project_rows: list[dict[str, Any]] = []
         for project in projects:
-            relations = self.store.list_project_markets(project["id"])
-            evidence = self.store.list_evidence(
-                selected_id,
-                subject_type="project",
-                subject_id=project["id"],
-                limit=40,
-            )
+            relations = relations_by_project.get(int(project["id"]), [])
+            evidence = evidence_by_project.get(int(project["id"]), [])
             development = None
             for row in evidence:
                 payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
@@ -3145,9 +5051,14 @@ class ChainEcosystemMonitor:
                     "source": "official_chain_config",
                 },
             )
-        latest_rankings = self.store.latest_rankings(selected_id)
+        latest_rankings = load("latest-rankings", lambda: self.store.latest_rankings(selected_id))
+        recent_leaders = load(
+            "recent-leaders",
+            lambda: self.store.recent_market_leaders_for_chain(selected_id, limit_per_market=8),
+        )
+        market_definitions = load("markets", lambda: self.store.list_markets(selected_id))
         market_rows: list[dict[str, Any]] = []
-        for market in self.store.list_markets(selected_id):
+        for market in market_definitions:
             snapshot = latest_rankings.get(market["key"])
             top: list[dict[str, Any]] = []
             for ranking in (snapshot or {}).get("rows", []):
@@ -3162,7 +5073,7 @@ class ChainEcosystemMonitor:
                         "scoreBreakdown": metrics_payload.get("scoreBreakdown", {}),
                     }
                 )
-            leaders = self.store.recent_market_leaders(selected_id, market["key"], limit=8) if top else []
+            leaders = recent_leaders.get(market["key"], []) if top else []
             leader_streak = 0
             if leaders:
                 leader_id = int(leaders[0].get("projectId") or 0)
@@ -3179,11 +5090,14 @@ class ChainEcosystemMonitor:
                     "observedAt": int((snapshot or {}).get("observedAt") or 0),
                 }
             )
-        source_health = self.store.list_source_health(selected_id)
+        source_health = load("source-health", lambda: self.store.list_source_health(selected_id))
         warnings = [f"{row['provider']} 数据延迟：{row['lastError']}" for row in source_health if row["status"] != "ok"]
         if not source_health:
             warnings.append("等待首次自动扫描")
-        evidence = self.store.list_evidence(selected_id, subject_type="chain", subject_id=selected_id, limit=20)
+        evidence = load(
+            "chain-evidence",
+            lambda: self.store.list_evidence(selected_id, subject_type="chain", subject_id=selected_id, limit=20),
+        )
         updated_candidates = [int(selected.get("updatedAt") or 0)]
         updated_candidates.extend(int(row.get("lastCheckedAt") or 0) for row in source_health)
         updated_candidates.extend(int(row.get("observedAt") or 0) for row in evidence)
@@ -3193,42 +5107,59 @@ class ChainEcosystemMonitor:
             any(row["status"] != "ok" for row in source_health)
             or (_now_ms() - max((row["lastSuccessAt"] for row in source_health), default=0) > self.stale_after_ms)
         )
+        chain_counts = load("chain-counts", self.store.chain_summary_counts)
         chain_summaries = []
         for chain in chains:
-            chain_projects = self.store.list_projects(chain["id"])
-            discovered_markets = {
-                relation["marketKey"]
-                for project in chain_projects
-                for relation in self.store.list_project_markets(project["id"])
-                if relation.get("reviewStatus") == "confirmed"
-            }
-            if chain.get("gasSymbol"):
-                discovered_markets.add("chain_token")
+            counts = chain_counts.get(int(chain["id"]), {})
+            market_count = int(counts.get("marketCount") or 0)
+            if chain.get("gasSymbol") and not counts.get("hasChainToken"):
+                market_count += 1
             chain_summaries.append(
                 {
                     **chain,
-                    "projectCount": len(chain_projects),
-                    "marketCount": len(discovered_markets),
+                    "projectCount": int(counts.get("projectCount") or 0),
+                    "marketCount": market_count,
                 }
             )
         with self._refresh_lock:
             refreshing = selected_id in self._refreshing
+            research_refreshing = self._research_refreshing
+        all_potential_projects = sorted(
+            (row for row in project_rows if row["tokenStage"] != "trading"),
+            key=lambda row: (-float(row["potentialScore"]["score"]), row["name"]),
+        )
+        visible_limit = max(
+            20,
+            min(200, int(_safe_float(os.environ.get("CHAIN_ECOSYSTEM_VISIBLE_PROJECTS")) or 80)),
+        )
+        visible_potential_projects = all_potential_projects[:visible_limit]
+        visible_project_ids = {int(row["id"]) for row in visible_potential_projects}
+        for market in market_rows:
+            for group in (market.get("top") or [], market.get("candidates") or []):
+                for row in group:
+                    project_id = int(_safe_float(row.get("projectId")) or 0)
+                    if project_id:
+                        visible_project_ids.add(project_id)
+        visible_projects = [row for row in project_rows if int(row["id"]) in visible_project_ids]
         return {
             "ok": True,
             "chains": chain_summaries,
             "selectedChain": {**selected, "evidence": evidence},
             "markets": market_rows,
-            "projects": project_rows,
-            "potentialProjects": sorted(
-                (row for row in project_rows if row["tokenStage"] != "trading"),
-                key=lambda row: (-float(row["potentialScore"]["score"]), row["name"]),
-            ),
-            "alerts": self.store.list_alerts(selected_id),
+            "projects": visible_projects,
+            "projectCount": len(project_rows),
+            "potentialProjects": visible_potential_projects,
+            "potentialProjectCount": len(all_potential_projects),
+            "alerts": load("alerts", lambda: self.store.list_alerts(selected_id)),
             "sourceHealth": source_health,
             "warnings": warnings,
             "updatedAt": updated_at,
             "stale": stale,
             "refreshing": refreshing,
+            "dailyResearch": {
+                **load("daily-research", lambda: self.store.onchain_research_payload(research_day=research_day)),
+                "refreshing": research_refreshing,
+            },
         }
 
     @staticmethod
@@ -3350,13 +5281,19 @@ class ChainEcosystemMonitor:
             raise
         return True
 
-    def refresh(self, chain_id: int | str, *, force: bool = False) -> dict[str, Any]:
+    def refresh(
+        self,
+        chain_id: int | str,
+        *,
+        force: bool = False,
+        research_day: str | None = None,
+    ) -> dict[str, Any]:
         chain = self._resolve_chain(chain_id)
         if not chain:
             raise ValueError("chain not found")
         if force:
             self.schedule_refresh(int(chain["id"]))
-        payload = self.payload(chain["id"])
+        payload = self.payload(chain["id"], research_day=research_day)
         payload["refreshScheduled"] = bool(force)
         return payload
 

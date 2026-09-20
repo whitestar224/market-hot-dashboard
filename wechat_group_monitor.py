@@ -18,7 +18,8 @@ import qq_onebot_bridge
 
 GROUP_COUNT_RE = re.compile(r"\s*[（(]\d+[）)]\s*$")
 TIME_RE = re.compile(r"^(?:\d{1,2}:\d{2}|昨天|星期[一二三四五六日天]|\d{1,2}月\d{1,2}日)$")
-SYMBOL_RE = re.compile(r"(?<![A-Za-z0-9])\$?([A-Z][A-Z0-9]{1,9})(?![A-Za-z0-9])")
+SYMBOL_RE = re.compile(r"(?<![A-Za-z0-9_@$])([A-Z0-9]{2,10})(?![A-Za-z0-9_])")
+EXPLICIT_SYMBOL_RE = re.compile(r"(?<![A-Za-z0-9_@$])\$([A-Za-z0-9]{2,20})(?![A-Za-z0-9_])")
 
 CHAT_PLATFORM_LABELS = {"wechat": "微信", "qq": "QQ"}
 
@@ -34,6 +35,31 @@ MARKET_TERMS = (
     "比特币", "以太坊", "美联储", "sec", "现货", "合约", "期权", "ipo",
 )
 NOISE_TERMS = ("哈哈", "早上好", "晚安", "收到", "好的", "在吗", "谢谢", "表情", "撤回了一条消息")
+HARD_SYMBOL_BLOCKLIST = {
+    "USDT", "USDC", "USD", "BUSD", "FDUSD", "DAI", "TUSD", "BTC", "ETH",
+}
+# Uppercase prose is common in bot feeds. These words are not token evidence
+# unless the author explicitly writes a cashtag such as $LINK or $AI.
+NON_TOKEN_ENGLISH_KEYWORDS = {
+    "AI", "API", "APP", "ETF", "IPO", "SEC", "TGE", "RT", "CA", "CEO", "CTO",
+    "DEV", "DAO", "KOL", "AMA", "NFT", "NEWS", "NEW", "UPDATE", "ALERT", "BREAKING",
+    "OFFICIAL", "LIVE", "BUY", "SELL", "LONG", "SHORT", "PUMP", "DUMP", "BULL", "BEAR",
+    "TOKEN", "COIN", "CRYPTO", "CHAIN", "WALLET", "CONTRACT", "SWAP", "SPOT", "FUTURES",
+    "PERP", "PERPS", "DEX", "CEX", "FDV", "MC", "MCAP", "TVL", "ATH", "ATL", "APR", "APY",
+    "BSC", "BNB", "SOL", "BASE", "ARB", "EVM", "GM", "GN", "LOL", "LFG", "DYOR", "NFA",
+    "LINK", "INFO", "MORE", "READ", "THREAD", "POST", "TEAM", "FROM", "ROADMAP", "COMMUNITY", "EVENT",
+    "OPEN", "CLOSE", "HIGH", "LOW", "PRICE", "VOLUME", "MARKET", "TRADING", "SIGNAL", "ENTRY",
+    "THE", "AND", "FOR", "WITH", "THIS", "THAT", "FROM", "INTO", "WILL", "WOULD", "CAN", "COULD",
+    "SHOULD", "IS", "ARE", "WAS", "WERE", "HAS", "HAVE", "HAD", "NOT", "NOW", "SOON", "TODAY",
+    "TOMORROW", "LISTED", "LISTING", "LAUNCH", "ANNOUNCEMENT", "PROJECT", "HOLDER", "HOLDERS",
+    "AVE", "WETH", "WBTC", "TIP", "ROBINHOOD", "PVP", "TH", "V1", "V2", "V3", "V4",
+}
+CRYPTO_CONTEXT_RE = re.compile(
+    r"(?:币|代币|土狗|链上|合约|现货|永续|空投|上所|上币|开盘|市值|流动性|交易所|钱包|"
+    r"meme|token|coin|crypto|on[ -]?chain|contract|perp|futures?|listing|airdrop|launch|"
+    r"binance|okx|bitget|dex|cex|bsc|solana|ethereum)",
+    re.I,
+)
 OCR_SKIP_TEXT = {
     "发送", "聊天信息", "语音聊天", "视频聊天", "查看更多消息", "以下为新消息",
     "搜索", "通讯录", "收藏", "朋友圈", "小程序", "手机端已登录", "文件传输助手",
@@ -121,15 +147,75 @@ def message_fingerprint(group_name: str, sender: str, content: str, marker: str 
     return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
 
 
+def candidate_symbol_is_ticker(value: str) -> bool:
+    """A digit-leading ticker is valid; amounts, durations and addresses are not."""
+    return bool(
+        re.search(r"[A-Z]", value)
+        and not value.startswith("0X")
+        and not re.fullmatch(r"\d+(?:[KMBT]|H|HR|D|W|MIN|MS)", value)
+    )
+
+
+def extract_explicit_candidate_symbols(text: Any) -> list[str]:
+    value = re.sub(r"https?://\S+|(?<!\w)@\w+", " ", str(text or ""))
+    return list(dict.fromkeys(
+        raw.upper() for raw in EXPLICIT_SYMBOL_RE.findall(value)
+        if candidate_symbol_is_ticker(raw.upper())
+    ))
+
+
 def extract_candidate_symbols(text: Any) -> list[str]:
-    blocked = {"USDT", "USDC", "USD", "BTC", "ETH", "API", "APP", "ETF", "IPO", "SEC", "TGE", "AI"}
+    value = re.sub(r"https?://\S+|(?<!\w)@\w+", " ", str(text or ""))
     found: list[str] = []
-    for match in SYMBOL_RE.findall(str(text or "")):
+    # Explicit cashtags take precedence over incidental uppercase prose.
+    explicit = extract_explicit_candidate_symbols(value)
+    for match in explicit:
         symbol = match.upper()
-        if symbol in blocked or symbol in found:
+        if symbol in HARD_SYMBOL_BLOCKLIST or symbol in found or not candidate_symbol_is_ticker(symbol):
+            continue
+        found.append(symbol)
+    has_crypto_context = bool(CRYPTO_CONTEXT_RE.search(value))
+    for match in SYMBOL_RE.findall(value):
+        symbol = match.upper()
+        if (
+            symbol in HARD_SYMBOL_BLOCKLIST
+            or symbol in NON_TOKEN_ENGLISH_KEYWORDS
+            or symbol in found
+            or not candidate_symbol_is_ticker(symbol)
+        ):
+            continue
+        # Quote pairs and crypto-context prose are strong enough to keep an
+        # unprefixed uppercase token. Generic English sentences are not.
+        if not has_crypto_context and not re.fullmatch(r"[A-Z0-9]{2,12}(?:USDT|USDC|USD|PERP)", symbol):
             continue
         found.append(symbol)
     return found[:8]
+
+
+def message_is_idle_chat(text: Any) -> bool:
+    """Return true only for messages with no trackable market identity or context."""
+    value = _stable_text(text)
+    if not value:
+        return True
+    if extract_candidate_symbols(value):
+        return False
+    if re.search(r"0x[0-9a-fA-F]{40}(?![0-9a-fA-F])", value):
+        return False
+    if re.search(
+        r"(?:\bca\b|合约地址|contract(?:\s+address)?)[：:\s#-]+[1-9A-HJ-NP-Za-km-z]{32,64}",
+        value,
+        flags=re.I,
+    ):
+        return False
+    lowered = value.casefold()
+    short_noise = any(term in lowered for term in NOISE_TERMS) and len(value) < 40
+    conversational = bool(re.fullmatch(
+        r"(?:哈+|好+|嗯+|哦+|收到|谢谢|辛苦了|在吗|早|早安|晚安|睡了|可以|行|没事|"
+        r"ok+|okay|thanks?|thank you|hello|hi|gm|gn|lol|[\W_]+)",
+        lowered,
+        flags=re.I,
+    ))
+    return short_noise or conversational or not bool(CRYPTO_CONTEXT_RE.search(value))
 
 
 def candidate_rule_score(text: Any) -> int:
@@ -144,7 +230,17 @@ def candidate_rule_score(text: Any) -> int:
     symbols = len(extract_candidate_symbols(value))
     links = 1 if re.search(r"https?://", value) else 0
     numbers = 1 if re.search(r"(?:\d+(?:\.\d+)?%|\d+(?:\.\d+)?[万亿])", value) else 0
-    return min(100, strong * 32 + market * 13 + symbols * 12 + links * 8 + numbers * 7)
+    contract = 1 if (
+        re.search(r"0x[0-9a-fA-F]{40}(?![0-9a-fA-F])", value)
+        or re.search(
+            r"(?:\bca\b|合约地址|contract(?:\s+address)?)[：:\s#-]+[1-9A-HJ-NP-Za-km-z]{32,64}",
+            value,
+            flags=re.I,
+        )
+    ) else 0
+    # A valid address is itself a concrete, trackable target. Give it enough
+    # weight to reach AI review even when the message contains no ticker yet.
+    return min(100, strong * 32 + market * 13 + symbols * 12 + links * 8 + numbers * 7 + contract * 40)
 
 
 def _walk(control: Any, depth: int = 0, limit: int = 1500) -> list[Any]:

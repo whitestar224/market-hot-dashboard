@@ -108,6 +108,49 @@ class BinanceWalletStructurePoolTests(unittest.TestCase):
         self.assertIn("币安钱包4H", rows[0]["structureMembershipSources"])
         self.assertEqual(rows[0]["monitorPool"], "aicoin-x-wallet")
 
+    def test_same_symbol_uses_latest_ranked_wallet_contract_instead_of_list_order(self):
+        rows = [
+            {
+                **self.wallet_row("SAME", "0xnew", 2),
+                "lastSeenAt": 1_800_000_200_000,
+                "walletHotRank": 2,
+                "walletHeat": 92,
+            },
+            {
+                **self.wallet_row("SAME", "0xold", 1),
+                "lastSeenAt": 1_800_000_100_000,
+                "walletHotRank": 1,
+                "walletHeat": 100,
+            },
+        ]
+
+        selected = server.price_structure_wallet_rows_by_symbol(rows)
+
+        self.assertEqual(selected["SAME"]["contractAddress"], "0xnew")
+
+    def test_wallet_contract_has_priority_over_a_conflicting_personal_x_contract(self):
+        wallet = {
+            **self.wallet_row("SAME", "0xwallet", 1),
+            "lastSeenAt": 1_800_000_200_000,
+            "walletHotRank": 1,
+        }
+        stored = {
+            "symbol": "SAME",
+            "personal_x_mentioned_at": 1_800_000_190_000,
+            "personal_x_source_text": "$SAME BSC 合约地址 0x1111111111111111111111111111111111111111",
+            "onchain_chain": "56",
+            "onchain_contract_address": "0x1111111111111111111111111111111111111111",
+        }
+
+        identity = server.price_structure_resolved_onchain_identity(
+            stored,
+            wallet_row=wallet,
+            market_activity={},
+        )
+
+        self.assertEqual(identity["contractAddress"], "0xwallet")
+        self.assertEqual(identity["source"], "binance-wallet-hot")
+
 
 if __name__ == "__main__":
     unittest.main()

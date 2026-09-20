@@ -55,6 +55,48 @@ class MarketAlertSpeechTests(unittest.TestCase):
         self.assertFalse(kol["title"].startswith("【"))
         self.assertEqual(kol["speech"], "")
 
+    def test_x_kol_ai_value_filter_suppresses_noise_and_keeps_information(self):
+        events = [
+            {"key": "x-noise", "source": "A", "xCategory": "kol", "originalText": "gm everyone"},
+            {"key": "x-value", "source": "B", "xCategory": "kol", "originalText": "项目主网上线并公布回购"},
+        ]
+        response = {
+            "choices": [{"message": {"content": '{"items":['
+                '{"key":"x-1","valuable":false,"valueScore":10,"informationType":"噪音","reason":"日常问候"},'
+                '{"key":"x-2","valuable":true,"valueScore":90,"informationType":"项目进展","reason":"主网上线与回购"}'
+                ']}'}}],
+        }
+        with TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(server, "deepseek_enabled", return_value=True),
+                patch.object(server, "deepseek_chat", return_value=response),
+            ):
+                accepted = server.x_kol_ai_filter_events(
+                    events,
+                    cache_path=Path(temp_dir) / "x-filter.json",
+                    settings={"provider": "test", "model": "test", "apiKey": "test", "maxTokens": 1000},
+                )
+        self.assertEqual([event["key"] for event in accepted], ["x-value"])
+
+    def test_x_tracking_never_emits_raw_popup(self):
+        now_ms = 1_800_000_000_000
+        events = [
+            {"key": "official", "title": "官方更新", "time": now_ms, "xCategory": "project_official"},
+            {"key": "kol", "title": "普通 KOL 有价值观点", "time": now_ms, "xCategory": "kol"},
+        ]
+        state = {"ready": ["x-kol"], "seen": {}}
+        feed = {"name": "x-kol", "maxAgeMs": 10 * 60 * 1000, "fetch": lambda: {}, "parse": lambda payload: events}
+        with (
+            patch.object(server, "load_site_alert_state", return_value=state),
+            patch.object(server, "save_site_alert_state"),
+            patch.object(server, "x_kol_ai_filter_events", side_effect=lambda rows: rows) as filter_events,
+            patch.object(server, "launch_desktop_alert") as launch_alert,
+            patch.object(server.time, "time", return_value=now_ms / 1000),
+        ):
+            server.sync_site_alert_feed(feed)
+        filter_events.assert_not_called()
+        launch_alert.assert_not_called()
+
     def test_aster_contract_rows_keep_perpetual_and_pending_contracts(self):
         class Response:
             def json(self):
@@ -148,8 +190,8 @@ class MarketAlertSpeechTests(unittest.TestCase):
             with (
                 patch.object(server, "ASTER_X_LISTING_CACHE_PATH", cache_path),
                 patch.object(server.time, "time", return_value=now_seconds),
-                patch.object(server, "x_kol_token", return_value="configured"),
-                patch.object(server, "x_kol_fetch_api_source", return_value=x_payload),
+                patch.object(server, "x_kol_fetch_rss_source", return_value=x_payload),
+                patch.object(server, "x_kol_fetch_api_source", side_effect=AssertionError("Aster must not use paid X API")),
             ):
                 rows = server.aster_official_x_listing_rows()
 
@@ -208,11 +250,7 @@ class MarketAlertSpeechTests(unittest.TestCase):
             ],
         }
 
-        event = server.parse_site_aster_contract_events(payload)[0]
-
-        self.assertEqual(event["key"], "aster-contract:TUTUSDT")
-        self.assertEqual(event["speech"], "Aster 合约上新公告，TUT 永续合约已上线。")
-        self.assertEqual(event["queuePriority"], 80)
+        self.assertEqual(server.parse_site_aster_contract_events(payload), [])
 
     def test_aster_announcements_bootstrap_recent_only_then_keep_new_additions(self):
         now_seconds = 1_800_000_000
@@ -299,8 +337,7 @@ class MarketAlertSpeechTests(unittest.TestCase):
             self.assertEqual(launch_alert.call_count, 0)
             server.sync_site_alert_feed(feed)
 
-        self.assertEqual(launch_alert.call_count, 1)
-        self.assertEqual(launch_alert.call_args.args[0]["key"], "aster-contract:NEWUSDT")
+        self.assertEqual(launch_alert.call_count, 0)
 
     def test_rank_new_entry_has_speech_but_other_rank_changes_do_not(self):
         row = {
@@ -337,7 +374,7 @@ class MarketAlertSpeechTests(unittest.TestCase):
             "chain": "56",
             "chainLabel": "BSC",
             "contractAddress": "0xFf673079235560e4de3fe4554c9981d759Af7777",
-            "url": "https://web3.binance.com/en/token/bsc/0xff673079235560e4de3fe4554c9981d759af7777",
+            "url": "https://www.binance.com/zh-CN/futures/TESTUSDT",
         }
 
         snapshot = server.rank_monitor_snapshot(source, row, 2, "hot")
@@ -347,8 +384,79 @@ class MarketAlertSpeechTests(unittest.TestCase):
         self.assertEqual(event["kind"], "币安钱包24小时热门榜新进")
         self.assertEqual(event["title"], "币安钱包24小时热门榜新进：我的女友景甜")
         self.assertEqual(event["speech"], "币安钱包热门榜新进，我的女友景甜 新进入24小时热门榜前十。")
-        self.assertEqual(event["url"], row["url"])
+        self.assertEqual(
+            event["url"],
+            "https://web3.binance.com/en/token/bsc/0xFf673079235560e4de3fe4554c9981d759Af7777?ref=MQ6JD2X4",
+        )
+        self.assertEqual(event["contractAddress"], row["contractAddress"])
+        self.assertEqual(event["chain"], row["chain"])
         self.assertEqual(event["queuePriority"], 74)
+
+    def test_binance_wallet_four_hour_popup_body_is_one_sentence_project_intro(self):
+        source = {
+            "id": "binance-wallet-hot",
+            "title": "币安钱包热门榜",
+            "sourceLabel": "BW",
+            "group": "crypto",
+            "period": "4h",
+            "periodLabel": "4 小时",
+        }
+        row = {
+            "rank": 9,
+            "symbol": "PERPSPAD",
+            "name": "PERPSPAD",
+            "price": "$0.00023594",
+            "change": "+28.99%",
+            "amount": 2_720_000,
+            "turnover": "4 小时成交 $2.72M",
+            "chain": "4663",
+            "chainLabel": "Robinhood",
+            "contractAddress": "0x14778a17d61ccc17a22265b6d7d434c7a5559700",
+            "narrativeLabel": "链上生态 / 交易平台",
+            "narrativeLabels": ["链上生态 / 交易平台"],
+            "url": "https://web3.binance.com/en/token/robinhood/0x14778a17d61ccc17a22265b6d7d434c7a5559700",
+        }
+
+        snapshot = server.rank_monitor_snapshot(source, row, 8, "hot")
+        event = server.rank_monitor_event("hot", snapshot, "new")
+
+        self.assertEqual(
+            event["body"],
+            "PERPSPAD 是 Robinhood 上主打链上生态、交易平台叙事的代币。",
+        )
+        self.assertNotIn("排名", event["body"])
+        self.assertNotIn("$", event["body"])
+        self.assertIn("榜单排名 #9", event["explanationContext"]["marketSnapshot"])
+        self.assertIn("价格 $0.00023594", event["explanationContext"]["marketSnapshot"])
+
+    def test_binance_wallet_four_hour_popup_prefers_official_binance_ai_narrative(self):
+        source = {
+            "id": "binance-wallet-hot",
+            "title": "币安钱包热门榜",
+            "sourceLabel": "BW",
+            "group": "crypto",
+            "period": "4h",
+            "periodLabel": "4 小时",
+        }
+        row = {
+            "rank": 4,
+            "symbol": "STONK",
+            "name": "STONK",
+            "chain": "CT_501",
+            "chainLabel": "Solana",
+            "contractAddress": "6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx",
+            "binanceAiNarrative": "STONK 源自互联网迷因 stonks，聚焦社区驱动的金融幽默文化。",
+            "narrativeLabel": "链上生态 / 交易平台",
+        }
+
+        snapshot = server.rank_monitor_snapshot(source, row, 3, "hot")
+        event = server.rank_monitor_event("hot", snapshot, "new")
+
+        self.assertEqual(
+            event["body"],
+            "STONK 源自互联网迷因 stonks，聚焦社区驱动的金融幽默文化。",
+        )
+        self.assertNotIn("链上生态", event["body"])
 
     def test_binance_wallet_monitor_baselines_then_broadcasts_every_new_top_ten_entry(self):
         def source(rows):
@@ -357,8 +465,8 @@ class MarketAlertSpeechTests(unittest.TestCase):
                 "title": "币安钱包热门榜",
                 "sourceLabel": "BW",
                 "group": "crypto",
-                "period": "24h",
-                "periodLabel": "24 小时",
+                "period": "4h",
+                "periodLabel": "4 小时",
                 "status": "ok",
                 "rows": rows,
             }
@@ -400,8 +508,8 @@ class MarketAlertSpeechTests(unittest.TestCase):
         self.assertEqual(len(events), 2)
         self.assertEqual(launch_alert.call_count, 2)
         titles = {call.args[0]["title"] for call in launch_alert.call_args_list}
-        self.assertIn("币安钱包24小时热门榜新进：我的女友景甜", titles)
-        self.assertIn("币安钱包24小时热门榜新进：NEWMEME", titles)
+        self.assertIn("币安钱包4小时热门榜新进：我的女友景甜", titles)
+        self.assertIn("币安钱包4小时热门榜新进：NEWMEME", titles)
 
     def test_stock_rank_new_entry_uses_company_name(self):
         row = {
@@ -435,8 +543,8 @@ class MarketAlertSpeechTests(unittest.TestCase):
 
         events = server.parse_site_listing_events(payload)
 
-        self.assertEqual(events[0]["speech"], "交易所上新提醒，Binance 将上线 TEST。")
-        self.assertEqual(events[1]["speech"], "上市信息提醒，测试科技将在纳斯达克上市。")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["speech"], "上市信息提醒，测试科技将在纳斯达克上市。")
 
     def test_gainers_leader_has_speech(self):
         payload = {
@@ -525,7 +633,7 @@ class MarketAlertSpeechTests(unittest.TestCase):
         self.assertIn({"symbol": "BIANRENSHENG", "name": "币安人生"}, group["members"])
         self.assertNotIn({"symbol": "BANANAS31", "name": "币安人生"}, group["members"])
 
-    def test_rotation_map_uses_dynamic_same_chain_candidates(self):
+    def test_rotation_map_uses_dynamic_semantic_candidates(self):
         market = {
             "sources": [
                 {
@@ -542,6 +650,7 @@ class MarketAlertSpeechTests(unittest.TestCase):
                             "amount": "$2.00M",
                             "chain": "bsc",
                             "chainLabel": "BNB Chain",
+                            "themes": ["Animal Meme"],
                             "url": "https://ave.ai/token/cys",
                         },
                         {
@@ -554,6 +663,7 @@ class MarketAlertSpeechTests(unittest.TestCase):
                             "amount": "$900.00K",
                             "chain": "bsc",
                             "chainLabel": "BNB Chain",
+                            "themes": ["Animal Meme"],
                             "url": "https://ave.ai/token/toad",
                         },
                     ],
@@ -577,6 +687,178 @@ class MarketAlertSpeechTests(unittest.TestCase):
         self.assertEqual(payload["maps"][0]["mappingStatus"], "mapped")
         self.assertEqual(payload["maps"][0]["candidates"][0]["symbol"], "TOAD")
         self.assertEqual(payload["maps"][0]["candidates"][0]["url"], "https://ave.ai/token/toad")
+
+    def test_rotation_map_does_not_treat_source_or_ranking_tags_as_a_theme(self):
+        market = {
+            "sources": [{
+                "id": "okx",
+                "title": "OKX 热门币种",
+                "rows": [
+                    {"rank": 1, "symbol": "PONS", "name": "PONS", "tags": ["OKX official hot", "24 小时"]},
+                    {"rank": 2, "symbol": "ARB", "name": "ARB", "tags": ["OKX official hot", "24 小时"]},
+                ],
+            }],
+        }
+        tickers = {
+            symbol: {
+                "symbol": symbol,
+                "priceValue": 1,
+                "changeValue": 2,
+                "turnoverValue": 2_000_000,
+                "exchange": "OKX SWAP",
+            }
+            for symbol in ("PONS", "ARB")
+        }
+
+        payload = server.rotation_map_payload(
+            market=market,
+            tickers=tickers,
+            leader_metrics={"PONS": {"impulseGainPct": 3738.2}},
+        )
+
+        self.assertEqual(payload["maps"][0]["leader"]["symbol"], "PONS")
+        self.assertEqual(payload["maps"][0]["candidates"], [])
+
+    def test_rotation_discussion_does_not_confuse_meme_word_with_meme_token(self):
+        discussion = [{
+            "source": "X/KOL",
+            "time": 1_800_000_000_000,
+            "text": "Aster 吉祥物形成社区 MEME，真正被提及的标的是 $DUST。",
+        }]
+
+        meme_context = server.deepseek_row_discussion_context(
+            {"symbol": "MEME", "name": "A Meme Coin"},
+            discussion,
+        )
+        dust_context = server.deepseek_row_discussion_context(
+            {"symbol": "DUST", "name": "Dust"},
+            discussion,
+        )
+
+        self.assertEqual(meme_context, "")
+        self.assertIn("$DUST", dust_context)
+
+    def test_rotation_rejects_cached_aster_mascot_claim_for_meme_token(self):
+        leaders = server.normalize_rotation_ai_leaders(
+            [{
+                "symbol": "MEME",
+                "confidence": 88,
+                "family": "Aster 关联 Meme",
+                "narratives": ["Aster 吉祥物叙事"],
+                "reason": "借助 Aster 吉祥物形成社区 Meme",
+                "peers": [],
+            }],
+            {"MEME", "DUST"},
+        )
+
+        self.assertEqual(leaders, [])
+
+    def test_real_animal_meme_family_requires_real_subject_evidence(self):
+        evidenced = server.rotation_meme_family_context({
+            "name": "KABOSU MOM",
+            "tags": ["动物 Meme"],
+            "discussion": "这是现实中的宠物狗 Kabosu 的妈妈，同一家族原型。",
+        })
+        generic = server.rotation_meme_family_context({
+            "name": "MOM COIN",
+            "tags": ["妈妈主题 Meme"],
+            "discussion": "社区把它叫作妈妈币。",
+        })
+
+        self.assertEqual(evidenced["entityType"], "real-animal")
+        self.assertIn("妈妈", evidenced["roles"])
+        self.assertEqual(generic, {})
+
+    def test_rotation_ai_preserves_real_meme_family_subject_and_role(self):
+        leaders = server.normalize_rotation_ai_leaders(
+            [{
+                "symbol": "DOGEONE",
+                "confidence": 90,
+                "memeEntityType": "real-animal",
+                "familySubject": "Kabosu",
+                "narratives": ["真实动物家族 Meme"],
+                "reason": "基于同一真实宠物家族",
+                "peers": [{
+                    "symbol": "DOGEMOM",
+                    "relationshipType": "family",
+                    "familyRole": "妈妈",
+                    "reason": "现实中属于同一宠物家族，角色是妈妈",
+                }],
+            }],
+            {"DOGEONE", "DOGEMOM"},
+        )
+
+        self.assertEqual(leaders[0]["memeEntityType"], "real-animal")
+        self.assertEqual(leaders[0]["familySubject"], "Kabosu")
+        self.assertEqual(leaders[0]["peers"][0]["familyRole"], "妈妈")
+
+        payload = server.rotation_map_payload(
+            market={"sources": [{
+                "id": "binance-wallet-hot",
+                "title": "币安钱包热门",
+                "rows": [
+                    {"symbol": "DOGEONE", "name": "Doge One", "chain": "bsc"},
+                    {"symbol": "DOGEMOM", "name": "Doge Mom", "chain": "solana"},
+                ],
+            }]},
+            tickers={
+                "DOGEONE": {"symbol": "DOGEONE", "priceValue": 1, "changeValue": 8, "turnoverValue": 2_000_000, "exchange": "Ave.ai"},
+                "DOGEMOM": {"symbol": "DOGEMOM", "priceValue": 0.2, "changeValue": 2, "turnoverValue": 1_000_000, "exchange": "Ave.ai"},
+            },
+            leader_metrics={"DOGEONE": {"impulseGainPct": 450}},
+            ai_snapshot={"status": "ready", "leaders": leaders},
+        )
+        mapping = payload["maps"][0]
+        self.assertIn("妈妈 · Doge Mom", mapping["familyLabels"])
+        self.assertEqual(mapping["candidates"][0]["familyRole"], "妈妈")
+
+    def test_rotation_map_keeps_confirmed_pair_and_reverses_cross_chain_theme(self):
+        market = {
+            "sources": [{
+                "id": "binance-wallet-hot",
+                "title": "币安钱包热门",
+                "rows": [
+                    {"symbol": "PONS", "name": "PONS", "chain": "robinhood", "chainLabel": "Robinhood"},
+                    {"symbol": "PAIR", "name": "PAIR", "chain": "robinhood", "chainLabel": "Robinhood"},
+                    {"symbol": "BREW", "name": "BREW", "chain": "bsc", "chainLabel": "BNB Chain"},
+                ],
+            }],
+        }
+        tickers = {
+            "PONS": {"symbol": "PONS", "priceValue": 1, "changeValue": 10, "turnoverValue": 5_000_000, "exchange": "Ave.ai"},
+            "BREW": {"symbol": "BREW", "priceValue": 0.2, "changeValue": 3, "turnoverValue": 2_000_000, "exchange": "Ave.ai"},
+        }
+        ai_snapshot = {
+            "status": "ready",
+            "leaders": [
+                {
+                    "symbol": "PONS", "confidence": 96, "family": "币股配对发行平台", "narratives": ["币股配对发行平台"],
+                    "reason": "主线龙头", "peers": [{
+                        "symbol": "PAIR", "relationshipType": "theme", "reason": "同属币股配对发行平台题材",
+                    }],
+                },
+                {
+                    "symbol": "BREW", "confidence": 72, "family": "BSC Launchpad", "narratives": ["发行平台"],
+                    "reason": "BSC 平台币", "peers": [{
+                        "symbol": "PONS", "relationshipType": "theme", "reason": "复制 PONS 的发行平台路径",
+                    }],
+                },
+            ],
+        }
+
+        payload = server.rotation_map_payload(
+            market=market,
+            tickers=tickers,
+            leader_metrics={"PONS": {"impulseGainPct": 500}},
+            ai_snapshot=ai_snapshot,
+        )
+        pons = next(item for item in payload["maps"] if item["leader"]["symbol"] == "PONS")
+        candidates = {item["symbol"]: item for item in pons["candidates"]}
+
+        self.assertIn("PAIR", candidates)
+        self.assertFalse(candidates["PAIR"]["marketDataAvailable"])
+        self.assertIn("BREW", candidates)
+        self.assertIn("cross-chain-type", candidates["BREW"]["signals"])
 
     def test_rotation_map_keeps_qualified_leader_while_candidates_are_analyzed(self):
         market = {
@@ -636,16 +918,19 @@ class MarketAlertSpeechTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["leaders"], 0)
         self.assertEqual(payload["maps"], [])
 
-    def test_rotation_map_adds_only_gainer_leaders_observed_after_leader_launch(self):
-        now_ms = 1_800_000_000_000
-        launch_at = now_ms - 2 * 24 * 60 * 60 * 1000
+    def test_rotation_map_does_not_use_gainer_board_as_mapping_evidence(self):
         market = {
             "sources": [
                 {
                     "id": "binance",
                     "title": "Binance 热门币种",
                     "rows": [{"rank": 1, "symbol": "LEAD", "name": "Leader", "change": "+30%"}],
-                }
+                },
+                {
+                    "id": "binance-gainers",
+                    "title": "Binance 涨幅榜",
+                    "rows": [{"rank": 1, "symbol": "TOP", "name": "Top Coin", "change": "+900%"}],
+                },
             ]
         }
         tickers = {
@@ -657,7 +942,7 @@ class MarketAlertSpeechTests(unittest.TestCase):
                 "exchange": "Binance Futures",
                 "marketSymbol": f"{symbol}USDT",
             }
-            for symbol in ("LEAD", "TOP", "OLD")
+            for symbol in ("LEAD", "TOP")
         }
 
         payload = server.rotation_map_payload(
@@ -668,36 +953,14 @@ class MarketAlertSpeechTests(unittest.TestCase):
                     "impulseGainPct": 410,
                     "launchLow": 1,
                     "swingHigh": 5.1,
-                    "launchAt": launch_at,
+                    "launchAt": 1_799_000_000_000,
                 }
             },
-            gainer_history=[
-                {
-                    "assetKey": "CRYPTO:TOP",
-                    "symbol": "TOP",
-                    "name": "Top Coin",
-                    "sourceTitle": "Binance 涨幅榜",
-                    "observedAt": now_ms - 24 * 60 * 60 * 1000,
-                },
-                {
-                    "assetKey": "CRYPTO:OLD",
-                    "symbol": "OLD",
-                    "name": "Old Coin",
-                    "sourceTitle": "OKX 合约涨幅榜",
-                    "observedAt": now_ms - 3 * 24 * 60 * 60 * 1000,
-                },
-            ],
-            now_ms=now_ms,
         )
 
-        candidates = {item["symbol"]: item for item in payload["maps"][0]["candidates"]}
-        self.assertIn("TOP", candidates)
-        self.assertNotIn("OLD", candidates)
-        self.assertIn("post-leader-gainer-top", candidates["TOP"]["signals"])
+        self.assertNotIn("TOP", {item["symbol"] for item in payload["maps"][0]["candidates"]})
 
-    def test_rotation_map_merges_family_and_gainer_evidence(self):
-        now_ms = 1_800_000_000_000
-        launch_at = now_ms - 2 * 24 * 60 * 60 * 1000
+    def test_rotation_map_ai_can_select_real_leader_below_fallback_threshold(self):
         market = {
             "sources": [
                 {
@@ -731,30 +994,183 @@ class MarketAlertSpeechTests(unittest.TestCase):
             tickers=tickers,
             leader_metrics={
                 "TUT": {
-                    "impulseGainPct": 520,
+                    "impulseGainPct": 220,
                     "launchLow": 0.01,
                     "swingHigh": 0.08,
-                    "launchAt": launch_at,
+                    "launchAt": 1_799_000_000_000,
                 }
             },
-            gainer_history=[
-                {
-                    "assetKey": "CRYPTO:TST",
-                    "symbol": "TST",
-                    "name": "Test Token",
-                    "sourceTitle": "Binance 涨幅榜",
-                    "observedAt": now_ms - 60 * 60 * 1000,
-                }
-            ],
-            now_ms=now_ms,
+            ai_snapshot={
+                "status": "ready",
+                "provider": "test-ai",
+                "updatedAt": 1_800_000_000_000,
+                "leaders": [{
+                    "symbol": "TUT",
+                    "confidence": 91,
+                    "leaderType": "Meme 叙事龙头",
+                    "family": "Four.meme 家族",
+                    "narratives": ["Four.meme", "Meme"],
+                    "reason": "近期叙事心智与多源持续性领先",
+                    "peers": [{
+                        "symbol": "TST",
+                        "relationshipType": "family",
+                        "reason": "同属 Four.meme 家族",
+                    }],
+                }],
+            },
         )
 
         matches = [item for item in payload["maps"][0]["candidates"] if item["symbol"] == "TST"]
         self.assertEqual(len(matches), 1)
-        self.assertEqual(
-            set(matches[0]["signals"]),
-            {"family", "post-leader-gainer-top"},
+        self.assertIn("family", matches[0]["signals"])
+        self.assertEqual(payload["maps"][0]["leader"]["aiConfidence"], 91)
+
+    def test_rotation_map_keeps_300_percent_onchain_leader_missing_from_old_ai_snapshot(self):
+        market = {
+            "sources": [{
+                "id": "binance-wallet-hot",
+                "title": "币安钱包热门",
+                "rows": [
+                    {"rank": 1, "symbol": "PONS", "name": "PONS", "themes": ["Robinhood Meme"]},
+                    {"rank": 2, "symbol": "MARSCOIN", "name": "MarsCoin", "themes": ["Space Meme"]},
+                ],
+            }],
+        }
+        payload = server.rotation_map_payload(
+            market=market,
+            tickers={},
+            leader_metrics={
+                "PONS": {"impulseGainPct": 3738.2, "provider": "链上多源 K线"},
+                "MARSCOIN": {"impulseGainPct": 630.42, "provider": "链上多源 K线"},
+            },
+            ai_snapshot={
+                "status": "ready",
+                "leaders": [{
+                    "symbol": "PONS",
+                    "confidence": 96,
+                    "leaderType": "近期真实龙头",
+                    "family": "Robinhood Meme",
+                    "narratives": ["Robinhood Meme"],
+                    "reason": "链上主升和叙事心智共振",
+                    "peers": [],
+                }],
+            },
         )
+
+        leaders = {item["leader"]["symbol"]: item["leader"] for item in payload["maps"]}
+        self.assertEqual(leaders["PONS"]["impulseGainPct"], 3738.2)
+        self.assertEqual(leaders["MARSCOIN"]["impulseGainPct"], 630.42)
+
+    def test_rotation_ai_worker_merges_increment_without_losing_existing_result(self):
+        pons = {
+            "symbol": "PONS",
+            "confidence": 96,
+            "leaderType": "近期真实龙头",
+            "family": "Robinhood Meme",
+            "narratives": ["Robinhood Meme"],
+            "reason": "既有结论",
+            "peers": [],
+        }
+        mars_row = {"symbol": "MARSCOIN", "sources": ["币安钱包热门"], "impulseGainPct": 630.42}
+        response = {
+            "choices": [{"message": {"content": '{"leaders":[{"symbol":"MARSCOIN","confidence":92,"leaderType":"链上Meme龙头","family":"Space Meme","narratives":["Space Meme"],"reason":"链上主升超过六倍","peers":[]}]}'}}],
+            "_provider": "codex-cli",
+        }
+        with TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "rotation-ai.json"
+            server.write_json_cache(cache_path, {
+                "version": 3,
+                "updatedAt": 1,
+                "provider": "codex-cli",
+                "analyzed": {},
+                "leaders": [pons],
+            })
+            with patch.object(server, "ROTATION_AI_CACHE_PATH", cache_path), patch.object(server, "deepseek_chat", return_value=response):
+                server.rotation_ai_worker([mars_row], [mars_row], {})
+            no_leader_row = {"symbol": "OTHER", "sources": ["Binance"], "impulseGainPct": 20}
+            empty_response = {
+                "choices": [{"message": {"content": '{"leaders":[]}'}}],
+                "_provider": "codex-cli",
+            }
+            with patch.object(server, "ROTATION_AI_CACHE_PATH", cache_path), patch.object(server, "deepseek_chat", return_value=empty_response):
+                server.rotation_ai_worker([no_leader_row], [no_leader_row], {})
+            stored = server.read_json_cache(cache_path)
+
+        self.assertEqual({item["symbol"] for item in stored["leaders"]}, {"PONS", "MARSCOIN"})
+        self.assertEqual(stored["version"], 3)
+        self.assertEqual(
+            stored["analyzed"]["MARSCOIN"]["fingerprint"],
+            server.rotation_ai_row_fingerprint(mars_row),
+        )
+        self.assertIn("OTHER", stored["analyzed"])
+
+    def test_rotation_ai_snapshot_has_no_ttl_rerun_for_unchanged_rows(self):
+        row = {"symbol": "PONS", "sources": ["币安钱包热门"], "impulseGainPct": 3738.2}
+        leader = {
+            "symbol": "PONS",
+            "confidence": 96,
+            "leaderType": "近期真实龙头",
+            "family": "Robinhood Meme",
+            "narratives": ["Robinhood Meme"],
+            "reason": "既有结论",
+            "peers": [],
+        }
+        with TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "rotation-ai.json"
+            server.write_json_cache(cache_path, {
+                "version": 3,
+                "updatedAt": 1,
+                "provider": "codex-cli",
+                "analyzed": {"PONS": {"fingerprint": server.rotation_ai_row_fingerprint(row), "analyzedAt": 1}},
+                "leaders": [leader],
+            })
+            with (
+                patch.object(server, "ROTATION_AI_CACHE_PATH", cache_path),
+                patch.object(server, "deepseek_enabled", return_value=True),
+                patch.object(server.ROTATION_AI_POOL, "submit") as submit,
+                patch.object(server, "ROTATION_AI_INFLIGHT", False),
+                patch.object(server, "ROTATION_AI_RETRY_AFTER", 0.0),
+            ):
+                snapshot = server.rotation_ai_leader_snapshot([row])
+
+        self.assertEqual(snapshot["status"], "ready")
+        self.assertEqual(snapshot["leaders"][0]["symbol"], "PONS")
+        submit.assert_not_called()
+
+    def test_rotation_alerts_baseline_then_reports_new_leader_and_semantic_change(self):
+        initial = {"updatedAt": 1_800_000_000_000, "maps": []}
+        leader = {
+            "updatedAt": 1_800_000_060_000,
+            "maps": [{
+                "family": "PONS 家族",
+                "themes": ["Robinhood Chain Meme"],
+                "leader": {"symbol": "PONS", "aiConfidence": 92, "aiReason": "近期叙事心智领先"},
+                "candidates": [{
+                    "symbol": "AI",
+                    "signals": ["family"],
+                    "semanticReasons": ["同属 Robinhood Chain Meme 家族"],
+                }],
+            }],
+        }
+        changed = {
+            **leader,
+            "updatedAt": 1_800_000_120_000,
+            "maps": [{
+                **leader["maps"][0],
+                "candidates": [
+                    *leader["maps"][0]["candidates"],
+                    {"symbol": "BONER", "signals": ["theme"], "semanticReasons": ["共享社区 Meme 题材"]},
+                ],
+            }],
+        }
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "rotation-alert.json"
+            self.assertEqual(server.parse_site_rotation_map_events(initial, state_path=state_path), [])
+            new_events = server.parse_site_rotation_map_events(leader, state_path=state_path)
+            self.assertEqual(server.parse_site_rotation_map_events(leader, state_path=state_path), [])
+            changed_events = server.parse_site_rotation_map_events(changed, state_path=state_path)
+        self.assertEqual(new_events[0]["title"], "新龙头入池：PONS")
+        self.assertIn("BONER", changed_events[0]["body"])
 
     def test_gainer_leader_history_baselines_then_records_real_change(self):
         first_payload = {

@@ -147,11 +147,11 @@ test("human analysis context can declare a main-wave expectation without bypassi
 });
 
 test("the page, strategy engine and persistent analysis cache publish the same strategy version", () => {
-  assert.match(js, /STRATEGY_CACHE_VERSION = "v89"/);
+  assert.match(js, /STRATEGY_CACHE_VERSION = "v91"/);
   for (const asset of ["dragon-wave-cases.js", "dragon-wave-data.js", "dragon-wave-engine.js", "dragon-wave.js"]) {
-    assert.match(html, new RegExp(`${asset.replace(".", "\\.")}\\?v=89`));
+    assert.match(html, new RegExp(`${asset.replace(".", "\\.")}\\?v=91`));
   }
-  assert.match(analysisWorkerSource, /dragon-wave-engine\.js\?v=89/);
+  assert.match(analysisWorkerSource, /dragon-wave-engine\.js\?v=91/);
 });
 
 test("buy-point feedback can be confirmed or denied directly on the K-line canvas", () => {
@@ -466,7 +466,7 @@ test("documented leader pairs keep leader permission even after the symbol field
 test("refresh restores the active chart first and reuses a bounded persistent analysis cache", () => {
   assert.match(js, /MARKET_CACHE_DB = "dragon-wave-market-cache-v1"/);
   assert.match(js, /window\.indexedDB\.open/);
-  assert.match(js, /STRATEGY_CACHE_VERSION = "v89"/);
+  assert.match(js, /STRATEGY_CACHE_VERSION = "v91"/);
   assert.match(js, /MARKET_CACHE_LIMIT = 48/);
   assert.match(js, /historical \? 30 \* 24 \* 60 \* 60_000 : 2 \* 60_000/);
   assert.match(js, /function provisionalChartResult/);
@@ -519,10 +519,60 @@ test("historical cases load locally precomputed results before browser or exchan
   assert.match(quietServerSource, /X-Dragon-Wave-Precomputed/);
 });
 
+function localPrecomputedReaderForTest(fetch) {
+  const source = js.slice(js.indexOf("  async function readLocalPrecomputed(params)"), js.indexOf("  function localPrecomputePendingError()"));
+  return new Function("fetch", "Data", "STRATEGY_CACHE_VERSION", "normalizeMainWaveStage", `${source}; return readLocalPrecomputed;`)(
+    fetch, { normalizePair: value => value, isCandleCoverageAcceptable: () => true }, "v90", value => value,
+  );
+}
+
+function localPrecomputedTestCase() {
+  const params = { historicalDocument: true, pair: "TUTUSDT", caseStart: "2026-07-09", caseEnd: "2026-08-10", interval: "1h", market: "futures", mainWaveStage: "active", window: {} };
+  const payload = { version: "v90", pair: params.pair, start: params.caseStart, end: params.caseEnd, interval: params.interval, market: params.market, mainWaveStage: params.mainWaveStage, result: { candles: [{ time: 1 }], signals: [{ time: 1, status: "buy" }] } };
+  return { params, payload };
+}
+
+test("local precomputed GET revalidates an existing HTTP cache entry with ETag", async () => {
+  const { params, payload } = localPrecomputedTestCase();
+  let options;
+  const read = localPrecomputedReaderForTest(async (url, requestOptions) => {
+    assert.match(url, /^\/api\/dragon-wave-precomputed\?/);
+    options = requestOptions;
+    return { ok: true, status: 200, json: async () => ({ ...payload, contextComplete: true }) };
+  });
+  assert.equal((await read(params)).contextComplete, true);
+  assert.equal(options.cache, "no-cache");
+});
+
+test("partial-context precomputed data stays pending but legacy complete data remains readable", async () => {
+  const { params, payload } = localPrecomputedTestCase();
+  let current = { ...payload, contextComplete: false };
+  const read = localPrecomputedReaderForTest(async () => ({ ok: true, status: 200, json: async () => current }));
+  const pending = await read(params);
+  assert.deepEqual(pending, { pending: true, contextComplete: false });
+  assert.equal(pending.result, undefined);
+  current = payload;
+  assert.equal(await read(params), payload);
+});
+
+test("a missing precomputed API is reported instead of pretending a background job is running", async () => {
+  const { params } = localPrecomputedTestCase();
+  const read = localPrecomputedReaderForTest(async () => ({ ok: false, status: 404 }));
+  await assert.rejects(read(params), { code: "local-precompute-unavailable" });
+});
+
+test("explicit partial-context waits for final precompute instead of falling back to stale IndexedDB", async () => {
+  const source = js.slice(js.indexOf("  async function loadAnalyzedInterval(params)"), js.indexOf("    const persistentKey = analyzedCacheKey(params)", js.indexOf("  async function loadAnalyzedInterval(params)")));
+  const load = new Function("readLocalPrecomputed", "localPrecomputePendingError", `${source}\n throw new Error('unexpected IndexedDB fallback');\n }; return loadAnalyzedInterval;`)(
+    async () => ({ pending: true, contextComplete: false }), () => Object.assign(new Error("pending"), { code: "local-precompute-pending" }),
+  );
+  await assert.rejects(load({ historicalDocument: true }), { code: "local-precompute-pending" });
+});
+
 test("the launcher warms historical leaders in a hidden low-priority process", () => {
   assert.match(launcher, /start_dragon_wave_precompute\.ps1/);
-  assert.match(launcher, /-Version v89/);
-  assert.match(launcher, /dragon-wave\.html\?v=89/);
+  assert.match(launcher, /-Version v91/);
+  assert.match(launcher, /dragon-wave\.html\?v=91/);
   assert.match(precomputeLauncher, /PriorityClass = "Idle"/);
   assert.match(precomputeSource, /dragon-wave-precomputed/);
   assert.match(precomputeSource, /zlib\.gzipSync/);
@@ -610,6 +660,6 @@ test("launcher uses a quiet detached server so repeated requests cannot block th
   assert.match(launcher, /pythonw\.exe/i);
   assert.match(launcher, /quiet_http_server\.py/i);
   assert.match(launcher, /Start-Sleep -Milliseconds 1200/);
-  assert.match(launcher, /dragon-wave\.html\?v=89/);
+  assert.match(launcher, /dragon-wave\.html\?v=91/);
   assert.ok(fs.existsSync(path.join(root, "quiet_http_server.py")));
 });

@@ -8,6 +8,16 @@ import server
 
 
 class BinanceWalletPriorHighTests(unittest.TestCase):
+    def test_page_payload_never_waits_for_activity_network_calls(self):
+        row = {"symbol": "SOPH", "manual_pinned": 1}
+        with patch.object(server, "price_watch_active_rows", return_value=[row]), \
+             patch.object(server, "NEW_COIN_LOW_ACTIVITY_CACHE", None), \
+             patch.object(server, "PRICE_MONITOR_ACTIVITY_STATES", {}), \
+             patch.object(server, "fetch_new_coin_low_market_activity", side_effect=AssertionError("network on page read")), \
+             patch.object(server, "price_structure_onchain_activity_state", side_effect=AssertionError("network on page read")):
+            payload = server.price_watch_payload(sync_candidates=False)
+        self.assertEqual(payload["items"][0]["symbol"], "SOPH")
+
     def setUp(self):
         handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         handle.close()
@@ -95,6 +105,31 @@ class BinanceWalletPriorHighTests(unittest.TestCase):
             active_symbols = {item["symbol"] for item in server.price_watch_active_rows()}
         self.assertNotIn("我的女友景甜", active_symbols)
         self.assertTrue(server.price_structure_symbol_excluded("我的女友景甜"))
+
+    def test_wallet_reentry_cannot_override_manual_exclusion(self):
+        base_ms = 1_800_000_000_000
+        row = self.wallet_row("MARSCOIN", "0x9876", base_ms)
+        server.sync_price_watch_binance_wallet_candidates([row], now_ms=base_ms)
+        server.exclude_price_structure_symbol("MARSCOIN")
+        sample_ms = server.PRICE_STRUCTURE_REENTRY_CONFIRM_INTERVAL_SECONDS * 1000
+        minimum_ms = server.PRICE_STRUCTURE_REENTRY_ABSENT_MIN_SECONDS * 1000
+        for observed_at in (base_ms, base_ms + sample_ms, base_ms + minimum_ms):
+            server.reconcile_price_structure_exclusions(
+                {"OTHER"},
+                source_is_current=True,
+                now_ms=observed_at,
+            )
+
+        reentry_ms = base_ms + minimum_ms + 1_000
+        server.sync_price_watch_binance_wallet_candidates(
+            [{**row, "lastSeenAt": reentry_ms}],
+            now_ms=reentry_ms,
+        )
+
+        with patch.object(server.time, "time", return_value=reentry_ms / 1000):
+            active_symbols = {item["symbol"] for item in server.price_watch_active_rows()}
+        self.assertNotIn("MARSCOIN", active_symbols)
+        self.assertTrue(server.price_structure_symbol_excluded("MARSCOIN"))
 
     def test_wallet_hot_membership_is_not_removed_by_generic_turnover_gate(self):
         now_ms = 1_800_000_000_000

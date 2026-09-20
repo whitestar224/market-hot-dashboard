@@ -4,12 +4,15 @@ from pathlib import Path
 import unittest
 from unittest.mock import Mock, patch
 
+import qq_onebot_bridge
 from qq_onebot_bridge import (
     QQOneBotBridge,
     QQOneBotClient,
     QQOneBotSupervisor,
     flatten_onebot_message,
+    friendly_onebot_error,
     normalize_group_event,
+    onebot_parallel_manual_qq_enabled,
     onebot_recovery_enabled,
 )
 
@@ -38,6 +41,32 @@ class FakeSession:
 
 
 class QQOneBotBridgeTests(unittest.TestCase):
+    def test_connection_refused_is_presented_as_a_safe_waiting_state(self):
+        status, message = friendly_onebot_error(
+            "HTTPConnectionPool(host='127.0.0.1', port=3000): Max retries exceeded "
+            "(Caused by NewConnectionError: [WinError 10061])"
+        )
+
+        self.assertEqual(status, "onebot_waiting")
+        self.assertIn("QQ 后台通道未连接", message)
+        self.assertNotIn("HTTPConnectionPool", message)
+        self.assertNotIn("WinError", message)
+
+    def test_bridge_backs_off_repeated_http_calls_while_onebot_is_offline(self):
+        client = Mock()
+        client.get_group_list.side_effect = RuntimeError("connection refused")
+        bridge = QQOneBotBridge(client)
+
+        with patch.object(qq_onebot_bridge.time, "monotonic", side_effect=[100.0, 101.0, 105.0]):
+            first = bridge.collect("地表最强bsc eth", "鲸鱼🐳PP")
+            throttled = bridge.collect("地表最强bsc eth", "鲸鱼🐳PP")
+            retried = bridge.collect("地表最强bsc eth", "鲸鱼🐳PP")
+
+        self.assertEqual(first["status"], "onebot_waiting")
+        self.assertTrue(throttled["retryAfter"] > 0)
+        self.assertEqual(retried["status"], "onebot_waiting")
+        self.assertEqual(client.get_group_list.call_count, 2)
+
     def test_local_recovery_is_opt_in(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("QQ_ONEBOT_RECOVERY_ENABLED", None)
@@ -46,13 +75,27 @@ class QQOneBotBridgeTests(unittest.TestCase):
         with patch.dict(os.environ, {"QQ_ONEBOT_RECOVERY_ENABLED": "1"}, clear=False):
             self.assertEqual(onebot_recovery_enabled(), os.name == "nt")
 
+    def test_parallel_manual_qq_mode_is_opt_in(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("QQ_NAPCAT_ALLOW_PARALLEL_MANUAL_QQ", None)
+            self.assertFalse(onebot_parallel_manual_qq_enabled())
+
+        with patch.dict(os.environ, {"QQ_NAPCAT_ALLOW_PARALLEL_MANUAL_QQ": "1"}, clear=False):
+            self.assertEqual(onebot_parallel_manual_qq_enabled(), os.name == "nt")
+
     def test_recovery_script_protects_interactive_qq(self):
         script = (Path(__file__).resolve().parents[1] / "tools" / "recover_napcat_bridge.ps1").read_text(
             encoding="utf-8"
         )
 
         self.assertIn("status = 'manual_qq_active'", script)
+        self.assertIn("[switch]$AllowParallelManualQq", script)
+        self.assertIn("$manualQq -and -not $AllowParallelManualQq", script)
+        self.assertIn("if ($managedIds.Count -gt 0)", script)
         self.assertIn("$command -notmatch $accountPattern", script)
+        self.assertIn("$targetSession", script)
+        self.assertIn("(Test-OneBotPorts) -and $targetSession", script)
+        self.assertIn("$positionalAccountPattern", script)
         self.assertNotIn("$path.StartsWith($qqDirectory", script)
 
     def test_supervisor_recovers_only_after_sustained_health_failures(self):

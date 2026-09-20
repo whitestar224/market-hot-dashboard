@@ -2,12 +2,25 @@
   const grid = document.querySelector("#priceWatchGrid");
   const form = document.querySelector("#watchAddForm");
   const symbolInput = document.querySelector("#watchSymbol");
+  const addButton = document.querySelector("#watchAddButton");
   const refreshButton = document.querySelector("#watchRefresh");
   const statusNode = document.querySelector("#watchStatus");
   const modeButtons = [...document.querySelectorAll("[data-watch-mode]")];
   const headingLabel = document.querySelector("#watchHeadingLabel");
   const headingTitle = document.querySelector("#watchHeadingTitle");
   const headingDescription = document.querySelector("#watchHeadingDescription");
+  function renderGrid(html) {
+    const openedResearch = new Set([...grid.querySelectorAll("details[data-research-detail][open]")].map((node) => node.dataset.researchDetail));
+    if (window.XingyunLiveDom?.render) {
+      const changed = window.XingyunLiveDom.render(grid, html);
+      grid.querySelectorAll("details[data-research-detail]").forEach((node) => { if (openedResearch.has(node.dataset.researchDetail)) node.open = true; });
+      return changed;
+    }
+    if (grid.innerHTML === html) return false;
+    grid.innerHTML = html;
+    grid.querySelectorAll("details[data-research-detail]").forEach((node) => { if (openedResearch.has(node.dataset.researchDetail)) node.open = true; });
+    return true;
+  }
   const metricNodes = {
     total: document.querySelector("#watchTotal"),
     auto: document.querySelector("#watchAuto"),
@@ -17,6 +30,7 @@
     oversoldNear: document.querySelector("#watchOversoldNear")
   };
   let loading = false;
+  let adding = false;
   let items = [];
   let structureItems = [];
   let newLowStructureItems = [];
@@ -27,6 +41,7 @@
   let asterItems = [];
   let eventItems = [];
   let newsTradeItems = [];
+  let mergedEventItems = [];
   const NEWS_TRADE_PAGE_SIZE = 10;
   const STRUCTURE_SYNC_INTERVAL_MS = 3_000;
   const STRUCTURE_INTERVALS = [
@@ -37,37 +52,28 @@
     { key: "4h", label: "4h", name: "4小时" },
     { key: "1d", label: "日", name: "日线" },
   ];
-  let newsTradePage = 1;
+  const newsTradeSections = window.XingyunNewsTradeSections;
+  const newsTradeView = newsTradeSections.createView({
+    section: new URLSearchParams(window.location.search).get("newsView"),
+    pageSize: NEWS_TRADE_PAGE_SIZE,
+  });
   let lastNewsTradeAiRequest = { signature: "", requestedAt: 0 };
   let newsTradeSearchState = { query: "", loading: false, preview: null, error: "", message: "" };
   let newsTradeExecutionNotice = null;
   let eventSummary = {};
   let eventExecution = { configured: false, liveEnabled: false, maxOrderUsdt: 200, missingConfiguration: [] };
-  const announcedEvmWalletProviders = new Map();
-  const boundEvmWalletProviders = new WeakSet();
-  let okxWalletState = {
-    providerKey: "",
-    evmAddress: "",
-    evmChainId: "",
-    solanaAddress: "",
-    connecting: false,
-    listenersBound: false,
-    solanaListenersBound: false
-  };
-  window.addEventListener("eip6963:announceProvider", (event) => {
-    const detail = event?.detail;
-    if (!detail?.provider?.request) return;
-    const key = String(detail.info?.uuid || detail.info?.rdns || detail.info?.name || announcedEvmWalletProviders.size);
-    announcedEvmWalletProviders.set(key, detail);
-    initializeOkxWallet().catch(() => {});
-  });
-  window.dispatchEvent(new Event("eip6963:requestProvider"));
+  const wallets = window.XingyunWallets;
+  const walletUiState = wallets.uiState;
   let eventLoaded = false;
-  let wechatMonitorPayload = { monitors: [], opportunities: [], summary: {} };
+  let wechatMonitorPayload = { monitors: [], opportunities: [], hourlySummaries: [], summary: {} };
   let personalXPayload = { account: null, items: [], summary: {}, pending: true };
   let personalXLoaded = false;
   let personalXStream = null;
   let personalXStreamReady = false;
+  let smartMoneyPayload = { supportedChains: [], wallets: [], events: [], health: [], summary: {} };
+  let smartMoneyLoaded = false;
+  let smartMoneyActionLoading = false;
+  let lastSmartMoneyLoadAt = 0;
   let chainEcosystemPayload = {
     chains: [],
     selectedChain: null,
@@ -82,7 +88,23 @@
   let chainActionLoading = false;
   let chainEcosystemRequestId = 0;
   let chainAiPollTimer = 0;
-  let selectedChainSlug = new URLSearchParams(window.location.search).get("chain") || "";
+  let chainResearchPaging = false;
+  const initialResearchParams = new URLSearchParams(window.location.search);
+  let selectedChainSlug = initialResearchParams.get("chain") || "";
+  let selectedResearchDay = initialResearchParams.get("researchDay") || "";
+  let selectedResearchPage = Math.max(1, Number(initialResearchParams.get("researchPage")) || 1);
+  let researchHistoryPage = Math.max(1, Number(initialResearchParams.get("researchHistoryPage")) || 1);
+  let onchainTrenchesPayload = { items: [], total: 0, counts: {}, networks: [], sourceStatus: {}, filters: {} };
+  let onchainTrenchesLoaded = false;
+  let onchainTrenchesLoading = false;
+  let onchainTrenchesRequestId = 0;
+  let onchainTrenchRetryTimer = 0;
+  let lastOnchainTrenchesLoadAt = 0;
+  let selectedTrenchNetwork = initialResearchParams.get("trenchChain") || "";
+  let selectedTrenchPage = Math.max(1, Number(initialResearchParams.get("trenchPage")) || 1);
+  const CHAIN_SUBMODES = ["today", "scan", "trenches", "ecosystem", "history", "system"];
+  const requestedChainSubMode = new URLSearchParams(window.location.search).get("chainView") || "today";
+  let chainSubMode = CHAIN_SUBMODES.includes(requestedChainSubMode) ? requestedChainSubMode : "today";
   let lastStructureLoadAt = 0;
   let lastNewLowStructureLoadAt = 0;
   let lastMappingLoadAt = 0;
@@ -91,8 +113,9 @@
   let lastWechatLoadAt = 0;
   let lastChainEcosystemLoadAt = 0;
   let currentSummary = {};
-  const requestedMode = new URLSearchParams(window.location.search).get("mode");
-  const supportedModes = ["prior", "oversold", "structure", "newlow", "mapping", "aster", "events", "news", "wechat", "personalx", "chains"];
+  const rawRequestedMode = new URLSearchParams(window.location.search).get("mode");
+  const requestedMode = rawRequestedMode === "events" ? "news" : rawRequestedMode;
+  const supportedModes = ["prior", "oversold", "structure", "newlow", "mapping", "aster", "news", "wechat", "personalx", "smartmoney", "chains"];
   let currentMode = supportedModes.includes(requestedMode) ? requestedMode : "prior";
 
   function escapeHtml(value) {
@@ -104,199 +127,41 @@
       .replaceAll("'", "&#039;");
   }
 
-  function walletProviderLabel(providerKey) {
-    return providerKey === "binance" ? "Binance Wallet" : "OKX Wallet";
+  function monitorBuyButton(row, extra = {}) {
+    return window.MonitorBuyCore?.button(row, extra) || "";
   }
 
-  function matchesWalletProvider(providerKey, provider, info = {}) {
-    const identity = `${info?.rdns || ""} ${info?.name || ""}`.toLowerCase();
-    if (providerKey === "binance") {
-      return Boolean(provider?.isBinance || provider?.isBinanceWallet || /binance/.test(identity));
-    }
-    return Boolean(provider?.isOkxWallet || /(^|[.\s])okx([.\s]|$)/.test(identity));
+  const walletAdapters = () => wallets.adapters();
+  const walletAdapter = key => wallets.adapter(key);
+  const walletProviderLabel = key => walletAdapter(key).label;
+  const walletProvider = (namespace = "evm", key = walletUiState.activeProviderKey) => wallets.provider(namespace, key);
+  const walletSession = key => wallets.session(key);
+  const setActiveWallet = key => wallets.setActive(key);
+  const connectedWalletSessions = () => wallets.connected();
+  function activeWalletSession(namespace = "evm") {
+    const active = walletSession(walletUiState.activeProviderKey);
+    const field = namespace === "solana" ? "solanaAddress" : "evmAddress";
+    return active[field] ? active : connectedWalletSessions().find(item => item[field]) || active;
   }
-
-  function okxWalletProvider(namespace = "evm", requestedProvider = "") {
-    const providerKey = requestedProvider || okxWalletState.providerKey || "okx";
-    if (namespace === "solana") return providerKey === "okx" ? window.okxwallet?.solana || null : null;
-    if (providerKey === "okx" && window.okxwallet?.request) return window.okxwallet;
-    if (providerKey === "binance") {
-      if (window.binancew3w?.ethereum?.request) return window.binancew3w.ethereum;
-      if (window.BinanceChain?.request) return window.BinanceChain;
-    }
-    const injected = Array.isArray(window.ethereum?.providers)
-      ? window.ethereum.providers
-      : (window.ethereum?.request ? [window.ethereum] : []);
-    for (const provider of injected) {
-      if (provider?.request && matchesWalletProvider(providerKey, provider)) return provider;
-    }
-    for (const detail of announcedEvmWalletProviders.values()) {
-      if (matchesWalletProvider(providerKey, detail.provider, detail.info)) return detail.provider;
-    }
-    return null;
-  }
-
-  function installedWalletProviders() {
-    return ["okx", "binance"].filter((providerKey) => Boolean(okxWalletProvider("evm", providerKey)));
-  }
-
-  function shortWalletAddress(address) {
-    const value = String(address || "");
-    return value.length > 14 ? `${value.slice(0, 7)}…${value.slice(-5)}` : value;
-  }
-
-  function okxWalletChainLabel(chainId) {
-    const normalized = String(chainId || "").toLowerCase();
-    return ({
-      "0x1": "Ethereum",
-      "0x38": "BNB Chain",
-      "0x2105": "Base",
-      "0xa4b1": "Arbitrum",
-      "0x1237": "Robinhood Chain"
-    })[normalized] || (normalized ? `Chain ${normalized}` : "链待确认");
-  }
-
-  function okxWalletToolbarTemplate() {
-    const installedProviders = installedWalletProviders();
-    const providerKey = okxWalletState.providerKey || installedProviders[0] || "okx";
-    const providerLabel = walletProviderLabel(providerKey);
-    const installed = Boolean(installedProviders.length || okxWalletProvider("solana", "okx"));
-    const address = okxWalletState.evmAddress || okxWalletState.solanaAddress;
-    const chain = okxWalletState.evmAddress
-      ? okxWalletChainLabel(okxWalletState.evmChainId)
-      : (okxWalletState.solanaAddress ? "Solana" : "未连接");
-    return `
-      <section class="news-trade-wallet ${address ? "is-connected" : ""}">
-        <span class="news-trade-wallet-mark">${providerKey === "binance" ? "BN" : "OKX"}</span>
-        <span class="news-trade-wallet-copy">
-          <b>${address ? `${escapeHtml(providerLabel)} · ${escapeHtml(chain)} · ${escapeHtml(shortWalletAddress(address))}` : `${escapeHtml(providerLabel)} 授权`}</b>
-          <em>${address ? "地址已由钱包授权；每笔交易仍需在钱包中确认" : "支持 OKX / Binance Wallet，只读取公开地址和当前链"}</em>
-        </span>
-        ${installed
-          ? `<span class="news-trade-wallet-actions">
-              <button type="button" data-wallet-connect data-wallet-provider="${providerKey}" data-wallet-switch-account="${address ? "true" : "false"}" ${okxWalletState.connecting ? "disabled" : ""}>${okxWalletState.connecting ? "等待钱包…" : (address ? "切换账户" : `连接 ${escapeHtml(providerLabel)}`)}</button>
-              ${installedProviders.filter((key) => key !== providerKey).map((key) => `<button class="is-secondary" type="button" data-wallet-connect data-wallet-provider="${key}" ${okxWalletState.connecting ? "disabled" : ""}>改用 ${escapeHtml(walletProviderLabel(key))}</button>`).join("")}
-            </span>`
-          : `<span class="news-trade-wallet-actions"><a href="https://web3.okx.com/wallet/download" target="_blank" rel="noreferrer noopener">安装 OKX</a><a href="https://www.binance.com/en/web3wallet" target="_blank" rel="noreferrer noopener">安装 Binance</a></span>`}
-      </section>`;
-  }
-
   function renderOkxWalletChange() {
     if (currentMode === "news" && eventLoaded) renderEventMonitor();
   }
-
-  async function initializeOkxWallet() {
-    const installedProviders = installedWalletProviders();
-    for (const providerKey of installedProviders) {
-      const evmProvider = okxWalletProvider("evm", providerKey);
-      try {
-        const [accounts, chainId] = await Promise.all([
-          evmProvider.request({ method: "eth_accounts" }),
-          evmProvider.request({ method: "eth_chainId" })
-        ]);
-        const address = Array.isArray(accounts) ? String(accounts[0] || "") : "";
-        if (address && (!okxWalletState.evmAddress || okxWalletState.providerKey === providerKey)) {
-          okxWalletState.providerKey = providerKey;
-          okxWalletState.evmAddress = address;
-          okxWalletState.evmChainId = String(chainId || "").toLowerCase();
-        }
-      } catch (_) {
-        // Passive detection must never interrupt the monitor page.
-      }
-      if (!boundEvmWalletProviders.has(evmProvider) && typeof evmProvider.on === "function") {
-        evmProvider.on("accountsChanged", (accounts) => {
-          okxWalletState.providerKey = providerKey;
-          okxWalletState.evmAddress = Array.isArray(accounts) ? String(accounts[0] || "") : "";
-          renderOkxWalletChange();
-        });
-        evmProvider.on("chainChanged", (chainId) => {
-          okxWalletState.providerKey = providerKey;
-          okxWalletState.evmChainId = String(chainId || "").toLowerCase();
-          renderOkxWalletChange();
-        });
-        boundEvmWalletProviders.add(evmProvider);
-      }
-    }
-    if (!okxWalletState.providerKey && installedProviders.length) okxWalletState.providerKey = installedProviders[0];
-    const solanaProvider = okxWalletProvider("solana", "okx");
-    if (solanaProvider?.isConnected && solanaProvider.publicKey) {
-      okxWalletState.solanaAddress = solanaProvider.publicKey.toString();
-    }
-    if (solanaProvider && !okxWalletState.solanaListenersBound && typeof solanaProvider.on === "function") {
-      solanaProvider.on("accountChanged", (publicKey) => {
-        okxWalletState.solanaAddress = publicKey ? publicKey.toString() : "";
-        renderOkxWalletChange();
-      });
-      solanaProvider.on("disconnect", () => {
-        okxWalletState.solanaAddress = "";
-        renderOkxWalletChange();
-      });
-      okxWalletState.solanaListenersBound = true;
-    }
-    renderOkxWalletChange();
-  }
-
+  window.addEventListener("xingyun:wallet-change", renderOkxWalletChange);
+  async function initializeOkxWallet() { await wallets.initialize(); }
   async function connectOkxWallet(opportunity = null, options = {}) {
-    const namespace = opportunity?.chain === "sol" ? "solana" : "evm";
-    const providerKey = namespace === "solana" ? "okx" : (options.providerKey || okxWalletState.providerKey || installedWalletProviders()[0] || "okx");
-    const providerLabel = walletProviderLabel(providerKey);
-    const provider = okxWalletProvider(namespace, providerKey);
-    if (!provider) throw new Error(`未检测到 ${providerLabel}；请安装插件后在浏览器中打开本页`);
-    okxWalletState.connecting = true;
-    renderOkxWalletChange();
-    try {
-      if (namespace === "solana") {
-        if (options.switchAccount && typeof provider.disconnect === "function") {
-          try { await provider.disconnect(); } catch (_) {}
-        }
-        const result = await provider.connect();
-        okxWalletState.providerKey = "okx";
-        okxWalletState.solanaAddress = String(result?.publicKey || provider.publicKey || "");
-        if (!okxWalletState.solanaAddress) throw new Error("OKX Wallet 未返回 Solana 地址");
-        return;
-      }
-      const previousAddress = okxWalletState.providerKey === providerKey ? okxWalletState.evmAddress : "";
-      if (options.switchAccount) {
-        try {
-          await provider.request({ method: "wallet_requestPermissions", params: [{ eth_accounts: {} }] });
-        } catch (error) {
-          if (Number(error?.code) === 4001) throw error;
-          if (![-32601, 4200].includes(Number(error?.code))) throw error;
-        }
-      }
-      const accounts = await provider.request({ method: "eth_requestAccounts" });
-      okxWalletState.providerKey = providerKey;
-      okxWalletState.evmAddress = Array.isArray(accounts) ? String(accounts[0] || "") : "";
-      okxWalletState.evmChainId = String(await provider.request({ method: "eth_chainId" }) || "").toLowerCase();
-      if (!okxWalletState.evmAddress) throw new Error(`${providerLabel} 未返回账户地址`);
-      if (options.switchAccount && previousAddress && previousAddress.toLowerCase() === okxWalletState.evmAddress.toLowerCase()) {
-        statusNode.textContent = `${providerLabel} 仍在使用原账户；请在钱包弹窗或扩展中选择另一账户`;
-      }
-      const targetChainId = Number(opportunity?.chainId);
-      const targetHex = Number.isInteger(targetChainId) && targetChainId > 0 ? `0x${targetChainId.toString(16)}` : "";
-      if (targetHex && okxWalletState.evmChainId !== targetHex) {
-        try {
-          await provider.request({ method: "wallet_switchEthereumChain", params: [{ chainId: targetHex }] });
-          okxWalletState.evmChainId = String(await provider.request({ method: "eth_chainId" }) || targetHex).toLowerCase();
-        } catch (error) {
-          statusNode.textContent = Number(error?.code) === 4902
-            ? `${providerLabel} 尚未添加 ${opportunity?.chainLabel || "目标链"}，请在钱包中添加后再确认交易`
-            : `钱包已连接，请在 ${providerLabel} 中切换到 ${opportunity?.chainLabel || "目标链"}`;
-        }
-      }
-    } finally {
-      okxWalletState.connecting = false;
-      renderOkxWalletChange();
-    }
+    const key = options.providerKey || walletUiState.activeProviderKey;
+    return wallets.connect(key, opportunity?.chain === "sol", false, { ...options, targetChainId: opportunity?.chainId });
   }
 
   function okxWalletAuthorization(opportunity) {
     const solana = opportunity?.chain === "sol";
+    const session = activeWalletSession(solana ? "solana" : "evm");
+    const adapter = walletAdapter(session.providerKey);
     return {
-      walletProvider: okxWalletState.providerKey || "okx",
+      walletProvider: adapter.authorizationProvider || "injected",
       walletNamespace: solana ? "solana" : "evm",
-      walletAddress: solana ? okxWalletState.solanaAddress : okxWalletState.evmAddress,
-      walletChainId: solana ? "501" : okxWalletState.evmChainId
+      walletAddress: solana ? session.solanaAddress : session.evmAddress,
+      walletChainId: solana ? "501" : session.evmChainId
     };
   }
 
@@ -394,7 +259,7 @@
         <header>
           <span class="price-watch-icon">${icon}<b>${escapeHtml(item.symbol.slice(0, 2))}</b></span>
           <span class="price-watch-asset">
-            <strong>${escapeHtml(primaryName)}</strong>
+            <strong>${escapeHtml(primaryName)} ${monitorBuyButton(item)}</strong>
             <em>${escapeHtml(secondaryName)}</em>
           </span>
           ${newLowCard ? "" : `<span class="price-structure-price">${compactPrice(item.currentPrice)}</span>`}
@@ -410,18 +275,18 @@
     const newLow = currentMode === "newlow";
     const visibleStructureItems = newLow ? newLowStructureItems : structureItems;
     grid.classList.add("is-structure");
-    grid.classList.remove("is-mapping", "is-aster", "is-events", "is-wechat", "is-chains");
+    grid.classList.remove("is-mapping", "is-aster", "is-events", "is-wechat", "is-smart-money", "is-chains");
     if (!visibleStructureItems.length) {
-      grid.innerHTML = `
+      renderGrid(`
         <div class="price-watch-empty">
           <b>${newLow ? "正在轮询近一年新币低位结构" : "正在识别 AICoin 热门币结构"}</b>
           <span>${newLow ? "不依赖热榜和成交量，按后台低频轮询逐个识别深跌后的低位横盘、收敛与抬高低点。" : "同步读取 1分钟、5分钟、15分钟、1小时、4小时和日线行情。"}</span>
-        </div>`;
+        </div>`);
       return;
     }
-    grid.innerHTML = (newLow
+    renderGrid((newLow
       ? newLowStructureItems.map(structureCardTemplate)
-      : structureItems.map(structureCardTemplate)).join("");
+      : structureItems.map(structureCardTemplate)).join(""));
   }
 
   function mappingChangeClass(value) {
@@ -441,21 +306,25 @@
   function mappingCandidateTemplate(candidate, leaderSymbol) {
     const reasons = Array.isArray(candidate.reasons) ? candidate.reasons.join(" · ") : "同题材候选";
     const href = candidate.url ? `href="${escapeHtml(candidate.url)}" target="_blank" rel="noreferrer noopener"` : "";
+    const familyRole = candidate.familyRole ? `家族：${candidate.familyRole} · ` : "";
+    const lagLabel = candidate.marketDataAvailable === false
+      ? "行情待同步"
+      : `较 ${escapeHtml(leaderSymbol)} ${Number(candidate.lagPct) > 0 ? `落后 ${Number(candidate.lagPct).toFixed(1)}%` : "同步活跃"}`;
     return `
-      <a class="rotation-candidate-row" ${href}>
+      <div class="rotation-candidate-row">
         ${mappingIcon(candidate)}
         <span class="rotation-candidate-name">
-          <strong>${escapeHtml(candidate.symbol || "--")}</strong>
-          <em>${escapeHtml(candidate.name || candidate.symbol || "--")} · ${escapeHtml(candidate.exchange || "等待行情")}</em>
+          <strong><a ${href}>${escapeHtml(candidate.symbol || "--")}</a> ${monitorBuyButton(candidate)}</strong>
+          <em>${escapeHtml(familyRole)}${escapeHtml(candidate.name || candidate.symbol || "--")} · ${escapeHtml(candidate.exchange || "等待行情")}</em>
         </span>
         <span class="rotation-candidate-reason">${escapeHtml(reasons)}</span>
         <span class="rotation-candidate-market">
           <strong>${escapeHtml(candidate.price || "--")}</strong>
           <em class="${mappingChangeClass(candidate.changeValue)}">${escapeHtml(candidate.change || "--")}</em>
         </span>
-        <span class="rotation-score"><b>${escapeHtml(candidate.score || "--")}</b><em>映射分</em></span>
-        <span class="rotation-lag">较 ${escapeHtml(leaderSymbol)} ${Number(candidate.lagPct) > 0 ? `落后 ${Number(candidate.lagPct).toFixed(1)}%` : "同步活跃"}</span>
-      </a>`;
+        <span class="rotation-score" title="${escapeHtml(candidate.relevanceLabel || '按叙事关系排列，非涨幅或收益预测')}"><b>${escapeHtml(candidate.relevanceScore ?? candidate.score ?? "--")}</b><em>相关分</em></span>
+        <span class="rotation-lag">${lagLabel}</span>
+      </div>`;
   }
 
   function mappingCardTemplate(item) {
@@ -464,7 +333,12 @@
     const themes = Array.isArray(item.themes) ? item.themes : [];
     const candidates = Array.isArray(item.candidates) ? item.candidates : [];
     const impulseGain = Number(leader.impulseGainPct);
-    const impulseLabel = Number.isFinite(impulseGain) ? `主升 +${impulseGain.toFixed(1)}%` : "主升幅度已确认";
+    const aiConfidence = Number(leader.aiConfidence);
+    const impulseLabel = Number.isFinite(impulseGain) && impulseGain > 0
+      ? `链上/市场主升 +${impulseGain.toFixed(1)}%`
+      : Number.isFinite(aiConfidence) && aiConfidence > 0
+        ? `AI 龙头置信 ${aiConfidence}`
+        : "实时龙头证据已确认";
     return `
       <article class="rotation-map-card">
         <header class="rotation-map-header">
@@ -474,9 +348,9 @@
         <div class="rotation-map-flow">
           <div class="rotation-stage is-leader">
             <em>01 · 本尊</em>
-            <span class="rotation-leader-line">${mappingIcon(leader)}<b>${escapeHtml(leader.symbol || "--")}</b></span>
+            <span class="rotation-leader-line">${mappingIcon(leader)}<b>${escapeHtml(leader.symbol || "--")}</b>${monitorBuyButton(leader)}</span>
             <span class="rotation-leader-gain">${escapeHtml(impulseLabel)}</span>
-            <small>${escapeHtml(leader.source || "热门榜")} #${escapeHtml(leader.rank || "-")} · ${escapeHtml(leader.change || "--")}</small>
+            <small>${escapeHtml(leader.source || "AI 实时龙头")} · ${escapeHtml(leader.change || "--")}${leader.aiReason ? ` · ${escapeHtml(leader.aiReason)}` : ""}</small>
           </div>
           <i aria-hidden="true">→</i>
           <div class="rotation-stage">
@@ -498,32 +372,32 @@
         <div class="rotation-candidate-list">
           ${candidates.length
             ? candidates.map((candidate) => mappingCandidateTemplate(candidate, leader.symbol || "龙头")).join("")
-            : `<div class="rotation-candidate-empty"><b>已纳入实时龙头监控</b><span>主升幅度超过 300%，正在持续分析同题材、同生态和资金扩散候选。</span></div>`}
+            : `<div class="rotation-candidate-empty"><b>已纳入实时龙头监控</b><span>AI 正在持续分析同叙事、同家族、同板块、同题材与跨链同类型候选。</span></div>`}
         </div>
       </article>`;
   }
 
   function renderMappings() {
-    grid.classList.remove("is-structure", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-chains");
+    grid.classList.remove("is-structure", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-chains");
     grid.classList.add("is-mapping");
     if (!mappingLoaded) {
-      grid.innerHTML = `
+      renderGrid(`
         <div class="price-watch-empty">
           <b>正在建立龙头补涨映射</b>
           <span>核对本尊、家族、同题材叙事和真实合约行情。</span>
-        </div>`;
+        </div>`);
       return;
     }
     if (!mappingItems.length) {
-      const scanned = Number(mappingSummary.hotScanned) || 0;
-      grid.innerHTML = `
+      const scanned = Number(mappingSummary.semanticRows) || Number(mappingSummary.leaderScanned) || 0;
+      renderGrid(`
         <div class="price-watch-empty">
-          <b>当前没有达到 300% 主升阈值的热门币</b>
-          <span>已扫描 ${escapeHtml(scanned)} 个热门标的，后台会继续实时分析。</span>
-        </div>`;
+          <b>AI 正在确认近期真实龙头</b>
+          <span>已扫描 ${escapeHtml(scanned)} 个实时标的；AICoin 与涨幅榜名次不参与认定。</span>
+        </div>`);
       return;
     }
-    grid.innerHTML = mappingItems.map(mappingCardTemplate).join("");
+    renderGrid(mappingItems.map(mappingCardTemplate).join(""));
   }
 
   function asterDate(value) {
@@ -546,10 +420,11 @@
       ? item.symbols.join(" · ")
       : (item.baseAsset || item.symbol || "--");
     return `
-      <a class="aster-contract-card ${pending ? "is-pending" : "is-trading"}" href="${escapeHtml(item.url || "https://www.asterdex.com/en")}" target="_blank" rel="noreferrer noopener">
+      <div class="aster-contract-card ${pending ? "is-pending" : "is-trading"}">
         <span class="aster-contract-mark">AS</span>
         <span class="aster-contract-name">
-          <strong>${escapeHtml(assetLabel)}</strong>
+          <strong><a href="${escapeHtml(item.url || "https://www.asterdex.com/en")}" target="_blank" rel="noreferrer noopener">${escapeHtml(assetLabel)}</a></strong>
+          <span>${(item.symbols?.length ? item.symbols : [item.baseAsset || item.symbol]).filter(Boolean).map(symbol => monitorBuyButton({ ...item, symbol })).join("")}</span>
           <em>${officialX ? "Aster 官方 X 上新" : official ? "Aster 官网上新公告" : "上新发现 · 待公告页同步"}${item.subtitle ? ` · ${escapeHtml(item.subtitle)}` : ""}</em>
         </span>
         <span class="aster-contract-status">
@@ -557,21 +432,21 @@
           <em>${official ? "发布" : "上线"} ${asterDate(item.onboardDate || item.date)}</em>
         </span>
         <span class="aster-contract-action">${officialX ? "查看 X" : official ? "查看公告" : "打开 Aster"}</span>
-      </a>`;
+      </div>`;
   }
 
   function renderAsterContracts() {
-    grid.classList.remove("is-structure", "is-mapping", "is-events", "is-wechat", "is-personal-x", "is-chains");
+    grid.classList.remove("is-structure", "is-mapping", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-chains");
     grid.classList.add("is-aster");
     if (!asterItems.length) {
-      grid.innerHTML = `
+      renderGrid(`
         <div class="price-watch-empty">
           <b>暂无新的 Aster 永续合约公告</b>
           <span>后台仍在持续比对公开合约接口；新合约首次出现后会立即生成公告卡并播报。</span>
-        </div>`;
+        </div>`);
       return;
     }
-    grid.innerHTML = asterItems.map(asterContractTemplate).join("");
+    renderGrid(asterItems.map(asterContractTemplate).join(""));
   }
 
   function eventScoreTone(score) {
@@ -778,7 +653,7 @@
         <span class="news-trade-candidate-rank">${primary ? "TOP1 主标" : `备选 ${index + 1}`}</span>
         <span class="news-trade-candidate-identity">
           <span class="news-trade-candidate-name">
-            <b>${escapeHtml(symbol)}</b>
+            <b>${escapeHtml(symbol)}</b>${monitorBuyButton(candidate)}
             <small class="news-trade-security is-${escapeHtml(securityStatus)}" title="${escapeHtml(securityTitle)}"><i></i>${escapeHtml(securityLabel)}</small>
           </span>
           <em>${escapeHtml(name && name !== symbol ? name : (candidate?.chainLabel || "链待确认"))}</em>
@@ -797,7 +672,7 @@
           title="${escapeHtml(candidateEligible
             ? (systemRecommended ? `输入金额后准备买入 ${symbol}` : `系统不主动推荐；仍可按你的手动意图买入 ${symbol}`)
             : disabledReason)}"
-        >${escapeHtml(buyLabel)}</button>` : ""}
+        hidden>${escapeHtml(buyLabel)}</button>` : ""}
         <span class="news-trade-candidate-foot">
           <span class="news-trade-candidate-meta">${escapeHtml(candidate?.chainLabel || "链待确认")} · ${escapeHtml(contractLabel)}${candidate?.holderCount ? ` · ${Math.round(Number(candidate.holderCount)).toLocaleString("en-US")} 持币` : ""}${transactions ? ` · ${Math.round(transactions).toLocaleString("en-US")} 笔` : ""} · ${escapeHtml(candidate?.associationLabel || "未确认关联")}</span>
           <span class="news-trade-candidate-foot-actions">
@@ -843,7 +718,7 @@
           </label>
           <button type="submit" ${newsTradeSearchState.loading ? "disabled" : ""}>${newsTradeSearchState.loading ? "正在理解…" : "搜索并理解"}</button>
         </form>
-        <div class="news-trade-score-legend"><b>评分体系</b><span>事件热度</span><span>大瓜</span><span>增长速度</span><span>跨平台</span><span>新奇反差</span><span>群体参与</span><span>符号传播</span><span>后续剧情</span><span>新奇猎奇</span><span>争议性</span><span>讨论度</span><span>传奇性</span><span>名字寓意</span><span>链上质量</span></div>
+        <details class="news-trade-score-help" data-research-detail="news-score-help"><summary>评分说明</summary><div class="news-trade-score-legend"><b>评分体系</b><span>事件热度</span><span>大瓜</span><span>增长速度</span><span>跨平台</span><span>新奇反差</span><span>群体参与</span><span>符号传播</span><span>后续剧情</span><span>新奇猎奇</span><span>争议性</span><span>讨论度</span><span>传奇性</span><span>名字寓意</span><span>链上质量</span></div></details>
         ${newsTradeSearchState.error ? `<p class="news-trade-search-message is-error">${escapeHtml(newsTradeSearchState.error)}</p>` : ""}
         ${topic ? `
           <div class="news-trade-search-preview">
@@ -867,16 +742,26 @@
       </section>`;
   }
 
-  function newsTradePaginationTemplate(total) {
-    const pageCount = Math.max(1, Math.ceil(total / NEWS_TRADE_PAGE_SIZE));
+  function newsTradeSubnavTemplate(view) {
+    return `
+      <nav class="chain-research-subnav news-trade-subnav" aria-label="News Trade 子板块">
+        ${newsTradeSections.sections.map((section) => `
+          <button type="button" class="${view.section === section.key ? "active" : ""}" data-news-section="${section.key}" aria-pressed="${view.section === section.key}">
+            <span>${escapeHtml(section.label)}</span><em>${eventLoaded ? view.counts[section.key] : "—"}</em>
+          </button>`).join("")}
+      </nav>`;
+  }
+
+  function newsTradePaginationTemplate(view) {
+    const { page: newsTradePage, pageCount, total } = view;
     if (pageCount <= 1) return "";
     const start = Math.max(1, Math.min(newsTradePage - 2, pageCount - 4));
     const end = Math.min(pageCount, start + 4);
     const pages = [];
     for (let page = start; page <= end; page += 1) pages.push(page);
     return `
-      <nav class="news-trade-pagination" aria-label="News Trade 主题分页">
-        <span>第 ${newsTradePage} / ${pageCount} 页 · 共 ${total} 个主题</span>
+      <nav class="news-trade-pagination" aria-label="News Trade 分页">
+        <span>${escapeHtml(view.label)} · 第 ${newsTradePage} / ${pageCount} 页 · 共 ${total} 条去重机会</span>
         <div>
           <button type="button" data-news-trade-page="${newsTradePage - 1}" ${newsTradePage <= 1 ? "disabled" : ""}>上一页</button>
           ${pages.map((page) => `<button type="button" data-news-trade-page="${page}" class="${page === newsTradePage ? "is-active" : ""}">${page}</button>`).join("")}
@@ -923,7 +808,7 @@
     const confirmations = Array.isArray(item.confirmation) ? item.confirmation : [];
     const evidence = Array.isArray(item.evidence) ? item.evidence : [];
     const score = Number(item.topicScore ?? item.score) || 0;
-    const href = escapeHtml(item.url || "./price-watch.html?mode=events");
+    const href = escapeHtml(safeExternalUrl(item.url) || "./price-watch.html?mode=news");
     const memeOpportunity = item.memeOpportunity && typeof item.memeOpportunity === "object" ? item.memeOpportunity : null;
     const memeCandidates = Array.isArray(item.memeCandidates) && item.memeCandidates.length
       ? item.memeCandidates.slice(0, 3)
@@ -941,23 +826,43 @@
       ? "仅复盘"
       : (phase.code === "expired" ? "已错过" : "事件观察");
     const enteredAt = Number(item.enteredAt || item.firstSeenAt || item.timestamp) || 0;
+    const messageAt = newsTradeSections.eventTime(item);
+    const analysis = item.aiAnalysis && typeof item.aiAnalysis === "object" ? item.aiAnalysis : null;
+    const ready = item.aiAnalysisStatus === "ready" && analysis;
+    const primarySymbol = String(analysis?.primarySymbol || analysis?.symbols?.[0] || memeOpportunity?.symbol || assets[0] || "");
+    const primaryTarget = memeCandidates.find((candidate) => String(candidate.symbol || "").toUpperCase() === primarySymbol.toUpperCase()) || { symbol: primarySymbol };
+    const verdict = ready ? analysis.verdict : "pending";
+    const actionable = verdict === "trade-candidate" && Number(analysis?.confidence) >= 60 && primarySymbol && item.sourceActive !== false;
+    const verdictLabel = item.sourceActive === false ? "已过时" : actionable ? "值得看" : verdict === "reject" ? "不值得看" : ready ? "先观察，暂不参与" : "待确认";
+    const summary = ready ? analysis.thesis : newsMode ? "尚未完成 AI 研判；当前热度不代表已经形成交易机会。" : item.thesis;
+    const detailKey = `news:${item.topicKey || item.id || item.url || item.title}`;
     return `
-      <article class="event-monitor-card ${newsMode ? `is-news-trade is-phase-${phase.code}` : ""} ${eventScoreTone(score)}">
+      <article class="event-monitor-card news-trade-focus-card ${newsMode ? `is-news-trade is-phase-${phase.code}` : ""}" data-live-key="event:${escapeHtml(item.topicKey || item.id || item.url || item.title)}">
         <header class="event-monitor-topline">
-          <span class="event-monitor-kind"><b>${escapeHtml(item.templateName || "事件驱动")}</b><em>${escapeHtml(item.source || "市场信息")}</em></span>
-          <span class="event-monitor-score"><b>${score}</b><em>置信分</em></span>
+          <span class="news-focus-source">${escapeHtml(item.source || "市场信息")} · ${messageAt ? `消息 ${relativeTime(messageAt)}` : "消息时间待确认"}</span>
+          <span class="news-focus-verdict ${actionable ? "is-opportunity" : ""}">${verdictLabel}</span>
         </header>
         <div class="event-monitor-main">
-          <div class="event-monitor-title-line">
-            ${newsMode ? `<span class="event-monitor-verified">NEWS TRADE</span>` : ""}
-            ${newsMode ? `<span class="news-trade-phase is-${escapeHtml(phase.code)}">${escapeHtml(phase.label)}</span>` : ""}
-            <h3>${escapeHtml(item.title || "市场事件")}</h3>
-            ${newsMode && Number(item.newsCount || item.sourceCount) > 1 ? `<span class="news-trade-source-count">${Number(item.newsCount || item.sourceCount)} 条合并</span>` : ""}
+          <div class="news-focus-target">
+            <div><span>${primarySymbol ? "关联标的" : "事件线索"}</span><h3>${escapeHtml(primarySymbol || "标的待确认")}</h3></div>
+            ${primarySymbol ? monitorBuyButton(primaryTarget) : ""}
           </div>
-          ${assets.length ? `<div class="event-monitor-assets">${assets.slice(0, 6).map((asset) => `<span>${escapeHtml(asset)}</span>`).join("")}</div>` : ""}
-          <p class="event-monitor-thesis">${escapeHtml(item.thesis || "等待更多确认信息")}</p>
-          ${newsMode ? newsTradeScoreTagsTemplate(item) : ""}
-          ${newsMode ? newsTradeIntelligenceTemplate(item) : ""}
+          <p class="news-focus-conclusion">${escapeHtml(summary || "等待更多来源确认。")}</p>
+          <details class="news-focus-details" data-research-detail="${escapeHtml(detailKey)}">
+            <summary>查看依据、风险与映射标的</summary>
+            <div class="news-focus-detail-body">
+              <h4 class="news-focus-heading">${escapeHtml(analysis?.eventType || item.templateName || "市场事件")}</h4>
+              <dl class="news-focus-decision">
+            ${ready && analysis.catalyst ? `<div><dt>核心理由</dt><dd>${escapeHtml(analysis.catalyst)}</dd></div>` : ""}
+            <div><dt>现在怎么做</dt><dd>${escapeHtml(ready ? analysis.actionHint || "继续核实，不把研判直接当成买入指令。" : "等待研判和标的确认，暂不按热度追入。")}</dd></div>
+            <div class="is-risk"><dt>主要风险</dt><dd>${escapeHtml(ready ? analysis.risk || "交易条件仍需在买入前重新核验。" : "叙事关联及交易条件尚未核验。")}</dd></div>
+              </dl>
+              <h4>${escapeHtml(item.title || "原始消息")}</h4>
+              ${item.body ? `<p>${escapeHtml(item.body)}</p>` : ""}
+              <p>事件权重 ${score} · ${escapeHtml(phase.label)} · ${Number(item.newsCount || item.sourceCount) || 1} 条来源合并</p>
+              ${assets.length ? `<div class="event-monitor-assets">${assets.slice(0, 6).map((asset) => `<span>${escapeHtml(asset)} ${monitorBuyButton({ symbol: asset })}</span>`).join("")}</div>` : ""}
+              ${newsMode ? newsTradeScoreTagsTemplate(item) : ""}
+              ${newsMode ? newsTradeIntelligenceTemplate(item) : ""}
           ${newsMode && memeCandidates.length ? newsTradeTargetsTemplate(memeCandidates, {
             eventId: item.id,
             executionEligible: Boolean(item.executionEligible),
@@ -971,15 +876,17 @@
             </div>
             ${memeRisks.length ? `<div class="event-meme-risks">${memeRisks.slice(0, 4).map((risk) => `<span>${escapeHtml(risk)}</span>`).join("")}</div>` : ""}
           ` : "")}
-        </div>
         <div class="event-monitor-signals">
           ${confirmations.slice(0, 4).map((label) => `<span>${escapeHtml(label)}</span>`).join("")}
           ${evidence.slice(0, 3).map((label) => `<span class="is-evidence">${escapeHtml(label)}</span>`).join("")}
         </div>
+            </div>
+          </details>
+        </div>
         <footer class="event-monitor-footer">
           <span><b>${escapeHtml(item.sourceLabel || "EV")}</b>${newsMode ? `入池 ${relativeTime(enteredAt)}` : relativeTime(item.timestamp)}</span>
           <span class="event-monitor-actions">
-            ${memeOpportunity && !memeCandidates.length ? `<button type="button" data-news-trade-prepare="${escapeHtml(item.id)}" ${executionEligible ? "" : "disabled"}>${executionEligible ? "买入" : inactiveActionLabel}</button>` : ""}
+            ${memeOpportunity && !memeCandidates.length ? monitorBuyButton(memeOpportunity) : ""}
             ${directTradeUrl ? `<a href="${escapeHtml(directTradeUrl)}" target="_blank" rel="noreferrer noopener">交易页</a>` : ""}
             <a href="${href}" target="_blank" rel="noreferrer noopener">打开来源</a>
           </span>
@@ -988,42 +895,37 @@
   }
 
   function renderEventMonitor() {
-    const newsMode = currentMode === "news";
-    const pageCount = Math.max(1, Math.ceil(newsTradeItems.length / NEWS_TRADE_PAGE_SIZE));
-    newsTradePage = Math.max(1, Math.min(newsTradePage, pageCount));
-    const pageStart = (newsTradePage - 1) * NEWS_TRADE_PAGE_SIZE;
-    const visibleItems = newsMode
-      ? newsTradeItems.slice(pageStart, pageStart + NEWS_TRADE_PAGE_SIZE)
-      : eventItems;
-    const searchToolbar = newsMode ? newsTradeSearchTemplate() : "";
-    const walletToolbar = newsMode ? okxWalletToolbarTemplate() : "";
-    const executionNotice = newsMode ? newsTradeExecutionNoticeTemplate() : "";
-    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-wechat", "is-personal-x", "is-chains");
+    const view = newsTradeView.snapshot(mergedEventItems);
+    const visibleItems = view.visibleItems;
+    const subnav = newsTradeSubnavTemplate(view);
+    const searchToolbar = newsTradeSearchTemplate();
+    const executionNotice = newsTradeExecutionNoticeTemplate();
+    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-wechat", "is-personal-x", "is-smart-money", "is-chains");
     grid.classList.add("is-events");
     if (!eventLoaded) {
-      grid.innerHTML = `
+      renderGrid(`
+        ${subnav}
         ${searchToolbar}
-        ${walletToolbar}
         ${executionNotice}
         <div class="price-watch-empty">
           <b>正在核对事件来源与市场确认</b>
           <span>只把新发生且具备时效性的事件纳入监控。</span>
-        </div>`;
+        </div>`);
       return;
     }
     if (!visibleItems.length) {
-      grid.innerHTML = `
+      renderGrid(`
+        ${subnav}
         ${searchToolbar}
-        ${walletToolbar}
         ${executionNotice}
         <div class="price-watch-empty">
-          <b>${newsMode ? "当前没有高置信 News Trade 候选" : "当前没有新的二级事件"}</b>
-          <span>${newsMode ? "需要同时具备明确标的、时效性以及原始或行情确认。" : "律动快讯、交易所公告和 X KOL 动态会继续在后台筛选。"}</span>
-        </div>`;
+          <b>当前没有可展示的${escapeHtml(view.label)}机会</b>
+          <span>可以切换其他子板块查看；后台仍会持续筛选、分析并去重。</span>
+        </div>`);
       return;
     }
-    grid.innerHTML = `${searchToolbar}${walletToolbar}${executionNotice}${visibleItems.map((item) => eventMonitorCardTemplate(item, newsMode)).join("")}${newsMode ? newsTradePaginationTemplate(newsTradeItems.length) : ""}`;
-    if (newsMode) Promise.resolve().then(() => requestVisibleNewsTradeAi(visibleItems));
+    renderGrid(`${subnav}${searchToolbar}${executionNotice}${visibleItems.map((item) => eventMonitorCardTemplate(item, item.mergedKind === "news-trade")).join("")}${newsTradePaginationTemplate(view)}`);
+    Promise.resolve().then(() => requestVisibleNewsTradeAi(visibleItems.filter((item) => item.mergedKind === "news-trade")));
   }
 
   function wechatStatusTone(status) {
@@ -1044,7 +946,7 @@
     const forwardError = String(item.lastForwardError || "").trim();
     const detail = [
       item.statusLabel || "等待连接",
-      relativeTime(item.lastSeenAt),
+      Number(item.lastSeenAt) > 0 ? relativeTime(item.lastSeenAt) : "",
       senderFilter ? `只看 ${senderFilter}` : "全部成员",
       item.forwardToWechat ? `转微信：${forwardTarget || "文件传输助手"}` : ""
     ].filter(Boolean).join(" · ");
@@ -1076,42 +978,109 @@
     const catalysts = Array.isArray(item.catalysts) ? item.catalysts.filter(Boolean) : [];
     const risks = Array.isArray(item.risks) ? item.risks.filter(Boolean) : [];
     const confidence = Math.max(0, Math.min(100, Number(item.confidence) || 0));
+    const narrativeStrength = Math.max(0, Math.min(100, Number(item.narrativeStrength) || 0));
+    const memePotential = Math.max(0, Math.min(100, Number(item.memePotential) || 0));
+    const aiAnalyzed = Boolean(item.aiAnalyzed);
+    const platformLabel = item.platform === "qq" ? "Q群 · " : "微信 · ";
+    const timeMeta = timestampView(item.capturedAt);
+    const message = opportunityDisplayText(item.content);
+    const messagePreview = message.length > 148 ? `${message.slice(0, 148).trim()}…` : message;
     return `
-      <article class="wechat-opportunity-card ${item.urgency === "high" ? "is-urgent" : ""}">
-        <header>
-          <span><b>${item.platform === "qq" ? "Q群 · " : "微信 · "}${escapeHtml(item.groupName || "群聊")}</b><em>${escapeHtml(item.sender || "群成员")}</em></span>
-          <time>${relativeTime(item.capturedAt)}</time>
+      <article class="wechat-opportunity-card ${item.urgency === "high" ? "is-urgent" : ""}" data-live-key="chat:${item.platform || "wechat"}:${Number(item.id) || `${item.capturedAt}:${item.content || ""}`}">
+        <header class="wechat-opportunity-card-head">
+          <span class="wechat-opportunity-source"><b>${platformLabel}${escapeHtml(item.groupName || "群聊")}</b><em>${escapeHtml(item.sender || "群成员")}</em></span>
+          <time datetime="${escapeHtml(timeMeta.iso)}" title="${escapeHtml(timeMeta.exact)}"><b>${escapeHtml(timeMeta.relative)}</b><em>${escapeHtml(timeMeta.exact)}</em></time>
         </header>
         <div class="wechat-opportunity-title">
-          <span>${escapeHtml(item.category || "市场线索")}</span>
-          <b>${confidence}</b><em>置信度</em>
+          <div class="wechat-opportunity-tags">
+            <span>${escapeHtml(item.category || "市场线索")}</span>
+            <small class="wechat-opportunity-ai-status ${aiAnalyzed ? "is-ready" : "is-fallback"}">${aiAnalyzed ? "AI 研判" : "AI 降级"}</small>
+          </div>
+          <span class="wechat-opportunity-confidence"><b>${confidence}</b><em>置信度</em></span>
         </div>
-        <p class="wechat-opportunity-message">${escapeHtml(item.content || "")}</p>
+        <div class="wechat-opportunity-ai-scores">
+          <span><em>叙事强度</em><b>${narrativeStrength}</b></span>
+          <span><em>Meme 潜力</em><b>${memePotential}</b></span>
+        </div>
         ${symbols.length ? `<div class="wechat-opportunity-symbols">${symbols.map((symbol) => {
           const state = symbolStates.get(String(symbol).toUpperCase()) || {};
           const statusClass = state.manuallyRemoved ? "is-removed" : state.dead ? "is-dead" : state.active ? "is-active" : "is-pending";
           const statusLabel = state.manuallyRemoved ? "已手动移除" : state.dead ? "30天无行情" : state.active ? "持续监控" : "等待行情";
           return `<span class="wechat-opportunity-symbol ${statusClass}">
-            <strong>${escapeHtml(symbol)}</strong>
-            <em>${statusLabel}</em>
+            <span class="wechat-opportunity-symbol-main"><strong>${escapeHtml(symbol)}</strong><em>${statusLabel}</em></span>
+            <span class="wechat-opportunity-symbol-action">${opportunityTradeAction(state, symbol)}</span>
             ${state.active ? `<button type="button" title="停止监控 ${escapeHtml(symbol)}" aria-label="停止监控 ${escapeHtml(symbol)}" data-wechat-opportunity-remove="${escapeHtml(symbol)}">×</button>` : ""}
           </span>`;
         }).join("")}</div>` : ""}
         ${item.thesis ? `<p class="wechat-opportunity-thesis">${escapeHtml(item.thesis)}</p>` : ""}
-        ${catalysts.length ? `<div class="wechat-opportunity-points"><b>催化</b>${catalysts.slice(0, 4).map((value) => `<span>${escapeHtml(value)}</span>`).join("")}</div>` : ""}
-        ${risks.length ? `<div class="wechat-opportunity-points is-risk"><b>风险</b>${risks.slice(0, 3).map((value) => `<span>${escapeHtml(value)}</span>`).join("")}</div>` : ""}
-        <footer><span>${escapeHtml(item.actionHint || "等待更多确认")}</span><em>${escapeHtml(item.analysisSource || "rules")}</em></footer>
+        ${catalysts.length ? `<div class="wechat-opportunity-points"><b>催化</b><div>${catalysts.slice(0, 4).map((value) => `<span>${escapeHtml(value)}</span>`).join("")}</div></div>` : ""}
+        ${risks.length ? `<div class="wechat-opportunity-points is-risk"><b>风险</b><div>${risks.slice(0, 3).map((value) => `<span>${escapeHtml(value)}</span>`).join("")}</div></div>` : ""}
+        ${message ? `<details class="wechat-opportunity-message"><summary><b>原始消息</b><span>${escapeHtml(messagePreview)}</span></summary><p>${escapeHtml(message)}</p></details>` : ""}
+        <footer><span>${escapeHtml(item.actionHint || "等待更多确认")}</span><em>${escapeHtml(aiAnalyzed ? `AI · ${item.analysisSource || "模型"}` : "规则预筛 · AI 暂不可用")}</em></footer>
       </article>`;
+  }
+
+  function chatHourlySummaryTemplate(summary) {
+    const rows = Array.isArray(summary.items) ? summary.items.slice(0, 10) : [];
+    const start = timestampView(summary.hourStart);
+    const end = timestampView(summary.hourEnd);
+    const rankLabels = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
+    return `
+      <article class="chat-hourly-summary" data-live-key="chat-hour:${escapeHtml(summary.scopeKey || "all")}:${Number(summary.hourStart) || 0}">
+        <header>
+          <span><em>HOURLY CA RANK</em><b>${escapeHtml(summary.groupName || "全部群聊")}</b></span>
+          <time title="${escapeHtml(start.exact)} – ${escapeHtml(end.exact)}">${escapeHtml(start.exact.split(" ").pop() || start.relative)}–${escapeHtml(end.exact.split(" ").pop() || end.relative)}</time>
+        </header>
+        <div class="chat-hourly-rank-list">
+          ${rows.map((item, index) => {
+            const initialValue = Number(item.initialMarketCapUsd) || 0;
+            const currentValue = Number(item.currentMarketCapUsd) || 0;
+            const delta = Number(item.changePct);
+            const hasDelta = initialValue > 0 && currentValue > 0 && Number.isFinite(delta);
+            const valueText = hasDelta
+              ? `${compactUsd(initialValue)} → ${compactUsd(currentValue)}`
+              : currentValue > 0 ? `现值 ${compactUsd(currentValue)}`
+                : initialValue > 0 ? `首提 ${compactUsd(initialValue)}` : "市值待确认";
+            const ageSeconds = Math.max(0, Number(item.ageSeconds) || 0);
+            const age = ageSeconds < 3600 ? `${Math.max(1, Math.round(ageSeconds / 60))}m` : `${Math.round(ageSeconds / 3600)}h`;
+            const url = safeExternalUrl(item.url);
+            const contract = escapeHtml(item.shortContract || item.contractAddress || "CA待确认");
+            return `<div class="chat-hourly-rank-row">
+              <strong>${rankLabels[index]}</strong>
+              <span class="chat-hourly-rank-main">
+                <b>${escapeHtml(item.symbol || "未知币种")}</b>
+                <em>${escapeHtml(valueText)}${hasDelta ? ` <i class="${delta >= 0 ? "is-up" : "is-down"}">Δ${delta >= 0 ? "+" : ""}${delta.toFixed(0)}%</i>` : ""}</em>
+              </span>
+              <span class="chat-hourly-rank-source"><b>🌐 ${escapeHtml(age)} ↦ ${escapeHtml(item.firstSender || "群成员")}</b><em>${Number(item.mentionCount) || 1} 次提及</em></span>
+              ${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${contract}</a>` : `<code>${contract}</code>`}
+            </div>`;
+          }).join("")}
+        </div>
+      </article>`;
+  }
+
+  function chatHourlySummariesTemplate(summaries) {
+    const rows = (Array.isArray(summaries) ? summaries : []).slice(0, 4);
+    if (!rows.length) return "";
+    return `<section class="chat-hourly-summary-section">
+      <div class="chat-hourly-summary-section-head"><span><em>每小时自动生成</em><b>群聊 CA 排行榜</b></span><small>闲聊与非币种英文词已过滤</small></div>
+      ${rows.map(chatHourlySummaryTemplate).join("")}
+    </section>`;
   }
 
   function renderWechatMonitor() {
     const monitors = Array.isArray(wechatMonitorPayload.monitors) ? wechatMonitorPayload.monitors : [];
     const opportunities = Array.isArray(wechatMonitorPayload.opportunities) ? wechatMonitorPayload.opportunities : [];
     const summary = wechatMonitorPayload.summary || {};
+    const allHourlySummaries = Array.isArray(wechatMonitorPayload.hourlySummaries)
+      ? wechatMonitorPayload.hourlySummaries
+      : [];
     const privacy = wechatMonitorPayload.collector?.privacy || "只在本机内存识别已打开的微信或 QQ 窗口，截图不保存、不上传";
-    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-personal-x", "is-chains");
+    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-personal-x", "is-smart-money", "is-chains");
     grid.classList.add("is-wechat");
-    grid.innerHTML = `
+    const localOpportunities = opportunities;
+    const localHourlySummaries = allHourlySummaries.filter((item) => ["wechat", "qq"].includes(item.platform));
+    renderGrid(`
       <section class="wechat-monitor-console">
         <aside class="wechat-monitor-sidebar">
           <form class="wechat-monitor-form" data-wechat-form>
@@ -1132,15 +1101,16 @@
             <div class="wechat-monitor-summary">
               <span><b>${Number(summary.active) || 0}</b>群监控</span>
               <span><b>${Number(summary.connected) || 0}</b>已连接</span>
-              <span><b>${Number(summary.opportunities) || opportunities.length}</b>条机会</span>
+              <span><b>${localOpportunities.length}</b>条机会</span>
               <span><b>${Number(summary.watchingSymbols) || 0}</b>币持续监控</span>
             </div>
           </header>
+          ${chatHourlySummariesTemplate(localHourlySummaries)}
           <div class="wechat-opportunity-list">
-            ${opportunities.length ? opportunities.map(wechatOpportunityTemplate).join("") : `<div class="price-watch-empty"><b>等待新的有效机会</b><span>首次连接只建立基线，不会把历史聊天误报为新机会。</span></div>`}
+            ${localOpportunities.length ? localOpportunities.map(wechatOpportunityTemplate).join("") : `<div class="price-watch-empty"><b>等待新的有效机会</b><span>首次连接只建立基线，不会把历史聊天误报为新机会。</span></div>`}
           </div>
         </section>
-      </section>`;
+      </section>`);
   }
 
   function personalXTransportLabel(value) {
@@ -1187,7 +1157,7 @@
     const remainingMinutes = Math.max(1, Math.ceil((Number(item.signalRemainingSeconds) || 0) / 60));
     return `
       <span class="personal-x-tactical-signal is-${escapeHtml(signalType)}" title="${escapeHtml(`${sourceLabel} · ${item.sourceText || "临盘信号"}`)}">
-        <b>${escapeHtml(item.symbol || "--")}</b>
+        <b>${escapeHtml(item.symbol || "--")}</b>${monitorBuyButton(item)}
         <em>${escapeHtml(item.signalLabel || (signalType === "watch" ? "重点看" : "有主升浪预期"))}</em>
         <small>${remainingMinutes} 分</small>
       </span>`;
@@ -1204,13 +1174,13 @@
     const avatarUrl = safeExternalUrl(account.avatar);
     const transport = personalXTransportLabel(payload.upstreamMode || summary.transport);
     const connected = personalXStreamReady || summary.connected;
-    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-chains");
+    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-chains");
     grid.classList.add("is-personal-x");
     if (!personalXLoaded && payload.pending) {
-      grid.innerHTML = `<div class="price-watch-empty"><b>正在连接个人 X 实时流</b><span>复用现有秒级监控通道，不建立第二套抓取。</span></div>`;
+      renderGrid(`<div class="price-watch-empty"><b>正在连接个人 X 实时流</b><span>复用现有秒级监控通道，不建立第二套抓取。</span></div>`);
       return;
     }
-    grid.innerHTML = `
+    renderGrid(`
       <section class="personal-x-console">
         <header class="personal-x-account">
           <span class="personal-x-avatar ${avatarUrl ? "" : "is-fallback"}">${avatarUrl ? `<img src="${escapeHtml(avatarUrl)}" alt="" referrerpolicy="no-referrer" onerror="this.parentElement.classList.add('is-fallback');this.remove()" />` : ""}<b>X</b></span>
@@ -1235,7 +1205,131 @@
             <div class="personal-x-post-list">${rows.length ? rows.map(personalXPostTemplate).join("") : `<div class="chain-section-empty"><b>等待新的个人动态</b><span>${escapeHtml(payload.message || payload.error || "实时连接已经建立，新动态会直接出现在这里。")}</span></div>`}</div>
           </section>
         </div>
-      </section>`;
+      </section>`);
+  }
+
+  function smartMoneyChainLabel(chain) {
+    return smartMoneyPayload.supportedChains?.find((row) => row.id === chain)?.label || ({
+      ethereum: "Ethereum", bsc: "BSC", base: "Base", solana: "Solana", robinhood: "Robinhood"
+    })[chain] || chain || "未知链";
+  }
+
+  function smartMoneyShortAddress(address, head = 8, tail = 6) {
+    const value = String(address || "");
+    return value.length > head + tail + 3 ? `${value.slice(0, head)}…${value.slice(-tail)}` : value || "--";
+  }
+
+  function smartMoneyExplorerUrl(event) {
+    const direct = safeExternalUrl(event?.transactionUrl);
+    if (direct) return direct;
+    const tx = encodeURIComponent(String(event?.transactionHash || ""));
+    if (!tx) return "";
+    const roots = {
+      ethereum: "https://etherscan.io/tx/",
+      bsc: "https://bscscan.com/tx/",
+      base: "https://basescan.org/tx/",
+      robinhood: "https://robinhoodchain.blockscout.com/tx/",
+      solana: "https://solscan.io/tx/",
+    };
+    return roots[event?.chain] ? `${roots[event.chain]}${tx}` : "";
+  }
+
+  function smartMoneyHealthTemplate(chain) {
+    const health = smartMoneyPayload.health?.find((row) => row.chain === chain.id) || {};
+    const walletCount = smartMoneyPayload.wallets?.filter((row) => row.chain === chain.id && row.enabled).length || 0;
+    const status = walletCount === 0 ? "idle" : (health.status || "waiting");
+    const labels = { ok: "监控正常", baseline: "基线已建", error: "节点异常", waiting: "等待扫描", idle: "暂无地址" };
+    const detail = walletCount === 0
+      ? "添加地址后自动启动"
+      : health.message || "正在等待首次只读扫描";
+    return `<span class="smart-money-health is-${escapeHtml(status)}" title="${escapeHtml(detail)}"><i></i><b>${escapeHtml(chain.label)}</b><em>${escapeHtml(labels[status] || status)} · ${walletCount} 地址</em></span>`;
+  }
+
+  function smartMoneyWalletTemplate(wallet) {
+    const chainLabel = smartMoneyChainLabel(wallet.chain);
+    const sourceKind = String(wallet.sourceKind || "");
+    const sourceLabel = sourceKind === "manual" ? "手动添加" : sourceKind === "seed" ? "用户预置" : "自动识别";
+    const eventCount = smartMoneyPayload.events?.filter((row) => row.chain === wallet.chain && row.walletAddress === wallet.address).length || 0;
+    return `<article class="smart-money-wallet ${wallet.enabled ? "is-enabled" : "is-paused"}">
+      <header><span><b>${escapeHtml(wallet.nickname || wallet.sourceName || "聪明钱地址")}</b><em>${escapeHtml(chainLabel)}</em></span><i>${wallet.enabled ? "监控中" : "已暂停"}</i></header>
+      <code title="${escapeHtml(wallet.address)}">${escapeHtml(smartMoneyShortAddress(wallet.address, 12, 10))}</code>
+      <dl>
+        <div><dt>来源</dt><dd title="${escapeHtml(wallet.sourceEvidence || "")}">${escapeHtml(wallet.sourceName || sourceLabel)} · ${sourceLabel}</dd></div>
+        <div><dt>弹窗线</dt><dd>${compactUsd(wallet.alertThresholdUsd || 10_000)}</dd></div>
+        <div><dt>买入记录</dt><dd>${eventCount} 笔</dd></div>
+      </dl>
+      <footer>
+        <button type="button" data-smart-money-toggle="${Number(wallet.id)}" data-smart-money-enabled="${wallet.enabled ? "1" : "0"}">${wallet.enabled ? "暂停" : "恢复"}</button>
+        <button type="button" class="is-danger" data-smart-money-remove="${Number(wallet.id)}" data-smart-money-name="${escapeHtml(wallet.nickname || smartMoneyShortAddress(wallet.address))}">删除</button>
+      </footer>
+    </article>`;
+  }
+
+  function smartMoneyEventTemplate(event) {
+    const explorerUrl = smartMoneyExplorerUrl(event);
+    const payment = `${compactNative(event.paymentAmount, event.paymentAsset)} · ${compactUsd(event.paymentUsd)}`;
+    const alertState = event.popupEligible ? (event.alertedAt ? "已弹窗" : "达到弹窗线") : "仅记录";
+    const buyRow = {
+      ...event,
+      contractAddress: event.tokenAddress,
+      chain: event.chain,
+      symbol: event.symbol || "未知代币",
+    };
+    return `<article class="smart-money-event ${event.popupEligible ? "is-alert" : "is-record"}">
+      <header>
+        <span><b>${escapeHtml(event.walletNickname || smartMoneyShortAddress(event.walletAddress))}</b><em>${escapeHtml(smartMoneyChainLabel(event.chain))}</em></span>
+        <i>${escapeHtml(alertState)}</i>
+      </header>
+      <div class="smart-money-event-trade">
+        <span><em>买入</em><b>${escapeHtml(event.symbol || "未知代币")}</b></span>
+        <span><em>支付</em><b>${escapeHtml(payment)}</b></span>
+        <span><em>收到</em><b>${escapeHtml(compactNative(event.tokenAmount, event.symbol))}</b></span>
+        <span><em>成交均价</em><b>${escapeHtml(compactPrice(event.priceUsd))}</b></span>
+      </div>
+      <div class="smart-money-event-contract"><span><em>CA</em><code title="${escapeHtml(event.tokenAddress)}">${escapeHtml(smartMoneyShortAddress(event.tokenAddress, 12, 10))}</code></span><span><em>钱包</em><code title="${escapeHtml(event.walletAddress)}">${escapeHtml(smartMoneyShortAddress(event.walletAddress, 10, 8))}</code></span></div>
+      <footer><time>${escapeHtml(relativeTime(event.observedAt))}</time><span>${monitorBuyButton(buyRow)}${explorerUrl ? `<a href="${escapeHtml(explorerUrl)}" target="_blank" rel="noreferrer noopener">查看链上交易</a>` : ""}</span></footer>
+    </article>`;
+  }
+
+  function renderSmartMoneyMonitor() {
+    const chains = Array.isArray(smartMoneyPayload.supportedChains) && smartMoneyPayload.supportedChains.length
+      ? smartMoneyPayload.supportedChains
+      : [
+          { id: "ethereum", label: "Ethereum" }, { id: "bsc", label: "BSC" },
+          { id: "base", label: "Base" }, { id: "solana", label: "Solana" },
+          { id: "robinhood", label: "Robinhood" },
+        ];
+    const wallets = Array.isArray(smartMoneyPayload.wallets) ? smartMoneyPayload.wallets : [];
+    const events = Array.isArray(smartMoneyPayload.events) ? smartMoneyPayload.events : [];
+    const summary = smartMoneyPayload.summary || {};
+    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-chains");
+    grid.classList.add("is-smart-money");
+    if (!smartMoneyLoaded) {
+      renderGrid(`<div class="price-watch-empty"><b>正在读取聪明钱地址</b><span>只建立最新链上基线，不追溯旧交易。</span></div>`);
+      return;
+    }
+    renderGrid(`<section class="smart-money-console">
+      <div class="smart-money-summary">
+        <span><b>${summary.running ? "运行中" : "准备中"}</b><em>只读监控</em></span>
+        <span><b>${Number(summary.enabledWallets || 0).toLocaleString("zh-CN")}</b><em>启用地址</em></span>
+        <span><b>${Number(summary.todayEligibleBuys || 0).toLocaleString("zh-CN")}</b><em>今日 ≥10,000U</em></span>
+        <span><b>${Number(summary.events || 0).toLocaleString("zh-CN")}</b><em>买入记录</em></span>
+      </div>
+      <form class="smart-money-add-form" data-smart-money-form>
+        <label><span>链</span><select name="chain">${chains.map((chain) => `<option value="${escapeHtml(chain.id)}"${chain.id === "bsc" ? " selected" : ""}>${escapeHtml(chain.label)}</option>`).join("")}</select></label>
+        <label class="is-address"><span>钱包地址</span><input name="address" required maxlength="180" autocomplete="off" placeholder="0x… / Solana 地址" /></label>
+        <label><span>备注</span><input name="nickname" maxlength="60" autocomplete="off" placeholder="例如 Inq5 连杆" /></label>
+        <label><span>来源</span><input name="sourceName" maxlength="80" autocomplete="off" placeholder="手动添加" /></label>
+        <label><span>弹窗线（U）</span><input name="alertThresholdUsd" type="number" min="1" step="1" value="10000" /></label>
+        <button type="submit" ${smartMoneyActionLoading ? "disabled" : ""}>${smartMoneyActionLoading ? "正在保存…" : "添加地址"}</button>
+      </form>
+      <p class="smart-money-readonly"><b>免费只读方案</b>：不会读取私钥、不会签名、不会自动交易。首次添加只从当前新区块开始，避免旧交易集中弹窗。</p>
+      <div class="smart-money-health-grid">${chains.map(smartMoneyHealthTemplate).join("")}</div>
+      <div class="smart-money-columns">
+        <section class="smart-money-panel"><header><span><p class="section-label">WATCHED WALLETS</p><h3>地址库</h3></span><em>${wallets.length} 条链上地址</em></header><div class="smart-money-wallet-list">${wallets.length ? wallets.map(smartMoneyWalletTemplate).join("") : `<div class="chain-section-empty"><b>还没有监控地址</b><span>可在上方手动添加，也会从明确写有“聪明钱地址”的群聊、个人 X 和 News Trade 自动收集。</span></div>`}</div></section>
+        <section class="smart-money-panel"><header><span><p class="section-label">VERIFIED BUY FLOW</p><h3>买入记录</h3></span><em>≥10,000U 弹窗 · 小额仅记录</em></header><div class="smart-money-event-list">${events.length ? events.map(smartMoneyEventTemplate).join("") : `<div class="chain-section-empty"><b>暂时没有新的买入</b><span>已建立的地址会继续在五条链上只读扫描。</span></div>`}</div></section>
+      </div>
+    </section>`);
   }
 
   function safeExternalUrl(value) {
@@ -1245,6 +1339,22 @@
     } catch (_) {
       return "";
     }
+  }
+
+  function opportunityTradeAction(state = {}, symbol = "") {
+    const action = state?.tradeAction && typeof state.tradeAction === "object" ? state.tradeAction : {};
+    const kind = String(action.kind || "").trim().toLowerCase();
+    if (kind === "exchange") {
+      const href = safeExternalUrl(action.url);
+      if (href) {
+        const venue = String(action.venue || "交易所").trim();
+        return `<a class="wechat-opportunity-trade-link" href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener" aria-label="在 ${escapeHtml(venue)} 打开 ${escapeHtml(symbol)} 合约交易" title="打开 ${escapeHtml(venue)} 对应合约页面">${escapeHtml(action.label || "买入")}<i aria-hidden="true">↗</i></a>`;
+      }
+    }
+    if (kind === "onchain" || (state.chain && state.contractAddress)) {
+      return monitorBuyButton({ ...state, symbol });
+    }
+    return `<button type="button" class="wechat-opportunity-trade-pending" disabled title="尚未确认对应交易市场">${escapeHtml(action.label || "交易待确认")}</button>`;
   }
 
   function compactUsd(value) {
@@ -1288,7 +1398,7 @@
     const verdictLabels = { strong: "强", watch: "观察", weak: "偏弱", avoid: "规避" };
     const ready = Boolean(analysis && status === "ready");
     const pending = status === "pending";
-    const summary = ready ? String(analysis.summary || "等待更多证据") : pending ? "分析中…" : "";
+    const summary = ready ? String(analysis.identitySummary || analysis.summary || "等待更多证据") : pending ? "分析中…" : "";
     const tooltip = ready
       ? `${provider} AI 研判：${summary}｜催化：${analysis.catalyst || "待确认"}｜风险：${analysis.risk || "待确认"}｜下一步：${analysis.nextFocus || "继续验证"}`
       : pending ? `${provider} AI 正在分析` : "AI 暂不可用，当前保留来源事实";
@@ -1336,13 +1446,11 @@
       : compactUsd(metrics.liquidityUsd);
     const content = `
       <span class="chain-rank-index">${index + 1}</span>
-      <span class="chain-rank-asset" title="${escapeHtml(ai.tooltip)}"><b>${escapeHtml(isNft ? row.name : row.symbol || row.name || "--")}</b><em>${escapeHtml(ai.ready ? `AI · ${ai.summary}` : ai.pending ? "AI 研判中…" : isNft ? "OpenSea · NFT" : row.name || "等待项目资料")}</em></span>
+      <span class="chain-rank-asset" title="${escapeHtml(ai.tooltip)}"><b>${href ? `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener">${escapeHtml(isNft ? row.name : row.symbol || row.name || "--")}</a>` : escapeHtml(row.symbol || row.name || "--")}${isNft ? "" : monitorBuyButton(row)}</b><em>${escapeHtml(ai.ready ? `AI · ${ai.summary}` : ai.pending ? "AI 研判中…" : isNft ? "OpenSea · NFT" : row.name || "等待项目资料")}</em></span>
       <span class="chain-rank-metrics"><b>${primaryMetric}</b><em>${isNft ? "地板价" : "流动性"}</em></span>
       <span class="chain-rank-metrics"><b>${compactUsd(metrics.volume24hUsd)}</b><em>24H成交</em></span>
       <span class="chain-rank-score ${ai.ready ? "is-ai" : ""}" title="${escapeHtml(ai.tooltip)}"><b>${ai.ready ? ai.narrativeStrength : Number(row.score) || 0}</b><em>${ai.ready ? `AI叙事 · 生态${Number(row.score) || 0}` : ai.pending ? "AI分析中" : "生态分"}</em></span>`;
-    return href
-      ? `<a class="chain-ranking-row ${index === 0 ? "is-leader" : ""}" href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener">${content}</a>`
-      : `<div class="chain-ranking-row ${index === 0 ? "is-leader" : ""}">${content}</div>`;
+    return `<div class="chain-ranking-row ${index === 0 ? "is-leader" : ""}">${content}</div>`;
   }
 
   function chainDiscoveryTemplate(row) {
@@ -1351,12 +1459,10 @@
     const ai = chainAiMeta(row);
     const content = `
       <span class="chain-discovery-mark">发现</span>
-      <span class="chain-discovery-asset"><b>${escapeHtml(row.symbol || row.name || "--")}</b><em>${escapeHtml(row.name || "等待项目资料")}</em></span>
+      <span class="chain-discovery-asset"><b>${href ? `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener">${escapeHtml(row.symbol || row.name || "--")}</a>` : escapeHtml(row.symbol || row.name || "--")}${monitorBuyButton(row)}</b><em>${escapeHtml(row.name || "等待项目资料")}</em></span>
       <span class="chain-discovery-stage" title="${escapeHtml(ai.tooltip)}"><b>${escapeHtml(tokenStageLabel(row.tokenStage))}</b><em>${escapeHtml(ai.ready ? `AI · ${ai.summary}` : ai.pending ? "AI 研判中…" : `${Number(row.evidenceCount) || 0} 条证据`)}</em></span>
       <span class="chain-discovery-score ${ai.ready ? "is-ai" : ""}" title="${escapeHtml(ai.tooltip)}"><b>${ai.ready ? ai.narrativeStrength : score}</b><em>${ai.ready ? `AI叙事 · 潜力${score}` : ai.pending ? "AI分析中" : "潜力分"}</em></span>`;
-    return href
-      ? `<a class="chain-discovery-row" href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener">${content}</a>`
-      : `<div class="chain-discovery-row">${content}</div>`;
+    return `<div class="chain-discovery-row">${content}</div>`;
   }
 
   function chainMarketTemplate(market) {
@@ -1413,23 +1519,549 @@
       </article>`;
   }
 
+  function binanceWalletTokenUrl(row) {
+    const contract = String(row?.contractAddress || "").trim();
+    const rawNetwork = String(row?.network || row?.chain || "").trim().toLowerCase();
+    const aliases = {
+      "56": "bsc", bnb: "bsc", bsc: "bsc", "bnb chain": "bsc", "bnb smart chain": "bsc",
+      "1": "ethereum", eth: "ethereum", ethereum: "ethereum",
+      "8453": "base", base: "base",
+      sol: "solana", solana: "solana", "501": "solana",
+      robinhood: "robinhood", "robinhood-chain": "robinhood"
+    };
+    const network = aliases[rawNetwork] || rawNetwork.replace(/[^a-z0-9-]/g, "");
+    if (!contract || !network) return "";
+    return safeExternalUrl(`https://web3.binance.com/en/token/${encodeURIComponent(network)}/${encodeURIComponent(contract)}`);
+  }
+
+  function onchainResearchCandidateTemplate(row, compact = false) {
+    const ai = chainAiMeta(row);
+    const framework = ai.analysis?.frameworkAssessment && typeof ai.analysis.frameworkAssessment === "object"
+      ? ai.analysis.frameworkAssessment : {};
+    const frameworkReady = ai.ready
+      && framework.version === "xmind-v4.4-attention-dual-radar-1"
+      && [framework.attentionState, framework.attentionTransition, framework.transitionTrigger,
+          framework.narrativeDiscovery, framework.mappingFit, framework.leaderElection,
+          framework.nextTrigger, framework.invalidation].every(Boolean);
+    const potentialLabels = { leader: "龙头潜力", "golden-dog": "大金狗潜力", watch: "框架观察", none: "暂无潜力结论" };
+    const potentialLabel = framework.potentialTier ? potentialLabels[framework.potentialTier] || "框架观察" : "";
+    const provisional = row.researchTier === "quantitative-breakout";
+    const newsTriggered = row.researchTier === "news-triggered";
+    const metrics = row?.metrics && typeof row.metrics === "object" ? row.metrics : {};
+    const href = binanceWalletTokenUrl(row);
+    const typeLabel = row.candidateType === "meme" ? "MEME" : "项目";
+    const typeTone = row.candidateType === "meme" ? "is-meme" : "is-project";
+    const decisionLabel = frameworkReady && ["leader", "golden-dog"].includes(framework.potentialTier)
+      ? `${potentialLabel} · ${framework.executionPermission || "UNKNOWN"}`
+      : newsTriggered
+      ? (row.researchEvidence?.identityStatus === "news-contract-explicit" ? "新闻触发 · CA明确" : "新闻触发 · 身份待核验")
+      : provisional
+      ? "爆发观察 · 非正式精选"
+      : row.decision === "shortlisted"
+      ? (frameworkReady ? (ai.analysis.verdict === "strong" ? "优先研究" : "有线索 · 待验证") : "初筛通过 · V4.4待复核")
+      : row.decision === "warming"
+        ? "早期观察"
+        : row.decision === "filtered"
+          ? "已过滤"
+          : "量化观察";
+    const reasons = Array.isArray(row.reasons) ? row.reasons : [];
+    const risks = Array.isArray(row.risks) ? row.risks : [];
+    const discoveryTime = Number(row.firstSeenAt) > 0
+      ? new Date(Number(row.firstSeenAt)).toLocaleTimeString("zh-CN", { hour12: false }) : "";
+    const timingNote = discoveryTime ? `发现 ${discoveryTime}${Number.isFinite(row.firstScreenMs) ? ` · 初筛 ${Math.ceil(row.firstScreenMs / 1000)}秒` : ""}${Number.isFinite(row.analysisLatencyMs) ? ` · AI ${Math.ceil(row.analysisLatencyMs / 1000)}秒` : ""}` : "";
+    const baseIdentityNote = row.researchEvidence?.identityStatus === "news-contract-explicit"
+      ? "新闻原文已给出当前 CA · 事件方身份仍需核验"
+      : row.identityAmbiguous && Number(row.sameSymbolContractCount) > 1
+      ? `同链 ${Number(row.sameSymbolContractCount)} 个同名合约 · 请核验当前 CA`
+      : ["same-chain-symbol-unverified", "news-name-contract-unverified", "event-name-contract-unverified"].includes(row.researchEvidence?.identityStatus)
+        ? "快讯题材复核 · 合约关联待核验"
+        : provisional ? "事件起因与合约身份仍待核验" : "";
+    const leaderNote = row.sameSymbolRole === "leader-candidate"
+      ? `龙一候选 · ${row.sameSymbolLeaderReason || "同名竞争中综合领先"}` : "";
+    const identityNote = [leaderNote, baseIdentityNote].filter(Boolean).join(" · ");
+    const walletProfile = row.walletProfile && typeof row.walletProfile === "object" ? row.walletProfile : {};
+    const walletNote = walletProfile.coverage ? `钱包结构：${walletProfile.summary || "已纳入分型验证"}` : "";
+    const chatValidation = row.crossValidation && typeof row.crossValidation === "object" ? row.crossValidation : {};
+    const chatNote = chatValidation.summary ? `群聊交叉验证：${chatValidation.summary.replace(/^群聊(?:交叉验证|旁证)：?/, "")}` : "";
+    const narrative = ai.analysis?.narrative || {};
+    const frameworkFields = [
+      ["框架定位", [framework.chainContext, framework.assetIdentity].filter(Boolean).join(" · ")],
+      ["状态 / 候选路径", [framework.currentStage, framework.stateTransition, framework.candidatePath].filter(Boolean).join(" · ")],
+      ["注意力跃迁", [framework.previousAttentionState && framework.attentionState ? `${framework.previousAttentionState} → ${framework.attentionState}` : framework.attentionState, framework.attentionTransition, framework.transitionTrigger].filter(Boolean).join(" · ")],
+      ["叙事发现", framework.narrativeDiscovery],
+      ["映射关系", [framework.mappingFit, Array.isArray(framework.candidateSet) ? framework.candidateSet.join("；") : ""].filter(Boolean).join(" · ")],
+      ["龙头竞选", [framework.leaderElection, framework.currentLeader, framework.leaderRelation].filter(Boolean).join(" · ")],
+      ["休眠 / 复燃", framework.dormantReactivation],
+      ["最小注意力单元", [framework.minAttentionUnit, framework.emotionalHook, framework.attentionHook].filter(Boolean).join(" · ")],
+      ["当前主要驱动", framework.primaryDriver],
+      ["Firstness", framework.firstness],
+      ["分发 / 付费买家", [framework.distribution, framework.paidBuyers].filter(Boolean).join(" · ")],
+      ["加速度 / 聪明钱", [framework.acceleration, framework.smartMoney].filter(Boolean).join(" · ")],
+      ["机制 / 报价迁移", [framework.mechanism, framework.quoteMigration].filter(Boolean).join(" · ")],
+      ["P0 / 母案例", [framework.p0OfficialAsset, framework.motherCaseSignals].filter(Boolean).join(" · ")],
+      ["跨形态接力 / 行动窗口", [framework.crossRegimeHandoff, framework.actionWindow].filter(Boolean).join(" · ")],
+      ["身份 / 时间 / 供应审计", framework.identityTimeSupplyAudit],
+      ["历史类比", Array.isArray(framework.historicalAnalogues) ? framework.historicalAnalogues.join("、") : ""],
+      ["下一触发条件", framework.nextTrigger || framework.nextTransition],
+      ["风险标签 / 硬阻断", [Array.isArray(framework.riskTags) ? framework.riskTags.join("、") : "", framework.hardBlockReason].filter(Boolean).join(" · ")],
+      ["失效条件", framework.invalidation],
+      ["研究保留", framework.version ? "风险只限制执行；事件、映射与候选研究记录继续保留" : ""]
+    ].filter(([, value]) => value);
+    const frameworkDetail = frameworkReady ? `
+      <section class="onchain-framework-assessment">
+        <header><b>${escapeHtml(potentialLabel || "V4.4 完整框架")}</b><em>注意力跃迁 · 叙事/龙头双雷达 · 六本账</em></header>
+        <div class="onchain-framework-scores">
+          ${[["叙事发现", framework.narrativeDiscoveryScore ?? framework.discoveryScore], ["注意力", framework.attentionTransitionScore], ["映射", framework.mappingFitScore], ["龙头竞选", framework.leaderElectionScore ?? framework.leaderScore], ["执行", framework.executionScore], ["风险", framework.riskScore], ["置信度", framework.confidenceScore]].map(([label, score]) => `<span><b>${Math.round(Number(score) || 0)}</b><em>${label}</em></span>`).join("")}
+        </div>
+        <p class="onchain-framework-permission is-${escapeHtml(String(framework.executionPermission || "unknown").toLowerCase())}">执行许可 ${escapeHtml(framework.executionPermission || "UNKNOWN")} · 审计 ${escapeHtml(framework.auditStatus || "unknown")} · UNKNOWN 不等于安全</p>
+        <dl>${frameworkFields.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl>
+      </section>` : "";
+    const narrativeDetail = frameworkReady && Object.values(narrative).some(Boolean) ? `
+      <details class="onchain-narrative-detail" data-research-detail="${escapeHtml(`${row.network}:${row.contractAddress}`)}">
+        <summary>展开完整 V4.4 投研、叙事与风控</summary>
+        ${frameworkDetail}
+        <dl>${[["thesis", "是什么 / 价值逻辑"], ["attention", "为何现在关注"], ["evidence", "事实依据与局限"], ["invalidation", "待验证 / 失效条件"]].map(([key, label]) => `<div><dt>${label}</dt><dd>${escapeHtml(narrative[key] || "暂无足够资料")}</dd></div>`).join("")}</dl>
+        <p>${escapeHtml(timingNote)}${row.analysisRefreshing ? " · 正在补充分析，原结果保留" : ""}</p>
+      </details>` : "";
+    const content = `
+      <span class="onchain-research-token">
+        <i class="${typeTone}">${typeLabel}</i>
+        ${newsTriggered ? `<i class="is-news-triggered">新闻触发</i>` : ""}
+        ${provisional ? `<i class="is-breakout">爆发观察</i>` : ""}
+        <span><b>${escapeHtml(row.symbol || row.name || "--")} ${monitorBuyButton(row)}</b><em>${escapeHtml(row.network || "链上")} · ${escapeHtml(row.name || "待补资料")}</em></span>
+      </span>
+      <span class="onchain-research-signal" title="${escapeHtml([frameworkReady ? ai.tooltip : "", timingNote].filter(Boolean).join(' / '))}"><b>${escapeHtml(frameworkReady ? ai.summary : newsTriggered ? row.newsTriggerReason || row.newsSignal?.title || "新闻催化已出现，V4.4 正在补充分析" : provisional ? row.provisionalReason || "链上量价达到爆发门槛，V4.4 正在核验叙事" : "尚未形成 V4.4 研究结论")}</b><em>${escapeHtml(identityNote || (frameworkReady ? `催化：${ai.analysis.catalyst || "待确认"}` : newsTriggered ? `来源：${row.newsSignal?.source || "聚合快讯"} · 事件先入档，V4.4 结论待补全` : "量化初筛不代表叙事成立"))}</em></span>
+      <span class="onchain-research-data"><b>${compactUsd(metrics.liquidityUsd)}</b><em>流动性</em></span>
+      <span class="onchain-research-data"><b>${compactUsd(metrics.volumeH1Usd)}</b><em>1H成交</em></span>
+      <span class="onchain-research-score ${frameworkReady ? "is-ai" : ""}"><b>${frameworkReady ? ai.narrativeStrength : Number(row.selectedScore) || 0}</b><em>${frameworkReady ? "V4.4叙事" : newsTriggered ? "新闻热度" : `${typeLabel}量化`}</em></span>
+      ${compact ? "" : `<span class="onchain-research-risk"><b>${escapeHtml(decisionLabel)}</b><em>${escapeHtml([frameworkReady ? ai.analysis.risk || risks[0] || "待核验安全数据" : risks[0] || "待核验持仓与权限", walletNote, chatNote].filter(Boolean).join(" · "))}</em></span>`}`;
+    return `<article class="onchain-research-entry ${provisional ? "is-provisional" : ""} ${newsTriggered ? "is-news-triggered" : ""}"><div class="onchain-research-candidate ${compact ? "is-compact" : ""}">${content}</div>
+      <div class="onchain-research-links">${href ? `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener" title="在币安钱包打开当前链与 CA">查看标的 ↗</a>` : ""}<span>${escapeHtml(row.network || "")} · ${escapeHtml(row.contractAddress || "合约待核验")}</span></div>${narrativeDetail}</article>`;
+  }
+
+  function onchainResearchPaginationTemplate(pagination, history = false) {
+    const page = Number(pagination?.page) || 1;
+    const pages = Number(pagination?.pages) || 1;
+    const total = Number(pagination?.total) || 0;
+    const attribute = history ? "data-research-history-page" : "data-chain-research-page";
+    return `<nav class="onchain-research-pagination" aria-label="${history ? "推荐变更" : "研究清单"}分页" aria-busy="${chainResearchPaging}"><span>共 ${total} 个 · 第 ${page} / ${pages} 页${chainResearchPaging ? " · 加载中" : ""}</span>
+      <button type="button" ${attribute}="${page - 1}" ${page <= 1 || chainResearchPaging ? "disabled" : ""}>上一页</button><button type="button" ${attribute}="${page + 1}" ${page >= pages || chainResearchPaging ? "disabled" : ""}>下一页</button></nav>`;
+  }
+
+  function onchainResearchNetworkLabel(network) {
+    return {
+      solana: "Solana",
+      bsc: "BSC",
+      base: "Base",
+      eth: "Ethereum",
+      robinhood: "Robinhood Chain",
+      arc: "ARC"
+    }[String(network || "").toLowerCase()] || String(network || "未知网络");
+  }
+
+  function onchainResearchNetworkStatusTemplate(research) {
+    const sourceStatus = research?.sourceStatus && typeof research.sourceStatus === "object" ? research.sourceStatus : {};
+    const researchNetworks = Array.isArray(research?.networks) ? research.networks : Object.keys(sourceStatus);
+    return `
+      <div class="onchain-research-networks" aria-label="当前扫盘网络">
+        <strong>当前扫盘网络</strong>
+        ${researchNetworks.map((network) => {
+          const status = sourceStatus[network] || "pending";
+          const statusLabel = status === "ok" ? "正常" : status === "degraded" ? "补连中 · 有快照" : status === "error" ? "重试中" : "等待首轮";
+          return `<span class="is-${escapeHtml(status)}"><i></i><b>${escapeHtml(onchainResearchNetworkLabel(network))}</b><em>${statusLabel}</em></span>`;
+        }).join("")}
+      </div>`;
+  }
+
+  function onchainResearchFunnelTemplate(funnel) {
+    return `
+      <div class="onchain-research-funnel">
+        <span><b>${Number(funnel?.discovered) || 0}</b><em>当天已发现</em></span><i>→</i>
+        <span><b>${Number(funnel?.filtered) || 0}</b><em>过滤噪音</em></span><i>→</i>
+        <span><b>${Number(funnel?.warming) || 0}</b><em>最早期观察</em></span><i>→</i>
+        <span><b>${Number(funnel?.quantified) || 0}</b><em>量化研究</em></span><i>→</i>
+        <span class="is-provisional"><b>${Number(funnel?.provisional) || 0}</b><em>爆发待核验</em></span><i>→</i>
+        <span class="is-selected"><b>${Number(funnel?.selected) || 0}</b><em>事件 / AI 精选</em></span>
+      </div>`;
+  }
+
+  function onchainResearchTemplate(research, view = "today") {
+    const funnel = research?.funnel && typeof research.funnel === "object" ? research.funnel : {};
+    const selected = Array.isArray(research?.selected) ? research.selected : [];
+    const selectedTotal = Number(research?.selectedTotal ?? selected.length);
+    const provisional = Array.isArray(research?.provisional) ? research.provisional : [];
+    const provisionalTotal = Number(research?.provisionalTotal ?? provisional.length);
+    const queue = research?.reviewQueue || {};
+    const queueNote = `新闻触发 ${Number(queue.newsTriggered) || 0} · 爆发待核验 ${provisionalTotal} · 同名分流 ${Number(queue.sameSymbolSuppressed) || 0} · 待 AI 复核 ${Number(queue.pending) || 0} · 暂不可用 ${Number(queue.unavailable) || 0} · 证据不足 ${Number(queue.needsEvidence) || 0} · AI 淘汰 ${Number(queue.filteredByAi) || 0}（不展示）`;
+    const history = Array.isArray(research?.recommendationHistory) ? research.recommendationHistory : [];
+    const historyTemplate = Number(research?.historyPagination?.total) ? `<details class="onchain-research-watching" data-research-detail="recommendation-history"><summary>推荐变更与撤回（${Number(research.historyPagination.total)}）</summary>
+      ${history.map((row) => `<article class="onchain-research-withdrawn"><b>${escapeHtml(row.symbol || row.name)} · ${escapeHtml(row.network)}</b><p>${escapeHtml(row.withdrawalReason)}</p><small>原结论：${escapeHtml(row.previousAnalysis?.summary || "待核对")} · ${escapeHtml(row.contractAddress)}</small></article>`).join("")}${onchainResearchPaginationTemplate(research.historyPagination, true)}</details>` : "";
+    const watching = Array.isArray(research?.watching) ? research.watching : [];
+    const reviewable = selected.filter((row, index, rows) => {
+      const key = `${row?.network || ""}:${row?.contractAddress || row?.poolAddress || row?.symbol || index}`;
+      return rows.findIndex((candidate, candidateIndex) => `${candidate?.network || ""}:${candidate?.contractAddress || candidate?.poolAddress || candidate?.symbol || candidateIndex}` === key) === index;
+    });
+    const benchmark = research?.benchmark && typeof research.benchmark === "object" ? research.benchmark : {};
+    const benchmarkCases = Array.isArray(benchmark.cases) ? benchmark.cases : [];
+    const sourceStatus = research?.sourceStatus && typeof research.sourceStatus === "object" ? research.sourceStatus : {};
+    const sourceOk = Object.values(sourceStatus).filter((value) => value === "ok" || value === "degraded").length;
+    const sourceTotal = Object.keys(sourceStatus).length;
+    const availableDays = Array.isArray(research?.availableDays) ? research.availableDays.slice(0, 14) : [];
+    const recallLabel = Number.isFinite(Number(benchmark.recallPct))
+      ? `${Number(benchmark.recallPct).toFixed(1)}%`
+      : `待回放 ${Number(benchmark.replayable) || 0}/${Number(benchmark.caseCount) || 0}`;
+
+    if (view === "scan") {
+      return `
+        <section class="onchain-research-board chain-research-view is-scan">
+          <header class="onchain-research-head">
+            <span><p class="section-label">FULL MARKET INTAKE / ${escapeHtml(research?.scoreVersion || "")}</p><h3>动态增量扫盘</h3><em>${escapeHtml(research?.day || "今日")} · 后台全量扫描，页面只保留需要你复核的候选</em></span>
+            <div><b>${Number(funnel.discovered) || 0}</b><em>已发现</em></div>
+            <div><b>${sourceTotal ? `${sourceOk}/${sourceTotal}` : "等待"}</b><em>链路正常</em></div>
+            <div><b>${selectedTotal + provisionalTotal}</b><em>需要查看</em></div>
+          </header>
+          <nav class="onchain-research-days" aria-label="扫盘日期回溯">
+            <strong>日期回溯</strong>
+            ${availableDays.map((day) => `<button type="button" class="${day === research?.day ? "active" : ""}" data-chain-research-day="${escapeHtml(day)}">${day === research?.currentDay ? `今天 · ${escapeHtml(day)}` : escapeHtml(day)}</button>`).join("")}
+          </nav>
+          ${onchainResearchNetworkStatusTemplate(research)}
+          ${onchainResearchFunnelTemplate(funnel)}
+          <div class="onchain-scan-columns is-focus-only">
+            <section class="onchain-scan-panel is-watching">
+              <header><span><b>需要你看的候选</b><em>相关新闻先进入精选视野；CA 或身份未确认时会明确标注，AI 随后补全分析</em></span><strong>${selectedTotal + provisionalTotal}</strong></header>
+              <div>${provisional.length || reviewable.length ? [...provisional, ...reviewable].map((row) => onchainResearchCandidateTemplate(row, true)).join("") : `<div class="chain-section-empty"><b>暂无值得查看的候选</b><span>全量扫描仍在后台运行，达到门槛后才会显示。</span></div>`}</div>
+              ${onchainResearchPaginationTemplate(research?.pagination)}
+            </section>
+          </div>
+          <p class="onchain-research-queue">${queueNote}</p>${historyTemplate}
+        </section>`;
+    }
+
+    if (view === "history") {
+      return `
+        <section class="onchain-research-board chain-research-view is-history">
+          <header class="onchain-research-head">
+            <span><p class="section-label">HISTORICAL LEADER REPLAY</p><h3>历史龙头复盘</h3><em>用真实早期快照检验规则，不用事后结果倒推命中率</em></span>
+            <div class="onchain-research-recall"><b>${escapeHtml(recallLabel)}</b><em>综合召回</em></div>
+            <div><b>${Number(benchmark.categories?.meme?.hits) || 0}/${Number(benchmark.categories?.meme?.replayable) || 0}</b><em>MEME 命中</em></div>
+            <div><b>${Number(benchmark.categories?.project?.hits) || 0}/${Number(benchmark.categories?.project?.replayable) || 0}</b><em>项目命中</em></div>
+          </header>
+          <section class="onchain-research-cases is-open">
+            <header><b>历史共识龙头样本</b><em>目标召回率 ≥ ${Number(benchmark.targetRecallPct) || 80}%</em></header>
+            <div>${benchmarkCases.map((row) => `
+              <article class="onchain-research-case ${row.hit ? "is-hit" : row.replayable ? "is-missed" : "is-pending"}">
+                <span><b>${escapeHtml(row.symbol || row.name || "--")}</b><em>${row.category === "meme" ? "MEME 龙头" : "项目型龙头"} · ${escapeHtml(row.network || "链上")}</em></span>
+                <p>${escapeHtml(row.reason || "历史共识龙头案例")}</p>
+                <strong>${row.hit ? `已早期命中 · ${Number(row.firstScore) || 0}分` : row.replayable ? "该版本未命中" : "待补启动时点快照"}</strong>
+              </article>`).join("") || `<div class="chain-section-empty"><b>暂无复盘样本</b><span>历史样本导入后会显示在这里。</span></div>`}</div>
+          </section>
+        </section>`;
+    }
+
+    return `
+      <section class="onchain-research-board chain-research-view is-today">
+        <header class="onchain-research-head">
+          <span><p class="section-label">TODAY'S RESEARCH DESK</p><h3>今日最值得研究的项目（推荐）</h3><em>${escapeHtml(research?.day || "今日")} · 新闻先触发，AI 随后补全起因、叙事和机会</em></span>
+          <div><b>${selectedTotal}</b><em>精选视野</em></div>
+          <div><b>${provisionalTotal}</b><em>爆发待核验</em></div>
+          <div><b>${relativeTime(research?.updatedAt)}</b><em>最近更新</em></div>
+        </header>
+        ${provisionalTotal ? `<section class="onchain-research-selected is-provisional">
+          <header><b>链上爆发 · 叙事待核验</b><em>双行情源确认强量价后先展示 · 非正式精选，不触发强推荐弹窗</em></header>
+          <div>${provisional.map((row) => onchainResearchCandidateTemplate(row)).join("")}</div>
+        </section>` : ""}
+        <section class="onchain-research-selected">
+          <header><b>优先研究清单</b><em>已按 AI 结论、证据完整度、叙事强度与置信度从优到次排序</em></header>
+          <div>${selected.length ? selected.map((row) => onchainResearchCandidateTemplate(row)).join("") : `<div class="chain-section-empty"><b>暂未筛出高质量候选</b><span>系统仍在后台记录全部新池；达到门槛后才会出现在这里。</span></div>`}</div>
+          ${onchainResearchPaginationTemplate(research?.pagination)}
+        </section>
+        <p class="onchain-research-queue">${queueNote}</p>${historyTemplate}
+      </section>`;
+  }
+
+  function onchainTrenchDecisionMeta(decision) {
+    return {
+      shortlisted: ["is-selected", "研究优先"],
+      watch: ["is-watch", "量化观察"],
+      warming: ["is-warming", "早期观察"],
+      filtered: ["is-filtered", "暂未过筛"],
+    }[String(decision || "").toLowerCase()] || ["is-watch", "待评估"];
+  }
+
+  function trenchPercent(value, digits = 1) {
+    if (value === null || value === undefined || value === "") return "--";
+    const number = Number(value);
+    if (!Number.isFinite(number)) return "--";
+    return `${number.toFixed(Math.abs(number) >= 10 ? 0 : digits)}%`;
+  }
+
+  function trenchSocialLabel(url) {
+    const value = String(url || "").toLowerCase();
+    if (value.includes("x.com") || value.includes("twitter.com")) return "X";
+    if (value.includes("t.me") || value.includes("telegram")) return "TG";
+    if (value.includes("instagram")) return "IG";
+    if (value.includes("tiktok")) return "TK";
+    return "WEB";
+  }
+
+  function trenchSocialGlyph(kind) {
+    return {
+      X: "𝕏",
+      TG: "➤",
+      IG: "◎",
+      TK: "♪",
+      WEB: "⌁",
+      SEARCH: "⌕",
+      AI: "✦",
+    }[kind] || "·";
+  }
+
+  function trenchXHoverTemplate(row, url) {
+    const original = row?.xOriginal && typeof row.xOriginal === "object" ? row.xOriginal : {};
+    const handle = String(original.handle || "").replace(/^@/, "");
+    const isTweet = Boolean(original.isTweet || original.statusId || /\/status\/\d+/i.test(url));
+    const text = String(original.text || "").trim();
+    return `<span class="onchain-trench-social-tool is-x" tabindex="0">
+      <a class="onchain-trench-social-button" href="${escapeHtml(url)}" target="_blank" rel="noreferrer noopener" aria-label="${isTweet ? "查看原 X" : "查看 X 账号"}">${trenchSocialGlyph("X")}</a>
+      <span class="onchain-trench-hover-card is-x-card" role="tooltip">
+        <span class="onchain-trench-x-head"><b>${handle ? `@${escapeHtml(handle)}` : "X 原始来源"}</b><em>${isTweet ? "原 X" : "官方账号"}</em></span>
+        <p>${text ? escapeHtml(text) : isTweet ? "GMGN 已返回原帖链接。为避免额外请求和 IP 限频，正文不会在后台主动抓取；点击即可打开原 X。" : "GMGN 已返回官方 X 账号，点击即可查看。"}</p>
+        <a href="${escapeHtml(url)}" target="_blank" rel="noreferrer noopener">${isTweet ? "打开原 X ↗" : "打开账号 ↗"}</a>
+      </span>
+    </span>`;
+  }
+
+  function trenchNarrativeHoverTemplate(row) {
+    const narrative = String(row?.gmgnNarrative || "").trim();
+    return `<span class="onchain-trench-social-tool is-ai ${narrative ? "has-native" : "is-unavailable"}" tabindex="0">
+      <button type="button" class="onchain-trench-social-button" aria-label="查看 GMGN AI 叙事">${trenchSocialGlyph("AI")}</button>
+      <span class="onchain-trench-hover-card is-ai-card" role="tooltip">
+        <b>GMGN AI 叙事</b>
+        <p>${narrative ? escapeHtml(narrative) : "GMGN 战壕接口本次未随主数据返回原生叙事。为避免 IP 限频，系统不会按币逐个补请求，也不会用其他模型冒充 GMGN。"}</p>
+        <small>${narrative ? "内容由 GMGN 随本次战壕数据返回；" : ""}悬停不发起新请求。AI 内容未经人工审核，请独立核实，不构成投资建议。</small>
+      </span>
+    </span>`;
+  }
+
+  function onchainTrenchSocialsTemplate(row) {
+    const links = row?.narrativeContext?.links && typeof row.narrativeContext.links === "object"
+      ? row.narrativeContext.links : {};
+    const fallback = Array.isArray(row?.narrativeContext?.socials) ? row.narrativeContext.socials : [];
+    const candidates = [
+      links.twitter || row?.xOriginal?.url,
+      links.telegram,
+      links.website,
+      links.instagram,
+      links.tiktok,
+      ...fallback,
+    ].map((value) => safeExternalUrl(value)).filter(Boolean);
+    const seen = new Set();
+    const socialButtons = candidates.map((url) => {
+      if (seen.has(url)) return "";
+      seen.add(url);
+      const kind = trenchSocialLabel(url);
+      if (kind === "X") return trenchXHoverTemplate(row, url);
+      return `<a class="onchain-trench-social-button" href="${escapeHtml(url)}" target="_blank" rel="noreferrer noopener" aria-label="打开 ${escapeHtml(kind)}" title="打开 ${escapeHtml(kind)}">${trenchSocialGlyph(kind)}</a>`;
+    }).join("");
+    const searchUrl = safeExternalUrl(row?.tradeUrl);
+    const searchButton = searchUrl
+      ? `<a class="onchain-trench-social-button is-search" href="${escapeHtml(searchUrl)}" target="_blank" rel="noreferrer noopener" aria-label="在 GMGN 搜索" title="在 GMGN 搜索">${trenchSocialGlyph("SEARCH")}</a>`
+      : "";
+    return `${trenchNarrativeHoverTemplate(row)}${socialButtons}${searchButton}`;
+  }
+
+  function trenchChip(label, value, tone = "") {
+    if (value === null || value === undefined || value === "" || value === "--") return "";
+    return `<span class="onchain-trench-chip ${tone ? `is-${tone}` : ""}"><em>${escapeHtml(label)}</em><b>${escapeHtml(value)}</b></span>`;
+  }
+
+  function trenchRiskTone(value, warning, danger) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return "";
+    if (number >= danger) return "danger";
+    if (number >= warning) return "warning";
+    return "safe";
+  }
+
+  function onchainTrenchesTemplate(payload) {
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+    const networks = Array.isArray(payload?.networks) && payload.networks.length
+      ? payload.networks : ["eth", "solana", "robinhood", "arc", "base", "bsc"];
+    const counts = payload?.counts || {};
+    const statuses = payload?.sourceStatus && typeof payload.sourceStatus === "object" ? payload.sourceStatus : {};
+    const healthySources = Object.values(statuses).filter((value) => value === "ok").length;
+    const sourceTotal = Object.keys(statuses).length;
+    const unsupportedSources = Object.entries(statuses).filter(([, value]) => value === "unsupported").map(([key]) => key.split("/")[0]);
+    const failedSources = Object.entries(statuses).filter(([, value]) => ["error", "rate_limited"].includes(value)).map(([key]) => key.split("/")[0]);
+    const retryAfter = Math.max(0, Number(payload?.retryAfterSeconds) || 0);
+    const cooldownUntil = Math.max(0, Number(payload?.cooldownUntil) || 0) * 1000;
+    const coolingDown = cooldownUntil > Date.now() || Boolean(payload?.rateLimited && retryAfter);
+    const apiConfigured = Boolean(payload?.gmgnApi?.personalKeyUsed);
+    const aiCoverage = payload?.aiCoverage || {};
+    const page = Number(payload?.page) || selectedTrenchPage;
+    const pages = Number(payload?.pages) || 1;
+    const total = Number(payload?.total) || 0;
+    const networkTabs = [{ key: "", label: "全部链" }, ...networks.map((network) => ({
+      key: network,
+      label: onchainResearchNetworkLabel(network),
+    }))];
+    return `
+      <section class="chain-research-view onchain-trenches-board">
+        <header class="onchain-trenches-hero">
+          <span class="onchain-trenches-kicker">GMGN LIVE TRENCH / OPENED / MIGRATED</span>
+          <div class="onchain-trenches-title">
+            <span><h3>GMGN 战壕 · 已开盘</h3><p>头像、持仓结构、聪明钱、社交与交易数据均来自 GMGN 实时接口。</p></span>
+            <button type="button" data-trench-refresh ${onchainTrenchesLoading || coolingDown ? "disabled" : ""}>${onchainTrenchesLoading ? "读取中…" : coolingDown ? `冷却中 ${retryAfter || Math.max(1, Math.ceil((cooldownUntil - Date.now()) / 1000))}s` : "刷新战壕"}</button>
+          </div>
+          <div class="onchain-trenches-summary">
+            <span><b>${total}</b><em>实时结果</em></span>
+            <span><b>${Number(counts.gmgn) || 0}</b><em>GMGN</em></span>
+            <span><b>${sourceTotal ? `${healthySources}/${sourceTotal}` : "等待"}</b><em>链已返回</em></span>
+            <span><b>${Number(aiCoverage.ready) || 0}/${Number(aiCoverage.total) || items.length || 0}</b><em>GMGN 原生叙事</em></span>
+          </div>
+        </header>
+        <aside class="onchain-trenches-preset-note">
+          <span><b>GMGN API 只读${apiConfigured ? " · 已接入个人 Key" : ""}</b><em>同一请求 90 秒合并复用，各链错峰读取；叙事只使用 GMGN 主响应附带内容，图标悬停零请求。429 冷却期间停止访问，不拿旧数据冒充实时。</em>${unsupportedSources.length ? `<small>${escapeHtml(unsupportedSources.map(onchainResearchNetworkLabel).join("、"))} 当前未获 GMGN 战壕接口支持</small>` : failedSources.length ? `<small>${escapeHtml(failedSources.map(onchainResearchNetworkLabel).join("、"))} 正在自动恢复${retryAfter ? `，约 ${retryAfter} 秒后可重试` : ""}</small>` : ""}</span>
+          <i>${escapeHtml(relativeTime(payload?.updatedAt))}</i>
+        </aside>
+        <div class="onchain-trenches-filterbar">
+          <div aria-label="战壕链筛选">${networkTabs.map((tab) => `<button type="button" class="${selectedTrenchNetwork === tab.key ? "active" : ""}" data-trench-network="${escapeHtml(tab.key)}">${escapeHtml(tab.label)}</button>`).join("")}</div>
+        </div>
+        <div class="onchain-trenches-tape" aria-busy="${onchainTrenchesLoading}">
+          ${onchainTrenchesLoading && !onchainTrenchesLoaded ? `<div class="chain-section-empty"><b>正在读取实时战壕</b><span>正在直接连接 GMGN 的已开盘接口。</span></div>` : items.length ? items.map((row) => {
+            const metrics = row.metrics || {};
+            const facts = row.launchFacts || {};
+            const [decisionTone, decisionLabel] = onchainTrenchDecisionMeta(row.decision);
+            const contract = String(row.contractAddress || "");
+            const href = safeExternalUrl(row.tradeUrl);
+            const avatar = safeExternalUrl(row.imageUrl);
+            const volume = Number(metrics.volumeH1Usd) > 0 ? metrics.volumeH1Usd : metrics.volumeH24Usd;
+            const volumeLabel = Number(metrics.volumeH1Usd) > 0 ? "1H 成交" : "24H 成交";
+            const devStatus = String(facts.creatorTokenStatus || "");
+            const chips = [
+              trenchChip("Top10", trenchPercent(facts.top10Percent), trenchRiskTone(facts.top10Percent, 20, 50)),
+              trenchChip("Dev", Number.isFinite(Number(facts.creatorHoldingPercent)) ? trenchPercent(facts.creatorHoldingPercent) : devStatus === "creator_close" ? "已退出" : devStatus === "creator_hold" ? "持有" : "", devStatus === "creator_close" ? "safe" : trenchRiskTone(facts.creatorHoldingPercent, 2, 5)),
+              trenchChip("狙击", facts.sniperCount ? `${Number(facts.sniperCount)} / ${trenchPercent(facts.sniperHoldingPercent)}` : trenchPercent(facts.sniperHoldingPercent), trenchRiskTone(facts.sniperHoldingPercent, 5, 15)),
+              trenchChip("捆绑", trenchPercent(facts.bundlerHoldingPercent), trenchRiskTone(facts.bundlerHoldingPercent, 15, 30)),
+              trenchChip("老鼠仓", trenchPercent(facts.insiderPercent), trenchRiskTone(facts.insiderPercent, 1, 5)),
+              trenchChip("聪明钱", Number(facts.smartMoneyHolders) || 0, Number(facts.smartMoneyHolders) > 0 ? "positive" : ""),
+              trenchChip("KOL", Number(facts.kolHolders) || 0, Number(facts.kolHolders) > 0 ? "positive" : ""),
+              trenchChip("持有人", Number.isFinite(Number(facts.holders ?? metrics.holders)) ? Number(facts.holders ?? metrics.holders).toLocaleString("en-US") : ""),
+              trenchChip("新钱包", trenchPercent(facts.freshWalletPercent)),
+              trenchChip("蓝筹钱包", trenchPercent(facts.bluechipOwnerPercent), Number(facts.bluechipOwnerPercent) > 0 ? "positive" : ""),
+              trenchChip("税", Number.isFinite(Number(facts.buyTaxPercent)) || Number.isFinite(Number(facts.sellTaxPercent)) ? `${trenchPercent(facts.buyTaxPercent)} / ${trenchPercent(facts.sellTaxPercent)}` : "", Math.max(Number(facts.buyTaxPercent) || 0, Number(facts.sellTaxPercent) || 0) > 10 ? "danger" : ""),
+              trenchChip("总手续费", Number.isFinite(Number(facts.totalFeeUsd)) ? compactUsd(facts.totalFeeUsd) : ""),
+              trenchChip("DEX 广告", facts.dexAd ? "有" : facts.dexTrendingBar ? "趋势位" : Number(facts.dexBoostFeeUsd) > 0 ? compactUsd(facts.dexBoostFeeUsd) : "", facts.dexAd || facts.dexTrendingBar || Number(facts.dexBoostFeeUsd) > 0 ? "warning" : ""),
+              trenchChip("社交", facts.socialCount ? `${Number(facts.socialCount)} 项` : ""),
+              trenchChip("X 粉丝", facts.xFollowers ? Number(facts.xFollowers).toLocaleString("en-US") : ""),
+              trenchChip("刷量", facts.washTrading ? "是" : "否", facts.washTrading ? "danger" : "safe"),
+            ].filter(Boolean).join("");
+            const changes = [["1m", metrics.priceChangeM1], ["5m", metrics.priceChangeM5], ["1h", metrics.priceChangeH1]]
+              .filter(([, value]) => value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value)))
+              .map(([label, value]) => `<span class="${Number(value) >= 0 ? "is-up" : "is-down"}"><em>${label}</em><b>${Number(value) >= 0 ? "+" : ""}${trenchPercent(value)}</b></span>`).join("");
+            return `<article class="onchain-trench-row">
+              <div class="onchain-trench-mainline">
+                <div class="onchain-trench-identity">
+                  <span class="onchain-trench-mark ${avatar ? "has-image" : ""}">${avatar ? `<img src="${escapeHtml(avatar)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.classList.remove('has-image');this.remove()" />` : ""}<b>${escapeHtml(String(row.symbol || row.name || "?").slice(0, 2))}</b></span>
+                  <span><b>${escapeHtml(row.symbol || row.name || "未知标的")}<small>${escapeHtml(row.name || "未命名项目")}</small></b><em>${escapeHtml(onchainResearchNetworkLabel(row.network))} · ${escapeHtml(row.launchpad || row.dexId || "已开盘")} · ${relativeTime(row.poolCreatedAt || row.firstSeenAt)}</em></span>
+                </div>
+                <div class="onchain-trench-socials">${onchainTrenchSocialsTemplate(row)}</div>
+                <div class="onchain-trench-price"><b>${compactUsd(metrics.marketCapUsd || metrics.fdvUsd)}</b><em>MC</em></div>
+                <div class="onchain-trench-price"><b>${compactUsd(metrics.liquidityUsd)}</b><em>流动性</em></div>
+                <div class="onchain-trench-price"><b>${compactUsd(volume)}</b><em>${volumeLabel}</em></div>
+                <div class="onchain-trench-price"><b>${Number(metrics.transactionsH1 || metrics.transactionsH24) || 0}</b><em>TX</em></div>
+                <div class="onchain-trench-verdict ${decisionTone}"><b>${decisionLabel}</b><em>${Number(row.selectedScore) || 0} 分</em></div>
+              </div>
+              ${changes ? `<div class="onchain-trench-changes">${changes}</div>` : ""}
+              <div class="onchain-trench-chipline">${chips || `<span class="onchain-trench-chip"><em>数据</em><b>GMGN 补充中</b></span>`}</div>
+              <footer><span title="${escapeHtml(contract)}">${escapeHtml(contract ? `${contract.slice(0, 8)}…${contract.slice(-6)}` : "GMGN 未返回 CA")}</span><em>CA · GMGN API</em>${href ? `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener">GMGN ↗</a>` : ""}${monitorBuyButton(row)}</footer>
+            </article>`;
+          }).join("") : payload?.rateLimited
+            ? `<div class="chain-section-empty"><b>GMGN API 正在限流冷却</b><span>不会继续重复请求当前 IP；${retryAfter ? `约 ${retryAfter} 秒后自动重试。` : "稍后自动重试。"}未使用本地旧数据。</span></div>`
+            : `<div class="chain-section-empty"><b>当前筛选没有 GMGN 实时战壕标的</b><span>可切换链，然后重新读取实时数据。</span></div>`}
+        </div>
+        <nav class="onchain-trenches-pagination" aria-label="战壕分页">
+          <span>共 ${total} 个 · 第 ${page} / ${pages} 页</span>
+          <button type="button" data-trench-page="${page - 1}" ${page <= 1 || onchainTrenchesLoading ? "disabled" : ""}>上一页</button>
+          <button type="button" data-trench-page="${page + 1}" ${page >= pages || onchainTrenchesLoading ? "disabled" : ""}>下一页</button>
+        </nav>
+      </section>`;
+  }
+
+  function chainResearchSubnavTemplate({ chains, dailyResearch, alerts, sourceHealth, warnings }) {
+    const funnel = dailyResearch?.funnel && typeof dailyResearch.funnel === "object" ? dailyResearch.funnel : {};
+    const benchmark = dailyResearch?.benchmark && typeof dailyResearch.benchmark === "object" ? dailyResearch.benchmark : {};
+    const errorCount = sourceHealth.filter((row) => row.status !== "ok").length + warnings.length;
+    const tabs = [
+      { key: "today", label: "今日最值得研究", badge: (Number(dailyResearch?.selectedTotal ?? dailyResearch?.selected?.length) || 0) + (Number(dailyResearch?.provisionalTotal ?? dailyResearch?.provisional?.length) || 0) },
+      { key: "scan", label: "动态增量扫盘", badge: Number(funnel.discovered) || 0 },
+      { key: "trenches", label: "战壕", badge: onchainTrenchesLoaded ? Number(onchainTrenchesPayload.total) || 0 : "—" },
+      { key: "ecosystem", label: "公链生态图谱", badge: chains.length },
+      { key: "history", label: "历史龙头复盘", badge: Number(benchmark.caseCount) || 0 },
+      { key: "system", label: "系统状态", badge: errorCount || alerts.length },
+    ];
+    return `
+      <nav class="chain-research-subnav" aria-label="链上投研子板块">
+        ${tabs.map((tab) => `
+          <button type="button" class="${chainSubMode === tab.key ? "active" : ""}" data-chain-submode="${tab.key}" aria-selected="${chainSubMode === tab.key}">
+            <span>${escapeHtml(tab.label)}</span><em>${tab.badge === "—" ? "—" : Number(tab.badge) || 0}</em>
+          </button>`).join("")}
+      </nav>`;
+  }
+
+  function chainSystemStatusTemplate(payload, chain, dailyResearch, sourceHealth, warnings, alerts) {
+    const researchErrors = Array.isArray(dailyResearch?.errors) ? dailyResearch.errors : [];
+    const healthySources = sourceHealth.filter((row) => row.status === "ok").length;
+    const issueCount = warnings.length + researchErrors.length;
+    return `
+      <section class="chain-research-view chain-system-console">
+        <header class="chain-system-hero">
+          <span><p class="section-label">SOURCE HEALTH / OPERATIONS</p><h3>系统状态</h3><em>${escapeHtml(chain?.name || "当前公链")} · 将异常集中在这里，不打断日常研究</em></span>
+          <div><b>${sourceHealth.length ? `${healthySources}/${sourceHealth.length}` : "—"}</b><em>生态数据源</em></div>
+          <div><b>${issueCount}</b><em>待恢复事项</em></div>
+          <button type="button" data-chain-refresh>重新扫描</button>
+        </header>
+        <div class="chain-system-grid">
+          <section class="chain-source-panel">
+            <header><span><b>当前公链数据源</b><em>最近检查、连续失败与错误摘要</em></span></header>
+            <div class="chain-source-list">${sourceHealth.length ? sourceHealth.map((row) => `
+              <article class="chain-source-row is-${row.status === "ok" ? "ok" : "error"}">
+                <i></i><span><b>${escapeHtml(row.provider || "未知来源")}</b><em>${relativeTime(row.lastCheckedAt)}${Number(row.failureStreak) ? ` · 连续失败 ${Number(row.failureStreak)} 次` : ""}</em></span>
+                <strong>${row.status === "ok" ? "正常" : "重试中"}</strong>
+                ${row.lastError ? `<p>${escapeHtml(row.lastError)}</p>` : ""}
+              </article>`).join("") : `<div class="chain-section-empty"><b>等待来源状态</b><span>首次扫描完成后显示。</span></div>`}</div>
+          </section>
+          <section class="chain-issue-panel">
+            <header><span><b>异常与退避</b><em>数据源失败不会阻塞其他链和其他子板块</em></span></header>
+            <div>${[...warnings, ...researchErrors].length ? [...new Set([...warnings, ...researchErrors])].map((message) => `<p>${escapeHtml(message)}</p>`).join("") : `<div class="chain-section-empty"><b>当前没有异常</b><span>所有已配置链路均正常运行。</span></div>`}</div>
+          </section>
+        </div>
+        <section class="chain-alert-timeline">
+          <header class="chain-section-head"><span><p class="section-label">HIGH-VALUE ALERTS</p><h3>高价值变化</h3></span><em>${alerts.length} 条</em></header>
+          <div class="chain-alert-list">${alerts.length ? alerts.slice(0, 20).map(chainAlertTemplate).join("") : `<div class="chain-section-empty"><b>暂无高价值变化</b><span>阶段升级、新市场、龙头变化和量能放大会进入这里。</span></div>`}</div>
+        </section>
+      </section>`;
+  }
+
   function renderChainEcosystem() {
     const payload = chainEcosystemPayload || {};
     const chains = Array.isArray(payload.chains) ? payload.chains : [];
     const chain = payload.selectedChain || null;
     const markets = Array.isArray(payload.markets) ? payload.markets : [];
     const potentialProjects = Array.isArray(payload.potentialProjects) ? payload.potentialProjects : [];
+    const potentialProjectCount = Number(payload.potentialProjectCount) || potentialProjects.length;
     const alerts = Array.isArray(payload.alerts) ? payload.alerts : [];
     const sourceHealth = Array.isArray(payload.sourceHealth) ? payload.sourceHealth : [];
+    const dailyResearch = payload.dailyResearch && typeof payload.dailyResearch === "object" ? payload.dailyResearch : {};
     const warnings = Array.isArray(payload.warnings) ? payload.warnings : [];
-    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-chains");
+    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-chains");
     grid.classList.add("is-chains");
     if (!chainEcosystemLoaded) {
-      grid.innerHTML = `<div class="price-watch-empty"><b>正在读取链上投研图谱</b><span>加载生命周期、细分市场、潜在发行项目和 Top 5 快照。</span></div>`;
+      renderGrid(`<div class="price-watch-empty"><b>正在读取链上投研图谱</b><span>加载生命周期、细分市场、潜在发行项目和 Top 5 快照。</span></div>`);
       return;
     }
     if (!chain) {
-      grid.innerHTML = `<div class="price-watch-empty"><b>还没有公链</b><span>登录后可通过人工入口添加首条观察链。</span></div>`;
+      renderGrid(`<div class="price-watch-empty"><b>还没有公链</b><span>登录后可通过人工入口添加首条观察链。</span></div>`);
       return;
     }
     selectedChainSlug = chain.slug || selectedChainSlug;
@@ -1443,8 +2075,8 @@
     const confirmedSources = sourceHealth.filter((row) => row.status === "ok").length;
     const chainAi = chainAiMeta(chain);
     const aiCoverage = payload.aiCoverage && typeof payload.aiCoverage === "object" ? payload.aiCoverage : {};
-    grid.innerHTML = `
-      <section class="chain-ecosystem-console">
+    const ecosystemView = `
+      <section class="chain-ecosystem-console chain-research-view is-ecosystem">
         <aside class="chain-ecosystem-sidebar">
           <header class="chain-sidebar-head"><span><b>公链雷达</b><em>${chains.length} 条链 · 三阶段</em></span><button type="button" data-chain-add-toggle>＋</button></header>
           <form class="chain-add-form" data-chain-form hidden>
@@ -1464,16 +2096,13 @@
               <span class="chain-stage-badge is-${stageTone}" title="${escapeHtml(chainAi.tooltip)}">${chainAi.ready ? `AI ${chainAi.narrativeStrength} · ${stageLabel}` : chainAi.pending ? `AI分析中 · ${stageLabel}` : stageLabel}</span>
               <span><b>${sourceHealth.length ? `${confirmedSources}/${sourceHealth.length}` : "—"}</b><em>来源可用</em></span>
               <span><b>${markets.filter((market) => market.top?.length || market.candidates?.length).length}</b><em>已发现市场</em></span>
-              <span><b>${potentialProjects.length}</b><em>潜在发行 · AI ${Number(aiCoverage.ready) || 0}/${Number(aiCoverage.total) || 0}</em></span>
+              <span><b>${potentialProjectCount}</b><em>潜在发行 · AI ${Number(aiCoverage.ready) || 0}/${Number(aiCoverage.total) || 0}</em></span>
             </div>
             <div class="chain-overview-actions">
               ${officialEvidence ? `<a href="${escapeHtml(safeExternalUrl(officialEvidence.url))}" target="_blank" rel="noreferrer noopener">查看官方证据</a>` : ""}
               <button type="button" data-chain-refresh>重新扫描</button>
             </div>
           </header>
-
-          ${warnings.length ? `<div class="chain-warning-strip ${payload.stale ? "is-stale" : ""}">${warnings.map((warning) => `<span>${escapeHtml(warning)}</span>`).join("")}</div>` : ""}
-
           <section class="chain-market-tree">
             ${groupedMarkets.map((group) => `
               <section class="chain-market-level">
@@ -1481,39 +2110,81 @@
                 <div class="chain-market-grid">${group.markets.map(chainMarketTemplate).join("")}</div>
               </section>`).join("")}
           </section>
-
-          <section class="chain-lower-grid">
-            <section class="chain-potential-pool">
-              <header class="chain-section-head"><span><p class="section-label">POTENTIAL ISSUANCE</p><h3>潜在发行池</h3></span><em>${potentialProjects.length} 个项目</em></header>
-              <form class="chain-project-form" data-chain-project-form>
-                <input name="name" maxlength="100" required placeholder="新增项目名称" />
-                <select name="marketKey"><option value="">待分类</option>${markets.map((market) => `<option value="${escapeHtml(market.key)}">${escapeHtml(market.name)}</option>`).join("")}</select>
-                <input name="officialUrl" type="url" placeholder="官方网址（可选）" />
-                <button type="submit">加入项目</button>
-              </form>
-              <div class="chain-potential-list">${potentialProjects.length ? potentialProjects.map(chainPotentialTemplate).join("") : `<div class="chain-section-empty"><b>暂无潜在发行项目</b><span>自动发现和人工补充都会进入这里。</span></div>`}</div>
-            </section>
-            <section class="chain-alert-timeline">
-              <header class="chain-section-head"><span><p class="section-label">HIGH-VALUE ALERTS</p><h3>高价值预警</h3></span><em>${alerts.length} 条</em></header>
-              <div class="chain-alert-list">${alerts.length ? alerts.slice(0, 20).map(chainAlertTemplate).join("") : `<div class="chain-section-empty"><b>暂无高价值变化</b><span>只记录阶段升级、新市场、龙头变化和量能放大。</span></div>`}</div>
-            </section>
+          <section class="chain-potential-pool">
+            <header class="chain-section-head"><span><p class="section-label">POTENTIAL ISSUANCE</p><h3>潜在发行池</h3></span><em>精选显示 ${potentialProjects.length} / 总计 ${potentialProjectCount}</em></header>
+            <form class="chain-project-form" data-chain-project-form>
+              <input name="name" maxlength="100" required placeholder="新增项目名称" />
+              <select name="marketKey"><option value="">待分类</option>${markets.map((market) => `<option value="${escapeHtml(market.key)}">${escapeHtml(market.name)}</option>`).join("")}</select>
+              <input name="officialUrl" type="url" placeholder="官方网址（可选）" />
+              <button type="submit">加入项目</button>
+            </form>
+            <div class="chain-potential-list">${potentialProjects.length ? potentialProjects.map(chainPotentialTemplate).join("") : `<div class="chain-section-empty"><b>暂无潜在发行项目</b><span>自动发现和人工补充都会进入这里。</span></div>`}</div>
           </section>
         </section>
       </section>`;
+    const activeView = chainSubMode === "ecosystem"
+      ? ecosystemView
+      : chainSubMode === "system"
+        ? chainSystemStatusTemplate(payload, chain, dailyResearch, sourceHealth, warnings, alerts)
+        : chainSubMode === "trenches"
+          ? onchainTrenchesTemplate(onchainTrenchesPayload)
+        : onchainResearchTemplate(dailyResearch, chainSubMode);
+    renderGrid(`
+      <section class="chain-research-workbench">
+        ${chainResearchSubnavTemplate({ chains, dailyResearch, alerts, sourceHealth, warnings })}
+        <div class="chain-research-viewport">${activeView}</div>
+      </section>`);
   }
 
   function relativeTime(value) {
     const time = Number(value);
     if (!time) return "等待首次更新";
-    const seconds = Math.max(0, Math.round((Date.now() - time) / 1000));
-    if (seconds < 60) return "刚刚更新";
-    if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`;
-    return `${Math.floor(seconds / 3600)} 小时前`;
+    const timestamp = time < 1_000_000_000_000 ? time * 1000 : time;
+    return timestampView(timestamp).relative;
+  }
+
+  function opportunityDisplayText(value) {
+    return String(value || "")
+      .replace(/\*\*/g, "")
+      .replace(/[—_=-]{8,}/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function timestampView(value) {
+    const time = Number(value);
+    if (!time) return { relative: "等待首次更新", exact: "时间待确认", iso: "" };
+    const timestamp = time < 1_000_000_000_000 ? time * 1000 : time;
+    const date = new Date(timestamp);
+    if (!Number.isFinite(date.getTime())) return { relative: "时间待确认", exact: "时间待确认", iso: "" };
+    const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+    const clock = new Intl.DateTimeFormat("zh-CN", {
+      timeZone: "Asia/Shanghai",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    }).format(date);
+    const exact = new Intl.DateTimeFormat("zh-CN", {
+      timeZone: "Asia/Shanghai",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    }).format(date).replaceAll("/", "-");
+    let relative = "刚刚";
+    if (seconds >= 7 * 24 * 3600) relative = exact;
+    else if (seconds >= 48 * 3600) relative = `${Math.floor(seconds / 86400)} 天前`;
+    else if (seconds >= 24 * 3600) relative = `昨天 ${clock}`;
+    else if (seconds >= 3600) relative = `${Math.floor(seconds / 3600)} 小时前`;
+    else if (seconds >= 60) relative = `${Math.floor(seconds / 60)} 分钟前`;
+    return { relative, exact: `${exact} 北京时间`, iso: date.toISOString() };
   }
 
   function statusMeta(item) {
     if (item.status === "near") return ["near", "接近前高"];
-    if (item.status === "forming") return ["forming", "等待回调 / 盘整"];
+    if (item.status === "redefining") return ["forming", "旧前高已失效 · 正在定义新高"];
+    if (item.status === "forming") return ["forming", "等待价格状态更新"];
     if (item.status === "breakout") return ["breakout", "已突破前高"];
     if (item.status === "unavailable") return ["unavailable", "行情暂不可用"];
     if (item.status === "pending") return ["pending", "等待价格数据"];
@@ -1539,9 +2210,12 @@
   function cardTemplate(item) {
     const [statusClass, statusLabel] = statusMeta(item);
     const distance = Number(item.distancePct);
-    const hasDistance = Number.isFinite(distance) && item.status !== "unavailable";
+    const hasDistance = item.distancePct !== null && item.distancePct !== undefined
+      && Number.isFinite(distance) && !["unavailable", "redefining"].includes(item.status);
     const distanceText = item.status === "breakout"
-      ? "已越过 7 日前高"
+      ? "已越过主升浪阶段高点"
+      : item.status === "redefining"
+        ? "原前高已被突破，等待新的高点结构形成"
       : item.status === "forming" && hasDistance
         ? `距前高 ${distance.toFixed(2)}% · 结构未确认`
       : hasDistance
@@ -1556,6 +2230,12 @@
           ? "手动"
           : item.origin === "binance-wallet"
             ? "币安钱包 4H 热门"
+            : item.origin === "ave"
+              ? "AVE.ai 热门榜新进"
+              : item.origin === "binance-gainers"
+                ? "Binance 涨幅榜"
+                : item.origin === "okx-gainers"
+                  ? "OKX 涨幅榜"
             : "AICoin 新进";
     const icon = item.icon
       ? `<img src="${escapeHtml(item.icon)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.closest('.price-watch-icon').classList.add('is-fallback');this.remove()" />`
@@ -1576,7 +2256,7 @@
         <header>
           <span class="price-watch-icon">${icon}<b>${escapeHtml(item.symbol.slice(0, 2))}</b></span>
           <span class="price-watch-asset">
-            <strong>${escapeHtml(item.symbol)}</strong>
+            <strong>${escapeHtml(item.symbol)} ${monitorBuyButton(item)}</strong>
             <em>${escapeHtml(item.name || item.symbol)}</em>
           </span>
           <span class="price-watch-origin" title="${escapeHtml(item.personalXSourceText || "")}">${sourceLabel}</span>
@@ -1584,7 +2264,7 @@
         </header>
         <div class="price-watch-values">
           <span><em>当前价格</em><b>${compactPrice(item.currentPrice)}</b></span>
-          <span><em>最近 7 日前高</em><b>${compactPrice(item.weekHigh)}</b></span>
+          <span><em>${item.status === "redefining" ? "已失效前高" : (item.stageHighLabel || (item.mainWaveQualified ? "主升浪阶段高点" : "阶段高点（未通过主升浪）"))}</em><b>${compactPrice(item.weekHigh)}</b></span>
         </div>
         <div class="price-watch-distance">
           <div><b>${distanceText}</b><em>${escapeHtml(item.provider || relativeTime(item.lastCheckedAt))}</em></div>
@@ -1594,7 +2274,7 @@
           <span class="price-watch-state">${statusLabel}</span>
           ${signal}
           ${confirmButton}
-          <time>${relativeTime(item.lastCheckedAt)}</time>
+          <time title="${item.latestAlertAt ? `上次提醒触发：${new Date(Number(item.latestAlertAt)).toLocaleString('zh-CN')}` : '尚无提醒触发记录'}">行情更新 ${relativeTime(item.lastCheckedAt)}</time>
         </footer>
       </article>
     `;
@@ -1632,6 +2312,12 @@
           ? "手动"
           : item.origin === "binance-wallet"
             ? "币安钱包 4H 热门"
+            : item.origin === "ave"
+              ? "AVE.ai 热门榜新进"
+              : item.origin === "binance-gainers"
+                ? "Binance 涨幅榜"
+                : item.origin === "okx-gainers"
+                  ? "OKX 涨幅榜"
             : "AICoin 新进";
     const icon = item.icon
       ? `<img src="${escapeHtml(item.icon)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.closest('.price-watch-icon').classList.add('is-fallback');this.remove()" />`
@@ -1660,7 +2346,7 @@
         <header>
           <span class="price-watch-icon">${icon}<b>${escapeHtml(item.symbol.slice(0, 2))}</b></span>
           <span class="price-watch-asset">
-            <strong>${escapeHtml(item.symbol)}</strong>
+            <strong>${escapeHtml(item.symbol)} ${monitorBuyButton(item)}</strong>
             <em>${escapeHtml(item.name || item.symbol)}</em>
           </span>
           <span class="price-watch-origin">${sourceLabel}</span>
@@ -1688,12 +2374,12 @@
     const newLow = currentMode === "newlow";
     const mapping = currentMode === "mapping";
     const aster = currentMode === "aster";
-    const events = currentMode === "events";
     const news = currentMode === "news";
     const wechat = currentMode === "wechat";
     const personalx = currentMode === "personalx";
+    const smartmoney = currentMode === "smartmoney";
     const chains = currentMode === "chains";
-    form.hidden = wechat || personalx || chains;
+    form.hidden = wechat || personalx || smartmoney || chains;
     modeButtons.forEach((button) => {
       const active = button.dataset.watchMode === currentMode;
       button.classList.toggle("active", active);
@@ -1702,7 +2388,7 @@
     if (structure) {
       headingLabel.textContent = "MULTI-TIMEFRAME / STRUCTURE MAP";
       headingTitle.textContent = "AICoin 热门币多周期结构";
-      headingDescription.innerHTML = `<b>1分钟</b> · 5分钟 · 15分钟 · 1小时 · 4小时 · 日线 · 使用龙头起爆策略识别A+买点与多周期共振 · 后台监控池与页面每 3 秒同步 · 仅保留 24H 成交额不低于 <b>1000 万美元</b>的标的`;
+      headingDescription.innerHTML = `<b>1分钟</b> · 5分钟 · 15分钟 · 1小时 · 4小时 · 日线 · 使用龙头起爆策略识别A+买点与多周期共振 · 后台监控池与页面每 3 秒同步 · 二级合约仅保留 24H 成交额不低于 <b>1000 万美元</b>的标的；链上 CA 标的不设该硬门槛`;
       return;
     }
     if (newLow) {
@@ -1723,28 +2409,28 @@
       headingDescription.innerHTML = `保留最近 <b>30 天</b> · 最新在前 · 官网公告 + 官方 X 上新 · 合约接口首见高速补充`;
       return;
     }
-    if (events) {
-      headingLabel.textContent = "EVENT DRIVEN / SECONDARY";
-      headingTitle.textContent = "二级事件驱动监控";
-      headingDescription.innerHTML = `信息延迟 · 价值锚/政策 · 瞬时重定价 · 公告延迟 · 市场错价 · 盘口/基差`;
-      return;
-    }
     if (news) {
-      headingLabel.textContent = "NEWS TRADE / HOT TOPICS / ONCHAIN MEME";
-      headingTitle.textContent = "热点主题与链上 MEME";
-      headingDescription.innerHTML = `<b>事件热度</b> · 叙事相关 · 池子/流动性 · Top1 主标 + 2 个备选`;
+      headingLabel.textContent = "NEWS TRADE / AI / ONCHAIN MEME";
+      headingTitle.textContent = "News Trade";
+      headingDescription.innerHTML = `<b>事件热度</b> · AI 叙事研判 · 链上机会 · 同内容与同合约自动去重`;
       return;
     }
     if (wechat) {
       headingLabel.textContent = "CHAT / LOCAL GROUP / OPPORTUNITY";
       headingTitle.textContent = "群聊机会监控";
-      headingDescription.innerHTML = `已识别机会持续监控 · 仅<b>手动移除</b>或连续 30 天无合约行情才停止`;
+      headingDescription.innerHTML = `微信 / Q群 + 独立 <b>DC监控</b> · 已识别机会持续跟踪 · 同一事件自动去重`;
       return;
     }
     if (personalx) {
       headingLabel.textContent = "PERSONAL X / REALTIME / RAW INPUT";
       headingTitle.textContent = "个人 X 秒级监控";
       headingDescription.innerHTML = `<b>@whitestar224</b> · 复用现有 API 实时流 · 原始动态独立展示`;
+      return;
+    }
+    if (smartmoney) {
+      headingLabel.textContent = "SMART MONEY / WALLET / VERIFIED BUY";
+      headingTitle.textContent = "聪明钱地址买入监控";
+      headingDescription.innerHTML = `Ethereum · BSC · Base · Solana · Robinhood · 单笔净买入达到 <b>10,000U</b> 才弹窗，小额仅记录`;
       return;
     }
     if (chains) {
@@ -1754,10 +2440,10 @@
       return;
     }
     headingLabel.textContent = oversold ? "OVERSOLD / LOW RANGE / REBOUND" : "ACTIVE WATCHLIST";
-    headingTitle.textContent = oversold ? "热门币超跌反弹监控" : "最近 7 日前高监控";
+    headingTitle.textContent = oversold ? "热门币超跌反弹监控" : "主升浪阶段高点监控";
     headingDescription.innerHTML = oversold
-      ? `低位震荡阶段高点 + 前段涨幅超过 <b>100%</b> 的近期日线主升浪 Fib <b>0.5 / 0.618</b> · 24H 成交额不低于 <b>1000 万美元</b>`
-      : `现价低于前高且距离不超过 <b>3%</b> · 24H 成交额不低于 <b>1000 万美元</b> · 30 天未再上榜自动移除`;
+      ? `低位震荡阶段高点 + 前段涨幅超过 <b>100%</b> 的近期日线主升浪 Fib <b>0.5 / 0.618</b> · 二级合约 24H 成交额需不低于 <b>1000 万美元</b>，链上 CA 不设该硬门槛`
+      : `现价低于前高且距离不超过 <b>3%</b> · 二级合约 24H 成交额需不低于 <b>1000 万美元</b>，链上 CA 不设该硬门槛 · 30 天未再上榜自动移除`;
   }
 
   function render(payload) {
@@ -1783,7 +2469,7 @@
       renderAsterContracts();
       return;
     }
-    if (currentMode === "events" || currentMode === "news") {
+    if (currentMode === "news") {
       renderEventMonitor();
       return;
     }
@@ -1795,31 +2481,45 @@
       renderPersonalXMonitor();
       return;
     }
+    if (currentMode === "smartmoney") {
+      renderSmartMoneyMonitor();
+      return;
+    }
     if (currentMode === "chains") {
       renderChainEcosystem();
       return;
     }
-    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-chains");
+    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-chains");
     const visibleItems = currentMode === "oversold"
       ? items.filter((item) => item.oversoldCandidate || item.fibCandidate)
       : items.filter((item) => item.priorHighEnabled !== false);
     if (!visibleItems.length) {
-      grid.innerHTML = `
+      renderGrid(`
         <div class="price-watch-empty">
           <b>${currentMode === "oversold" ? "暂无符合条件的超跌币种" : "暂无监控币种"}</b>
           <span>${currentMode === "oversold" ? "当前还没有满足低位震荡反弹或近期主升浪 Fib 回撤条件的币种。" : "AICoin 热门榜出现新币后会自动加入，也可以在上方手动添加。"}</span>
-        </div>`;
+        </div>`);
       return;
     }
-    grid.innerHTML = visibleItems
+    renderGrid(visibleItems
       .map(currentMode === "oversold" ? oversoldCardTemplate : cardTemplate)
-      .join("");
+      .join(""));
   }
 
   function setBusy(busy, text = "") {
     loading = busy;
     refreshButton.disabled = busy;
     if (text) statusNode.textContent = text;
+  }
+
+  function setAddBusy(busy, symbol = "") {
+    adding = busy;
+    form.setAttribute("aria-busy", String(busy));
+    symbolInput.disabled = busy;
+    addButton.disabled = busy;
+    addButton.classList.toggle("is-loading", busy);
+    addButton.textContent = busy ? "正在添加…" : "添加监控";
+    if (busy) statusNode.textContent = `正在识别 ${symbol} 并写入监控池，行情随后在后台更新…`;
   }
 
   async function getPayload(refresh = false) {
@@ -1957,6 +2657,25 @@
     return payload;
   }
 
+  async function getSmartMoneyPayload(refresh = false) {
+    const response = await fetch(`/api/smart-money-monitor${refresh ? "?refresh=1" : ""}`, { cache: "no-store" });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || "聪明钱买入监控读取失败");
+    return payload;
+  }
+
+  async function postSmartMoneyAction(action, extra = {}) {
+    const response = await fetch("/api/smart-money-monitor", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, ...extra })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || "聪明钱地址操作失败");
+    return payload;
+  }
+
   function applyPersonalXPayload(payload) {
     personalXPayload = payload && typeof payload === "object" ? payload : { account: null, items: [], summary: {} };
     personalXLoaded = true;
@@ -2009,10 +2728,26 @@
     const url = new URL("/api/chain-ecosystem", window.location.origin);
     if (refresh) url.searchParams.set("refresh", "1");
     if (chainSlug) url.searchParams.set("chain", chainSlug);
+    if (selectedResearchDay) url.searchParams.set("researchDay", selectedResearchDay);
+    url.searchParams.set("researchPage", selectedResearchPage);
+    url.searchParams.set("researchHistoryPage", researchHistoryPage);
     const response = await fetch(`${url.pathname}${url.search}`, { cache: "no-store" });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok || (payload.ok === false && !payload.selectedChain)) {
       throw new Error(payload.error || "链上投研读取失败");
+    }
+    return payload;
+  }
+
+  async function getOnchainTrenchesPayload() {
+    const url = new URL("/api/onchain-trenches", window.location.origin);
+    url.searchParams.set("page", String(selectedTrenchPage));
+    url.searchParams.set("pageSize", "24");
+    if (selectedTrenchNetwork) url.searchParams.set("network", selectedTrenchNetwork);
+    const response = await fetch(`${url.pathname}${url.search}`, { cache: "no-store" });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || (payload.ok === false && !payload.rateLimited)) {
+      throw new Error(payload.error || payload.errors?.[0] || "实时战壕读取失败");
     }
     return payload;
   }
@@ -2071,7 +2806,7 @@
   }
 
   async function loadMappings({ refresh = false, quiet = false } = {}) {
-    const cacheFresh = mappingLoaded && Date.now() - lastMappingLoadAt < 60_000;
+    const cacheFresh = mappingLoaded && Date.now() - lastMappingLoadAt < 300_000;
     if (!refresh && cacheFresh) {
       renderMappings();
       return;
@@ -2084,9 +2819,14 @@
       mappingLoaded = true;
       lastMappingLoadAt = Date.now();
       renderMappings();
-      const scanned = Number(mappingSummary.hotScanned) || 0;
+      const scanned = Number(mappingSummary.semanticRows) || Number(mappingSummary.leaderScanned) || 0;
       const leaders = Number(mappingSummary.leaders) || mappingItems.length;
-      statusNode.textContent = `已实时扫描 ${scanned} 个热门标的，监控 ${leaders} 个 300% 以上主升龙头；每 60 秒更新`;
+      const aiStatus = mappingSummary.aiStatus === "ready"
+        ? "AI 固化结果已就绪"
+        : mappingSummary.aiStatus === "incremental"
+          ? "AI 正在增量分析"
+          : "AI 正在首次分析";
+      statusNode.textContent = `已扫描 ${scanned} 个标的，${aiStatus}，当前 ${leaders} 个近期真实龙头；每 5 分钟更新`;
     } catch (error) {
       if (!quiet) statusNode.textContent = error.message;
       if (!mappingLoaded) {
@@ -2127,6 +2867,9 @@
       const payload = await getEventPayload(refresh);
       eventItems = Array.isArray(payload.events) ? payload.events : [];
       newsTradeItems = Array.isArray(payload.newsTrades) ? payload.newsTrades : [];
+      mergedEventItems = Array.isArray(payload.mergedItems)
+        ? payload.mergedItems
+        : [...newsTradeItems.map((item) => ({ ...item, mergedKind: "news-trade" })), ...eventItems.map((item) => ({ ...item, mergedKind: "event" }))];
       eventSummary = payload.summary && typeof payload.summary === "object" ? payload.summary : {};
       eventExecution = payload.execution && typeof payload.execution === "object" ? payload.execution : eventExecution;
       eventLoaded = true;
@@ -2134,9 +2877,8 @@
       renderEventMonitor();
       const eventCount = Number(eventSummary.events) || eventItems.length;
       const newsCount = Number(eventSummary.newsTrades) || newsTradeItems.length;
-      statusNode.textContent = currentMode === "news"
-        ? `已筛出 ${newsCount} 条高置信候选；仅新事件进入提醒队列`
-        : `已核对 ${eventCount} 条二级事件，其中 ${newsCount} 条达到 News Trade 条件`;
+      const duplicatesRemoved = Number(eventSummary.duplicatesRemoved) || 0;
+      statusNode.textContent = `News Trade 当前 ${mergedEventItems.length} 条 · 已合并 ${newsCount + eventCount} 条信息并去重 ${duplicatesRemoved} 条`;
     } catch (error) {
       if (!quiet) statusNode.textContent = error.message;
       if (!eventLoaded) {
@@ -2187,22 +2929,50 @@
     }
   }
 
+  async function loadSmartMoneyMonitor({ refresh = false, quiet = false } = {}) {
+    const cacheFresh = smartMoneyLoaded && Date.now() - lastSmartMoneyLoadAt < 4_000;
+    if (!refresh && cacheFresh) {
+      renderSmartMoneyMonitor();
+      return;
+    }
+    if (!smartMoneyLoaded) renderSmartMoneyMonitor();
+    try {
+      smartMoneyPayload = await getSmartMoneyPayload(refresh);
+      smartMoneyLoaded = true;
+      lastSmartMoneyLoadAt = Date.now();
+      renderSmartMoneyMonitor();
+      const summary = smartMoneyPayload.summary || {};
+      statusNode.textContent = `${Number(summary.enabledWallets || 0)} 条地址监控中 · 今日达到 10,000U 的买入 ${Number(summary.todayEligibleBuys || 0)} 笔 · 全程只读`;
+    } catch (error) {
+      if (!quiet) statusNode.textContent = error.message;
+      if (!smartMoneyLoaded) {
+        grid.classList.add("is-smart-money");
+        grid.innerHTML = `<div class="price-watch-empty"><b>聪明钱买入监控暂不可用</b><span>${escapeHtml(error.message)}</span></div>`;
+      }
+    }
+  }
+
   async function loadChainEcosystem({ refresh = false, quiet = false } = {}) {
     const aiPending = chainEcosystemPayload.aiAnalysisStatus === "pending";
     const cacheFresh = chainEcosystemLoaded && Date.now() - lastChainEcosystemLoadAt < (aiPending ? 3_000 : 60_000);
     if (!refresh && cacheFresh) {
       renderChainEcosystem();
-      return;
+      if (chainSubMode === "trenches") {
+        if (!onchainTrenchesLoaded) await loadOnchainTrenches({ quiet });
+      }
+      return true;
     }
     if (!chainEcosystemLoaded) renderChainEcosystem();
     const requestId = ++chainEcosystemRequestId;
     try {
       const payload = await getChainEcosystemPayload(refresh);
-      if (requestId !== chainEcosystemRequestId) return;
+      if (requestId !== chainEcosystemRequestId) return false;
       chainEcosystemPayload = payload;
       chainEcosystemLoaded = true;
       lastChainEcosystemLoadAt = Date.now();
       selectedChainSlug = chainEcosystemPayload.selectedChain?.slug || selectedChainSlug;
+      selectedResearchPage = Math.max(1, Number(chainEcosystemPayload.dailyResearch?.pagination?.page) || selectedResearchPage);
+      researchHistoryPage = Math.max(1, Number(chainEcosystemPayload.dailyResearch?.historyPagination?.page) || researchHistoryPage);
       renderChainEcosystem();
       const activeMarkets = (chainEcosystemPayload.markets || []).filter((market) => market.top?.length || market.candidates?.length).length;
       const potential = (chainEcosystemPayload.potentialProjects || []).length;
@@ -2221,11 +2991,64 @@
           if (currentMode === "chains") loadChainEcosystem({ quiet: true });
         }, 4_000);
       }
+      if (chainSubMode === "trenches") {
+        if (!onchainTrenchesLoaded) await loadOnchainTrenches({ quiet });
+      }
+      return true;
     } catch (error) {
       if (!quiet) statusNode.textContent = error.message;
       if (!chainEcosystemLoaded) {
         grid.classList.add("is-chains");
         grid.innerHTML = `<div class="price-watch-empty"><b>链上投研暂不可用</b><span>${escapeHtml(error.message)}</span></div>`;
+      }
+      return false;
+    }
+  }
+
+  async function loadOnchainTrenches({ quiet = false, refresh = false } = {}) {
+    if (onchainTrenchesLoading) return false;
+    const liveFresh = onchainTrenchesLoaded && Date.now() - lastOnchainTrenchesLoadAt < 90_000;
+    if (!refresh && liveFresh) {
+      renderChainEcosystem();
+      return true;
+    }
+    onchainTrenchesLoading = true;
+    window.clearTimeout(onchainTrenchRetryTimer);
+    const requestId = ++onchainTrenchesRequestId;
+    renderChainEcosystem();
+    try {
+      const payload = await getOnchainTrenchesPayload();
+      if (requestId !== onchainTrenchesRequestId) return false;
+      onchainTrenchesPayload = payload;
+      onchainTrenchesLoaded = true;
+      lastOnchainTrenchesLoadAt = Date.now();
+      selectedTrenchPage = Math.max(1, Number(payload.page) || selectedTrenchPage);
+      if (!quiet) {
+        const coverage = payload.aiCoverage || {};
+        statusNode.textContent = payload.rateLimited
+          ? `GMGN 请求已暂停，防止 IP 继续受限 · 约 ${Number(payload.retryAfterSeconds) || 60} 秒后自动恢复`
+          : `GMGN 实时战壕已更新 · ${Number(payload.counts?.gmgn) || 0} 条 · 原生叙事 ${Number(coverage.ready) || 0}/${Number(coverage.total) || 0} · 悬停不请求接口`;
+      }
+      if (payload.rateLimited) {
+        const retryMs = Math.max(10_000, (Number(payload.retryAfterSeconds) || 60) * 1_000 + 1_500);
+        onchainTrenchRetryTimer = window.setTimeout(() => {
+          if (currentMode === "chains" && chainSubMode === "trenches") loadOnchainTrenches({ quiet: true, refresh: true });
+        }, retryMs);
+      }
+      return true;
+    } catch (error) {
+      if (!quiet) statusNode.textContent = error.message;
+      if (!onchainTrenchesLoaded) {
+        onchainTrenchesPayload = {
+          items: [], total: 0, counts: {}, networks: ["eth", "solana", "robinhood", "arc", "base", "bsc"],
+          sourceStatus: {}, errors: [error.message], filters: {}, page: 1, pages: 1,
+        };
+      }
+      return false;
+    } finally {
+      onchainTrenchesLoading = false;
+      if (currentMode === "chains" && chainSubMode === "trenches") {
+        renderChainEcosystem();
       }
     }
   }
@@ -2242,10 +3065,26 @@
     return payload;
   }
 
+  async function waitForAddJob(jobId, requested) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < 120_000) {
+      await new Promise((resolve) => window.setTimeout(resolve, 650));
+      const response = await fetch(`/api/price-watch/add-status?id=${encodeURIComponent(jobId)}`, { cache: "no-store" });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || payload.ok === false) throw new Error(payload.error || "添加状态读取失败");
+      const state = payload.job?.status || "adding";
+      if (state === "complete") return payload;
+      if (state === "failed") throw new Error(payload.job?.error || "后台写入失败");
+      const elapsedSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+      statusNode.textContent = `正在添加 ${requested}… 已等待 ${elapsedSeconds} 秒，监控池正在完成写入`;
+    }
+    throw new Error("后台仍在处理，请稍后刷新监控池确认");
+  }
+
   async function load({ refresh = false, quiet = false } = {}) {
     if (loading) return;
     setBusy(true, refresh
-      ? (["structure", "newlow"].includes(currentMode) ? (currentMode === "newlow" ? "后台推进近一年新币低位结构轮询…" : "后台运行龙头策略六周期扫描…") : currentMode === "mapping" ? "后台重建补涨映射…" : currentMode === "aster" ? "后台核对 Aster 合约上新公告…" : ["events", "news"].includes(currentMode) ? "后台核对事件来源与确认依据…" : currentMode === "wechat" ? "后台检查当前可见群聊…" : currentMode === "personalx" ? "后台唤醒个人 X 实时通道…" : currentMode === "chains" ? "后台重新扫描链上投研证据…" : "后台核对 7 日价格数据…")
+      ? (["structure", "newlow"].includes(currentMode) ? (currentMode === "newlow" ? "后台推进近一年新币低位结构轮询…" : "后台运行龙头策略六周期扫描…") : currentMode === "mapping" ? "后台重建补涨映射…" : currentMode === "aster" ? "后台核对 Aster 合约上新公告…" : currentMode === "news" ? "后台更新 News Trade 并去重…" : currentMode === "wechat" ? "后台检查当前可见群聊…" : currentMode === "personalx" ? "后台唤醒个人 X 实时通道…" : currentMode === "smartmoney" ? "后台扫描聪明钱地址的新交易…" : currentMode === "chains" ? "后台重新扫描链上投研证据…" : "后台核对 7 日价格数据…")
       : statusNode.textContent);
     try {
       if (currentMode === "wechat") {
@@ -2254,6 +3093,10 @@
       }
       if (currentMode === "personalx") {
         await loadPersonalXMonitor({ refresh, quiet });
+        return;
+      }
+      if (currentMode === "smartmoney") {
+        await loadSmartMoneyMonitor({ refresh, quiet });
         return;
       }
       if (currentMode === "chains") {
@@ -2274,13 +3117,13 @@
         await loadAsterContracts({ refresh, quiet });
         return;
       }
-      if (currentMode === "events" || currentMode === "news") {
+      if (currentMode === "news") {
         await loadEventMonitor({ refresh, quiet });
         return;
       }
       statusNode.textContent = currentMode === "oversold"
         ? (refresh ? "超跌结构、主升浪起点与 Fib 价位已更新" : "接近低位阶段高点或主升浪 Fib 0.5 / 0.618 时提醒")
-        : (refresh ? "价格与最近 7 日前高已更新" : "现价低于最近 7 日前高且距离不超过 3% 时提醒");
+        : (refresh ? "价格与主升浪阶段高点已更新" : "现价低于主升浪阶段高点且距离不超过 3% 时提醒");
     } catch (error) {
       if (!quiet) statusNode.textContent = error.message;
     } finally {
@@ -2291,21 +3134,81 @@
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     const symbol = symbolInput.value.trim();
-    if (!symbol || loading) return;
-    setBusy(true, `正在添加 ${symbol.toUpperCase()}…`);
+    if (!symbol || adding) return;
+    setAddBusy(true, symbol);
     try {
-      const payload = await postAction("add", symbol);
-      render(payload);
+      let payload = await postAction("add", symbol);
+      if (payload.addition?.status === "adding" && payload.addition?.jobId) {
+        statusNode.textContent = `${symbol} 的添加请求已受理，正在识别名称和交易所合约…`;
+        payload = await waitForAddJob(payload.addition.jobId, symbol);
+      }
+      const addition = payload.addition || {};
+      const addedItem = addition.item;
+      if (addedItem?.symbol) {
+        const alreadyPresent = items.some((item) => item.symbol === addedItem.symbol);
+        const nextItems = [addedItem, ...items.filter((item) => item.symbol !== addedItem.symbol && item.symbol !== addition.replacedSymbol)];
+        const nextSummary = { ...currentSummary };
+        if (!alreadyPresent) {
+          nextSummary.total = Number(nextSummary.total || items.length) + 1;
+          nextSummary.manual = Number(nextSummary.manual || 0) + 1;
+          nextSummary.priorHighTotal = Number(nextSummary.priorHighTotal || 0) + (addedItem.priorHighEnabled === false ? 0 : 1);
+          nextSummary.priorHighManual = Number(nextSummary.priorHighManual || 0) + (addedItem.priorHighEnabled === false ? 0 : 1);
+        }
+        render({ items: nextItems, summary: nextSummary });
+      } else if (Array.isArray(payload.items)) {
+        render(payload);
+      }
       symbolInput.value = "";
-      statusNode.textContent = `${symbol.toUpperCase()} 已加入，价格将在后台更新`;
+      const resolvedName = addition.name || addition.symbol || symbol.toUpperCase();
+      const market = addition.marketProvider ? `，K线优先使用 ${addition.marketProvider}` : "";
+      statusNode.textContent = `${resolvedName} 已加入监控池${market}；价格正在后台更新`;
+      window.setTimeout(() => load({ quiet: true }), 900);
     } catch (error) {
-      statusNode.textContent = error.message;
+      statusNode.textContent = `添加失败：${error.message}`;
     } finally {
-      setBusy(false);
+      setAddBusy(false);
     }
   });
 
   grid.addEventListener("submit", async (event) => {
+    const smartMoneyForm = event.target.closest("[data-smart-money-form]");
+    if (smartMoneyForm) {
+      event.preventDefault();
+      if (smartMoneyActionLoading) return;
+      const data = new FormData(smartMoneyForm);
+      const chain = data.get("chain")?.toString() || "";
+      const address = data.get("address")?.toString().trim() || "";
+      const nickname = data.get("nickname")?.toString().trim() || "";
+      const sourceName = data.get("sourceName")?.toString().trim() || "手动添加";
+      const alertThresholdUsd = Number(data.get("alertThresholdUsd"));
+      if (!chain || !address) {
+        statusNode.textContent = "请选择链并填写钱包地址";
+        return;
+      }
+      if (!Number.isFinite(alertThresholdUsd) || alertThresholdUsd <= 0) {
+        statusNode.textContent = "弹窗金额必须大于 0U";
+        return;
+      }
+      smartMoneyActionLoading = true;
+      renderSmartMoneyMonitor();
+      statusNode.textContent = "正在校验地址并写入只读监控…";
+      try {
+        smartMoneyPayload = await postSmartMoneyAction("add", {
+          chain, address, nickname, sourceName, sourceKind: "manual", alertThresholdUsd,
+        });
+        smartMoneyLoaded = true;
+        lastSmartMoneyLoadAt = Date.now();
+        smartMoneyForm.reset();
+        statusNode.textContent = `${nickname || smartMoneyShortAddress(address)} 已加入 ${smartMoneyChainLabel(chain)}；首次扫描只建立当前基线`;
+      } catch (error) {
+        statusNode.textContent = `添加失败：${error.message}`;
+      } finally {
+        smartMoneyActionLoading = false;
+        renderSmartMoneyMonitor();
+      }
+      return;
+    }
+
     const newsTradeSearchForm = event.target.closest("[data-news-trade-search]");
     if (newsTradeSearchForm) {
       event.preventDefault();
@@ -2448,6 +3351,62 @@
   });
 
   grid.addEventListener("click", async (event) => {
+    const smartMoneyToggle = event.target.closest("[data-smart-money-toggle]");
+    if (smartMoneyToggle && currentMode === "smartmoney" && !smartMoneyActionLoading) {
+      const id = Number(smartMoneyToggle.dataset.smartMoneyToggle) || 0;
+      const enabled = smartMoneyToggle.dataset.smartMoneyEnabled !== "1";
+      smartMoneyActionLoading = true;
+      smartMoneyToggle.disabled = true;
+      statusNode.textContent = enabled ? "正在恢复地址监控…" : "正在暂停地址监控…";
+      try {
+        smartMoneyPayload = await postSmartMoneyAction("save", { id, enabled });
+        smartMoneyLoaded = true;
+        lastSmartMoneyLoadAt = Date.now();
+        statusNode.textContent = enabled ? "地址已恢复，只从最新链上进度继续" : "地址已暂停，历史买入记录仍然保留";
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        smartMoneyActionLoading = false;
+        renderSmartMoneyMonitor();
+      }
+      return;
+    }
+
+    const smartMoneyRemove = event.target.closest("[data-smart-money-remove]");
+    if (smartMoneyRemove && currentMode === "smartmoney" && !smartMoneyActionLoading) {
+      const id = Number(smartMoneyRemove.dataset.smartMoneyRemove) || 0;
+      const name = smartMoneyRemove.dataset.smartMoneyName || "该地址";
+      if (!window.confirm(`确认从聪明钱监控中删除 ${name}？历史买入记录会保留。`)) return;
+      smartMoneyActionLoading = true;
+      smartMoneyRemove.disabled = true;
+      statusNode.textContent = `正在删除 ${name}…`;
+      try {
+        smartMoneyPayload = await postSmartMoneyAction("remove", { id });
+        smartMoneyLoaded = true;
+        lastSmartMoneyLoadAt = Date.now();
+        statusNode.textContent = `${name} 已从地址库删除；历史买入记录仍然保留`;
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        smartMoneyActionLoading = false;
+        renderSmartMoneyMonitor();
+      }
+      return;
+    }
+
+    const newsSectionButton = event.target.closest("[data-news-section]");
+    if (newsSectionButton && currentMode === "news") {
+      const section = newsSectionButton.dataset.newsSection;
+      if (newsTradeView.select(section)) {
+        const url = new URL(window.location.href);
+        url.searchParams.set("newsView", section);
+        window.history.replaceState({}, "", url);
+        renderEventMonitor();
+        grid.querySelector(`[data-news-section="${section}"]`)?.focus({ preventScroll: true });
+      }
+      return;
+    }
+
     const newsTradeSearchAdd = event.target.closest("[data-news-trade-search-add]");
     if (newsTradeSearchAdd && !newsTradeSearchAdd.disabled && !newsTradeSearchState.loading) {
       const previewId = newsTradeSearchAdd.dataset.newsTradeSearchAdd || "";
@@ -2478,8 +3437,7 @@
 
     const newsTradePageButton = event.target.closest("[data-news-trade-page]");
     if (newsTradePageButton && !newsTradePageButton.disabled) {
-      const pageCount = Math.max(1, Math.ceil(newsTradeItems.length / NEWS_TRADE_PAGE_SIZE));
-      newsTradePage = Math.max(1, Math.min(Number(newsTradePageButton.dataset.newsTradePage) || 1, pageCount));
+      newsTradeView.setPage(newsTradePageButton.dataset.newsTradePage, mergedEventItems);
       renderEventMonitor();
       grid.scrollIntoView({ behavior: "smooth", block: "start" });
       return;
@@ -2545,20 +3503,6 @@
       return;
     }
 
-    const okxWalletConnect = event.target.closest("[data-wallet-connect]");
-    if (okxWalletConnect && !okxWalletState.connecting) {
-      const providerKey = okxWalletConnect.dataset.walletProvider || okxWalletState.providerKey || "okx";
-      const switchAccount = okxWalletConnect.dataset.walletSwitchAccount === "true";
-      try {
-        await connectOkxWallet(null, { providerKey, switchAccount });
-        if (!switchAccount || !statusNode.textContent.includes("仍在使用原账户")) {
-          statusNode.textContent = `${walletProviderLabel(providerKey)} 已授权公开地址；真实交易仍会逐笔弹出钱包确认`;
-        }
-      } catch (error) {
-        statusNode.textContent = Number(error?.code) === 4001 ? "你已取消本次钱包授权" : error.message;
-      }
-      return;
-    }
 
     const newsTradeNoticeClose = event.target.closest("[data-news-trade-notice-close]");
     if (newsTradeNoticeClose) {
@@ -2582,7 +3526,8 @@
         return contractMatches && chainMatches;
       }) || newsItem?.memeOpportunity || null;
       try {
-        await connectOkxWallet(opportunity, { providerKey: okxWalletState.providerKey || "okx" });
+        const activeSession = activeWalletSession(opportunity?.chain === "sol" ? "solana" : "evm");
+        await connectOkxWallet(opportunity, { providerKey: activeSession.providerKey || "binance" });
       } catch (error) {
         statusNode.textContent = Number(error?.code) === 4001 ? "你已取消本次钱包授权" : error.message;
         return;
@@ -2629,6 +3574,114 @@
       return;
     }
 
+    const researchPageButton = event.target.closest("[data-chain-research-page], [data-research-history-page]");
+    if (researchPageButton && currentMode === "chains" && !researchPageButton.disabled && !chainResearchPaging) {
+      const isHistory = researchPageButton.hasAttribute("data-research-history-page");
+      const nextPage = Math.max(1, Number(isHistory ? researchPageButton.dataset.researchHistoryPage : researchPageButton.dataset.chainResearchPage) || 1);
+      const previousPage = isHistory ? researchHistoryPage : selectedResearchPage;
+      if (nextPage === previousPage) return;
+      if (isHistory) researchHistoryPage = nextPage;
+      else selectedResearchPage = nextPage;
+      const updatePageInUrl = (page) => {
+        const url = new URL(window.location.href);
+        const key = isHistory ? "researchHistoryPage" : "researchPage";
+        if (page <= 1) url.searchParams.delete(key);
+        else url.searchParams.set(key, page);
+        window.history.replaceState({}, "", url);
+      };
+      updatePageInUrl(nextPage);
+      chainResearchPaging = true;
+      renderChainEcosystem();
+      statusNode.textContent = `正在加载第 ${nextPage} 页…`;
+      lastChainEcosystemLoadAt = 0;
+      try {
+        const loaded = await loadChainEcosystem({ quiet: false });
+        if (!loaded) {
+          if (isHistory) researchHistoryPage = previousPage;
+          else selectedResearchPage = previousPage;
+          updatePageInUrl(previousPage);
+        }
+      } finally {
+        chainResearchPaging = false;
+        renderChainEcosystem();
+      }
+      return;
+    }
+
+    const trenchFilterButton = event.target.closest("[data-trench-network]");
+    if (trenchFilterButton && currentMode === "chains" && chainSubMode === "trenches" && !onchainTrenchesLoading) {
+      selectedTrenchNetwork = trenchFilterButton.dataset.trenchNetwork || "";
+      selectedTrenchPage = 1;
+      const url = new URL(window.location.href);
+      if (selectedTrenchNetwork) url.searchParams.set("trenchChain", selectedTrenchNetwork);
+      else url.searchParams.delete("trenchChain");
+      url.searchParams.delete("trenchSource");
+      url.searchParams.delete("trenchPage");
+      window.history.replaceState({}, "", url);
+      await loadOnchainTrenches({ refresh: true });
+      return;
+    }
+
+    const trenchPageButton = event.target.closest("[data-trench-page]");
+    if (trenchPageButton && currentMode === "chains" && chainSubMode === "trenches" && !trenchPageButton.disabled && !onchainTrenchesLoading) {
+      const nextPage = Math.max(1, Number(trenchPageButton.dataset.trenchPage) || 1);
+      if (nextPage === selectedTrenchPage) return;
+      selectedTrenchPage = nextPage;
+      const url = new URL(window.location.href);
+      if (nextPage <= 1) url.searchParams.delete("trenchPage");
+      else url.searchParams.set("trenchPage", String(nextPage));
+      window.history.replaceState({}, "", url);
+      await loadOnchainTrenches({ refresh: true });
+      return;
+    }
+
+    const trenchRefreshButton = event.target.closest("[data-trench-refresh]");
+    if (trenchRefreshButton && currentMode === "chains" && chainSubMode === "trenches" && !onchainTrenchesLoading) {
+      await loadOnchainTrenches({ refresh: true });
+      return;
+    }
+
+    const chainSubmodeButton = event.target.closest("[data-chain-submode]");
+    if (chainSubmodeButton && currentMode === "chains") {
+      const nextMode = chainSubmodeButton.dataset.chainSubmode || "today";
+      if (!CHAIN_SUBMODES.includes(nextMode) || nextMode === chainSubMode) return;
+      chainSubMode = nextMode;
+      const url = new URL(window.location.href);
+      if (chainSubMode === "today") url.searchParams.delete("chainView");
+      else url.searchParams.set("chainView", chainSubMode);
+      window.history.replaceState({}, "", url);
+      renderChainEcosystem();
+      if (chainSubMode === "trenches") {
+        statusNode.textContent = "正在直连 GMGN 实时战壕…";
+        await loadOnchainTrenches();
+      } else {
+        statusNode.textContent = chainSubmodeButton.textContent.trim();
+      }
+      return;
+    }
+
+    const chainResearchDay = event.target.closest("[data-chain-research-day]");
+    if (chainResearchDay && currentMode === "chains" && !loading) {
+      const nextDay = chainResearchDay.dataset.chainResearchDay || "";
+      if (!/^20\d{2}-\d{2}-\d{2}$/.test(nextDay) || nextDay === selectedResearchDay) return;
+      selectedResearchDay = nextDay;
+      selectedResearchPage = 1;
+      researchHistoryPage = 1;
+      const url = new URL(window.location.href);
+      url.searchParams.set("researchDay", selectedResearchDay);
+      url.searchParams.delete("researchPage");
+      url.searchParams.delete("researchHistoryPage");
+      window.history.replaceState({}, "", url);
+      lastChainEcosystemLoadAt = 0;
+      setBusy(true, `正在回溯 ${nextDay} 的扫盘记录…`);
+      try {
+        await loadChainEcosystem();
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
+
     const chainAddToggle = event.target.closest("[data-chain-add-toggle]");
     if (chainAddToggle) {
       const chainForm = grid.querySelector("[data-chain-form]");
@@ -2639,9 +3692,13 @@
     const chainSelect = event.target.closest("[data-chain-select]");
     if (chainSelect && !loading) {
       selectedChainSlug = chainSelect.dataset.chainSelect || "";
+      selectedResearchPage = 1;
+      researchHistoryPage = 1;
       const url = new URL(window.location.href);
       if (selectedChainSlug) url.searchParams.set("chain", selectedChainSlug);
       else url.searchParams.delete("chain");
+      url.searchParams.delete("researchPage");
+      url.searchParams.delete("researchHistoryPage");
       window.history.replaceState({}, "", url);
       lastChainEcosystemLoadAt = 0;
       setBusy(true, "正在切换链上投研…");
@@ -2825,13 +3882,13 @@
           : "正在用龙头策略扫描 AICoin 热门币六周期行情";
         loadStructures();
       } else if (currentMode === "mapping") {
-        statusNode.textContent = "正在建立龙头、家族与题材补涨映射";
+        statusNode.textContent = "AI 正在建立真实龙头、家族与题材补涨映射";
         loadMappings();
       } else if (currentMode === "aster") {
         statusNode.textContent = "正在读取 Aster 永续合约列表";
         loadAsterContracts();
-      } else if (currentMode === "events" || currentMode === "news") {
-        statusNode.textContent = currentMode === "news" ? "正在筛选高置信 News Trade 候选" : "正在核对二级事件来源";
+      } else if (currentMode === "news") {
+        statusNode.textContent = "正在更新 News Trade 并去重";
         loadEventMonitor();
       } else if (currentMode === "wechat") {
         statusNode.textContent = "正在检查当前可见的微信与 Q 群";
@@ -2839,13 +3896,16 @@
       } else if (currentMode === "personalx") {
         statusNode.textContent = "正在连接 @whitestar224 秒级实时流";
         loadPersonalXMonitor();
+      } else if (currentMode === "smartmoney") {
+        statusNode.textContent = "正在读取五条链的聪明钱地址与买入记录";
+        loadSmartMoneyMonitor();
       } else if (currentMode === "chains") {
         statusNode.textContent = "正在读取公链生命周期与 L0-L3 生态市场";
         loadChainEcosystem();
       } else {
         statusNode.textContent = currentMode === "oversold"
           ? "接近低位阶段高点或主升浪 Fib 0.5 / 0.618 时提醒"
-          : "现价低于最近 7 日前高且距离不超过 3% 时提醒";
+          : "现价低于主升浪阶段高点且距离不超过 3% 时提醒";
       }
     });
   });
@@ -2853,7 +3913,7 @@
   initializeOkxWallet();
   load();
   window.setInterval(() => {
-    if (currentMode === "events" || currentMode === "news") {
+    if (currentMode === "news") {
       loadEventMonitor({ quiet: true });
       return;
     }
@@ -2863,7 +3923,15 @@
       else connectPersonalXStream();
       return;
     }
+    if (currentMode === "smartmoney") {
+      loadSmartMoneyMonitor({ quiet: true });
+      return;
+    }
     if (currentMode === "chains") return;
+    if (currentMode === "mapping") {
+      loadMappings({ quiet: true });
+      return;
+    }
     load({ quiet: true });
   }, 30_000);
   window.setInterval(() => {
@@ -2876,6 +3944,9 @@
   });
   window.setInterval(() => {
     if (currentMode === "wechat") loadWechatMonitor({ quiet: true });
+  }, 5_000);
+  window.setInterval(() => {
+    if (currentMode === "smartmoney") loadSmartMoneyMonitor({ quiet: true });
   }, 5_000);
   window.setInterval(() => {
     if (currentMode === "chains") loadChainEcosystem({ quiet: true });

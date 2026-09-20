@@ -6,7 +6,8 @@
   const Cases = window.DragonWaveCases;
   const Feedback = window.DragonWaveFeedback;
   const Vision = window.DragonWaveVision;
-  if (!Engine || !Data || !Cases || !Feedback || !Vision) return;
+  const PriorHigh = window.PriorHighEngine;
+  if (!Engine || !Data || !Cases || !Feedback || !Vision || !PriorHigh) return;
 
   const $ = (selector, scope = document) => scope.querySelector(selector);
   const $$ = (selector, scope = document) => [...scope.querySelectorAll(selector)];
@@ -24,8 +25,8 @@
   const MARKET_CACHE_SCHEMA = 2;
   const MARKET_CACHE_LIMIT = 48;
   const MARKET_CANDLE_CACHE_LIMIT = 640;
-  const STRATEGY_CACHE_VERSION = "v89";
-  const ANALYSIS_WORKER_URL = new URL("./dragon-wave-analysis-worker.js?v=89", window.location.href);
+  const STRATEGY_CACHE_VERSION = "v91";
+  const ANALYSIS_WORKER_URL = new URL("./dragon-wave-analysis-worker.js?v=91", window.location.href);
   const ANALYSIS_WORKER_COUNT = Math.max(1, Math.min(2, Number(navigator.hardwareConcurrency) || 2));
   const VISUAL_RANGE_MIN_BARS = 12;
   const FEEDBACK_INDEX_SIGNAL_FIELDS = Object.freeze([
@@ -150,6 +151,21 @@
         rejectedCount: rejected.length,
       },
     };
+  }
+
+  const priorHighViewCache = new WeakMap();
+
+  function priorHighResultFor(sourceResult, interval) {
+    if (!sourceResult || typeof sourceResult !== "object") return sourceResult;
+    let byInterval = priorHighViewCache.get(sourceResult);
+    if (!byInterval) {
+      byInterval = new Map();
+      priorHighViewCache.set(sourceResult, byInterval);
+    }
+    if (!byInterval.has(interval)) {
+      byInterval.set(interval, PriorHigh.analyzeForChart(sourceResult, interval));
+    }
+    return byInterval.get(interval);
   }
 
   class WaveChart {
@@ -1567,6 +1583,15 @@
         signalCount.textContent = "0 确认 · 0 候选";
         filterCount.textContent = "0 过滤";
       } else {
+        source.textContent = venue?.label || "—";
+        price.textContent = formatPrice(result.stats.lastPrice);
+        if (result.priorHighAnalysisVersion) {
+          regime.textContent = "前高监控";
+          regime.classList.add("is-bullish");
+          signalCount.textContent = `${result.stats.signalCount || 0} B点 · ${result.stats.pendingCount || 0} 提醒`;
+          filterCount.textContent = `${result.priorHighLevels?.length || 0} 压力位`;
+          return;
+        }
         const regimeIndex = this.focusIndex ?? result.candles.length - 1;
         const close = result.candles[regimeIndex]?.close;
         const ema90 = result.indicators.ema90[regimeIndex];
@@ -1575,8 +1600,6 @@
         const strongAtFocus = bullishAtFocus && close >= ema90 + (result.indicators.atr[regimeIndex] || 0) * 0.6;
         regime.textContent = strongAtFocus ? "主升环境" : bullishAtFocus ? "多头观察" : "禁止追多";
         regime.classList.add(bullishAtFocus ? "is-bullish" : "is-blocked");
-        source.textContent = venue.label;
-        price.textContent = formatPrice(result.stats.lastPrice);
         signalCount.textContent = `${result.stats.signalCount} 买点 · ${result.stats.secondaryBreakoutHintCount || 0} 二次提示 · ${result.stats.pendingCount || 0} 预备 · ${result.stats.retainedCandidateCount || 0} 候选`;
         filterCount.textContent = `${result.stats.rejectedCount} 过滤`;
       }
@@ -2047,6 +2070,7 @@
     ledgerFilter: "all",
     drawTool: "pan",
     activeInterval: "15m",
+    strategyPage: "ignition",
     failures: new Map(),
     activeCase: null,
     liveLeaders: [],
@@ -2586,10 +2610,34 @@
       "4h": ["REGIME", "4小时"],
       "1d": ["MACRO", "日线"],
     };
-    $("#mainChartRole").textContent = labels[interval][0];
+    const priorHighPage = state.strategyPage === "prior-high";
+    const legend = priorHighPage
+      ? {
+          buy: ["前高突破 B", false], secondary: ["", true], pending: ["接近前高提醒", false],
+          visual: ["", true], filtered: ["", true], structure: ["", true], ema90: ["EMA90", false],
+        }
+      : {
+          buy: ["因果买点", false], secondary: ["防洗二次突破", false], pending: ["预备触发", false],
+          visual: ["V · 视觉预确认", false], filtered: ["过滤点", false], structure: ["结构预确认", false], ema90: ["EMA90", false],
+        };
+    Object.entries(legend).forEach(([key, [label, hidden]]) => {
+      const item = $(`[data-legend="${key}"]`);
+      if (!item) return;
+      item.hidden = hidden;
+      const text = $("b", item);
+      if (text) text.textContent = label;
+    });
+    $("#chartsTitle").textContent = priorHighPage ? "结构前高监控盘面" : "龙头主升盘面";
+    $("#mainChartRole").textContent = priorHighPage ? "PRIOR HIGH" : labels[interval][0];
     $("#mainChartInterval").textContent = labels[interval][1];
     $$('[data-timeframe]').forEach((button) => button.classList.toggle("is-active", button.dataset.timeframe === interval));
-    if (loaded) chart.setData(resultForDisplay(loaded.result, pair), loaded.venue, focusTime, pair);
+    $("#signalPolicyNote").hidden = priorHighPage;
+    $("#priorHighPolicyNote").hidden = !priorHighPage;
+    $(".secondary-hint-policy").hidden = priorHighPage;
+    if (loaded && priorHighPage) {
+      chart.setData(priorHighResultFor(loaded.result, interval), loaded.venue, focusTime, pair);
+    }
+    else if (loaded) chart.setData(resultForDisplay(loaded.result, pair), loaded.venue, focusTime, pair);
     else if (state.failures.has(interval)) chart.setError(state.failures.get(interval));
     else chart.setLoading(`${Data.INTERVALS[interval].label} · 读取中`);
   }
@@ -2922,7 +2970,7 @@
   async function readLocalPrecomputed(params) {
     if (!params.historicalDocument || !params.caseStart || !params.caseEnd) return null;
     const query = new URLSearchParams({
-      version: STRATEGY_CACHE_VERSION,
+      version: params.precomputedVersion || STRATEGY_CACHE_VERSION,
       pair: Data.normalizePair(params.pair),
       start: params.caseStart,
       end: params.caseEnd,
@@ -2933,13 +2981,22 @@
     try {
       const response = await fetch(`/api/dragon-wave-precomputed?${query}`, {
         signal: params.signal,
-        cache: "default",
+        // 同一任务会先写出单周期暂存结果，再由完整跨周期结果覆盖。
+        // 每次读取都用 ETag 重验证，不能沿用 HTTP 的一天新鲜期。
+        cache: "no-cache",
         headers: { Accept: "application/json" },
       });
-      if (response.status === 202 || response.status === 404) return { pending: true };
+      if (response.status === 202) return { pending: true };
+      if (response.status === 404) {
+        const error = new Error("本地策略结果接口不可用");
+        error.code = "local-precompute-unavailable";
+        throw error;
+      }
       if (!response.ok) return { pending: true };
       const value = await response.json();
-      const matchesRequest = value?.version === STRATEGY_CACHE_VERSION
+      // 老版本完整缓存没有此字段，保持兼容；显式 false 才是未完成。
+      if (value?.contextComplete === false) return { pending: true, contextComplete: false };
+      const matchesRequest = value?.version === (params.precomputedVersion || STRATEGY_CACHE_VERSION)
         && value?.pair === Data.normalizePair(params.pair)
         && value?.start === params.caseStart
         && value?.end === params.caseEnd
@@ -2951,7 +3008,7 @@
         || !Data.isCandleCoverageAcceptable(value.result.candles, params.window, params.interval)) return null;
       return value;
     } catch (error) {
-      if (error?.name === "AbortError") throw error;
+      if (error?.name === "AbortError" || error?.code === "local-precompute-unavailable") throw error;
       return { pending: true };
     }
   }
@@ -2960,6 +3017,49 @@
     const error = new Error("本地策略结果正在后台生成");
     error.code = "local-precompute-pending";
     return error;
+  }
+
+  async function resolveLocalStrategyRelease(params) {
+    if (!params.historicalDocument) return null;
+    const query = new URLSearchParams({ pair: Data.normalizePair(params.pair),
+      start: params.caseStart, end: params.caseEnd, market: params.market,
+      stage: normalizeMainWaveStage(params.mainWaveStage) });
+    try {
+      const response = await fetch(`/api/dragon-wave-release?${query}`, { signal: params.signal, cache: "no-store" });
+      if (!response.ok) return null;
+      const value = await response.json();
+      if (value.requestedVersion !== STRATEGY_CACHE_VERSION
+        || ![STRATEGY_CACHE_VERSION, "v90", null].includes(value.selectedVersion)
+        || value.pair !== Data.normalizePair(params.pair) || value.start !== params.caseStart
+        || value.end !== params.caseEnd || value.market !== params.market
+        || value.stage !== normalizeMainWaveStage(params.mainWaveStage)) return null;
+      return value;
+    } catch (error) {
+      if (error?.name === "AbortError") throw error;
+      return null;
+    }
+  }
+
+  function scheduleStrategyReleaseCheck(params, generation) {
+    if (state.precomputedRetryTimer) clearTimeout(state.precomputedRetryTimer);
+    state.precomputedRetryTimer = window.setTimeout(async () => {
+      state.precomputedRetryTimer = null;
+      if (generation !== state.generation || state.loadingWorkspace) return;
+      let release;
+      try { release = await resolveLocalStrategyRelease(params); } catch (_error) { return; }
+      if (generation !== state.generation) return;
+      if (release?.selectedVersion === STRATEGY_CACHE_VERSION) {
+        // Do not disturb a selected candle, manual range or an open review panel.
+        $("#summaryHint").textContent = "新版 v91 已就绪，点击「扫描起爆点」加载；当前盘面与人工选择保持不变";
+        return;
+      }
+      if (release?.needsAttention) {
+        $("#summaryStatus").textContent = "新版案例未完成 · 继续显示旧版";
+        $("#summaryHint").textContent = "本轮计算已结束，该案例仍需检查本地计算记录；已有 B 点和人工确认保持不变";
+        return;
+      }
+      scheduleStrategyReleaseCheck(params, generation);
+    }, 30000);
   }
 
   async function loadAnalyzedInterval(params) {
@@ -2974,8 +3074,14 @@
         persistentCacheHit: true,
         localCandleCacheHit: true,
         localPrecomputedHit: true,
+        precomputedVersion: precomputed.version,
       };
     }
+    // 明确处于跨周期汇总中时，不用旧 IndexedDB 结果覆盖等待状态。
+    // 这样会沿用本地预计算的自动重试，不展示可能变化的临时 B 点。
+    if (precomputed?.contextComplete === false) throw localPrecomputePendingError();
+    // A pinned whole-case release must not mix in stale per-interval browser data.
+    if (params.precomputedVersion && params.historicalDocument) throw localPrecomputePendingError();
     const persistentKey = analyzedCacheKey(params);
     const cached = params.historicalDocument
       ? await readAnalyzedCache(persistentKey, analyzedCacheMaxAge(params))
@@ -3164,6 +3270,7 @@
     $("#sourceRoute span").textContent = "读取本机行情缓存；缺失部分再连接交易所…";
     state.charts.get("main").setLoading(`${Data.INTERVALS[state.activeInterval].label} · 优先读取`);
 
+    let caseRelease = null;
     const buildParams = (requestPair, interval) => ({
       pair: requestPair,
       interval,
@@ -3176,11 +3283,15 @@
       historicalDocument: Boolean(state.activeCase?.valid && !state.activeCase.live),
       caseStart: state.activeCase?.valid && !state.activeCase.live ? state.activeCase.start : "",
       caseEnd: state.activeCase?.valid && !state.activeCase.live ? state.activeCase.end : "",
+      precomputedVersion: caseRelease?.selectedVersion || STRATEGY_CACHE_VERSION,
       window: state.activeCase?.valid && !state.activeCase.live
         ? Data.buildCaseWindow(state.activeCase.start, state.activeCase.end, interval)
         : Data.buildWindow(focusTime, interval),
       signal: state.controller.signal,
     });
+    try { caseRelease = await resolveLocalStrategyRelease(buildParams(pair, state.activeInterval)); }
+    catch (error) { if (error?.name === "AbortError") return; throw error; }
+    if (generation !== state.generation) return;
     const loadOne = async (interval) => {
       try {
         const loaded = await loadAnalyzedInterval(buildParams(pair, interval));
@@ -3290,6 +3401,17 @@
           $("#summaryHint").textContent = "看板没有现场运算；生成完成后会自动读取并显示 B 点";
           $("#sourceRoute span").textContent = `本机预计算进行中 · 已就绪 ${usable.length}/${intervals.length} 个周期 · 页面仅负责加载展示`;
           schedulePrecomputedReload(generation);
+        } else if (caseRelease?.pending && caseRelease.selectedVersion) {
+          $("#summaryStatus").textContent = caseRelease.needsAttention
+            ? `新版案例需检查 · 当前显示 ${caseRelease.selectedVersion}`
+            : `新版 ${STRATEGY_CACHE_VERSION} 后台计算中 · 当前显示 ${caseRelease.selectedVersion}`;
+          $("#summaryHint").textContent = caseRelease.needsAttention
+            ? "本轮计算已结束，该案例仍未完整就绪；旧版 B 点和人工确认保持不变"
+            : "继续显示旧版完整 B 点；五个周期全部就绪后可切换，人工确认保留";
+          if (!caseRelease.needsAttention) scheduleStrategyReleaseCheck(buildParams(pair, activeInterval), generation);
+        }
+        if (usable.some((item) => item.localPrecomputedHit)) {
+          $("#sourceRoute span").textContent += ` · 策略 ${caseRelease?.selectedVersion || STRATEGY_CACHE_VERSION}`;
         }
       }
       if (hydratedVisualRecords) await persistFeedback();
@@ -3394,7 +3516,10 @@
 
   function ledgerItems() {
     const pair = Data.normalizePair($("#symbolInput").value);
-    const generated = [...state.results.values()].flatMap(({ result, venue }) => {
+    const generated = [...state.results.values()].flatMap(({ result: sourceResult, venue }) => {
+      const result = state.strategyPage === "prior-high"
+        ? priorHighResultFor(sourceResult, sourceResult.interval)
+        : sourceResult;
       const activeTimes = new Set([
         ...(result.signals || []),
         ...(result.secondaryBreakoutHints || []),
@@ -3412,7 +3537,7 @@
           .filter((item) => !quietCandidateTimes.has(Number(item.time)))
           .map((item) => ({ ...item, venue: venue.label })),
       ];
-    }).filter((item) => signalDisplayAllowed(item, pair))
+    }).filter((item) => state.strategyPage === "prior-high" || signalDisplayAllowed(item, pair))
       .map((item) => ({ ...item, feedbackKey: item.feedbackKey || Feedback.signalKey(pair, item) }));
     const generatedKeys = new Set(generated.map((item) => item.feedbackKey).filter(Boolean));
     const retained = Object.values(state.feedback.records || {})
@@ -3552,7 +3677,7 @@
       const structureTags = Feedback.normalizeStructureTags(feedbackRecord?.structureTags || item.manualStructureTags);
       const structureSummary = structureTags.map((tag) => STRUCTURE_TAG_LABELS[tag]).filter(Boolean).join(" / ");
       const className = `${item.secondaryBreakoutHint ? "is-secondary-hint" : item.status === "buy" ? "is-buy" : item.status === "pending" ? "is-pending" : item.status === "candidate" ? "is-candidate" : "is-filtered"} ${item.visualPreconfirmed ? "is-visual" : ""} ${feedbackRecord?.decision === "confirmed" ? "is-confirmed" : feedbackRecord?.decision === "pending" ? "is-review-pending" : feedbackRecord?.decision === "denied" ? "is-denied" : ""}`;
-      const badge = feedbackRecord?.decision === "confirmed" ? "LOCKED" : item.secondaryBreakoutHint ? "B!" : item.status === "buy" ? "IGNITE" : item.visualPreconfirmed ? "VISION" : item.status === "pending" ? "WATCH" : item.status === "candidate" ? "CANDIDATE" : "VETO";
+      const badge = feedbackRecord?.decision === "confirmed" ? "LOCKED" : item.secondaryBreakoutHint ? "B!" : state.strategyPage === "prior-high" && item.status === "buy" ? "B" : item.status === "buy" ? "IGNITE" : item.visualPreconfirmed ? "VISION" : item.status === "pending" ? "WATCH" : item.status === "candidate" ? "CANDIDATE" : "VETO";
       const feedbackLabel = feedbackRecord?.decision === "confirmed"
         ? "正样本 · 永久保留并提升同类结构权重"
         : feedbackRecord?.decision === "pending"
@@ -3606,6 +3731,12 @@
     $$('[data-timeframe]').forEach((button) => button.addEventListener("click", () => {
       state.activeInterval = button.dataset.timeframe;
       renderActiveChart();
+    }));
+    $$('[data-strategy-page]').forEach((button) => button.addEventListener("click", () => {
+      state.strategyPage = button.dataset.strategyPage;
+      $$('[data-strategy-page]').forEach((item) => item.classList.toggle("is-active", item === button));
+      renderActiveChart();
+      renderLedger();
     }));
     $$('[data-draw-tool]').forEach((button) => button.addEventListener("click", () => {
       state.drawTool = button.dataset.drawTool;

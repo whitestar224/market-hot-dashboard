@@ -27,7 +27,7 @@ test("News Trade is the first monitor tab", () => {
 test("hot-coin structure tab now describes all six shared strategy frames", () => {
   assert.match(js, /1分钟、5分钟、15分钟、1小时、4小时和日线/);
   assert.match(js, /使用龙头起爆策略识别A\+买点与多周期共振/);
-  assert.match(html, /price-watch\.js\?v=59/);
+  assert.match(html, /price-watch\.js\?v=\d+/);
 });
 
 test("multi-timeframe page follows the authoritative background pool every three seconds", () => {
@@ -38,6 +38,14 @@ test("multi-timeframe page follows the authoritative background pool every three
   assert.doesNotMatch(js, /每 3 分钟更新/);
 });
 
+test("a consumed prior high is shown as invalid while a new high is being formed", () => {
+  assert.match(js, /item\.status === "redefining"/);
+  assert.match(js, /旧前高已失效 · 正在定义新高/);
+  assert.match(js, /原前高已被突破，等待新的高点结构形成/);
+  assert.match(js, /已失效前高/);
+  assert.match(html, /price-watch\.js\?v=\d+/);
+});
+
 test("removing from any pool creates one global monitor exclusion", () => {
   assert.match(js, /data-exclude-prior-high=/);
   assert.match(js, /data-exclude-oversold=/);
@@ -45,7 +53,7 @@ test("removing from any pool creates one global monitor exclusion", () => {
   assert.match(js, /item\.priorHighEnabled !== false/);
   assert.match(server, /prior_high_excluded_at/);
   assert.match(server, /prior_high_absent_at/);
-  assert.match(server, /restoreRule": "leave_then_reenter_or_manual_readd"/);
+  assert.match(server, /restoreRule": "manual_readd_only"/);
   assert.match(server, /def exclude_monitor_symbol_globally/);
   assert.match(server, /opportunity_manual_removed_at = \?/);
   assert.match(server, /price_watch_oversold_alert_state/);
@@ -58,6 +66,7 @@ test("Binance Wallet 4h hot members also enter prior-high monitoring", () => {
   assert.match(server, /def sync_price_watch_binance_wallet_candidates/);
   assert.match(server, /binance_wallet_hot_last_seen_at/);
   assert.match(server, /personal_x_active or aicoin_active or binance_wallet_active/);
+  assert.doesNotMatch(server, /personal_x_active or aicoin_active or ave_active or binance_wallet_active/);
   assert.match(js, /币安钱包 4H 热门/);
 });
 
@@ -68,7 +77,7 @@ test("multi-timeframe cards use the global manual exclusion", () => {
   assert.match(server, /CREATE TABLE IF NOT EXISTS price_structure_exclusions/);
   assert.match(server, /def exclude_price_structure_symbol/);
   assert.match(server, /price_structure_symbol_excluded\(symbol\)/);
-  assert.match(html, /styles\.css\?v=87/);
+  assert.match(html, /styles\.css\?v=\d+/);
 });
 
 test("group monitoring supports a targeted QQ speaker, structure admission, and WeChat forwarding", () => {
@@ -125,7 +134,8 @@ test("recent-year new coins have a dedicated low-position structure monitor", ()
   assert.match(server, /def new_coin_low_activity_state/);
   assert.match(server, /def price_structure_monitor_next_rows/);
   assert.match(server, /def filter_price_monitor_rows_by_activity/);
-  assert.match(js, /仅保留 24H 成交额不低于 <b>1000 万美元<\/b>/);
+  assert.match(js, /二级合约仅保留 24H 成交额不低于 <b>1000 万美元<\/b>/);
+  assert.match(js, /链上 CA 标的不设该硬门槛/);
   assert.match(server, /merge_new_coin_low_listing_candidate/);
   assert.match(server, /start_new_coin_low_structure_monitor\(\)/);
   assert.match(js, /price-structure-card\$\{newLowCard \? " is-new-low" : ""\}/);
@@ -164,24 +174,47 @@ test("News Trade blocks unsafe contracts and previews fees, slippage and minimum
   assert.match(css, /\.news-trade-execution-notice\.is-blocked/);
 });
 
-test("News Trade wallet adapter can switch accounts and use Binance Wallet", () => {
-  assert.match(js, /eip6963:requestProvider/);
-  assert.match(js, /window\.binancew3w\?\.ethereum/);
-  assert.match(js, /window\.BinanceChain\?\.request/);
-  assert.match(js, /wallet_requestPermissions/);
-  assert.match(js, /data-wallet-provider/);
-  assert.match(js, /walletProvider: okxWalletState\.providerKey \|\| "okx"/);
-  assert.match(server, /provider in \{"okx", "binance"\}/);
-  assert.match(css, /\.news-trade-wallet-actions/);
+test("News Trade wallet adapter supports multiple simultaneous wallet sessions", () => {
+  const shared = fs.readFileSync(path.join(root, "wallets.js"), "utf8");
+  assert.match(js, /const wallets = window.XingyunWallets/);
+  assert.doesNotMatch(js, /const walletSessions = new Map/);
+  assert.ok(html.indexOf('wallets.js') < html.indexOf('price-watch.js'));
+  const jsPage = js;
+  checkShared(shared);
+  assert.doesNotMatch(jsPage, /okxWalletToolbarTemplate|walletToolbar|data-wallet-panel-toggle/);
+  assert.match(jsPage, /walletProvider: adapter\.authorizationProvider \|\| "injected"/);
 });
 
-test("News Trade candidate safety is compact and paired topic cards stay aligned", () => {
+function checkShared(js) {
+  assert.match(js, /const WALLET_ADAPTERS = Object\.freeze\(\[/);
+  assert.match(js, /\{ key: "binance", label: "Binance Wallet"/);
+  assert.match(js, /\{ key: "okx", label: "OKX Wallet"/);
+  assert.match(js, /\{ key: "metamask", label: "MetaMask"/);
+  assert.match(js, /\{ key: "bitget", label: "Bitget Wallet"/);
+  assert.ok(js.indexOf('{ key: "binance"') < js.indexOf('{ key: "okx"'));
+  assert.match(js, /eip6963:requestProvider/);
+  assert.match(js, /window\.binancew3w\?\.ethereum/);
+  assert.match(js, /window\.BinanceChain/);
+  assert.match(js, /window\.bitgetWallet\?\.ethereum/);
+  assert.match(js, /provider\?\.isMetaMask/);
+  assert.match(js, /const sessions = new Map\(\)/);
+  assert.match(js, /data-global-wallet-select/);
+  assert.match(js, /wallet_requestPermissions/);
+  assert.match(js, /data-global-wallet-connect/);
+  assert.match(server, /provider in \{"binance", "okx", "metamask", "bitget", "injected"\}/);
+  assert.match(css, /\.news-trade-wallet-actions/);
+  assert.match(css, /\.news-trade-wallet-panel/);
+}
+
+test("News Trade uses full-width readable cards and keeps candidate safety visible", () => {
   assert.match(js, /news-trade-candidate-name/);
   assert.match(js, /news-trade-candidate-foot-actions/);
   assert.match(js, /securityStatus === "safe"/);
   assert.match(css, /grid-template-rows: repeat\(3, minmax\(54px, 1fr\)\)/);
   assert.match(css, /\.price-watch-grid\.is-events > \.event-monitor-card/);
   assert.match(css, /\.price-watch-grid\.is-events \{[^}]*column-gap: 18px;[^}]*row-gap: 22px;/s);
+  assert.match(css, /\.price-watch-grid\.is-events \{\s*grid-template-columns: minmax\(0, 1fr\)/);
+  assert.match(css, /\.price-watch-grid\.is-events \.news-trade-ai-notes b \{[^}]*font-size: 14px;[^}]*white-space: normal;/s);
   assert.match(css, /\.news-trade-security > i/);
   assert.doesNotMatch(css, /\.news-trade-security \{[^}]*grid-column: 2 \/ -1/s);
 });
@@ -197,7 +230,7 @@ test("chain watch admission responds before the background ecosystem scan", () =
 test("public-chain monitoring uses AI analysis for every visible judgement slot", () => {
   assert.match(server, /def chain_ecosystem_ai_subjects/);
   assert.match(server, /def chain_ecosystem_attach_ai/);
-  assert.match(server, /chain_ecosystem_attach_ai\(payload, settings\)/);
+  assert.match(server, /chain_ecosystem_attach_ai\(source_payload, settings\)/);
   assert.match(server, /"analysisMode"\] = "ai-primary"/);
   assert.match(js, /function chainAiMeta/);
   assert.match(js, /AI 研判/);

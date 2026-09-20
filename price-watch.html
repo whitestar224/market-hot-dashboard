@@ -8,8 +8,8 @@
     <link rel="icon" type="image/png" sizes="32x32" href="./assets/favicon-32.png?v=2" />
     <link rel="apple-touch-icon" sizes="180x180" href="./assets/apple-touch-icon.png?v=2" />
     <link rel="manifest" href="./site.webmanifest" />
-    <script src="./desktop_adapter.js?v=1"></script>
-    <link rel="stylesheet" href="./styles.css?v=87" />
+    <script src="./desktop_adapter.js?v=2"></script>
+    <link rel="stylesheet" href="./styles.css?v=122" />
   </head>
   <body>
     <main class="app-shell price-watch-shell">
@@ -31,11 +31,12 @@
             <a class="nav-link" href="./turnover.html">成交额榜</a>
             <a class="nav-link" href="./newboards.html">新币新股</a>
             <a class="nav-link" href="./listings.html">上新IPO</a>
-            <a class="nav-link" href="./newsflash.html">律动快讯</a>
+            <a class="nav-link" href="./newsflash.html">聚合快讯</a>
             <a class="nav-link" href="./briefs.html">自动简报</a>
             <a class="nav-link" href="./rss.html">RSS订阅</a>
             <a class="nav-link" href="./xwatch.html">X追踪</a>
             <a class="nav-link active" href="./price-watch.html">监控</a>
+            <a class="nav-link" href="./event-flow.html">事件流</a>
             <a class="nav-link" href="./strategy.html">策略看盘</a>
             <a class="nav-link" href="./todo.html">TodoList</a>
             <a class="nav-link nav-discord" href="https://discord.gg/mKyCwtHW" target="_blank" rel="noreferrer noopener" aria-label="打开星云社 Discord 社区">Discord</a>
@@ -61,10 +62,10 @@
             <span>币种</span>
             <input id="watchSymbol" type="text" maxlength="24" autocomplete="off" placeholder="输入 HYPE / HYPEUSDT" aria-label="币种代码" />
           </label>
-          <button class="action-button price-watch-add" type="submit">添加监控</button>
+          <button id="watchAddButton" class="action-button price-watch-add" type="submit">添加监控</button>
         </form>
         <div class="price-watch-control-meta">
-          <span id="watchStatus">读取本地监控数据</span>
+          <span id="watchStatus" role="status" aria-live="polite">读取本地监控数据</span>
           <button id="watchRefresh" class="action-button" type="button">刷新价格</button>
         </div>
       </section>
@@ -77,16 +78,16 @@
         <button type="button" role="tab" aria-selected="false" data-watch-mode="newlow">新币低位结构</button>
         <button type="button" role="tab" aria-selected="false" data-watch-mode="mapping">补涨映射</button>
         <button type="button" role="tab" aria-selected="false" data-watch-mode="aster">Aster 上新公告</button>
-        <button type="button" role="tab" aria-selected="false" data-watch-mode="events">事件驱动</button>
         <button type="button" role="tab" aria-selected="false" data-watch-mode="wechat">群聊机会</button>
         <button type="button" role="tab" aria-selected="false" data-watch-mode="personalx">个人 X</button>
+        <button type="button" role="tab" aria-selected="false" data-watch-mode="smartmoney">聪明钱买入</button>
         <button type="button" role="tab" aria-selected="false" data-watch-mode="chains">链上投研</button>
       </div>
 
       <section class="price-watch-heading">
         <div>
           <p id="watchHeadingLabel" class="section-label">ACTIVE WATCHLIST</p>
-          <h2 id="watchHeadingTitle">最近 7 日前高监控</h2>
+          <h2 id="watchHeadingTitle">主升浪阶段高点监控</h2>
         </div>
         <span id="watchHeadingDescription">现价低于前高且距离不超过 <b>3%</b> · 监控数量不限 · 连续 30 天未再上热门榜自动移除</span>
       </section>
@@ -96,8 +97,12 @@
       </section>
     </main>
 
-    <script src="./auth.js?v=18"></script>
-    <script src="./price-watch.js?v=59"></script>
+    <script src="./wallets.js?v=6"></script>
+    <script src="./auth.js?v=19"></script>
+  <script src="./monitor-buy-core.js?v=6"></script>
+  <script src="./monitor-buy.js?v=22"></script>
+    <script src="./news-trade-sections.js?v=2"></script>
+    <script src="./price-watch.js?v=104"></script>
     <script src="./todo_reminder.js?v=2"></script>
   </body>
 </html>

@@ -18,6 +18,14 @@ const newboardCoin = document.querySelector("#newboardCoin");
 const newboardStock = document.querySelector("#newboardStock");
 const newboardToday = document.querySelector("#newboardToday");
 
+function renderLive(node, html) {
+  if (!node) return false;
+  if (window.XingyunLiveDom?.render) return window.XingyunLiveDom.render(node, html);
+  if (node.innerHTML === html) return false;
+  node.innerHTML = html;
+  return true;
+}
+
 const dateTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
   month: "2-digit",
   day: "2-digit",
@@ -420,9 +428,10 @@ function renderCoinRow(row, rank, board) {
   const changeClass = valueClass(row.change);
   const heat = rowHeatInfo(row, rank);
   const insight = renderInsight(row, board, rank);
+  const liveKey = `${board?.id || "coin"}:${row.contractAddress || row.address || row.symbol || row.name || rank}`;
 
   return `
-    <a class="rank-row newboard-row-link newcoin-rank-row ${heat.high ? "is-hot" : ""}" href="${url}" target="_blank" rel="noreferrer">
+    <a class="rank-row newboard-row-link newcoin-rank-row ${heat.high ? "is-hot" : ""}" data-live-key="row:${escapeHtml(liveKey)}" href="${url}" target="_blank" rel="noreferrer">
       <div class="rank-badge">${rank}</div>
       <div class="asset-cell">
         ${renderAssetIcon(row, board)}
@@ -452,9 +461,10 @@ function renderStockRow(row, rank, board) {
   const dateLabel = escapeHtml(row.date ? formatDateTime(row.date) : "--");
   const heat = rowHeatInfo(row, rank);
   const insight = renderInsight(row, board, rank);
+  const liveKey = `${board?.id || "stock"}:${row.symbol || row.title || row.name || rank}`;
 
   return `
-    <a class="rank-row newboard-row-link ${heat.high ? "is-hot" : ""}" href="${url}" target="_blank" rel="noreferrer">
+    <a class="rank-row newboard-row-link ${heat.high ? "is-hot" : ""}" data-live-key="row:${escapeHtml(liveKey)}" href="${url}" target="_blank" rel="noreferrer">
       <div class="rank-badge">${rank}</div>
       <div class="asset-cell">
         ${renderAssetIcon(row, board)}
@@ -498,7 +508,7 @@ function renderBoard(board, index) {
     : `<div class="newboard-empty">${escapeHtml(board.emptyMessage || "当前没有可展示的数据。")}</div>`;
 
   return `
-    <article class="board-card newboard-card ${board.rows.length ? "" : "is-muted"}" style="--accent: ${board.accent}; --delay: ${index * 45}ms">
+    <article class="board-card newboard-card ${board.rows.length ? "" : "is-muted"}" data-live-key="board:${escapeHtml(board.id || board.title)}" style="--accent: ${board.accent}; --delay: ${index * 45}ms">
       <header class="board-head newboard-card-head">
         <div>
           <p>${isCoin ? "新币 / 新市场榜" : "新股榜"}</p>
@@ -529,10 +539,10 @@ function renderBoards() {
   renderMetrics();
   const boards = visibleBoards();
   if (!boards.length) {
-    newboardGrid.innerHTML = '<div class="loading-panel">没有匹配的新币或新股信息。</div>';
+    renderLive(newboardGrid, '<div class="loading-panel">没有匹配的新币或新股信息。</div>');
     return;
   }
-  newboardGrid.innerHTML = boards.map(renderBoard).join("");
+  renderLive(newboardGrid, boards.map(renderBoard).join(""));
   requestAiInsights(boards);
 }
 

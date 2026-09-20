@@ -228,6 +228,7 @@
   function sourceTheme(source, mode = "") {
     const text = sourceText(source, mode).toLowerCase();
     if (/okx[-\s]?dex|web3|onchain|链上|dex/.test(text)) return GENERIC_CRYPTO_SOURCE_THEME.dex;
+    if (/binance[-\s]?wallet|wallet|币安钱包/.test(text)) return GENERIC_CRYPTO_SOURCE_THEME.dex;
     if (/binance|bn\b/.test(text)) return GENERIC_CRYPTO_SOURCE_THEME.binance;
     if (/bitget|bg\b/.test(text)) return GENERIC_CRYPTO_SOURCE_THEME.bitget;
     if (/aicoin|ai\b/.test(text)) return GENERIC_CRYPTO_SOURCE_THEME.aicoin;
@@ -312,29 +313,41 @@
     return "叙事验证";
   }
 
-  function buildRowInsight(row, context = {}) {
-    const source = context.source || row?.source || {};
-    const rank = Number(context.rank || row?.rank || 999);
-    const mode = context.mode || "";
-    const aiInsight = window.XingyunAiInsights?.getRowInsight(row, { source, rank, mode });
-    if (aiInsight?.detail) return aiInsight;
-    if (window.XingyunAiInsights?.isPending?.(row, { source, rank, mode })) {
-      return { reason: "AI", theme: "", tone: "", detail: "正在分析题材", provider: "pending" };
-    }
-    if (window.XingyunAiInsights?.shouldDeferFallback?.(row, { source, rank, mode })) return null;
+  function buildFallbackInsight(row, source, rank, mode, force = false) {
     const imp = importance(row, source, rank, mode);
-    if (!imp.ok) return null;
-
-    const reason = reasonFor(imp.trigger, row, source, mode);
     const theme = inferTheme(row, source, mode);
+    if (!force && !imp.ok) return null;
+    if (!theme && !imp.ok) return null;
+
+    const reason = theme ? theme.split("/")[0].trim() : reasonFor(imp.trigger, row, source, mode);
+    const detail = theme
+      ? theme.split("/").map((part) => part.trim()).filter(Boolean).join(" · ")
+      : reason;
     const change = Math.abs(parseSignedNumber(row?.change));
     const tone = imp.trigger === "heat" || imp.trigger === "new" || change >= 15 ? "is-hot" : "";
     return {
       reason,
       theme,
       tone,
-      detail: theme && theme !== reason ? `${reason} · ${theme}` : reason
+      detail,
+      provider: "taxonomy"
     };
+  }
+
+  function buildRowInsight(row, context = {}) {
+    const source = context.source || row?.source || {};
+    const rank = Number(context.rank || row?.rank || 999);
+    const mode = context.mode || "";
+    const aiInsight = window.XingyunAiInsights?.getRowInsight(row, { source, rank, mode });
+    if (aiInsight?.detail) return aiInsight;
+    const pending = window.XingyunAiInsights?.isPending?.(row, { source, rank, mode });
+    const deferred = window.XingyunAiInsights?.shouldDeferFallback?.(row, { source, rank, mode });
+    if (pending || deferred) {
+      const fallback = buildFallbackInsight(row, source, rank, mode, true);
+      if (fallback) return { ...fallback, pending: Boolean(pending) };
+      if (pending) return { reason: "AI", theme: "", tone: "", detail: "正在分析题材", provider: "pending" };
+    }
+    return buildFallbackInsight(row, source, rank, mode);
   }
 
   window.XingyunInsights = { buildRowInsight };

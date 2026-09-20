@@ -32,9 +32,30 @@
     "1d": 24 * 60 * 60_000,
   });
 
+  // These synchronous scopes are restored in finally blocks. Public helper calls
+  // outside an analysis never reuse data from a previous, possibly mutated input.
+  let activeAnalysisContext = null;
+  let activeCausalAnalysisCache = null;
+  let activeCausalReplayRequest = null;
+  const CAUSAL_ANALYSIS_CACHE_LIMIT = 32;
+  const CAUSAL_REPLAY_CACHE_LIMIT = 4;
+  const NORMALIZED_CANDLE_FIELDS = Object.freeze([
+    "time", "closeTime", "open", "high", "low", "close", "volume",
+    "quoteVolume", "takerBuyVolume", "tradeCount",
+  ]);
+
   function finite(value) {
     const number = Number(value);
     return Number.isFinite(number) ? number : 0;
+  }
+
+  function hasPositivePriceEvidence(value) {
+    // 缺少前高不是价格 0。null/空串/布尔转为数字后可能“有限”，
+    // 但不能据此制造前高共振，或绕过母箱体内部突破的限制。
+    if (typeof value !== "number" && typeof value !== "string") return false;
+    if (typeof value === "string" && !value.trim()) return false;
+    const price = Number(value);
+    return Number.isFinite(price) && price > 0;
   }
 
   function clamp(value, min, max) {
@@ -1386,8 +1407,9 @@
 
     // EMA90 只使用结构起点及以前的数据。它不负责产生买点，只用来识别
     // “局部反弹仍从属于下降趋势”的市场阶段。历史太短时不做这项否定。
-    const closesThroughStart = candles.slice(0, startIndex + 1).map((row) => row.close);
-    const ema90Series = ema(closesThroughStart, 90);
+    const ema90Series = activeAnalysisContext?.candles === candles
+      ? activeAnalysisContext.ema90
+      : ema(candles.slice(0, startIndex + 1).map((row) => row.close), 90);
     const ema90AtStart = ema90Series[startIndex] ?? endpoint;
     const emaShortAnchor = Math.max(0, startIndex - 8);
     const emaMediumAnchor = Math.max(0, startIndex - 21);
@@ -3702,6 +3724,19 @@
     const triangleComponent = foundationComponents.find((item) => item.type === "triangle") || null;
     const relaunchComponent = foundationComponents.find((item) => item.type === "relaunch") || null;
     const previousHighComponent = candidate.components.find((item) => item.type === "previousHigh") || null;
+    const triangleWindowStart = triangleComponent?.triangleLines?.structureStartIndex
+      ?? triangleComponent?.triangleLines?.upper?.startIndex;
+    const triangleMotherHigh = Number.isInteger(triangleWindowStart)
+      && triangleWindowStart >= 0 && triangleWindowStart < index
+      ? Math.max(...candles.slice(triangleWindowStart, index).map((row) => row.high))
+      : null;
+    // 紧凑三角借“前高共振”补足成熟度时，必须是该结构的整体高点，
+    // 不能拿末端一根附近阳线的高点替代。只读突破前的K线；完整动态
+    // 三角和高周期结构仍可独立从自身上轨触发，不要求再过静态峰值。
+    const trianglePreviousHighIsOuter = hasPositivePriceEvidence(triangleMotherHigh)
+      && hasPositivePriceEvidence(previousHighComponent?.level)
+      ? previousHighComponent.level >= triangleMotherHigh * (1 - 1e-10)
+      : null;
     const horizontalUrgency = baseComponent?.horizontalUrgency || null;
     const horizontalDwell = assessHorizontalBaseDwell(baseComponent);
     const independentMatureTriangle = Boolean(triangleComponent)
@@ -4166,6 +4201,16 @@
     const currentStructureHasPriorAdvance = horizontalLaunchContext?.hasPriorAdvance === true
       || triangleLaunchContext?.hasPriorAdvance === true
       || triangleComponent?.preStructureContext?.bestAdvance?.qualified === true;
+    // 旧插针发生得早，并不等于其后的无序修复已经结束。当前平台仍嵌在
+    // 未收复的下跌/大盘整中时，主升语境与末端站回均线不能替代独立结构。
+    // 已独立成熟的三角保留自己的资格，不由附带的横盘子模型反向否决。
+    const unorderedRepairStillActive = motherStructure.risky === true
+      && motherStructure.mode === "unordered-mother-box"
+      && horizontalPreStructureContext?.insideBroadConsolidation === true
+      && horizontalPreStructureContext?.downtrendRepairBounce === true
+      && horizontalPreStructureContext?.unrecoveredPriorDecline === true
+      && horizontalPreStructureContext?.freshRangeExpansion !== true
+      && !independentMatureTriangle;
     const currentStructureMature = foundationTypes.length >= 1
       && (confirmedPlatformBreak || candidate.matureTriangleOuterEdge === true || oneHourPlatformPivotReady);
     const mainWaveStructureQualityPermit = ["active", "expected"].includes(mainWaveStage)
@@ -4202,12 +4247,36 @@
       && (triangleComponent.quality || 0) >= 0.72
       && (triangleComponent.channelInteriorOccupancy || 0) >= 0.78
       && (triangleComponent.channelSideTransitions || 0) >= 3;
+    // 小时级别的新平台也可能由温和拉升、低量整理和拐点共同成立，不必
+    // 复制旧平台的八次试顶。检验整个新平台守均线的事实，而非只看末几根。
+    let postShockPlatformAboveEmaRatio = null;
+    if (oneHourPlatformPivotReady && postShockStructureStartsAfterLow
+      && motherStructure.risky && motherStructure.mode === "shock-formed-mother-box") {
+      const start = Math.max(0, baseComponent.structureStartIndex);
+      let above = 0;
+      let valid = 0;
+      for (let cursor = start; cursor < index; cursor += 1) {
+        if (!Number.isFinite(indicators.ema90[cursor])) continue;
+        valid += 1;
+        if (candles[cursor].close >= indicators.ema90[cursor]) above += 1;
+      }
+      if (valid === index - start && valid > 0) postShockPlatformAboveEmaRatio = above / valid;
+    }
+    const rebuiltHourlyPivotPlatform = oneHourPlatformPivotReady
+      && confirmedPlatformBreak
+      && motherStructure.localShare >= 1 / 3
+      && Number.isFinite(horizontalLaunchContext?.retracementRatio)
+      && horizontalLaunchContext.retracementRatio <= 0.5
+      && Number.isFinite(baseComponent?.rangeCompression)
+      && baseComponent.rangeCompression <= 1
+      && postShockPlatformAboveEmaRatio != null
+      && postShockPlatformAboveEmaRatio >= 0.8;
     const matureHigherTimeframePostShockRecovery = ["1h", "4h"].includes(interval)
       && motherStructure.risky === true
       && motherStructure.mode === "shock-formed-mother-box"
       && motherStructure.position >= 0.72
       && postShockStructureStartsAfterLow
-      && (maturePostShockBase || maturePostShockTriangle)
+      && (maturePostShockBase || maturePostShockTriangle || rebuiltHourlyPivotPlatform)
       && currentStructureHasPriorAdvance
       && effectiveHorizontalPriorAdvanceAtr >= 4
       && horizontalLaunchContext?.postSelloffRecovery !== true
@@ -4229,6 +4298,7 @@
     const mainWaveOldDeclinePressureException = motherStructure.risky === true
       && motherStructure.mode === "unordered-mother-box"
       && !strictMotherBox
+      && !unorderedRepairStillActive
       && oldBoundaryPrecedesIndependentAdvance
       && mainWaveStructureQualityPermit;
     const structuralExceptionProbe = {
@@ -4291,7 +4361,7 @@
       structuralExceptionProbe,
     );
     if (matureFifteenMinuteRetryPlatformIgnition) effectiveAscendingStructureTrap = null;
-    const motherStructureException = options.newCoinNotFalling === true
+    const motherStructureException = !unorderedRepairStillActive && (options.newCoinNotFalling === true
       || shockBoxHorizontalLaunchException
       || shockBoxAscendingTriangleException
       || ema90ReclaimContinuation.qualified
@@ -4301,7 +4371,7 @@
       || softTestExtendedTriangleBreakout
       || matureFifteenMinutePriorHighTriangleIgnition
       || mainWaveOldDeclinePressureException
-      || (!strictMotherBox && (candidate.matureTriangleOuterEdge === true || horizontalStructureException));
+      || (!strictMotherBox && (candidate.matureTriangleOuterEdge === true || horizontalStructureException)));
     if (motherStructure.risky && !motherStructureException) {
       reasons.push(motherStructure.mode === "shock-formed-mother-box"
         ? `仍在急杀形成的母箱体内部：${interval} 母压力 ${motherStructure.motherHigh.toFixed(8)} 尚未突破，局部反弹小结构不作为起爆点`
@@ -4407,6 +4477,7 @@
       reasons.push("三角前缺少向上推动，不属于主升浪中继结构");
     }
     if (candidate.insideMotherBase
+      && !matureHigherTimeframePostShockRecovery
       && !matureOneHourLongTriangleReset
       && !matureOneHourOuterPlatformReset
       && !softTestExtendedTriangleBreakout) {
@@ -4541,13 +4612,20 @@
         `视觉因果窗口向左覆盖前置拉升 ${geometryStructureStartIndex - impulseStartIndex} 根；结构线仍只从拉升后的盘整起点开始`,
       );
     }
-    const visualSignature = Vision?.buildVisualSignature?.(candles, index, {
+    const visualOptions = {
       interval,
       triggerPrice: candidate.triggerPrice,
       ema90: indicators.ema90,
       structureStartIndex: visualStructureStartIndex,
       structureSource: "strategy",
-    }) || null;
+    };
+    const visualBuilder = activeAnalysisContext?.candles === candles
+      && activeAnalysisContext.ema90 === indicators.ema90
+      ? activeAnalysisContext.visualBuilder
+      : null;
+    const visualSignature = (visualBuilder
+      ? visualBuilder(index, visualOptions)
+      : Vision?.buildVisualSignature?.(candles, index, visualOptions)) || null;
     const consolidationBreakout = interval !== "1m"
       && ((foundationTypes.includes("base") && confirmedPlatformBreak)
         || (auxiliaryTypes.includes("previousHigh")
@@ -4581,7 +4659,7 @@
       consolidationBreakout,
       crossedLevel: candidate.crossedLevel === true,
       openedBeyondTrigger: candidate.openedBeyondTrigger === true,
-      insideMotherBase: candidate.insideMotherBase === true,
+      insideMotherBase: candidate.insideMotherBase === true && !matureHigherTimeframePostShockRecovery,
       featureCutoff: current.time - 1,
       confluence: candidate.confluence,
       foundationTypes,
@@ -4595,6 +4673,8 @@
       level: candidate.level,
       previousHighLevel: previousHighComponent?.level
         || (shockMotherBoxOuterEdgeBreakout ? candidate.level : null),
+      triangleMotherHigh,
+      trianglePreviousHighIsOuter,
       stop: candidate.stop,
       score,
       relativeVolume,
@@ -4640,6 +4720,8 @@
       declaredMainWaveStructurePermit,
       mainWaveOldDeclinePressureException,
       matureHigherTimeframePostShockRecovery,
+      postShockPlatformAboveEmaRatio,
+      unorderedRepairStillActive,
       matureOneHourLongTriangleReset,
       longBasePreviousHighIgnition,
       softTestExtendedTriangleBreakout,
@@ -5131,6 +5213,7 @@
         || (item?.klineVelocity || 0) >= 0.85);
     const secondCandidates = (Array.isArray(secondaryItems) ? secondaryItems : [])
       .filter((item) => item?.crossedLevel === true && item?.openedBeyondTrigger !== true)
+      .filter((item) => item?.unorderedRepairStillActive !== true)
       .filter((item) => item?.status !== "candidate")
       .filter((item) => item?.status !== "filtered"
         || isLifecycleFilteredCandidate(item)
@@ -5209,7 +5292,15 @@
         if (!crossedReference) return false;
         // 已经独立通过长平台真前高审计，或明确属于“软试盘后实体首次脱离”
         // 的成熟三角，本根本身就是新的绿色正式买点，不降级成红色防踏空提示。
-        if (second.longBasePreviousHighIgnition === true
+        const independentPostShockRecovery = second.status === "buy"
+          && second.matureHigherTimeframePostShockRecovery === true
+          && second.motherStructureNoise !== true
+          && second.insideMotherBase !== true
+          && second.unorderedRepairStillActive !== true
+          && (second.outerEdgeConfirmed === true || second.directStructuralBoundary === true)
+          && assessExecutionHierarchy(second).permit;
+        if (independentPostShockRecovery
+          || second.longBasePreviousHighIgnition === true
           || second.softTestExtendedTriangleBreakout === true
           || second.matureOneHourOuterPlatformReset === true
           || second.oneHourRelaunchPivotIgnition === true
@@ -5523,6 +5614,33 @@
       Number.isFinite(lifecycleStop) && row.low <= lifecycleStop
     ));
     if (stopOffset < 0) {
+      // 前次突破K自己的新高还不是一个新的成熟压力区。只统计前次入场
+      // 之后对新价格的独立试顶，不能把旧平台几十根K的触点数搬到新高上。
+      const boundaryTolerance = Math.max(atrValue, priorSignal.atrAtDecision || 0, 1e-8) * 0.15;
+      const priorBreakoutHigh = candles[priorSignal.index]?.high;
+      const inheritedPlatform = Number.isFinite(evaluation.horizontalStructureStartIndex)
+        && evaluation.horizontalStructureStartIndex < priorSignal.index
+        && (evaluation.foundationTypes || []).includes("base");
+      const priorBarCreatedBoundary = Number.isFinite(priorBreakoutHigh)
+        && Math.abs(evaluation.level - priorBreakoutHigh) <= boundaryTolerance
+        && evaluation.level > priorSignal.level + boundaryTolerance;
+      let newBoundaryTouchGroups = 0;
+      let touchingNewBoundary = false;
+      if (inheritedPlatform && priorBarCreatedBoundary) for (const row of afterEntry) {
+        const touching = Math.abs(row.high - evaluation.level) <= boundaryTolerance;
+        if (touching && !touchingNewBoundary) newBoundaryTouchGroups += 1;
+        if (touching) touchingNewBoundary = true;
+        // 上影略超触顶带不算离开压力区；只有整根退到带下方才结束一组。
+        else if (row.high < evaluation.level - boundaryTolerance) touchingNewBoundary = false;
+        if (newBoundaryTouchGroups >= 2) break;
+      }
+      if (inheritedPlatform && priorBarCreatedBoundary && newBoundaryTouchGroups < 2
+        && evaluation.directStructuralBoundary !== true) {
+        return {
+          reason: "同一盘整已有有效买点；新压力仅来自前次突破K高点，尚未形成独立边界，不能重复沿用旧平台成熟度",
+          retryMaturity: false,
+        };
+      }
       const triggerUpgrade = evaluation.triggerPrice >= priorSignal.triggerPrice + Math.max(
         atrValue,
         priorSignal.atrAtDecision || 0,
@@ -5702,8 +5820,30 @@
       // 一次新的起爆，而不是旧区间里的普通反弹复穿。
       && (evaluation.orderFlowScore || 0) >= 55
       && (evaluation.klineVelocity || 0) >= 0.85;
+    // 失败试盘后的完整回落—修复，也是一种结构重置。仅使用突破前的K线：
+    // 原结构支撑未破，低点已经出现，随后至少完成更高低点与半程收复。
+    // 新触发仍须通过原有核心结构和质量审核，但不强迫同一外沿再抬高0.18ATR。
+    const postTrial = afterEntry.slice(stopOffset);
+    let repairLowOffset = -1;
+    for (let cursor = 0; cursor < postTrial.length; cursor += 1) {
+      if (repairLowOffset < 0 || postTrial[cursor].low < postTrial[repairLowOffset].low) repairLowOffset = cursor;
+    }
+    const repairLow = postTrial[repairLowOffset];
+    const repairLast = postTrial.at(-1);
+    const repairPrevious = postTrial.at(-2);
+    const repairedMatureBoundary = (independentMotherPlatform || independentTriangleEdge)
+      && executionHierarchy.permit === true
+      && repairLowOffset >= 0 && repairLowOffset < postTrial.length - 2
+      && Number.isFinite(configuredStop) && repairLow.low > configuredStop
+      && repairPrevious.low > repairLow.low
+      && repairLast.low > repairPrevious.low
+      && repairLast.close >= Math.max(lifecycleStop, (repairLow.close + priorSignal.triggerPrice) / 2)
+      && pressureUpgradeAtr >= -0.15
+      && evaluation.crossedLevel === true
+      && evaluation.breakoutOpen < evaluation.triggerPrice;
     const triggerOrStructureReset = (triggerAdvanced && pressureUpgradeAtr >= 0.18)
-      || independentLevelReset;
+      || independentLevelReset
+      || repairedMatureBoundary;
     const highQualityOpportunityRearm = triggerOrStructureReset
       && (independentMotherPlatform || independentTriangleEdge || independentCompactParent)
       && (evaluation.confluence?.length || 0) >= 2
@@ -5724,7 +5864,9 @@
       return {
         reason: "",
         retryMaturity: true,
-        retryEvidence: independentLevelReset && pressureUpgradeAtr < 0.18
+        retryEvidence: repairedMatureBoundary && pressureUpgradeAtr < 0.18
+          ? "前次外沿试盘失效后，原结构支撑保持、回落低点已完成修复；成熟外沿再次从线下触发，不要求压力机械抬高"
+          : independentLevelReset && pressureUpgradeAtr < 0.18
           ? `前次试错止损后已完成独立母平台结构重置；新真实外沿从线下突破，按新机会立即重入，不要求高于旧突破线或等待固定根数`
           : `前次试错止损后已形成新的高质量真实外沿；当前从线下突破并完成压力升级，按新机会立即重入，不以固定重建根数延迟`,
       };
@@ -5829,7 +5971,7 @@
     const horizontalAdvanceAtr = Number(signal?.horizontalLaunchPriorAdvanceAtr) || 0;
     const triangleAdvanceAtr = Number(signal?.trianglePriorAdvanceAtr) || 0;
     const hasPreviousHigh = auxiliaries.has("previousHigh")
-      || Number.isFinite(Number(signal?.previousHighLevel));
+      || hasPositivePriceEvidence(signal?.previousHighLevel);
 
     const independentPlatform = foundations.has("base")
       && signal?.outerEdgeConfirmed === true
@@ -5905,7 +6047,31 @@
         ])],
       };
     }
-    if (!isDirectionalRecoveryPivotOnly(signal)) return signal;
+    if (!isDirectionalRecoveryPivotOnly(signal)) {
+      const unsupportedHorizontalLabel = signal?.horizontalLaunchUrgent === true
+        || signal?.horizontalLaunchInsufficientEdgeDwell === true;
+      if (!unsupportedHorizontalLabel || !String(signal?.pattern || "").includes("横盘起飞")) return signal;
+      // 母平台/三角的执行权与横盘子标签分离：只纠正不准确的描述，
+      // 不撤销已经独立成立的结构B，也不篡改用于回归审计的原始结构字段。
+      const withoutHorizontal = (values) => (values || []).filter((value) => value !== "base");
+      const childStructures = (signal.executionHierarchy?.childStructures || [])
+        .filter((value) => value !== "horizontal-launch");
+      return {
+        ...signal,
+        pattern: signal.pattern.split(/\s*\+\s*/).filter((label) => label !== "横盘起飞").join(" + "),
+        displayConfluence: withoutHorizontal(signal.displayConfluence || signal.confluence),
+        displayFoundationTypes: withoutHorizontal(signal.displayFoundationTypes || signal.foundationTypes),
+        horizontalLaunchDisplayQualified: false,
+        ...(signal.executionHierarchy ? {
+          executionHierarchy: { ...signal.executionHierarchy, childStructures },
+          executionChildStructures: childStructures,
+        } : {}),
+        evidence: [...new Set([
+          ...(signal.evidence || []),
+          "横盘子标签未通过：末端推进急促或贴边蓄势不足；独立成立的盘整/三角突破仍保留B",
+        ])],
+      };
+    }
     return {
       ...signal,
       pattern: "拐点收复",
@@ -5932,91 +6098,194 @@
       atr: atr(candles, 14),
       volumeMean: rollingMean(volumes, 20),
     };
-    const signals = [];
-    const pending = [];
-    const rejected = [];
-    const structures = [];
-    const crossedEvaluations = [];
+    const context = {
+      candles,
+      ema90: indicators.ema90,
+      visualBuilder: Vision?.createVisualSignatureBuilder?.(candles, indicators.ema90) || null,
+    };
+    const previousContext = activeAnalysisContext;
+    activeAnalysisContext = context;
+    try {
+      const request = activeCausalReplayRequest;
+      if (request?.rows === rows && request.options === options) {
+        return replayNormalizedTimeframe(candles, closes, indicators, interval, options, request);
+      }
+      return analyzeNormalizedTimeframe(candles, closes, indicators, interval, options);
+    } finally {
+      activeAnalysisContext = previousContext;
+    }
+  }
 
+  function analyzeNormalizedTimeframe(candles, closes, indicators, interval, options) {
+    const state = createAnalysisState();
     for (let index = 30; index < candles.length; index += 1) {
-      const rightEdge = index === candles.length - 1;
-      const candidates = findCandidates(candles, index, indicators, {
-        rightEdge,
-        interval,
-        newCoinNotFalling: options.newCoinNotFalling === true,
-      });
-      candidates.forEach((candidate) => {
-        if (!candidate.crossedLevel && !rightEdge) return;
-        const evaluation = evaluateCandidate(candles, index, candidate, indicators, interval, options);
-        if (candidate.crossedLevel) crossedEvaluations.push(evaluation);
-        if (evaluation.triangleLines
-          && ["falling-wedge", "converging-triangle", "ascending-triangle"].includes(evaluation.structureShape)
-          && !evaluation.highLevelDistribution
-          && !evaluation.riskStructureShape
-          && !isWeaklyRotatingShortFrameConvergence(evaluation)
-          && (evaluation.consolidationBars || 0) >= 36
-          && (evaluation.structureQuality || 0) >= 0.48
-          && ((evaluation.channelSideTransitions || 0) >= 1
-            || (evaluation.outerEdgeConfirmed === true
-              && (evaluation.channelInteriorOccupancy || 0) >= 0.62))) {
-          structures.push({
-            ...evaluation,
-            status: "structure",
-            structurePreconfirmed: true,
-            executionAllowed: evaluation.status === "buy",
-          });
-        }
-        if (evaluation.status === "buy") {
-          const lifecycle = structureLifecycleDecision(
-            signals,
-            evaluation,
-            candles,
-            index,
-            Math.max(indicators.atr[index - 1], 1e-8),
-          );
-          // 同一盘整只允许一笔活跃交易。假突破止损后必须扩大调整级别并重建结构；
-          // 重建成熟后不限制再次突破的次数，因此不会漏掉多次试错后的真正起爆。
-          if (!lifecycle.reason) {
-            if (lifecycle.replacePriorId) {
-              const replaceIndex = signals.findIndex((signal) => signal.id === lifecycle.replacePriorId);
-              if (replaceIndex >= 0) signals.splice(replaceIndex, 1);
-            }
-            const accepted = lifecycle.retryMaturity
-              ? {
-                ...evaluation,
-                ...(lifecycle.inheritStructureContext || {}),
-                evidence: [
-                  ...evaluation.evidence,
-                  lifecycle.retryEvidence || "前次试错已完成回落重置，允许再次突破，但不会因此提高确定性评级",
-                ],
-              }
-              : evaluation;
-            signals.push(accepted);
+      processAnalysisCandle(state, candles, index, indicators, interval, options, index === candles.length - 1);
+    }
+    return finalizeAnalysis(state, candles, closes, indicators, interval);
+  }
+
+  function createAnalysisState() {
+    return { signals: [], pending: [], rejected: [], structures: [], crossedEvaluations: [] };
+  }
+
+  function cloneAnalysisState(state) {
+    // The secondary-breakout finalizer annotates historical signal objects. Each
+    // terminal branch needs its own top-level records, preserving aliases between
+    // state collections; nested geometry and evidence are read-only here.
+    const copies = new Map();
+    const copy = (item) => {
+      if (!copies.has(item)) copies.set(item, { ...item });
+      return copies.get(item);
+    };
+    return Object.fromEntries(Object.entries(state).map(([key, items]) => [key, items.map(copy)]));
+  }
+
+  function processAnalysisCandle(state, candles, index, indicators, interval, options, rightEdge) {
+    const { signals, pending, rejected, structures, crossedEvaluations } = state;
+    const prepared = rightEdge && activeAnalysisContext?.candles === candles
+      && activeAnalysisContext.preparedCandle?.index === index
+      ? activeAnalysisContext.preparedCandle
+      : null;
+    const candidates = prepared?.candidates || findCandidates(candles, index, indicators, {
+      rightEdge,
+      interval,
+      newCoinNotFalling: options.newCoinNotFalling === true,
+    });
+    candidates.forEach((candidate, candidateIndex) => {
+      if (!candidate.crossedLevel && !rightEdge) return;
+      const evaluation = prepared
+        ? prepared.evaluations[candidateIndex]
+        : evaluateCandidate(candles, index, candidate, indicators, interval, options);
+      if (candidate.crossedLevel) crossedEvaluations.push(evaluation);
+      if (evaluation.triangleLines
+        && ["falling-wedge", "converging-triangle", "ascending-triangle"].includes(evaluation.structureShape)
+        && !evaluation.highLevelDistribution
+        && !evaluation.riskStructureShape
+        && !isWeaklyRotatingShortFrameConvergence(evaluation)
+        && (evaluation.consolidationBars || 0) >= 36
+        && (evaluation.structureQuality || 0) >= 0.48
+        && ((evaluation.channelSideTransitions || 0) >= 1
+          || (evaluation.outerEdgeConfirmed === true
+            && (evaluation.channelInteriorOccupancy || 0) >= 0.62))) {
+        structures.push({
+          ...evaluation,
+          status: "structure",
+          structurePreconfirmed: true,
+          executionAllowed: evaluation.status === "buy",
+        });
+      }
+      if (evaluation.status === "buy") {
+        const lifecycle = structureLifecycleDecision(
+          signals,
+          evaluation,
+          candles,
+          index,
+          Math.max(indicators.atr[index - 1], 1e-8),
+        );
+        // 同一盘整只允许一笔活跃交易。假突破止损后必须扩大调整级别并重建结构；
+        // 重建成熟后不限制再次突破的次数，因此不会漏掉多次试错后的真正起爆。
+        if (!lifecycle.reason) {
+          if (lifecycle.replacePriorId) {
+            const replaceIndex = signals.findIndex((signal) => signal.id === lifecycle.replacePriorId);
+            if (replaceIndex >= 0) signals.splice(replaceIndex, 1);
           }
-          else if (candidate.crossedLevel) {
-            const coveredByBuy = signals.some((signal) => (
-              signal.index === index
-              && Math.abs(signal.triggerPrice - evaluation.triggerPrice) <= Math.max(indicators.atr[index - 1], 1e-8) * 0.25
-            ));
-            if (!coveredByBuy) rejected.push({
+          const accepted = lifecycle.retryMaturity
+            ? {
               ...evaluation,
-              id: `${evaluation.id}-lifecycle-veto`,
-              status: "filtered",
-              reasons: [...evaluation.reasons, lifecycle.reason],
-              evidence: [...evaluation.evidence, "结构生命周期只读取当前时点以前的止损与重建过程"],
-            });
-          }
-        } else if (evaluation.status === "pending") {
-          if (index === candles.length - 1) pending.push(evaluation);
-        } else if (candidate.crossedLevel) {
+              ...(lifecycle.inheritStructureContext || {}),
+              evidence: [
+                ...evaluation.evidence,
+                lifecycle.retryEvidence || "前次试错已完成回落重置，允许再次突破，但不会因此提高确定性评级",
+              ],
+            }
+            : evaluation;
+          signals.push(accepted);
+        }
+        else if (candidate.crossedLevel) {
           const coveredByBuy = signals.some((signal) => (
             signal.index === index
             && Math.abs(signal.triggerPrice - evaluation.triggerPrice) <= Math.max(indicators.atr[index - 1], 1e-8) * 0.25
           ));
-          if (!coveredByBuy) rejected.push(evaluation);
+          if (!coveredByBuy) rejected.push({
+            ...evaluation,
+            id: `${evaluation.id}-lifecycle-veto`,
+            status: "filtered",
+            reasons: [...evaluation.reasons, lifecycle.reason],
+            evidence: [...evaluation.evidence, "结构生命周期只读取当前时点以前的止损与重建过程"],
+          });
         }
-      });
+      } else if (evaluation.status === "pending") {
+        if (rightEdge) pending.push(evaluation);
+      } else if (candidate.crossedLevel) {
+        const coveredByBuy = signals.some((signal) => (
+          signal.index === index
+          && Math.abs(signal.triggerPrice - evaluation.triggerPrice) <= Math.max(indicators.atr[index - 1], 1e-8) * 0.25
+        ));
+        if (!coveredByBuy) rejected.push(evaluation);
+      }
+    });
+  }
+
+  function resetCausalReplay(replay) {
+    replay.state = createAnalysisState();
+    replay.prefix = [];
+    replay.nextIndex = 30;
+  }
+
+  function hasPotentialCausalParentEntry(evaluations) {
+    // Lifecycle can inherit geometry or replace earlier buys, but it cannot
+    // promote a filtered evaluation into a current buy/pending. Keep all buys
+    // and pending items for the original lifecycle and downstream selection.
+    return evaluations.some((evaluation) => evaluation.status === "buy" || evaluation.status === "pending");
+  }
+
+  function replayNormalizedTimeframe(candles, closes, indicators, interval, options, request) {
+    const terminalIndex = candles.length - 1;
+    const terminal = candles[terminalIndex];
+    // Normalization can drop an invalid partial parent. In that case the old
+    // analyzer treats an earlier candle as the right edge, so use it unchanged.
+    if (!terminal || terminal.time !== request.parentStart || terminal.closeTime !== request.cutoff) {
+      return analyzeNormalizedTimeframe(candles, closes, indicators, interval, options);
     }
+    const candidates = terminalIndex >= 30
+      ? findCandidates(candles, terminalIndex, indicators, {
+        rightEdge: true, interval, newCoinNotFalling: options.newCoinNotFalling === true,
+      })
+      : [];
+    const evaluations = candidates.map((candidate) => (
+      evaluateCandidate(candles, terminalIndex, candidate, indicators, interval, options)
+    ));
+    // A negative preflight must not advance the stable prefix. Its result is
+    // independent of child trigger/preconfirmation, so it can use the same memo.
+    if (!hasPotentialCausalParentEntry(evaluations)) return null;
+    activeAnalysisContext.preparedCandle = { index: terminalIndex, candidates, evaluations };
+    const replay = request.replay;
+    const samePrefix = replay.prefix.length <= terminalIndex
+      && replay.prefix.every((row, index) => NORMALIZED_CANDLE_FIELDS.every((key) => (
+        Object.is(row[key], candles[index][key])
+      )));
+    // A backward parent request or revised historical input starts a fresh
+    // forward replay. Never retain a checkpoint containing future parent bars.
+    if (!samePrefix) resetCausalReplay(replay);
+    try {
+      for (let index = replay.nextIndex; index < terminalIndex; index += 1) {
+        processAnalysisCandle(replay.state, candles, index, indicators, interval, options, false);
+      }
+      replay.nextIndex = Math.max(30, terminalIndex);
+      replay.prefix = candles.slice(0, terminalIndex);
+    } catch (error) {
+      resetCausalReplay(replay);
+      throw error;
+    }
+    const branch = cloneAnalysisState(replay.state);
+    if (terminalIndex >= 30) {
+      processAnalysisCandle(branch, candles, terminalIndex, indicators, interval, options, true);
+    }
+    return finalizeAnalysis(branch, candles, closes, indicators, interval);
+  }
+
+  function finalizeAnalysis(state, candles, closes, indicators, interval) {
+    const { signals, pending, rejected, structures, crossedEvaluations } = state;
 
     // 超长、低效率的单一横向区间即使没有生成可成交候选，也要留下一个明确的
     // 过滤审计原因。否则“没有 B”看起来像漏识别，实际却是价格数百根都在同一
@@ -6787,7 +7056,7 @@
     const hasBase = foundations.has("base");
     const hasTriangle = foundations.has("triangle");
     const hasPreviousHigh = auxiliaries.has("previousHigh")
-      || Number.isFinite(Number(signal?.previousHighLevel))
+      || hasPositivePriceEvidence(signal?.previousHighLevel)
       || signal?.outerEdgeConfirmed === true;
     const hasTrendline = auxiliaries.has("trendline") || Boolean(signal?.trendline);
     const bars = Number(signal?.consolidationBars) || 0;
@@ -6866,7 +7135,9 @@
       && (signal?.launchDistancePercent == null || signal.launchDistancePercent <= 7)
       && !signal?.riskStructureShape;
     const hardRisk = signal?.openedBeyondTrigger === true
+      || signal?.unorderedRepairStillActive === true
       || (signal?.insideMotherBase === true
+        && !matureHigherTimeframePostShockRecovery
         && !independentNestedMainWaveStructure
         && !matureOneHourLongTriangleReset
         && !matureOneHourOuterPlatformReset
@@ -6946,6 +7217,8 @@
     const compactOccupiedTriangleBoundary = hasTriangle
       && triangleHasCausalAdvance
       && hasPreviousHigh
+      && (!["5m", "15m"].includes(signal?.interval)
+        || signal?.trianglePreviousHighIsOuter !== false)
       && signal?.hasPivot === true
       && bars >= (signal?.interval === "5m" ? 28 : 18)
       && (signal?.structureQuality || 0) >= 0.68
@@ -7040,12 +7313,15 @@
     if (signal?.multiTimeframeConfluence === true) boosters.push("multi-timeframe");
     const missing = [];
     if (!primaryFoundation) missing.push("missing-mother-boundary");
+    if (!primaryFoundation && hasTriangle && ["5m", "15m"].includes(signal?.interval)
+      && signal?.trianglePreviousHighIsOuter === false) missing.push("compact-triangle-local-high-only");
     if ((hasBase || hasTriangle) && !baseHasCausalAdvance && !triangleHasCausalAdvance) missing.push("missing-prior-advance");
     if (launchDistance > 7) missing.push("launch-distance-over-7-percent");
     if (fiveMinuteQuietEdgeNotSeasoned) missing.push("five-minute-edge-not-seasoned");
     if (hardRisk) missing.push("hard-structure-veto");
     const missingLabelMap = {
       "missing-mother-boundary": "缺少成熟母平台或三角真实外沿",
+      "compact-triangle-local-high-only": "紧凑三角只突破内部局部前高，尚未突破整个盘整高点",
       "missing-prior-advance": "结构前缺少独立拉升",
       "launch-distance-over-7-percent": "起涨位置到前高超过7%",
       "five-minute-edge-not-seasoned": "5分钟安静突破缺少足够久的外沿记忆或反复试顶",
@@ -7081,6 +7357,7 @@
   }
 
   function isHighCertaintyEntry(signal) {
+    if (signal?.unorderedRepairStillActive === true) return false;
     const hierarchy = signal?.executionHierarchy || assessExecutionHierarchy(signal);
     if (!hierarchy.permit) return false;
     const foundations = signal.foundationTypes || [];
@@ -7548,13 +7825,73 @@
       && (signal.launchDistancePercent ?? 99) <= 7;
   }
 
-  function rebuildCausalParentAtChild(parentResult, lowerFrame, parentSignal, childSignal, parentInterval, options = {}) {
-    const childCandle = lowerFrame?.candles?.[childSignal?.index];
-    const parentStart = Number(parentSignal?.time);
+  function causalAnalysisCacheFor(parentCandles, childCandles, parentInterval, parentStart, cutoff) {
+    if (!activeCausalAnalysisCache) return null;
+    let childCaches = activeCausalAnalysisCache.byParent.get(parentCandles);
+    if (!childCaches) {
+      childCaches = new WeakMap();
+      activeCausalAnalysisCache.byParent.set(parentCandles, childCaches);
+    }
+    let cache = childCaches.get(childCandles);
+    if (!cache) {
+      cache = new Map();
+      childCaches.set(childCandles, cache);
+    }
+    const branches = [];
+    for (const key of [parentInterval, parentStart, cutoff]) {
+      if (!cache.has(key)) cache.set(key, new Map());
+      branches.push({ parent: cache, key });
+      cache = cache.get(key);
+    }
+    return { values: cache, branches, entries: activeCausalAnalysisCache.entries };
+  }
+
+  function rememberCausalAnalysis(cache, mainWaveStage, analysis) {
+    if (!cache) return;
+    cache.values.set(mainWaveStage, analysis);
+    cache.entries.push({ values: cache.values, branches: cache.branches, mainWaveStage });
+    if (cache.entries.length <= CAUSAL_ANALYSIS_CACHE_LIMIT) return;
+    const expired = cache.entries.shift();
+    expired.values.delete(expired.mainWaveStage);
+    // Remove empty lookup branches as well as the result, so unique cutoffs do
+    // not leave an ever-growing collection of empty Maps during a long call.
+    for (let index = expired.branches.length - 1; index >= 0; index -= 1) {
+      const { parent, key } = expired.branches[index];
+      if (parent.get(key)?.size) break;
+      parent.delete(key);
+    }
+  }
+
+  function causalReplayFor(parentCandles, parentInterval, mainWaveStage) {
+    if (!activeCausalAnalysisCache) return null;
+    const replays = activeCausalAnalysisCache.replays;
+    const existing = replays.find((replay) => replay.parentCandles === parentCandles
+      && replay.parentInterval === parentInterval && replay.mainWaveStage === mainWaveStage);
+    if (existing) return existing;
+    const replay = { parentCandles, parentInterval, mainWaveStage };
+    resetCausalReplay(replay);
+    replays.push(replay);
+    if (replays.length > CAUSAL_REPLAY_CACHE_LIMIT) replays.shift();
+    return replay;
+  }
+
+  function analyzeCausalTimeframe(rows, options, parentCandles, parentStart, cutoff) {
+    // Only this private invocation can use the forward state. Public analyses,
+    // including reentrant calls with other row/option objects, still replay fully.
+    const replay = causalReplayFor(parentCandles, options.interval, options.mainWaveStage);
+    if (!replay) return analyzeTimeframe(rows, options);
+    const previousRequest = activeCausalReplayRequest;
+    activeCausalReplayRequest = { rows, options, replay, parentStart, cutoff };
+    try {
+      return analyzeTimeframe(rows, options);
+    } finally {
+      activeCausalReplayRequest = previousRequest;
+    }
+  }
+
+  function analyzeCausalParent(parentCandles, childCandles, parentInterval, parentStart, cutoff, mainWaveStage) {
     const parentMs = INTERVAL_MS[parentInterval];
-    if (!childCandle || !Number.isFinite(parentStart) || !parentMs) return null;
-    const cutoff = Number(childCandle.closeTime ?? childCandle.time);
-    const childRows = (lowerFrame.candles || []).filter((row) => (
+    const childRows = childCandles.filter((row) => (
       row.time >= parentStart
       && row.time < parentStart + parentMs
       && (row.closeTime ?? row.time) <= cutoff
@@ -7574,17 +7911,49 @@
       tradeCount: childRows.reduce((sum, row) => sum + (row.tradeCount || 0), 0),
     };
     const causalRows = [
-      ...(parentResult.candles || []).filter((row) => row.time < parentStart),
+      ...parentCandles.filter((row) => row.time < parentStart),
       partialParent,
     ];
-    const causalResult = analyzeTimeframe(causalRows, {
+    const causalResult = analyzeCausalTimeframe(causalRows, {
       interval: parentInterval,
       now: cutoff,
       preselectedLeader: true,
-      mainWaveStage: options.mainWaveStage,
+      mainWaveStage,
       mainWaveContextSource: "adjacent-frame-causal-rebuild",
       mainWaveContextLabel: "相邻周期因果重建",
-    });
+    }, parentCandles, parentStart, cutoff);
+    if (!causalResult) return null;
+    // The selection below only reads current-parent signals and pending items.
+    // Drop all historical candles, indicators and audit output before caching.
+    return {
+      partialParent,
+      causalResult: {
+        signals: (causalResult.signals || []).filter((item) => item.time === parentStart),
+        pending: (causalResult.pending || []).filter((item) => item.time === parentStart),
+      },
+    };
+  }
+
+  function rebuildCausalParentAtChild(parentResult, lowerFrame, parentSignal, childSignal, parentInterval, options = {}) {
+    const childCandle = lowerFrame?.candles?.[childSignal?.index];
+    const parentStart = Number(parentSignal?.time);
+    const parentMs = INTERVAL_MS[parentInterval];
+    if (!childCandle || !Number.isFinite(parentStart) || !parentMs) return null;
+    const cutoff = Number(childCandle.closeTime ?? childCandle.time);
+    const parentCandles = parentResult.candles || [];
+    const childCandles = lowerFrame.candles || [];
+    const cache = causalAnalysisCacheFor(parentCandles, childCandles, parentInterval, parentStart, cutoff);
+    let analysis;
+    if (cache?.values.has(options.mainWaveStage)) {
+      analysis = cache.values.get(options.mainWaveStage);
+    } else {
+      analysis = analyzeCausalParent(parentCandles, childCandles, parentInterval, parentStart, cutoff, options.mainWaveStage);
+      rememberCausalAnalysis(cache, options.mainWaveStage, analysis);
+    }
+    if (!analysis) return null;
+    const { partialParent, causalResult } = analysis;
+    // Reuse only the market analysis. The child's trigger and preconfirmation
+    // permission still independently select the parent on every invocation.
     const candidates = [...(causalResult.signals || []), ...(causalResult.pending || [])]
       .filter((item) => item.time === parentStart && (
         item.crossedLevel === true
@@ -8108,6 +8477,16 @@
   }
 
   function applyContextGates(results, marketResults = [], options = {}) {
+    const previousCache = activeCausalAnalysisCache;
+    activeCausalAnalysisCache = { byParent: new WeakMap(), entries: [], replays: [] };
+    try {
+      return applyContextGatesWithCache(results, marketResults, options);
+    } finally {
+      activeCausalAnalysisCache = previousCache;
+    }
+  }
+
+  function applyContextGatesWithCache(results, marketResults, options) {
     const list = (Array.isArray(results) ? results : []).filter(Boolean);
     const preselectedLeader = options.preselectedLeader === true;
     const declaredMainWaveStage = ["active", "expected"].includes(options.mainWaveStage)
@@ -8158,6 +8537,7 @@
       const keptPending = [];
       const downgraded = [];
       const contextualPromotions = (result.rejected || [])
+        .filter((signal) => signal.unorderedRepairStillActive !== true)
         .map((signal) => (
           promoteAdjacentMotherChildConfluence(byInterval, result, signal, preselectedLeader)
           || promoteCrossFramePrecision(byInterval, result, signal)
@@ -8320,7 +8700,9 @@
           || preHigherFrameMainWaveIgnitionPermit
           || inferredMainWavePermit;
         let reason = "";
-        if (result.interval === "1m" && !isOneMinuteHorizontalBase(signal)) {
+        if (signal.unorderedRepairStillActive === true) {
+          reason = "仍在更大母箱体内部无序修复；主升语境或跨周期共振不能替代独立结构";
+        } else if (result.interval === "1m" && !isOneMinuteHorizontalBase(signal)) {
           reason = "1分钟仅保留高确定性横盘起飞或箱体突破，其他结构全部过滤";
         } else if ((signal.auxiliaryTypes || []).includes("previousHigh") && riseFromBreakoutLowPercent > 7) {
           reason = "突破K首次触发前低点到前高的涨幅超过 7%，不做这次突破前高";

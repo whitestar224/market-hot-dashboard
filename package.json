@@ -7,6 +7,7 @@
   "author": "Xingyun Society",
   "license": "SEE LICENSE IN LICENSE",
   "scripts": {
+    "monitor:build-buy": "esbuild tools/monitor-buy-executor-entry.js --bundle --format=esm --platform=browser --target=es2022 --minify --outfile=assets/monitor-buy-executor.js",
     "desktop:dev": "electron .",
     "desktop:prepare-config": "powershell -NoProfile -ExecutionPolicy Bypass -File desktop/prepare-desktop-config.ps1",
     "desktop:backend:win": "powershell -NoProfile -ExecutionPolicy Bypass -File desktop/build-backend-win.ps1",
@@ -17,7 +18,8 @@
   },
   "devDependencies": {
     "electron": "^42.2.0",
-    "electron-builder": "^26.8.1"
+    "electron-builder": "^26.8.1",
+    "esbuild": "0.28.2"
   },
   "build": {
     "appId": "com.xingyunshe.marketdashboard",
@@ -45,13 +47,33 @@
           "*.ico",
           "*.webmanifest",
           "server.py",
+          "smart_money_monitor.py",
+          "prior_high_monitor.py",
+          "newsflash_sources.py",
+            "monitor_buy.py",
+            "monitor_balances.py",
+            "monitor_identity.py",
+            "session_buy.py",
+          "event_flow.py",
+          "event_flow_window.py",
+          "alert_delivery.py",
+          "listing_alerts.py",
+          "binance_agentic.py",
+          "gmgn_agentic.py",
+          "network_proxy.py",
           "chain_ecosystem_monitor.py",
           "wechat_group_monitor.py",
           "desktop_alert.py",
+          "news_trade_explanations.py",
+          "news_trade_reader.py",
+          "binance_web3.py",
+          "binance_buy.py",
+          "configure_binance_web3.py",
           "desktop_alert_bridge.py",
           "requirements.txt",
           "assets/**",
           "docs/**",
+          "go/prior-high-monitor/**",
           "tools/dragon_wave_monitor_bridge.js",
           "tools/publish_automation_briefs.py",
           ".env.production.example",
@@ -114,5 +136,16 @@
     "portable": {
       "artifactName": "XingyunShe-Portable-${version}-${arch}.${ext}"
     }
+  },
+  "overrides": {
+    "jayson": {
+      "uuid": "11.1.1"
+    }
+  },
+  "dependencies": {
+    "@relayprotocol/relay-sdk": "7.0.3",
+    "@solana/web3.js": "1.98.4",
+    "buffer": "6.0.3",
+    "viem": "2.56.3"
   }
 }

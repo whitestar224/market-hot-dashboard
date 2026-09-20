@@ -9,22 +9,32 @@ const Data = require("../dragon-wave-data");
 const Engine = require("../dragon-wave-engine");
 const Feedback = require("../dragon-wave-feedback");
 const cases = require("../dragon-wave-cases");
+const Compatibility = require("./dragon_wave_cache_compatibility");
 
 const ROOT = path.resolve(__dirname, "..");
 const LOCAL_ORIGIN = process.env.DRAGON_WAVE_ORIGIN || "http://127.0.0.1:8791";
-const STRATEGY_VERSION = process.argv.find((arg) => arg.startsWith("--version="))?.split("=")[1] || "v89";
+const STRATEGY_VERSION = process.argv.find((arg) => arg.startsWith("--version="))?.split("=")[1] || "v91";
 const INTERVALS = (process.argv.find((arg) => arg.startsWith("--intervals="))?.split("=")[1]
   || "5m,15m,1h,4h,1d").split(",").map((value) => value.trim()).filter((value) => Data.INTERVALS[value]);
 const SYMBOL_FILTER = new Set((process.argv.find((arg) => arg.startsWith("--symbols="))?.split("=")[1] || "")
   .split(",").map((value) => value.trim()).filter(Boolean));
 const FORCE = process.argv.includes("--force");
+const FULL_BATCH = process.argv.includes("--full-batch") || Number(STRATEGY_VERSION.slice(1)) >= 91;
+const LOCAL_ONLY = process.argv.includes("--local-only");
+const PRIORITY_SYMBOLS = (process.argv.find((arg) => arg.startsWith("--priority-symbols="))?.split("=")[1] || "").split(",").filter(Boolean);
+const FULL_BATCH_INTERVAL_ORDER = [...Compatibility.PRODUCTION_OPTIONS.intervals];
 const COMPACT_EXISTING = process.argv.includes("--compact-existing");
 const MAX_CASES = Math.max(0, Number(process.argv.find((arg) => arg.startsWith("--max-cases="))?.split("=")[1] || 0));
 const OUTPUT_ROOT = path.join(ROOT, ".runtime-cache", "dragon-wave-precomputed", STRATEGY_VERSION);
 const MANIFEST_PATH = path.join(OUTPUT_ROOT, "manifest.json");
 const LOCK_PATH = path.join(ROOT, ".runtime-cache", "dragon-wave-precomputed", `${STRATEGY_VERSION}.lock`);
 const REQUEST_ROOT = path.join(ROOT, ".runtime-cache", "dragon-wave-precomputed", `${STRATEGY_VERSION}.requests`);
+const RAW_CANDLE_ROOT = path.join(ROOT, ".runtime-cache", "dragon-wave-candles");
+const ENGINE_SHA256 = crypto.createHash("sha256")
+  .update(fs.readFileSync(path.join(ROOT, "dragon-wave-engine.js"))).digest("hex");
 const LOCAL_ARCHIVE_CACHE = new Map();
+let lockOwned = false;
+let compatibilityPolicy = null;
 const LOCAL_ARCHIVE_DIRS = [
   path.join(ROOT, ".runtime-cache", "confirmed-native-audit-candles"),
   path.join(ROOT, ".runtime-cache", "strategy-issue-candles"),
@@ -70,12 +80,79 @@ function recordUsable(manifest, item, interval) {
   return !FORCE && record?.file && fs.existsSync(path.join(OUTPUT_ROOT, record.file));
 }
 
+function fullCaseKey(item) {
+  return [STRATEGY_VERSION, Data.normalizePair(item.pair), item.start, item.end, "futures", "active"].join("|");
+}
+
+function fullCaseReuse(manifest, item, intervals) {
+  if (FORCE || !intervals.length) return null;
+  const checkpoint = manifest.cases?.[fullCaseKey(item)];
+  if (checkpoint?.state !== "complete") return null;
+  const current = checkpoint.engineSha256 === ENGINE_SHA256 && intervals.every((interval) => {
+    const record = manifest.records[cacheKey(item, interval)];
+    return recordUsable(manifest, item, interval)
+      && record.contextComplete === true
+      && record.engineSha256 === ENGINE_SHA256
+      && intervals.every((required) => record.contextIntervals?.includes(required));
+  });
+  if (current) return { compatible: false };
+  compatibilityPolicy ||= Compatibility.loadCompatibility({ workspaceRoot: ROOT, cacheRoot: OUTPUT_ROOT,
+    version: STRATEGY_VERSION, engineSha256: ENGINE_SHA256, productionOptions: Compatibility.PRODUCTION_OPTIONS });
+  const assessed = compatibilityPolicy.assessCase(manifest, fullCaseKey(item), intervals);
+  return assessed.compatible ? assessed : null;
+}
+
+function fullCaseUsable(manifest, item, intervals) {
+  return Boolean(fullCaseReuse(manifest, item, intervals));
+}
+
+function recordFailure(manifest, item, interval, error, phase = "fetch-or-analysis") {
+  const key = cacheKey(item, interval);
+  manifest.failures ||= {};
+  manifest.failures[key] = {
+    key, pair: Data.normalizePair(item.pair), symbol: item.symbol,
+    start: item.start, end: item.end, interval, phase,
+    message: error?.message || String(error),
+    attempts: error?.attempts || [],
+    updatedAt: Date.now(),
+  };
+}
+
+function rawCandlePath(item, interval) {
+  const key = [Data.normalizePair(item.pair), item.start, item.end, interval, "futures"].join("|");
+  return path.join(RAW_CANDLE_ROOT, fileNameFor(key));
+}
+
+function readPersistedCandles(item, interval) {
+  try {
+    const value = JSON.parse(zlib.gunzipSync(fs.readFileSync(rawCandlePath(item, interval))).toString("utf8"));
+    const matches = value.schema === 1 && value.pair === Data.normalizePair(item.pair)
+      && value.start === item.start && value.end === item.end
+      && value.interval === interval && value.market === "futures";
+    if (!matches || !Data.isCandleCoverageAcceptable(value.candles,
+      Data.buildCaseWindow(item.start, item.end, interval), interval)) return null;
+    return { candles: value.candles, venue: value.venue, attempts: value.attempts || [], coverage: value.coverage };
+  } catch (_error) {
+    return null;
+  }
+}
+
+function persistCandles(item, interval, payload) {
+  const value = {
+    schema: 1, pair: Data.normalizePair(item.pair), symbol: item.symbol,
+    start: item.start, end: item.end, interval, market: "futures", generatedAt: Date.now(),
+    candles: payload.candles, venue: payload.venue, attempts: payload.attempts || [], coverage: payload.coverage,
+  };
+  atomicWrite(rawCandlePath(item, interval), zlib.gzipSync(Buffer.from(JSON.stringify(value)), { level: 6 }));
+}
+
 function acquireLock() {
   fs.mkdirSync(path.dirname(LOCK_PATH), { recursive: true });
   try {
     const descriptor = fs.openSync(LOCK_PATH, "wx");
     fs.writeFileSync(descriptor, JSON.stringify({ pid: process.pid, startedAt: Date.now() }));
     fs.closeSync(descriptor);
+    lockOwned = true;
     return true;
   } catch (error) {
     if (error.code !== "EEXIST") throw error;
@@ -83,25 +160,32 @@ function acquireLock() {
       const lock = JSON.parse(fs.readFileSync(LOCK_PATH, "utf8"));
       let processAlive = false;
       try {
-        process.kill(Number(lock.pid), 0);
+        const pid = Number(lock.pid);
+        if (!Number.isInteger(pid) || pid <= 0) return false;
+        process.kill(pid, 0);
         processAlive = true;
       } catch (_processError) {
-        processAlive = false;
+        processAlive = _processError?.code !== "ESRCH";
       }
-      if (!processAlive || Date.now() - Number(lock.startedAt || 0) > 24 * 60 * 60 * 1000) {
+      if (!processAlive) {
         fs.unlinkSync(LOCK_PATH);
         return acquireLock();
       }
     } catch (_readError) {
-      fs.rmSync(LOCK_PATH, { force: true });
-      return acquireLock();
+      // An unreadable/partially written lock is not proof its owner is dead.
+      return false;
     }
     return false;
   }
 }
 
 function releaseLock() {
-  try { fs.rmSync(LOCK_PATH, { force: true }); } catch (_error) { /* best effort */ }
+  if (!lockOwned) return;
+  try {
+    const lock = JSON.parse(fs.readFileSync(LOCK_PATH, "utf8"));
+    if (Number(lock.pid) === process.pid) fs.rmSync(LOCK_PATH, { force: true });
+  } catch (_error) { /* best effort; never remove an unverified owner's lock */ }
+  lockOwned = false;
 }
 
 function priorityRequests() {
@@ -284,9 +368,16 @@ function readLocalArchivedCandles(item, interval) {
   };
 }
 
-async function fetchAndAnalyze(item, interval) {
+async function fetchAndAnalyze(item, interval, onPhase = null) {
+  const phase = (name, state = "running") => {
+    if (typeof onPhase === "function") onPhase(name, state);
+  };
+  phase("fetch");
   const window = Data.buildCaseWindow(item.start, item.end, interval);
-  const payload = readLocalArchivedCandles(item, interval) || await Data.fetchCandles({
+  let payload = (FULL_BATCH && readPersistedCandles(item, interval))
+    || readLocalArchivedCandles(item, interval);
+  if (!payload && LOCAL_ONLY) throw new Error("本地K线不完整，保留旧版结果；本次不连接交易所补数");
+  payload ||= await Data.fetchCandles({
     pair: item.pair,
     interval,
     provider: "auto",
@@ -294,19 +385,32 @@ async function fetchAndAnalyze(item, interval) {
     window,
   });
   if (!Data.isCandleCoverageAcceptable(payload.candles, window, interval)) {
-    throw new Error(`指定区间不完整 ${(payload.coverage?.spanCoverage * 100 || 0).toFixed(1)}%`);
+    const error = new Error(`指定区间不完整 ${(payload.coverage?.spanCoverage * 100 || 0).toFixed(1)}%`);
+    error.attempts = payload.attempts || [];
+    throw error;
   }
+  phase("fetch", "complete");
+  // Save source candles before CPU-heavy analysis: interrupted full batches can
+  // rebuild all timeframe context without returning to the exchange.
+  if (FULL_BATCH) {
+    phase("persist-candles");
+    persistCandles(item, interval, payload);
+    phase("persist-candles", "complete");
+  }
+  phase("analyze");
   const rawResult = Engine.analyzeTimeframe(payload.candles, {
     interval,
     now: Date.now(),
-    mainWaveStage: "active",
-    mainWaveContextSource: "leader-default-main-wave",
-    mainWaveContextLabel: "龙头默认主升浪环境",
+    ...Compatibility.PRODUCTION_OPTIONS.analysis,
   });
+  phase("analyze", "complete");
+  if (!Data.isCandleCoverageAcceptable(rawResult?.candles, window, interval)) {
+    throw new Error("策略规范化后的K线不完整，不能保存为零买点结果");
+  }
   return { interval, rawResult, venue: payload.venue, attempts: payload.attempts || [], coverage: payload.coverage };
 }
 
-function storeAnalyzedEntry(item, manifest, entry, result) {
+function storeAnalyzedEntry(item, manifest, entry, result, context = null) {
   const key = cacheKey(item, entry.interval);
   const file = fileNameFor(key);
   const value = {
@@ -324,6 +428,7 @@ function storeAnalyzedEntry(item, manifest, entry, result) {
     venue: entry.venue,
     attempts: entry.attempts,
     coverage: entry.coverage,
+    ...(context ? { ...context, engineSha256: ENGINE_SHA256 } : {}),
     result: compactResultForDashboard(result || entry.rawResult),
   };
   const compressed = zlib.gzipSync(Buffer.from(JSON.stringify(value)), { level: 6 });
@@ -342,6 +447,7 @@ function storeAnalyzedEntry(item, manifest, entry, result) {
     bytes: compressed.length,
     generatedAt: value.generatedAt,
     compactSchema: 1,
+    ...(context ? { ...context, engineSha256: ENGINE_SHA256 } : {}),
   };
 }
 
@@ -349,13 +455,126 @@ function contextGate(entries) {
   return new Map(Engine.applyContextGates(
     entries.map((entry) => entry.rawResult),
     [],
-    {
-      preselectedLeader: true,
-      mainWaveStage: "active",
-      mainWaveContextSource: "leader-default-main-wave",
-      mainWaveContextLabel: "龙头默认主升浪环境",
-    },
+    { ...Compatibility.PRODUCTION_OPTIONS.context },
   ).map((result) => [result.interval, result]));
+}
+
+async function buildFullCase(item, manifest, position, total) {
+  const intervals = [
+    ...FULL_BATCH_INTERVAL_ORDER.filter((interval) => INTERVALS.includes(interval)),
+    ...INTERVALS.filter((interval) => !FULL_BATCH_INTERVAL_ORDER.includes(interval)),
+  ];
+  const reusable = fullCaseReuse(manifest, item, intervals);
+  if (reusable) {
+    process.stdout.write(`[${position}/${total}] ${item.symbol} 完整案例${reusable.compatible ? `已验证兼容，复用原结果；凭据 ${reusable.evidenceId}` : "已缓存"}\n`);
+    return { built: 0, skipped: intervals.length, failed: 0,
+      compatibleSkipped: reusable.compatible ? intervals.length : 0 };
+  }
+  manifest.cases ||= {};
+  manifest.failures ||= {};
+  const checkpoint = {
+    state: "running", intervals, completedIntervals: [], failedIntervals: [],
+    engineSha256: ENGINE_SHA256, startedAt: Date.now(), updatedAt: Date.now(),
+    timings: [],
+  };
+  manifest.cases[fullCaseKey(item)] = checkpoint;
+  writeManifest(manifest);
+  const loaded = [];
+  let latestContext = null;
+  let activeTiming = null;
+  const reportPhase = (phase, state = "running", interval = null, details = {}) => {
+    const now = Date.now();
+    if (state === "running") {
+      activeTiming = { phase, ...(interval ? { interval } : {}), startedAt: now, state, ...details };
+      checkpoint.timings.push(activeTiming);
+    } else if (activeTiming?.phase === phase && (activeTiming.interval || null) === interval) {
+      Object.assign(activeTiming, { state, completedAt: now,
+        durationMs: Math.max(0, now - activeTiming.startedAt), ...details });
+    }
+    checkpoint.updatedAt = now;
+    manifest.status ||= {};
+    manifest.status.currentTask = {
+      pair: Data.normalizePair(item.pair), symbol: item.symbol, start: item.start, end: item.end,
+      ...(interval ? { interval } : { intervals }), phase, phaseState: state,
+      startedAt: activeTiming?.startedAt ?? now, updatedAt: now,
+      timings: checkpoint.timings, ...details,
+    };
+    const elapsed = state === "running" ? "" : ` ${activeTiming?.durationMs ?? 0}ms`;
+    process.stdout.write(`[${position}/${total}] ${item.symbol} ${interval ? `${interval} ` : ""}${phase} ${state}${elapsed}${details.reused ? " reused" : ""}\n`);
+    writeManifest(manifest);
+  };
+  // A partial case is always re-analyzed as a whole. Never reuse context-gated
+  // output as raw input, and never skip a timeframe merely because its first
+  // provisional file already exists.
+  for (const interval of intervals) {
+    let phase = "fetch";
+    const onPhase = (nextPhase, state = "running") => {
+      phase = nextPhase;
+      reportPhase(phase, state, interval);
+    };
+    try {
+      const entry = await fetchAndAnalyze(item, interval, onPhase);
+      loaded.push(entry);
+      // A new raw input invalidates the previous gate, even if this gate fails.
+      latestContext = null;
+      onPhase("partial-context");
+      const partial = contextGate(loaded);
+      latestContext = { entries: loaded.slice(), gated: partial };
+      onPhase("partial-context", "complete");
+      onPhase("partial-storage");
+      storeAnalyzedEntry(item, manifest, entry, partial.get(interval), {
+        contextComplete: false, contextIntervals: loaded.map((value) => value.interval),
+      });
+      onPhase("partial-storage", "complete");
+      checkpoint.completedIntervals.push(interval);
+      delete manifest.failures[cacheKey(item, interval)];
+      process.stdout.write(`[${position}/${total}] ${item.symbol} ${interval} 已落盘 ${entry.rawResult.candles.length} 根；等待完整案例共振\n`);
+    } catch (error) {
+      reportPhase(phase, "failed", interval);
+      checkpoint.failedIntervals.push(interval);
+      recordFailure(manifest, item, interval, error, phase);
+      process.stderr.write(`[${position}/${total}] ${item.symbol} ${interval} 失败：${error?.message || error}\n`);
+    }
+    checkpoint.updatedAt = Date.now();
+    writeManifest(manifest);
+  }
+  let finalPhase = "full-context";
+  let finalInterval = null;
+  try {
+    const reused = loaded.length > 0
+      && latestContext?.entries.length === loaded.length
+      && latestContext.entries.every((entry, index) => entry === loaded[index]
+        && latestContext.gated.has(entry.interval));
+    const contextDetails = { reused: Boolean(reused), ...(loaded.length ? {} : { skipped: true }) };
+    reportPhase(finalPhase, "running", null, contextDetails);
+    const gated = !loaded.length ? new Map() : reused ? latestContext.gated : contextGate(loaded);
+    reportPhase(finalPhase, "complete", null, contextDetails);
+    const contextComplete = loaded.length > 0
+      && checkpoint.failedIntervals.length === 0 && loaded.length === intervals.length;
+    for (const entry of loaded) {
+      finalPhase = "final-storage";
+      finalInterval = entry.interval;
+      reportPhase(finalPhase, "running", finalInterval);
+      storeAnalyzedEntry(item, manifest, entry, gated.get(entry.interval), {
+        contextComplete, contextIntervals: loaded.map((value) => value.interval),
+      });
+      reportPhase(finalPhase, "complete", finalInterval);
+    }
+    checkpoint.state = contextComplete ? "complete" : "partial";
+    if (contextComplete) checkpoint.completedAt = Date.now();
+  } catch (error) {
+    reportPhase(finalPhase, "failed", finalInterval);
+    checkpoint.state = "partial";
+    for (const interval of intervals) {
+      if (!checkpoint.failedIntervals.includes(interval)) checkpoint.failedIntervals.push(interval);
+      recordFailure(manifest, item, interval, error, finalPhase);
+    }
+  }
+  checkpoint.updatedAt = Date.now();
+  manifest.status.currentTask = null;
+  writeManifest(manifest);
+  process.stdout.write(`[${position}/${total}] ${item.symbol} ${checkpoint.state === "complete" ? "完整案例完成" : "部分完成，需续算"}：${loaded.length}/${intervals.length} 周期\n`);
+  return { built: loaded.length, skipped: 0, failed: checkpoint.failedIntervals.length };
 }
 
 async function buildCase(
@@ -367,6 +586,7 @@ async function buildCase(
   onlyPreferred = false,
   afterInterval = null,
 ) {
+  if (FULL_BATCH) return buildFullCase(item, manifest, position, total);
   const eligibleIntervals = onlyPreferred
     ? preferredIntervals.filter((interval) => INTERVALS.includes(interval))
     : INTERVALS;
@@ -428,8 +648,12 @@ async function main() {
       return;
     }
     let selected = cases.filter((item) => item.valid && (!SYMBOL_FILTER.size || SYMBOL_FILTER.has(item.symbol)));
+    if (PRIORITY_SYMBOLS.length) selected.sort((left, right) => {
+      const rank = (item) => { const index = PRIORITY_SYMBOLS.indexOf(item.symbol); return index < 0 ? PRIORITY_SYMBOLS.length : index; };
+      return rank(left) - rank(right);
+    });
     if (MAX_CASES) selected = selected.slice(0, MAX_CASES);
-    const totals = { built: 0, skipped: 0, failed: 0 };
+    const totals = { built: 0, skipped: 0, failed: 0, compatibleSkipped: 0 };
     manifest.status = {
       state: "running",
       pid: process.pid,
@@ -437,9 +661,12 @@ async function main() {
       totalCases: selected.length,
       processedCases: 0,
       intervals: INTERVALS,
+      fullBatch: FULL_BATCH,
+      localOnly: LOCAL_ONLY,
+      engineSha256: ENGINE_SHA256,
     };
     writeManifest(manifest);
-    await drainPriorityRequests(manifest, totals);
+    if (!FULL_BATCH) await drainPriorityRequests(manifest, totals);
     for (let index = 0; index < selected.length; index += 1) {
       const result = await buildCaseSafely(
         selected[index],
@@ -448,37 +675,48 @@ async function main() {
         selected.length,
         [],
         false,
-        () => drainPriorityRequests(manifest, totals),
+        FULL_BATCH ? null : () => drainPriorityRequests(manifest, totals),
       );
       totals.built += result.built;
       totals.skipped += result.skipped;
       totals.failed += result.failed;
+      totals.compatibleSkipped += result.compatibleSkipped || 0;
       manifest.status.processedCases = index + 1;
       manifest.status.updatedAt = Date.now();
       writeManifest(manifest);
-      await drainPriorityRequests(manifest, totals);
+      if (!FULL_BATCH) await drainPriorityRequests(manifest, totals);
       // 后台预热让出一点 CPU，避免用户正在看盘或确认买点时被批量分析抢占。
       await new Promise((resolve) => setTimeout(resolve, 300));
     }
-    await drainPriorityRequests(manifest, totals);
+    if (!FULL_BATCH) await drainPriorityRequests(manifest, totals);
+    const fullCatalogScope = selected.length === cases.filter((item) => item.valid).length
+      && FULL_BATCH_INTERVAL_ORDER.every((interval) => INTERVALS.includes(interval));
     manifest.status = {
       ...manifest.status,
-      state: "complete",
+      state: FULL_BATCH && (totals.failed > 0 || !fullCatalogScope) ? "partial" : "complete",
+      scopeComplete: totals.failed === 0,
+      currentTask: null,
       finishedAt: Date.now(),
       built: totals.built,
       skipped: totals.skipped,
+      compatibleSkipped: totals.compatibleSkipped,
       failed: totals.failed,
       recordCount: Object.keys(manifest.records || {}).length,
     };
     writeManifest(manifest);
-    console.log(`预计算结束：新增 ${totals.built}，复用 ${totals.skipped}，失败 ${totals.failed}。`);
+    console.log(`预计算结束：新增 ${totals.built}，复用 ${totals.skipped}（验证兼容 ${totals.compatibleSkipped}），失败 ${totals.failed}。`);
   } finally {
     releaseLock();
   }
 }
 
-main().catch((error) => {
-  releaseLock();
-  console.error(error);
-  process.exitCode = 1;
-});
+module.exports = { main, buildCase, buildFullCase, fullCaseUsable, fullCaseKey, cacheKey,
+  rawCandlePath, readPersistedCandles, fetchAndAnalyze, acquireLock, releaseLock };
+
+if (require.main === module) {
+  main().catch((error) => {
+    releaseLock();
+    console.error(error);
+    process.exitCode = 1;
+  });
+}

@@ -40,6 +40,18 @@ class PriceWatchTradeUrlTests(unittest.TestCase):
             "https://web3.binance.com/en/token/robinhood/0x56910d4409f3a0c78c64dd8d0545ff0705389870?ref=MQ6JD2X4",
         )
 
+    def test_wallet_origin_overrides_secondary_contract_provider(self):
+        self.assertEqual(
+            server.price_watch_trade_url(
+                "STONK",
+                "Binance Futures",
+                chain_id="CT_501",
+                contract_address="6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx",
+                prefer_wallet=True,
+            ),
+            "https://web3.binance.com/en/token/sol/6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx?ref=MQ6JD2X4",
+        )
+
     def test_price_alert_view_uses_signal_provider_trade_page(self):
         event = {
             "symbol": "WLD",
@@ -87,6 +99,27 @@ class PriceWatchTradeUrlTests(unittest.TestCase):
             payload = server.launch_price_watch_alert(event)
 
         self.assertIn("/token/robinhood/0x56910d4409f3a0c78c64dd8d0545ff0705389870", payload["url"])
+
+    def test_wallet_origin_alert_ignores_secondary_provider_page(self):
+        event = {
+            "symbol": "STONK",
+            "distancePct": 2.93,
+            "currentPrice": 0.2819,
+            "weekHigh": 0.29041137,
+            "episode": 1,
+            "provider": "Binance Futures",
+            "chain": "CT_501",
+            "contractAddress": "6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx",
+            "binanceWalletHot": True,
+        }
+        with patch.object(server, "launch_desktop_alert", side_effect=lambda payload: payload):
+            payload = server.launch_price_watch_alert(event)
+
+        self.assertIn(
+            "/token/sol/6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx",
+            payload["url"],
+        )
+        self.assertNotIn("/futures/", payload["url"])
 
 
 if __name__ == "__main__":

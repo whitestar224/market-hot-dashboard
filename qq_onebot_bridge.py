@@ -30,6 +30,36 @@ class OneBotRecoveryError(RuntimeError):
     pass
 
 
+def friendly_onebot_error(error: Any) -> tuple[str, str]:
+    """Convert local transport failures into stable, user-facing QQ states."""
+    text = _stable_text(error)
+    lowered = text.casefold()
+    if any(marker in lowered for marker in (
+        "connection refused",
+        "failed to establish a new connection",
+        "max retries exceeded",
+        "winerror 10061",
+        "actively refused",
+        "目标计算机积极拒绝",
+    )):
+        return (
+            "onebot_waiting",
+            "QQ 后台通道未连接，正在安全重试；不会关闭或重新登录当前 QQ",
+        )
+    if any(marker in lowered for marker in ("timed out", "timeout", "响应超时")):
+        return "onebot_waiting", "QQ 后台通道响应超时，正在自动重连"
+    if any(marker in lowered for marker in ("401", "403", "unauthorized", "forbidden")):
+        return "onebot_unavailable", "QQ 后台通道授权失效，请检查本机连接配置"
+    if text and not any(marker in lowered for marker in (
+        "httpconnectionpool",
+        "newconnectionerror",
+        "connectionerror",
+        "traceback",
+    )):
+        return "onebot_unavailable", text[:180]
+    return "onebot_unavailable", "QQ 后台通道暂时不可用，正在等待恢复"
+
+
 def _stable_text(value: Any) -> str:
     return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", str(value or ""))).strip()
 
@@ -212,6 +242,9 @@ class QQOneBotBridge:
         self.connected = False
         self.last_error = ""
         self.last_event_at = 0
+        self._failure_count = 0
+        self._retry_at = 0.0
+        self._last_unavailable_result: dict[str, Any] = {}
 
     def _resolve_group(self, group_name: str) -> dict[str, Any]:
         key = _group_key(group_name)
@@ -256,6 +289,11 @@ class QQOneBotBridge:
         return normalized
 
     def collect(self, group_name: str, sender_filter: str = "") -> dict[str, Any]:
+        checked_at = time.monotonic()
+        with self._lock:
+            if self._last_unavailable_result and checked_at < self._retry_at:
+                retry_after = max(1, int(self._retry_at - checked_at + 0.999))
+                return {**self._last_unavailable_result, "retryAfter": retry_after}
         try:
             group = self._resolve_group(group_name)
             group_id = _stable_text(group.get("group_id"))
@@ -268,7 +306,7 @@ class QQOneBotBridge:
                     continue
                 merged[str(item.get("messageId") or item.get("hash"))] = item
             messages = sorted(merged.values(), key=lambda item: int(item.get("capturedAt") or 0))[-120:]
-            return {
+            result = {
                 "ok": True,
                 "status": "connected",
                 "messages": messages,
@@ -278,16 +316,30 @@ class QQOneBotBridge:
                 "senderFilter": _stable_text(sender_filter),
                 "groupId": group_id,
             }
+            with self._lock:
+                self._failure_count = 0
+                self._retry_at = 0.0
+                self._last_unavailable_result = {}
+            return result
         except Exception as exc:
-            self.last_error = str(exc)
-            return {
+            status, message = friendly_onebot_error(exc)
+            self.last_error = message
+            with self._lock:
+                self._failure_count = min(5, self._failure_count + 1)
+                retry_delay = min(60, 4 * (2 ** (self._failure_count - 1)))
+                self._retry_at = checked_at + retry_delay
+            result = {
                 "ok": False,
-                "status": "onebot_unavailable",
+                "status": status,
                 "messages": [],
-                "error": str(exc)[:320],
+                "error": message,
                 "collectorMode": "onebot",
                 "platform": "qq",
+                "retryAfter": retry_delay,
             }
+            with self._lock:
+                self._last_unavailable_result = dict(result)
+            return result
 
     def start(self) -> None:
         with self._lock:
@@ -356,7 +408,8 @@ class QQOneBotBridge:
                 "error": self.last_error,
             }
         except Exception as exc:
-            return {"ok": False, "status": "onebot_unavailable", "connected": False, "error": str(exc)[:320]}
+            status, message = friendly_onebot_error(exc)
+            return {"ok": False, "status": status, "connected": False, "error": message}
 
 
 def recover_local_napcat() -> dict[str, Any]:
@@ -399,6 +452,8 @@ def recover_local_napcat() -> dict[str, Any]:
         "-Account",
         account,
     ]
+    if onebot_parallel_manual_qq_enabled():
+        command.append("-AllowParallelManualQq")
     completed = subprocess.run(
         command,
         cwd=str(ROOT),
@@ -510,6 +565,12 @@ def onebot_recovery_enabled() -> bool:
     }
 
 
+def onebot_parallel_manual_qq_enabled() -> bool:
+    return os.name == "nt" and str(
+        os.getenv("QQ_NAPCAT_ALLOW_PARALLEL_MANUAL_QQ", "0")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def get_qq_onebot_bridge() -> QQOneBotBridge | None:
     global _BRIDGE
     if not onebot_enabled():
@@ -540,11 +601,12 @@ def collect_qq_onebot_messages(group_name: str, sender_filter: str = "") -> dict
         bridge.start()
         return bridge.collect(group_name, sender_filter)
     except Exception as exc:
+        status, message = friendly_onebot_error(exc)
         return {
             "ok": False,
-            "status": "onebot_unavailable",
+            "status": status,
             "messages": [],
-            "error": str(exc)[:320],
+            "error": message,
             "collectorMode": "onebot",
             "platform": "qq",
         }

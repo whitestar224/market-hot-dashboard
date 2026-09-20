@@ -80,7 +80,41 @@ class PersonalXMonitorPriorityTests(unittest.TestCase):
         self.assertEqual(structure_rows[0]["symbol"], "CHIP")
         self.assertEqual(structure_rows[0]["adaptiveContext"]["label"], "个人 X 提及")
 
-    def test_same_cached_post_cannot_undo_manual_exclusions_but_new_post_can(self):
+    def test_digit_leading_cashtag_is_prioritized_and_keeps_contract_identity(self):
+        now = 1_800_000_000_000
+        contract = "0xd270d4e1ec6e6e0d28c0ecb8be966ec75997ffff"
+        self.ingest(now, f"RT @someone: $4Stock BSC 合约 {contract} 重点看")
+        rows = server.price_watch_active_rows()
+        self.assertEqual([row["symbol"] for row in rows], ["4STOCK"])
+        self.assertEqual(rows[0]["onchain_contract_address"], contract)
+        self.assertEqual(rows[0]["onchain_chain"], "56")
+        self.assertTrue(server.price_watch_public_item(rows[0])["personalXPriority"])
+
+    def test_explicit_digit_tickers_survive_noise_and_candidate_limit(self):
+        text = "RT @someone: AAA BBB CCC DDD EEE FFF GGG HHH $4Stock $BNC4 50M $500 $50M $24h"
+        symbols = server.strategy_adaptive_symbols_from_text(text)
+        self.assertEqual(symbols[:2], ["4STOCK", "BNC4"])
+        self.assertFalse({"RT", "500", "50M", "24H"} & set(symbols))
+
+    def test_digit_leading_pairs_and_amounts_do_not_confuse_identity(self):
+        symbols = server.strategy_adaptive_symbols_from_text("4STOCK 1INCHUSDT 500USDT $2Z $0x123abc https://example.com/FOO @BAR")
+        self.assertIn("4STOCK", symbols)
+        self.assertIn("1INCH", symbols)
+        self.assertIn("2Z", symbols)
+        self.assertFalse({"500", "FOO", "BAR", "0X123ABC"} & set(symbols))
+
+    def test_newly_recognized_old_post_cannot_revive_a_later_global_exclusion(self):
+        now = 1_800_000_000_000
+        with server.auth_db() as conn:
+            conn.execute(
+                "INSERT INTO price_structure_exclusions(symbol,excluded_at,updated_at) VALUES('4STOCK',?,?)",
+                (now, now),
+            )
+        self.ingest(now - 60_000, "$4Stock 重点看")
+        self.assertTrue(server.price_structure_symbol_excluded("4STOCK"))
+        self.assertFalse(server.price_watch_active_rows())
+
+    def test_neither_cached_nor_new_post_can_undo_manual_exclusion(self):
         now = 1_800_000_000_000
         self.ingest(now)
         server.exclude_price_watch_prior_high("CHIP")
@@ -99,9 +133,9 @@ class PersonalXMonitorPriorityTests(unittest.TestCase):
             new_asset = conn.execute(
                 "SELECT prior_high_excluded_at, personal_x_mentioned_at FROM price_watch_assets WHERE symbol = 'CHIP'"
             ).fetchone()
-        self.assertEqual(new_asset["prior_high_excluded_at"], 0)
-        self.assertEqual(new_asset["personal_x_mentioned_at"], now + 60_000)
-        self.assertFalse(server.price_structure_symbol_excluded("CHIP"))
+        self.assertGreater(new_asset["prior_high_excluded_at"], 0)
+        self.assertEqual(new_asset["personal_x_mentioned_at"], now)
+        self.assertTrue(server.price_structure_symbol_excluded("CHIP"))
 
     def test_recent_personal_x_asset_survives_aicoin_cleanup(self):
         now = 1_800_000_000_000
@@ -234,6 +268,41 @@ class PersonalXMonitorPriorityTests(unittest.TestCase):
             structure_rows = server.price_structure_watch_rows()
         self.assertEqual(structure_rows[0]["contractAddress"], contract)
         self.assertEqual(structure_rows[0]["chain"], "56")
+        self.assertEqual(structure_rows[0]["contractSelectionSource"], "personal-x-explicit")
+
+    def test_new_personal_x_ca_does_not_replace_a_wallet_rank_ca(self):
+        now = 1_800_000_000_000
+        wallet_contract = "0x2222222222222222222222222222222222222222"
+        x_contract = "0x3333333333333333333333333333333333333333"
+        with server.auth_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO price_watch_assets (
+                    symbol, name, binance_wallet_hot_first_seen_at,
+                    binance_wallet_hot_last_seen_at, onchain_chain,
+                    onchain_chain_label, onchain_contract_address,
+                    created_at, updated_at
+                ) VALUES ('SAME', 'SAME', ?, ?, '56', 'BNB Chain', ?, ?, ?)
+                """,
+                (now - 60_000, now - 30_000, wallet_contract, now - 60_000, now - 30_000),
+            )
+
+        server.upsert_personal_x_monitor_symbol(
+            "SAME",
+            source_name="@whitestar224",
+            source_text=f"$SAME BSC 合约地址 {x_contract}",
+            observed_at=now,
+            now_ms=now,
+            chain="56",
+            chain_label="BNB Chain",
+            contract_address=x_contract,
+        )
+
+        with server.auth_db() as conn:
+            asset = conn.execute(
+                "SELECT onchain_contract_address FROM price_watch_assets WHERE symbol='SAME'"
+            ).fetchone()
+        self.assertEqual(asset["onchain_contract_address"], wallet_contract)
 
     def test_onchain_pool_aggregates_same_contract_volume_across_pools(self):
         response = Mock()
@@ -274,6 +343,56 @@ class PersonalXMonitorPriorityTests(unittest.TestCase):
         self.assertEqual(pool["poolCount"], 2)
         self.assertEqual(pool["volume24hUsd"], 12_000_000)
         self.assertEqual(pool["aggregateLiquidityUsd"], 1_800_000)
+
+    def test_generic_same_ticker_selection_combines_heat_discussion_volume_and_research(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "pairs": [
+                {
+                    "chainId": "bsc",
+                    "pairAddress": "0xcopy-pool",
+                    "baseToken": {"symbol": "SAME", "address": "0xcopy"},
+                    "liquidity": {"usd": 2_000_000},
+                    "volume": {"h24": 5_000_000},
+                    "txns": {"h24": {"buys": 5, "sells": 5}},
+                },
+                {
+                    "chainId": "bsc",
+                    "pairAddress": "0xreal-pool",
+                    "baseToken": {"symbol": "SAME", "address": "0xreal"},
+                    "liquidity": {"usd": 400_000},
+                    "volume": {"h24": 8_000_000},
+                    "txns": {"h24": {"buys": 3_100, "sells": 2_900}},
+                    "boosts": {"active": 10},
+                    "info": {"socials": [{"type": "twitter"}]},
+                },
+            ]
+        }
+        evidence = {
+            ("SAME", "0xreal"): {
+                "heat": 100,
+                "searchHeat": 8_000,
+                "discussion": 6_000,
+                "volume24hUsd": 8_000_000,
+                "attention": 100,
+                "sourceCount": 3,
+                "newsVerified": True,
+                "researchScore": 86,
+            }
+        }
+        with server.PRICE_STRUCTURE_ONCHAIN_POOL_CACHE_LOCK:
+            server.PRICE_STRUCTURE_ONCHAIN_POOL_CACHE.clear()
+        with (
+            patch.object(server.CHAIN_ECOSYSTEM_MONITOR.store, "list_chains", return_value=[]),
+            patch.object(server, "price_structure_onchain_contract_evidence", return_value=evidence),
+            patch.object(server.requests, "get", return_value=response),
+        ):
+            pool = server.price_structure_onchain_pool("SAME")
+
+        self.assertEqual(pool["contractAddress"], "0xreal")
+        self.assertEqual(pool["contractSelectionSource"], "combined-market-evidence")
+        self.assertTrue(pool["contractSelectionEvidence"]["newsVerified"])
 
     def test_prior_high_reuses_preferred_structure_source_for_onchain_personal_x_asset(self):
         def candles(symbol, interval, *, limit=140, min_rows=30, timeout=8):

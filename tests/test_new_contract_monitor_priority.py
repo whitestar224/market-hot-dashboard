@@ -70,7 +70,7 @@ class NewContractMonitorPriorityTests(unittest.TestCase):
             now_ms=expected,
         )["enabled"])
 
-    def test_exchange_contracts_enter_neither_structure_nor_prior_high_by_themselves(self):
+    def test_binance_and_okx_contracts_enter_prior_high_but_not_structure_by_themselves(self):
         now = self.china_ms(2026, 8, 16, 19, 0)
         binance_at = self.china_ms(2026, 8, 16, 10, 0)
         okx_at = self.china_ms(2026, 8, 16, 18, 0)
@@ -97,8 +97,8 @@ class NewContractMonitorPriorityTests(unittest.TestCase):
             prior_rows = server.price_watch_active_rows()
             self.assertEqual([row["symbol"] for row in prior_rows[:3]], ["ONEW", "BNEW", "MANUAL"])
             public = {row["symbol"]: server.price_watch_public_item(row) for row in prior_rows}
-            self.assertFalse(public["ONEW"]["priorHighEnabled"])
-            self.assertFalse(public["BNEW"]["priorHighEnabled"])
+            self.assertTrue(public["ONEW"]["priorHighEnabled"])
+            self.assertTrue(public["BNEW"]["priorHighEnabled"])
             self.assertFalse(public["MANUAL"]["priorHighEnabled"])
             with patch.object(
                 server, "price_watch_aicoin_source", return_value={"status": "ok", "rows": []}
@@ -239,7 +239,7 @@ class NewContractMonitorPriorityTests(unittest.TestCase):
             server.NEW_COIN_LOW_ITEMS.clear()
             server.NEW_COIN_LOW_ITEMS.update(original_items)
 
-    def test_main_structure_broadcast_requires_aicoin_or_personal_x_membership(self):
+    def test_any_regular_monitor_member_can_broadcast_even_when_source_metadata_is_missing(self):
         unauthorized = {
             "symbol": "ASTERONLY",
             "monitorPool": "aicoin-x",
@@ -253,7 +253,7 @@ class NewContractMonitorPriorityTests(unittest.TestCase):
             "structureMembershipSources": ["AiCoin"],
         }
 
-        self.assertFalse(server.price_structure_broadcast_allowed(unauthorized, "4h"))
+        self.assertTrue(server.price_structure_broadcast_allowed(unauthorized, "4h"))
         self.assertTrue(server.price_structure_broadcast_allowed(authorized, "4h"))
         membership, provider = server.price_structure_alert_source_labels(authorized)
         self.assertEqual(membership, "入池：AiCoin")
@@ -290,6 +290,10 @@ class NewContractMonitorPriorityTests(unittest.TestCase):
             "symbol": "FRESH",
             "newCoinFirstListedAt": now - 3 * 24 * 60 * 60 * 1000,
         }
+        brand_new_row = {
+            "symbol": "BRANDNEW",
+            "newCoinFirstListedAt": now - 3 * 60 * 60 * 1000,
+        }
 
         inactive = server.new_coin_low_activity_state(
             old_row,
@@ -302,6 +306,9 @@ class NewContractMonitorPriorityTests(unittest.TestCase):
             now_ms=now,
         )
         unavailable = server.new_coin_low_activity_state(old_row, {}, now_ms=now)
+        brand_new_unavailable = server.new_coin_low_activity_state(
+            brand_new_row, {}, now_ms=now
+        )
         recent_but_inactive = server.new_coin_low_activity_state(
             recent_row,
             {"FRESH": {"turnover24hUsd": 1, "source": "HTX"}},
@@ -311,12 +318,15 @@ class NewContractMonitorPriorityTests(unittest.TestCase):
         self.assertFalse(inactive["active"])
         self.assertEqual(inactive["status"], "inactive")
         self.assertTrue(recovered["active"])
-        self.assertTrue(unavailable["active"])
-        self.assertEqual(unavailable["reason"], "activity-data-unavailable-keep")
+        self.assertFalse(unavailable["active"])
+        self.assertEqual(unavailable["reason"], "activity-data-unavailable-expired")
+        self.assertTrue(brand_new_unavailable["active"])
+        self.assertEqual(brand_new_unavailable["reason"], "new-listing-grace")
         self.assertFalse(recent_but_inactive["active"])
         self.assertEqual(recent_but_inactive["status"], "inactive")
         self.assertEqual(server.NEW_COIN_LOW_MIN_TURNOVER_24H_USD, 10_000_000)
-        self.assertEqual(server.NEW_COIN_LOW_ACTIVITY_GRACE_DAYS, 0)
+        self.assertEqual(server.NEW_COIN_LOW_ACTIVITY_GRACE_DAYS, 0.25)
+        self.assertEqual(server.NEW_COIN_LOW_UNAVAILABLE_MAX_AGE_DAYS, 7)
 
     def test_history_only_exchange_can_disqualify_later_structure_admission(self):
         now = self.china_ms(2026, 8, 23, 12, 0)
@@ -441,7 +451,7 @@ class NewContractMonitorPriorityTests(unittest.TestCase):
         self.assertEqual(restored["new_contract_source"], "OKX 新合约")
         self.assertTrue(server.price_structure_symbol_excluded("NEW"))
 
-    def test_aicoin_or_personal_x_are_the_only_prior_high_sources(self):
+    def test_nonapproved_new_contract_source_needs_another_eligible_source(self):
         now = self.china_ms(2026, 8, 16, 19, 0)
         base = {
             "symbol": "ONLY",
@@ -452,6 +462,18 @@ class NewContractMonitorPriorityTests(unittest.TestCase):
         }
         with patch.object(server.time, "time", return_value=now / 1000):
             self.assertFalse(server.price_watch_prior_high_source_enabled(base, now_ms=now))
+            self.assertFalse(server.price_watch_prior_high_source_enabled(
+                {**base, "new_contract_source": "HTX 新合约"}, now_ms=now
+            ))
+            self.assertFalse(server.price_watch_prior_high_source_enabled(
+                {**base, "new_contract_source": "Aster 新合约"}, now_ms=now
+            ))
+            self.assertTrue(server.price_watch_prior_high_source_enabled(
+                {**base, "new_contract_source": "Binance 新合约"}, now_ms=now
+            ))
+            self.assertTrue(server.price_watch_prior_high_source_enabled(
+                {**base, "new_contract_source": "OKX 新合约"}, now_ms=now
+            ))
             self.assertTrue(server.price_watch_prior_high_source_enabled(
                 {**base, "aicoin_last_seen_at": now - 29 * 24 * 60 * 60 * 1000}, now_ms=now
             ))
@@ -461,6 +483,123 @@ class NewContractMonitorPriorityTests(unittest.TestCase):
             self.assertFalse(server.price_watch_prior_high_source_enabled(
                 {**base, "aicoin_last_seen_at": now - 31 * 24 * 60 * 60 * 1000}, now_ms=now
             ))
+
+    def test_existing_nonapproved_listing_only_state_is_removed_from_prior_high(self):
+        now = self.china_ms(2026, 8, 16, 19, 0)
+        with server.auth_db() as conn:
+            for symbol, source in (("GATEONLY", "Gate 新合约"), ("BINANCEOK", "Binance 新合约")):
+                conn.execute(
+                    """
+                    INSERT INTO price_watch_assets(
+                        symbol, name, new_contract_listed_at, new_contract_source,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (symbol, symbol, now - 60_000, source, now, now),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO price_watch_alert_state(
+                        symbol, reference_high, in_zone, last_alert_at,
+                        left_zone_at, episode, updated_at
+                    ) VALUES (?, 10, 1, ?, 0, 1, ?)
+                    """,
+                    (symbol, now, now),
+                )
+
+        removed = server.purge_unapproved_new_contract_prior_high_state(now_ms=now)
+
+        self.assertEqual(removed, ["GATEONLY"])
+        with server.auth_db() as conn:
+            self.assertIsNone(conn.execute(
+                "SELECT 1 FROM price_watch_alert_state WHERE symbol='GATEONLY'"
+            ).fetchone())
+            self.assertIsNotNone(conn.execute(
+                "SELECT 1 FROM price_watch_alert_state WHERE symbol='BINANCEOK'"
+            ).fetchone())
+
+    def test_price_refreshes_do_not_recreate_nonapproved_listing_state(self):
+        now = self.china_ms(2026, 8, 16, 19, 0)
+        with server.auth_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO price_watch_assets(
+                    symbol, name, new_contract_listed_at, new_contract_source,
+                    current_price, week_high, status, provider, structure_json,
+                    last_checked_at, created_at, updated_at
+                ) VALUES('GATEONLY', 'GATEONLY', ?, 'Gate Futures',
+                         9.8, 10, 'near', 'Gate Futures',
+                         '{"priorHighConfirmed":true,"referenceHigh":10}', ?, ?, ?)
+                """,
+                (now - 60_000, now - 1_000, now - 60_000, now - 1_000),
+            )
+
+        def seed_states():
+            with server.auth_db() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO price_watch_alert_state(
+                        symbol, reference_high, in_zone, last_alert_at,
+                        left_zone_at, episode, updated_at
+                    ) VALUES('GATEONLY', 10, 1, ?, 0, 1, ?)
+                    """,
+                    (now - 1_000, now - 1_000),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO price_watch_breakout_state(
+                        symbol, in_breakout, last_alert_at, updated_at
+                    ) VALUES('GATEONLY', 0, 0, ?)
+                    """,
+                    (now - 1_000,),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO price_watch_first_confirmations(
+                        symbol, episode, confirmed_at
+                    ) VALUES('GATEONLY', 1, ?)
+                    """,
+                    (now - 1_000,),
+                )
+
+        def assert_states_absent():
+            with server.auth_db() as conn:
+                for table in (
+                    "price_watch_alert_state",
+                    "price_watch_breakout_state",
+                    "price_watch_first_confirmations",
+                ):
+                    self.assertIsNone(conn.execute(
+                        f"SELECT 1 FROM {table} WHERE symbol='GATEONLY'"
+                    ).fetchone())
+
+        seed_states()
+        events = server.update_price_watch_snapshot({
+            "symbol": "GATEONLY",
+            "currentPrice": 9.9,
+            "weekHigh": 10,
+            "observedHigh": 10,
+            "distancePct": 1,
+            "provider": "Gate Futures",
+            "status": "near",
+            "checkedAt": now,
+        })
+        self.assertEqual(events, [])
+        assert_states_absent()
+
+        seed_states()
+        with server.auth_db() as conn:
+            row = dict(conn.execute(
+                "SELECT * FROM price_watch_assets WHERE symbol='GATEONLY'"
+            ).fetchone())
+        result = server.apply_price_watch_realtime_quotes(
+            [row],
+            {"GATEONLY": {"price": 9.95, "provider": "Gate Futures"}},
+            checked_at=now + 1_000,
+            persist_alerts=False,
+        )
+        self.assertEqual(result["alerts"], [])
+        assert_states_absent()
 
     def test_official_new_contract_window_does_not_qualify_structure_broadcast(self):
         now = self.china_ms(2026, 8, 16, 19, 0)

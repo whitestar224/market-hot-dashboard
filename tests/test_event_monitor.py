@@ -11,6 +11,18 @@ import server
 class EventMonitorTests(unittest.TestCase):
     def setUp(self):
         self.now_ms = int(time.time() * 1000)
+        self.flow_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.flow_temp.cleanup)
+        for name, value in (
+            ("EVENT_FLOW_STORE", server.EventFlowStore(Path(self.flow_temp.name) / "flow.sqlite")),
+            ("NEWS_TRADE_ALERT_STATE_PATH", Path(self.flow_temp.name) / "alerts.json"),
+        ):
+            patcher = patch.object(server, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        alert_patcher = patch.object(server, "launch_desktop_alert", return_value={"ok": True, "queued": True})
+        alert_patcher.start()
+        self.addCleanup(alert_patcher.stop)
 
     def classify(self, **overrides):
         row = {
@@ -194,7 +206,7 @@ class EventMonitorTests(unittest.TestCase):
     def test_accepted_popup_news_is_persisted_as_existing_pipeline_input(self):
         with tempfile.TemporaryDirectory() as tempdir, patch.object(
             server, "NEWS_TRADE_DESKTOP_INTAKE_PATH", Path(tempdir) / "desktop-intake.json"
-        ):
+        ), patch.object(server, "trigger_api_refresh"):
             item = server.normalize_desktop_alert({
                 "key": "flash:fixture-1",
                 "kind": "律动快讯",
@@ -215,7 +227,7 @@ class EventMonitorTests(unittest.TestCase):
     def test_x_alert_intake_preserves_project_identity_and_original_text(self):
         with tempfile.TemporaryDirectory() as tempdir, patch.object(
             server, "NEWS_TRADE_DESKTOP_INTAKE_PATH", Path(tempdir) / "desktop-intake.json"
-        ):
+        ), patch.object(server, "trigger_api_refresh"):
             item = server.normalize_desktop_alert({
                 "key": "x-kol:official-1",
                 "kind": "X KOL动态",
@@ -238,6 +250,91 @@ class EventMonitorTests(unittest.TestCase):
         self.assertEqual(row["xCategoryLabel"], "项目官方X")
         self.assertEqual(row["claimStatus"], "project-official")
         self.assertIn("new community mascot", row["body"])
+
+    def test_first_meme_newsflash_is_visible_before_full_discovery_or_ai(self):
+        item = {
+            "id": "desktop-alert:zzz",
+            "desktopAlertKey": "flash:215216|meme币zzz市值短时突破5100万美元，24小时涨超180%|1788928517",
+            "sourceType": "newsflash",
+            "source": "BlockBeats 律动",
+            "sourceLabel": "BB",
+            "title": "Meme币ZZZ市值短时突破5100万美元，24小时涨超180%",
+            "body": "Robinhood 生态 Meme 币 ZZZ 市值短时突破 5100 万美元。",
+            "timestamp": self.now_ms,
+            "capturedAt": self.now_ms,
+        }
+        with tempfile.TemporaryDirectory() as tempdir, patch.object(
+            server, "NEWS_TRADE_DESKTOP_INTAKE_PATH", Path(tempdir) / "desktop-intake.json"
+        ):
+            server.write_json_cache(server.NEWS_TRADE_DESKTOP_INTAKE_PATH, {"rows": [item]})
+            topics = server.recent_desktop_intake_topics(self.now_ms - 1, now_ms=self.now_ms)
+
+        self.assertEqual(len(topics), 1)
+        self.assertEqual(topics[0]["topicKey"], "narrative:zzz")
+        self.assertEqual(topics[0]["analysisIntakeReason"], "律动快讯机会")
+        self.assertEqual(topics[0]["candidateTier"], "event-observation")
+        self.assertFalse(topics[0]["executionEligible"])
+
+    def test_event_monitor_payload_overlays_fresh_intake_without_waiting_for_rebuild(self):
+        item = {
+            "id": "desktop-alert:zzz",
+            "desktopAlertKey": "flash:215216|meme币zzz首次提及|1788928517",
+            "sourceType": "newsflash",
+            "source": "BlockBeats 律动",
+            "sourceLabel": "BB",
+            "title": "Meme币ZZZ市值短时突破5100万美元",
+            "body": "这是快讯中第一次提及 ZZZ。",
+            "timestamp": self.now_ms,
+            "capturedAt": self.now_ms,
+        }
+        core = {"ok": True, "updatedAt": self.now_ms - 1, "events": [], "newsTrades": [], "summary": {}}
+        with tempfile.TemporaryDirectory() as tempdir, patch.object(
+            server, "NEWS_TRADE_DESKTOP_INTAKE_PATH", Path(tempdir) / "desktop-intake.json"
+        ), patch.object(server, "cached_event_monitor_core_payload", return_value=core), patch.object(
+            server, "system_llm_settings", return_value={}
+        ), patch.object(
+            server, "news_trade_attach_ai", side_effect=lambda rows, _settings: [
+                {**row, "aiAnalysisStatus": "queued"} for row in rows
+            ]
+        ), patch.object(server, "update_price_structure_event_contexts"), patch.object(
+            server, "trigger_event_flow_news_record"
+        ) as journal:
+            server.write_json_cache(server.NEWS_TRADE_DESKTOP_INTAKE_PATH, {"rows": [item]})
+            payload = server.event_monitor_payload()
+
+        self.assertEqual(payload["newsTrades"][0]["topicKey"], "narrative:zzz")
+        self.assertEqual(payload["newsTrades"][0]["aiAnalysisStatus"], "queued")
+        journal.assert_called_once()
+
+    def test_newsflash_ai_semantic_dedupe_batches_and_caches_core_meaning(self):
+        rows = [
+            {
+                "id": "a", "sourceId": "blockbeats", "source": "BlockBeats 律动", "sourcePriority": 100,
+                "title": "某交易所宣布 ABC 将于今晚开放交易", "content": "ABC 正式上线",
+                "add_time": self.now_ms // 1000, "sources": [{"id": "blockbeats", "name": "BlockBeats 律动"}],
+            },
+            {
+                "id": "b", "sourceId": "bwenews", "source": "方程式新闻", "sourcePriority": 80,
+                "title": "ABC 今夜登陆该交易平台", "content": "平台将开放 ABC 交易",
+                "add_time": self.now_ms // 1000, "sources": [{"id": "bwenews", "name": "方程式新闻"}],
+            },
+        ]
+        response = {"choices": [{"message": {"content": json.dumps({
+            "items": [{"key": "p1", "sameEvent": True, "reason": "主体、动作和标的一致"}],
+        }, ensure_ascii=False)}}]}
+        with tempfile.TemporaryDirectory() as tempdir, patch.object(
+            server, "NEWSFLASH_SEMANTIC_AI_CACHE_PATH", Path(tempdir) / "semantic.json"
+        ), patch.object(server, "deepseek_enabled", return_value=True), patch.object(
+            server, "deepseek_chat", return_value=response
+        ) as chat:
+            first, removed = server.newsflash_ai_semantic_dedupe(rows, {"apiKey": "configured"})
+            second, second_removed = server.newsflash_ai_semantic_dedupe(rows, {"apiKey": "configured"})
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(removed, 1)
+        self.assertEqual(second_removed, 1)
+        self.assertEqual({source["id"] for source in second[0]["sources"]}, {"blockbeats", "bwenews"})
+        self.assertEqual(chat.call_count, 1)
 
     def test_project_official_meme_post_enters_news_trade_without_fake_trade_route(self):
         event = server.classify_event_monitor_row(
@@ -560,6 +657,7 @@ class EventMonitorTests(unittest.TestCase):
             sourceType="x-kol",
             source="Elon Musk",
             sourceLabel="X",
+            xCategory="notable",
             title="Elon Musk 正式发文提及 DOGE",
             body="DOGEUSDT 价格和成交量快速变化",
         )
@@ -567,7 +665,128 @@ class EventMonitorTests(unittest.TestCase):
         self.assertIsNotNone(event)
         self.assertEqual(event["template"], "kol-latency")
         self.assertIn("DOGE", event["assets"])
-        self.assertFalse(event["isNewsTrade"])
+        self.assertTrue(event["isNewsTrade"])
+        self.assertEqual(event["analysisIntakeReason"], "名人动态")
+
+    def test_blockbeats_opportunity_enters_news_trade_ai_without_onchain_contract(self):
+        event = self.classify(
+            sourceType="newsflash",
+            source="BlockBeats",
+            sourceLabel="BB",
+            title="监管机构正式批准 DOGE ETF",
+            body="法院裁决与监管批准已经落地，但链上尚未发现对应新币合约。",
+        )
+
+        self.assertIsNotNone(event)
+        self.assertTrue(event["isNewsTrade"])
+        self.assertEqual(event["analysisIntakeReason"], "律动快讯机会")
+        self.assertEqual(event["candidateTier"], "event-observation")
+        self.assertFalse(event["executionEligible"])
+
+    def test_only_priority_x_categories_enter_news_trade_analysis(self):
+        for category in ("celebrity", "notable", "founder", "project_official"):
+            with self.subTest(category=category):
+                event = self.classify(
+                    sourceType="x-kol",
+                    source="重点账号",
+                    sourceLabel="X",
+                    xCategory=category,
+                    title="正式宣布推出 DOGE 社区合作计划",
+                    body="DOGE 社区将参与新的活动。",
+                )
+                self.assertIsNotNone(event)
+                self.assertTrue(event["isNewsTrade"])
+
+        ordinary = self.classify(
+            sourceType="x-kol",
+            source="普通交易员",
+            sourceLabel="X",
+            xCategory="kol",
+            title="正式宣布推出 DOGE 社区合作计划",
+            body="DOGE 社区将参与新的活动。",
+        )
+        self.assertIsNone(ordinary)
+
+    def test_realtime_x_snapshot_enters_news_trade_source_rows_without_opening_x_page(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "PERSIST_CACHE_DIR", Path(temp_dir)
+        ):
+            server.write_json_cache(
+                Path(temp_dir) / "x_kol_realtime_7.json",
+                {
+                    "savedAt": self.now_ms,
+                    "payload": {
+                        "updatedAt": self.now_ms,
+                        "sources": [{
+                            "id": "source-1",
+                            "handle": "projectalpha",
+                            "displayName": "Project Alpha",
+                            "category": "project_official",
+                        }],
+                        "items": [{
+                            "id": "tweet-1",
+                            "sourceId": "source-1",
+                            "text": "Official launch of ALPHA staking",
+                            "url": "https://x.com/projectalpha/status/1",
+                            "publishedAt": self.now_ms,
+                        }],
+                    },
+                },
+            )
+
+            rows = [row for row in server.event_monitor_source_rows() if row.get("id") == "tweet-1"]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], "tweet-1")
+        self.assertEqual(rows[0]["xCategory"], "project_official")
+        self.assertEqual(rows[0]["source"], "Project Alpha")
+
+    def test_recent_ordinary_kol_desktop_intake_is_not_added_to_news_trade(self):
+        item = {
+            "id": "desktop-alert:ordinary-kol",
+            "desktopAlertKey": "ordinary-kol",
+            "sourceType": "x-kol",
+            "xCategory": "kol",
+            "source": "普通交易员",
+            "sourceLabel": "X",
+            "kind": "X KOL动态",
+            "title": "DOGE 社区更新",
+            "body": "普通行情观点，不是官方事件。",
+            "timestamp": self.now_ms,
+            "capturedAt": self.now_ms,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "NEWS_TRADE_DESKTOP_INTAKE_PATH", Path(temp_dir) / "desktop-intake.json"
+        ):
+            server.write_json_cache(server.NEWS_TRADE_DESKTOP_INTAKE_PATH, {"rows": [item]})
+            topics = server.recent_desktop_intake_topics(self.now_ms - 1, now_ms=self.now_ms)
+
+        self.assertEqual(topics, [])
+
+    def test_old_ordinary_kol_only_topic_is_filtered_from_analysis(self):
+        ordinary = {
+            "sourceType": "x-kol",
+            "xCategory": "kol",
+            "source": "普通交易员",
+            "sources": ["普通交易员"],
+            "relatedNews": [{"sourceType": "x-kol", "xCategory": "kol", "source": "普通交易员"}],
+        }
+        cross_confirmed = {
+            **ordinary,
+            "sources": ["普通交易员", "BlockBeats"],
+            "relatedNews": [
+                *ordinary["relatedNews"],
+                {"sourceType": "newsflash", "source": "BlockBeats"},
+            ],
+        }
+
+        self.assertFalse(server.news_trade_topic_analysis_source_allowed(ordinary))
+        self.assertTrue(server.news_trade_topic_analysis_source_allowed(cross_confirmed))
+        cleaned = server.news_trade_filter_topic_analysis_sources(cross_confirmed)
+        self.assertIsNotNone(cleaned)
+        self.assertEqual(cleaned["source"], "BlockBeats")
+        self.assertEqual(cleaned["sourceType"], "newsflash")
+        self.assertFalse(any(item.get("xCategory") == "kol" for item in cleaned["relatedNews"]))
 
     def test_usdc_depeg_is_anchor_policy_candidate(self):
         event = self.classify(
@@ -578,7 +797,7 @@ class EventMonitorTests(unittest.TestCase):
         self.assertIsNotNone(event)
         self.assertEqual(event["template"], "anchor-policy")
         self.assertIn("USDC", event["assets"])
-        self.assertFalse(event["isNewsTrade"])
+        self.assertTrue(event["isNewsTrade"])
 
     def test_grayscale_lawsuit_win_is_instant_repricing_candidate(self):
         event = self.classify(
@@ -589,7 +808,7 @@ class EventMonitorTests(unittest.TestCase):
         self.assertIsNotNone(event)
         self.assertEqual(event["template"], "instant-repricing")
         self.assertIn("BTC", event["assets"])
-        self.assertFalse(event["isNewsTrade"])
+        self.assertTrue(event["isNewsTrade"])
 
     def test_binance_listing_is_listing_latency_candidate(self):
         event = self.classify(
@@ -671,7 +890,7 @@ class EventMonitorTests(unittest.TestCase):
         self.assertIsNotNone(event)
         self.assertEqual(event["template"], "market-dislocation")
         self.assertIn("BTC", event["assets"])
-        self.assertFalse(event["isNewsTrade"])
+        self.assertTrue(event["isNewsTrade"])
 
     def test_orderbook_basis_anomaly_is_risk_candidate(self):
         event = self.classify(
@@ -682,7 +901,7 @@ class EventMonitorTests(unittest.TestCase):
         self.assertIsNotNone(event)
         self.assertEqual(event["template"], "orderbook-risk")
         self.assertIn("BROCCOLI714", event["assets"])
-        self.assertFalse(event["isNewsTrade"])
+        self.assertTrue(event["isNewsTrade"])
 
     def test_hot_culture_meme_event_resolves_chain_contract_and_trade_route(self):
         with patch.object(server, "event_monitor_dex_pair", return_value={}), patch.object(
@@ -883,6 +1102,7 @@ class EventMonitorTests(unittest.TestCase):
                 id="news-b",
                 source="重点 KOL",
                 sourceType="x-kol",
+                xCategory="notable",
                 title="《牛来》登上热搜，链上同名 Meme 继续扩散",
                 body="官方账号发文后，市场成交量与流动性同步上升",
                 timestamp=self.now_ms,
@@ -1084,6 +1304,23 @@ class EventMonitorTests(unittest.TestCase):
         self.assertTrue(authorization["authorized"])
         self.assertTrue(authorization["chainMatches"])
 
+    def test_metamask_bitget_and_discovered_wallets_share_the_guarded_evm_path(self):
+        for provider in ("metamask", "bitget", "injected"):
+            with self.subTest(provider=provider):
+                authorization = server.news_trade_wallet_authorization(
+                    {
+                        "walletProvider": provider,
+                        "walletNamespace": "evm",
+                        "walletAddress": "0x3333333333333333333333333333333333333333",
+                        "walletChainId": "0x38",
+                    },
+                    {"chain": "bsc", "chainId": "56"},
+                )
+
+                self.assertEqual(authorization["provider"], provider)
+                self.assertTrue(authorization["authorized"])
+                self.assertTrue(authorization["chainMatches"])
+
     def test_generic_market_commentary_is_ignored(self):
         event = self.classify(
             title="市场今日整体平稳",
@@ -1143,7 +1380,134 @@ class EventMonitorTests(unittest.TestCase):
 
         self.assertIsNone(event)
 
-    def test_parser_only_emits_early_news_trade_transition_with_priority_and_speech(self):
+    def test_merged_event_monitor_prefers_news_trade_and_deduplicates_shared_news(self):
+        news_topic = {
+            "id": "topic-alpha",
+            "topicKey": "narrative:alpha",
+            "title": "ALPHA 社区事件形成链上映射",
+            "assets": ["ALPHA"],
+            "updatedAt": self.now_ms,
+            "topicScore": 82,
+            "relatedNews": [{
+                "id": "event-alpha",
+                "url": "https://example.com/alpha",
+            }],
+        }
+        events = [
+            {
+                "id": "event-alpha",
+                "title": "ALPHA 社区事件形成链上映射",
+                "url": "https://example.com/alpha",
+                "timestamp": self.now_ms - 1_000,
+            },
+            {
+                "id": "event-beta",
+                "title": "BETA 上线公告",
+                "url": "https://example.com/beta",
+                "timestamp": self.now_ms - 2_000,
+            },
+        ]
+
+        merged = server.merge_event_monitor_items(events, [news_topic])
+
+        self.assertEqual(len(merged), 2)
+        alpha = next(item for item in merged if item.get("id") == "topic-alpha")
+        self.assertEqual(alpha["mergedKind"], "news-trade")
+        self.assertEqual(alpha["mergedDuplicateCount"], 2)
+        self.assertEqual(next(item for item in merged if item.get("id") == "event-beta")["mergedKind"], "event")
+
+    def test_news_trade_ai_completion_emits_one_fresh_popup(self):
+        topic = {
+            "id": "topic-ai-popup",
+            "topicKey": "narrative:ai-popup",
+            "title": "热点人物事件形成 Meme 机会",
+            "timestamp": self.now_ms,
+            "eventHeatScore": 85,
+            "relatedNews": [{"title": "新机制引发社区二创", "timestamp": self.now_ms + 30000}],
+            "assets": ["MEME"],
+            "newsTradePhase": "understanding",
+            "eventStage": "accelerating",
+            "sourceActive": True,
+            "updatedAt": self.now_ms,
+        }
+        ready = {
+            **topic,
+            "updatedAt": self.now_ms + 60_000,
+            "aiAnalysisStatus": "ready",
+            "aiAnalysisUpdatedAt": self.now_ms + 60_000,
+            "aiAnalysis": {
+                "verdict": "trade-candidate",
+                "confidence": 86,
+                "primarySymbol": "MEME",
+                "narrativeStrength": 85,
+                "attentionStage": "rising",
+                "catalystEvidenceId": server.attention_evidence(topic)[-1]["id"],
+                "symbols": ["MEME"],
+                "eventType": "大瓜",
+                "thesis": "人物热点具备强传播与同名币映射空间",
+                "catalyst": "多个社区开始二创",
+                "risk": "合约关联性仍需核验",
+                "actionHint": "等待链上成交确认",
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "news-trade-alert-state.json"
+            with patch.object(server, "NEWS_TRADE_ALERT_STATE_PATH", state_path):
+                baseline = server.parse_site_event_monitor_events({"updatedAt": self.now_ms, "newsTrades": [topic]})
+                first = server.parse_site_event_monitor_events({
+                    "updatedAt": self.now_ms + 60_000,
+                    "newsTrades": [ready],
+                })
+                repeated = server.parse_site_event_monitor_events({
+                    "updatedAt": self.now_ms + 90_000,
+                    "newsTrades": [ready],
+                })
+
+        self.assertEqual(baseline, [])
+        self.assertEqual(repeated, [])
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0]["kind"], "News Trade · 潜在机会")
+        self.assertEqual(first[0]["title"], "机会标的：MEME")
+        self.assertEqual(first[0]["queuePriority"], 75)
+        self.assertIn("人物热点具备强传播", first[0]["body"])
+
+    def test_news_trade_ai_watch_result_never_emits_popup(self):
+        topic = {
+            "id": "topic-ai-watch",
+            "topicKey": "narrative:ai-watch",
+            "title": "普通讨论",
+            "assets": ["MEME"],
+            "newsTradePhase": "understanding",
+            "eventStage": "accelerating",
+            "sourceActive": True,
+            "updatedAt": self.now_ms,
+        }
+        analyzed = {
+            **topic,
+            "updatedAt": self.now_ms + 60_000,
+            "aiAnalysisStatus": "ready",
+            "aiAnalysisUpdatedAt": self.now_ms + 60_000,
+            "aiAnalysis": {
+                "verdict": "watch",
+                "confidence": 91,
+                "primarySymbol": "MEME",
+                "symbols": ["MEME"],
+                "eventType": "其他",
+                "thesis": "没有形成可交易催化",
+                "actionHint": "继续观察",
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "news-trade-alert-state.json"
+            with patch.object(server, "NEWS_TRADE_ALERT_STATE_PATH", state_path):
+                server.parse_site_event_monitor_events({"updatedAt": self.now_ms, "newsTrades": [topic]})
+                alerts = server.parse_site_event_monitor_events({
+                    "updatedAt": self.now_ms + 60_000,
+                    "newsTrades": [analyzed],
+                })
+        self.assertEqual(alerts, [])
+
+    def test_parser_does_not_emit_before_ai_confirms_an_opportunity(self):
         topic = {
             "id": "topic-test",
             "title": "《TEST》热点进入早期传播",
@@ -1175,10 +1539,7 @@ class EventMonitorTests(unittest.TestCase):
                 })
 
         self.assertEqual(baseline, [])
-        self.assertEqual(len(alerts), 1)
-        self.assertEqual(alerts[0]["queuePriority"], 70)
-        self.assertIn("News Trade 早期提醒", alerts[0]["speech"])
-        self.assertIn("多个平台", alerts[0]["body"])
+        self.assertEqual(alerts, [])
 
     def test_ended_or_old_news_trade_confirmation_never_alerts(self):
         topic = {

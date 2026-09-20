@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>星云社 · 事件流</title>
+    <link rel="icon" href="./favicon.ico?v=2" sizes="any" />
+    <script src="./desktop_adapter.js?v=2"></script>
+    <link rel="stylesheet" href="./styles.css?v=113" />
+    <link rel="stylesheet" href="./event-flow.css?v=3" />
+    <link rel="stylesheet" href="./event-flow-inbox.css?v=1" />
+  </head>
+  <body>
+    <main class="app-shell price-watch-shell event-flow-shell">
+      <header class="command-deck price-watch-deck">
+        <div class="topbar">
+          <div class="brand"><span class="brand-mark brand-logo"><img src="./assets/xingyunshe-logo.png?v=2" alt="星云社" /></span>
+            <div><p class="eyebrow">XINGYUN SOCIETY</p><h1>星云社</h1><span class="brand-subtitle">新闻交易事件流</span></div>
+          </div>
+          <nav class="page-nav" aria-label="页面导航">
+            <a class="nav-link" href="./index.html">热门榜</a>
+            <a class="nav-link" href="./gainers.html">涨幅榜</a>
+            <a class="nav-link" href="./turnover.html">成交额榜</a>
+            <a class="nav-link" href="./newboards.html">新币新股</a>
+            <a class="nav-link" href="./listings.html">上新IPO</a>
+            <a class="nav-link" href="./newsflash.html">聚合快讯</a>
+            <a class="nav-link" href="./briefs.html">自动简报</a>
+            <a class="nav-link" href="./rss.html">RSS订阅</a>
+            <a class="nav-link" href="./xwatch.html">X追踪</a>
+            <a class="nav-link" href="./price-watch.html">监控</a>
+            <a class="nav-link active" href="./event-flow.html" aria-current="page">事件流</a>
+            <a class="nav-link" href="./strategy.html">策略看盘</a>
+            <a class="nav-link" href="./todo.html">TodoList</a>
+            <a class="nav-link nav-discord" href="https://discord.gg/mKyCwtHW" target="_blank" rel="noreferrer noopener" aria-label="打开星云社 Discord 社区">Discord</a>
+          </nav>
+        </div>
+      </header>
+      <section class="event-flow-heading">
+        <div><p class="section-label">LIVE OPPORTUNITIES</p><h2>实时事件流</h2><p>可交易机会、尚未发币的大 MEME 潜力事件、前高预警与突破，合并呈现在这里。</p></div>
+        <span id="eventFlowStatus" role="status">正在读取事件记录</span>
+      </section>
+      <p id="eventFlowCount" class="event-flow-count"></p>
+      <section id="eventFlowList" class="price-watch-grid is-events event-flow-list" aria-label="事件时间线">
+        <div class="price-watch-empty"><b>正在读取记录</b><span>只展示已有消息与研判；未发币事件会明确标注，不会被当作可交易标的。</span></div>
+      </section>
+      <button id="eventFlowOlder" class="action-button event-flow-older" type="button" hidden>更多当前机会</button>
+      <p class="event-flow-footnote">后台保留历史记录，但不在这里补展示旧机会。“未发币 / 尚无可交易标的”只代表事件值得继续追踪，不触发买入；每笔交易仍须你确认。</p>
+      <details id="alertArchive" class="alert-inbox">
+        <summary>未读播报与投递记录 <span id="unreadCount">—</span></summary>
+        <p>错过的提醒保留在这里；过期记录不代表现在仍有交易机会。</p>
+        <div class="toolbar"><div><button data-filter="unread" aria-pressed="true">未读</button><button data-filter="all" aria-pressed="false">全部记录</button></div><span id="status" role="status">正在读取</span></div>
+        <section id="list" aria-label="播报记录"></section><button id="older" hidden>更早的记录</button>
+      </details>
+    </main>
+    <script src="./wallets.js?v=6"></script>
+    <script src="./auth.js?v=19"></script>
+  <script src="./monitor-buy-core.js?v=6"></script>
+  <script src="./monitor-buy.js?v=22"></script>
+    <script src="./event-flow.js?v=4"></script>
+    <script src="./alert-inbox.js?v=2"></script>
+    <script src="./todo_reminder.js?v=2"></script>
+  </body>
+</html>

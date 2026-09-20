@@ -56,7 +56,7 @@
   }
 
   function isTotalBoardSource(source) {
-    return normalizedMarketRealm(source) === "crypto";
+    return normalizedMarketRealm(source) === "crypto" && source?.excludeFromTotal !== true;
   }
 
   function paginateTotalBoardEntries(rows, requestedPage, pageSize = 10) {

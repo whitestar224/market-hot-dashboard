@@ -317,17 +317,46 @@
   function buildVisualSignature(candles, selectedIndex, options = {}) {
     const rows = (Array.isArray(candles) ? candles : []).map(normalizeCandle);
     const index = clamp(Math.trunc(finite(selectedIndex)), 0, rows.length);
-    const prior = rows.slice(0, index);
-    if (prior.length < 24 || !rows[index]) return null;
+    if (index < 24 || !rows[index]) return null;
     const providedEma = Array.isArray(options.ema90) ? options.ema90.slice(0, index).map(finite) : null;
-    const completeEma = providedEma?.length === prior.length
+    const completeEma = providedEma?.length === index
       ? providedEma
-      : ema(prior.map((row) => row.close), 90);
+      : ema(rows.slice(0, index).map((row) => row.close), 90);
+    return buildPreparedVisualSignature(rows, completeEma, index, options);
+  }
+
+  // The private, detached snapshot belongs to one analysis. Public standalone
+  // calls above always prepare fresh inputs, even when array identities repeat.
+  function createVisualSignatureBuilder(candles, ema90) {
+    const rows = (Array.isArray(candles) ? candles : []).map(normalizeCandle);
+    // Preserve map(finite)'s index fallback for invalid EMA entries.
+    const providedEma = Array.isArray(ema90) ? ema90.map(finite) : null;
+    let calculatedEma = null;
+    const fallbackEma = () => {
+      if (!calculatedEma) calculatedEma = ema(rows.map((row) => row.close), 90);
+      return calculatedEma;
+    };
+    return function buildSignature(selectedIndex, options = {}) {
+      const index = clamp(Math.trunc(finite(selectedIndex)), 0, rows.length);
+      if (index < 24 || !rows[index]) return null;
+      const override = options.ema90;
+      let completeEma;
+      if (override !== undefined && override !== ema90) {
+        const overrideEma = Array.isArray(override) ? override.slice(0, index).map(finite) : null;
+        completeEma = overrideEma?.length === index ? overrideEma : fallbackEma();
+      } else {
+        completeEma = providedEma?.length >= index ? providedEma : fallbackEma();
+      }
+      return buildPreparedVisualSignature(rows, completeEma, index, options);
+    };
+  }
+
+  function buildPreparedVisualSignature(rows, completeEma, index, options) {
     const requestedWindows = [...new Set((options.windows || DEFAULT_WINDOWS).map((value) => Math.max(24, Math.trunc(finite(value)))))];
-    const triggerPrice = finite(options.triggerPrice, prior.at(-1).close);
+    const triggerPrice = finite(options.triggerPrice, rows[index - 1].close);
     const windows = requestedWindows.map((span) => {
-      const length = Math.min(span, prior.length);
-      return encodeWindow(prior.slice(-length), completeEma.slice(-length), span, triggerPrice, "context");
+      const start = index - Math.min(span, index);
+      return encodeWindow(rows.slice(start, index), completeEma.slice(start, index), span, triggerPrice, "context");
     }).filter(Boolean);
     const requestedStart = Math.trunc(finite(options.structureStartIndex, -1));
     const structureStartIndex = requestedStart >= 0 && requestedStart <= index - 12
@@ -335,14 +364,14 @@
       : -1;
     let structure = null;
     if (structureStartIndex >= 0) {
-      const focusRows = prior.slice(structureStartIndex);
+      const focusRows = rows.slice(structureStartIndex, index);
       const focusEma = ema(focusRows.map((row) => row.close), 90);
       const focusWindow = encodeWindow(focusRows, focusEma, "focus", triggerPrice, "focus");
       if (focusWindow) windows.unshift(focusWindow);
       structure = {
         source: String(options.structureSource || "strategy"),
         startIndex: structureStartIndex,
-        startTime: prior[structureStartIndex].time,
+        startTime: rows[structureStartIndex].time,
         bars: index - structureStartIndex,
       };
     }
@@ -351,7 +380,7 @@
       model: "causal-kline-structure-raster-v2",
       interval: String(options.interval || ""),
       selectedCandleTime: rows[index].time,
-      featureCutoffTime: prior.at(-1).closeTime,
+      featureCutoffTime: rows[index - 1].closeTime,
       causality: "completed-candles-before-selected-index-only",
       structure,
       windows,
@@ -426,6 +455,7 @@
     VERSION,
     DEFAULT_WINDOWS,
     buildVisualSignature,
+    createVisualSignatureBuilder,
     compareVisualSignatures,
   });
 });

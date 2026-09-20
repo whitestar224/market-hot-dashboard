@@ -119,6 +119,44 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["monitorMode"], "parallel-priority")
         self.assertEqual(payload["summary"]["available"], 2)
 
+    def test_stale_snapshot_still_checks_a_never_delivered_structure_observation(self):
+        rows = [{"symbol": "ZHONGJI", "name": "ZHONGJI"}]
+        cache_key = server.price_structure_cache_key(rows)
+        previous = {
+            "symbol": "ZHONGJI",
+            "checkedAt": 1,
+            "frames": [{"key": "5m", "pattern": "盘整突破", "pending": {"id": "pending"}}],
+            "signals": [],
+        }
+        fresh = {
+            **previous,
+            "checkedAt": server.MONITOR_ALERT_REPLAY_MAX_GAP_MS + 2,
+        }
+        with server.PRICE_STRUCTURE_CACHE_LOCK:
+            original_cache = dict(server.PRICE_STRUCTURE_CACHE)
+            server.PRICE_STRUCTURE_CACHE.clear()
+            server.PRICE_STRUCTURE_CACHE[cache_key] = (0, {"items": [previous]})
+        try:
+            with patch.object(server, "fetch_price_structure_item", return_value=fresh), patch.object(
+                server, "price_structure_excluded_symbols", return_value=set()
+            ), patch.object(
+                server, "suppress_price_structure_replay_alerts"
+            ) as suppress, patch.object(
+                server, "launch_price_structure_first_observation_alerts", return_value=1
+            ) as first_observation, patch.object(
+                server, "launch_price_structure_strategy_alerts"
+            ) as strategy_alert, patch.object(server, "write_json_cache"):
+                payload = server.refresh_price_structure_strategy_monitor_item(rows[0], rows)
+        finally:
+            with server.PRICE_STRUCTURE_CACHE_LOCK:
+                server.PRICE_STRUCTURE_CACHE.clear()
+                server.PRICE_STRUCTURE_CACHE.update(original_cache)
+
+        suppress.assert_called_once()
+        first_observation.assert_called_once_with(fresh, previous)
+        strategy_alert.assert_not_called()
+        self.assertEqual(payload["summary"]["alerts"], 1)
+
     def test_hot_coin_monitor_uses_shared_dragon_wave_engine_for_all_six_frames(self):
         market_rows = candles([100 + index * 0.05 for index in range(120)])
         strategy_frames = [
@@ -353,7 +391,7 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         }
         payload = {
             "items": [
-                {"symbol": "HEMI", "provider": "Binance Futures", "checkedAt": now_ms - 1_000, "frames": [fresh_pending], "broadcastEligibility": {"eligible": True, "allowedIntervals": []}},
+                {"symbol": "HEMI", "provider": "Binance Futures", "checkedAt": now_ms - 1_000, "frames": [fresh_pending], "broadcastEligibility": {"eligible": False, "reason": "low-quality", "allowedIntervals": []}},
                 {"symbol": "OLD", "provider": "OKX Swap", "checkedAt": now_ms - 999_000, "frames": [fresh_pending], "broadcastEligibility": {"eligible": True, "allowedIntervals": []}},
                 {
                     "symbol": "DONE", "provider": "OKX Swap", "checkedAt": now_ms - 1_000,
@@ -445,12 +483,13 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         launch.assert_not_called()
 
     def test_prearm_monitor_updates_background_health_status_even_without_page(self):
+        started_at = int(time.time() * 1000)
         with patch.object(server, "price_structure_prearm_candidates", return_value=[]):
             result = server.price_structure_prearm_monitor_once()
 
         self.assertEqual(result["candidates"], 0)
         health = server.health_payload()["monitors"]
-        self.assertGreater(health["structurePrearmStatus"]["lastRunAt"], int(time.time() * 1000) - 2_000)
+        self.assertGreaterEqual(health["structurePrearmStatus"]["lastRunAt"], started_at)
         self.assertEqual(health["structurePrearmForecastMinutes"], 10)
 
     def test_structure_only_frames_never_emit_a_desktop_alert(self):
@@ -505,6 +544,36 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         self.assertEqual(alert["excludeSymbol"], "CHIP")
         self.assertEqual(alert["excludeLabel"], "剔除结构")
         self.assertEqual(alert["excludeAction"], "exclude_structure")
+
+    def test_wallet_origin_first_structure_opens_wallet_token_page(self):
+        current = {
+            "symbol": "JACOB",
+            "provider": "Binance Futures",
+            "chain": "4663",
+            "contractAddress": "0x3df3644bcf4ce0d993e18c86c3080e53bfea06f1",
+            "structureMembershipSources": ["币安钱包4H"],
+            "checkedAt": 2_000,
+            "frames": [{
+                "key": "5m", "label": "5分钟", "pattern": "盘整突破",
+                "stage": "结构观察", "confidence": 82,
+            }],
+        }
+        with patch.object(server, "price_structure_symbol_excluded", return_value=False), patch.object(
+            server, "price_structure_broadcast_allowed", return_value=True
+        ), patch.object(server, "price_structure_alert_interval_allowed", return_value=True), patch.object(
+            server, "claim_price_structure_observation_alert", return_value=True
+        ), patch.object(
+            server, "launch_desktop_alert", return_value={"queued": True}
+        ) as launch:
+            count = server.launch_price_structure_first_observation_alerts(current, None)
+
+        self.assertEqual(count, 1)
+        alert_url = launch.call_args.args[0]["url"]
+        self.assertIn(
+            "web3.binance.com/en/token/robinhood/0x3df3644bcf4ce0d993e18c86c3080e53bfea06f1",
+            alert_url,
+        )
+        self.assertNotIn("/futures/", alert_url)
 
     def test_closed_bar_signal_is_not_replayed_but_live_buy_trigger_is_alerted(self):
         base = {
@@ -988,7 +1057,7 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         self.assertEqual(server.PRICE_MONITOR_ACTIVITY_SUMMARY["excluded"], 1)
         self.assertEqual(server.PRICE_MONITOR_ACTIVITY_SUMMARY["thresholdUsd"], 10_000_000)
 
-    def test_contract_turnover_replaces_same_ticker_cex_activity(self):
+    def test_low_turnover_onchain_contract_is_kept_despite_same_ticker_cex_activity(self):
         rows = [{
             "symbol": "FGL",
             "chain": "4663",
@@ -1010,9 +1079,53 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         ) as onchain:
             filtered = server.filter_price_monitor_rows_by_activity(rows)
 
-        self.assertEqual(filtered, [])
+        self.assertEqual([row["symbol"] for row in filtered], ["FGL"])
         self.assertEqual(onchain.call_args.kwargs["contract_address"], rows[0]["contractAddress"])
         self.assertEqual(onchain.call_args.kwargs["chain"], "4663")
+
+    def test_onchain_activity_reports_turnover_without_applying_the_cex_floor(self):
+        with patch.object(server, "price_structure_onchain_pool", return_value={
+            "network": "bsc",
+            "poolAddress": "0xpool",
+            "contractAddress": "0xasset",
+            "volume24hUsd": 250_000,
+            "source": "DexScreener 链上主池",
+            "poolCount": 1,
+        }):
+            state = server.price_structure_onchain_activity_state(
+                "THIN", contract_address="0xasset", chain="56"
+            )
+
+        self.assertTrue(state["active"])
+        self.assertEqual(state["turnover24hUsd"], 250_000)
+        self.assertIsNone(state["thresholdUsd"])
+        self.assertFalse(state["turnoverGateApplied"])
+
+    def test_onchain_resolver_outage_does_not_fall_back_to_the_cex_turnover_gate(self):
+        row = {
+            "symbol": "CHAINONLY",
+            "chain": "56",
+            "contractAddress": "0xchainonly",
+        }
+        unavailable = {
+            "active": True,
+            "status": "unavailable",
+            "reason": "onchain-activity-unavailable-keep",
+            "turnover24hUsd": None,
+            "thresholdUsd": None,
+            "turnoverGateApplied": False,
+        }
+        with patch.object(
+            server,
+            "fetch_new_coin_low_market_activity",
+            return_value={"CHAINONLY": {"turnover24hUsd": 500_000, "source": "Binance"}},
+        ), patch.object(
+            server, "price_structure_onchain_activity_state", return_value=unavailable
+        ):
+            filtered = server.filter_price_monitor_rows_by_activity([row])
+
+        self.assertEqual([item["symbol"] for item in filtered], ["CHAINONLY"])
+        self.assertEqual(filtered[0]["marketActivity"]["status"], "unavailable")
 
     def test_unicode_contract_symbols_keep_independent_onchain_activity(self):
         rows = [
@@ -1038,26 +1151,30 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         ):
             filtered = server.filter_price_monitor_rows_by_activity(rows)
 
-        self.assertEqual([row["symbol"] for row in filtered], ["金猫"])
+        self.assertEqual([row["symbol"] for row in filtered], ["彩礼币", "金猫"])
 
-    def test_broadcast_qualification_rejects_formal_and_prearm_exits(self):
+    def test_monitored_structure_alerts_ignore_coin_quality_rejection(self):
         rejected = {"eligible": False, "reason": "deep-legacy-no-new-wave", "allowedIntervals": []}
+        now_ms = int(time.time() * 1000)
         item = {
             "symbol": "BEAT",
+            "monitorPool": "aicoin-x-wallet",
+            "structureMembershipSources": [],
             "broadcastEligibility": rejected,
             "signals": [{
                 "id": "beat-5m", "interval": "5m", "label": "5分钟",
-                "decisionTime": 1_740_226_620_000, "pattern": "横盘起飞",
+                "decisionTime": now_ms, "barsAgo": 0, "pattern": "横盘起飞",
                 "certainty": 99, "grade": "A+", "price": 0.44,
             }],
         }
         candidate = {
             "id": "beat-prearm", "symbol": "BEAT", "interval": "5m",
+            "monitorPool": "aicoin-x-wallet",
             "triggerPrice": 0.45, "certainty": 99, "grade": "A+",
             "broadcastEligibility": rejected,
         }
         with patch.object(server, "price_structure_symbol_excluded", return_value=False), patch.object(
-            server, "launch_desktop_alert"
+            server, "launch_desktop_alert", return_value={"queued": True}
         ) as launch:
             formal_count = server.launch_price_structure_strategy_alerts(item)
             prearm = server.launch_price_structure_prearm_alert(
@@ -1065,10 +1182,9 @@ class PriceStructureRecognitionTests(unittest.TestCase):
                 {"price": 0.448, "speedPctPerMinute": 0.2, "upRatio": 0.8},
             )
 
-        self.assertEqual(formal_count, 0)
-        self.assertTrue(prearm["skipped"])
-        self.assertEqual(prearm["reason"], "broadcast qualification rejected")
-        launch.assert_not_called()
+        self.assertEqual(formal_count, 1)
+        self.assertTrue(prearm["queued"])
+        self.assertEqual(launch.call_count, 2)
 
 
 if __name__ == "__main__":

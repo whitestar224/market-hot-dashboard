@@ -65,7 +65,7 @@ class PriceWatchPriorHighExclusionTests(unittest.TestCase):
 
         self.assertTrue(payload["ok"])
         self.assertFalse(payload["exclusion"]["priorHighEnabled"])
-        self.assertEqual(payload["exclusion"]["restoreRule"], "leave_then_reenter_or_manual_readd")
+        self.assertEqual(payload["exclusion"]["restoreRule"], "manual_readd_only")
         with server.auth_db() as conn:
             asset = conn.execute(
                 "SELECT prior_high_excluded_at, prior_high_absent_at FROM price_watch_assets WHERE symbol = 'TEST'"
@@ -93,6 +93,43 @@ class PriceWatchPriorHighExclusionTests(unittest.TestCase):
         self.assertIsNone(fib_state)
         self.assertIsNotNone(global_exclusion)
         self.assertEqual(server.price_watch_active_rows(), [])
+
+    def test_temporary_exclusion_waits_for_leave_then_reentry(self):
+        self.insert_asset()
+
+        result = server.temporarily_exclude_monitor_symbol("TEST")
+        archived_at = result["archivedAt"]
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "temporary")
+        with server.auth_db() as conn:
+            row = dict(conn.execute(
+                "SELECT * FROM price_watch_assets WHERE symbol = 'TEST'"
+            ).fetchone())
+            self.assertIsNone(conn.execute(
+                "SELECT 1 FROM price_structure_exclusions WHERE symbol = 'TEST'"
+            ).fetchone())
+
+        # A ranking timestamp that merely keeps advancing while the item stays
+        # on the board must not undo the temporary removal.
+        row["aicoin_last_seen_at"] = archived_at + 1
+        self.assertEqual(
+            server.filter_price_monitor_cold_archives([row], now_ms=archived_at + 2),
+            [],
+        )
+
+        # Once the old membership has actually gone stale, the archive arms;
+        # the next genuinely fresh ranking observation restores the item.
+        absent_at = archived_at + server.PRICE_MONITOR_SOURCE_GRACE_SECONDS["aicoin"] * 1000 + 2
+        self.assertEqual(
+            server.filter_price_monitor_cold_archives([row], now_ms=absent_at),
+            [],
+        )
+        row["aicoin_last_seen_at"] = absent_at + 1
+        self.assertEqual(
+            server.filter_price_monitor_cold_archives([row], now_ms=absent_at + 2),
+            [row],
+        )
 
     def test_excluded_symbol_stays_out_after_aicoin_source_flaps_and_reentry(self):
         self.insert_asset()

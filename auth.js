@@ -25,7 +25,16 @@
   }
 
   function navNode() {
-    return document.querySelector(".page-nav");
+    const topbar = document.querySelector(".topbar");
+    if (!topbar || !topbar.querySelector(".page-nav")) return null;
+    let utilities = topbar.querySelector(".topbar-utilities");
+    if (!utilities) {
+      utilities = document.createElement("div");
+      utilities.className = "topbar-utilities";
+      utilities.setAttribute("aria-label", "账户与钱包");
+      topbar.appendChild(utilities);
+    }
+    return utilities;
   }
 
   function removeExistingPill() {

@@ -64,7 +64,7 @@ class PriceStructureExclusionTests(unittest.TestCase):
         result = server.exclude_price_structure_symbol("TEST")
 
         self.assertTrue(result["ok"])
-        self.assertEqual(result["restoreRule"], "leave_then_reenter_or_manual_readd")
+        self.assertEqual(result["restoreRule"], "manual_readd_only")
         with server.auth_db() as conn:
             exclusion = conn.execute(
                 "SELECT excluded_at, absent_at FROM price_structure_exclusions WHERE symbol = 'TEST'"
@@ -112,8 +112,8 @@ class PriceStructureExclusionTests(unittest.TestCase):
                 FROM price_structure_exclusions WHERE symbol = 'TEST'
                 """
             ).fetchone()
-        self.assertGreater(absent["absent_at"], 0)
-        self.assertEqual(absent["absent_confirmations"], 1)
+        self.assertEqual(absent["absent_at"], 0)
+        self.assertEqual(absent["absent_confirmations"], 0)
 
         with patch.object(server, "strategy_active_adaptive_contexts", return_value=[]), patch.object(
             server, "price_watch_active_rows", return_value=[]
@@ -132,7 +132,7 @@ class PriceStructureExclusionTests(unittest.TestCase):
         self.assertEqual(reset["absent_confirmations"], 0)
         self.assertEqual(reset["last_absent_at"], 0)
 
-    def test_confirmed_aicoin_leave_then_reentry_restores_symbol(self):
+    def test_confirmed_aicoin_reentry_needs_explicit_manual_readd(self):
         with server.auth_db() as conn:
             conn.execute(
                 """
@@ -160,7 +160,10 @@ class PriceStructureExclusionTests(unittest.TestCase):
             source_is_current=True,
             now_ms=base_ms + minimum_ms + 1_000,
         )
-        self.assertNotIn("TEST", restored)
+        self.assertIn("TEST", restored)
+        self.assertTrue(server.price_structure_symbol_excluded("TEST"))
+        with patch.object(server.threading, "Thread"), patch.object(server, "price_watch_payload", return_value={}):
+            server.add_price_watch_symbol("TEST")
         self.assertFalse(server.price_structure_symbol_excluded("TEST"))
         with server.auth_db() as conn:
             asset = conn.execute(

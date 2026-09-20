@@ -25,6 +25,14 @@ const nodes = {
   stock: document.querySelector("#rankingStock")
 };
 
+function renderLive(node, html) {
+  if (!node) return false;
+  if (window.XingyunLiveDom?.render) return window.XingyunLiveDom.render(node, html);
+  if (node.innerHTML === html) return false;
+  node.innerHTML = html;
+  return true;
+}
+
 const groupLabels = {
   crypto: "币圈",
   aicoin: "AIcoin",
@@ -459,9 +467,10 @@ function renderRow(row, index, board) {
   const url = escapeHtml(row.targetUrl || "#");
   const sourceTag = escapeHtml(row.sourceLabel || groupLabels[row.group] || "MK");
   const insight = renderInsight(row, row.source || board, index + 1);
+  const liveKey = `${row.sourceId || row.source || board?.id || board?.title || "ranking"}:${row.contractAddress || row.address || row.symbol || row.name || index}`;
 
   return `
-    <a class="rank-row rank-row-link ranking-row" href="${url}" target="_blank" rel="noreferrer" title="打开 ${symbol} 交易/行情页面">
+    <a class="rank-row rank-row-link ranking-row" data-live-key="row:${escapeHtml(liveKey)}" href="${url}" target="_blank" rel="noreferrer" title="打开 ${symbol} 交易/行情页面">
       <div class="rank-badge">${index + 1}</div>
       <div class="asset-cell">
         ${renderAssetIcon(row, row.source)}
@@ -488,7 +497,7 @@ function renderBoard(board, index) {
     : `<div class="empty-state"><b>${modeConfig.empty}</b><span>可以切换市场筛选或刷新榜单。</span></div>`;
 
   return `
-    <article class="board-card ranking-board" style="--accent: ${board.accent}; --delay: ${index * 45}ms">
+    <article class="board-card ranking-board" data-live-key="board:${escapeHtml(board.id || board.title)}" style="--accent: ${board.accent}; --delay: ${index * 45}ms">
       <header class="board-head">
         <div>
           <p>${modeConfig.title}</p>
@@ -520,10 +529,10 @@ function render() {
   renderMetrics();
   const boards = buildBoards();
   if (!boards.some((board) => board.rows.length)) {
-    nodes.grid.innerHTML = `<div class="loading-panel">${modeConfig.empty}</div>`;
+    renderLive(nodes.grid, `<div class="loading-panel">${modeConfig.empty}</div>`);
     return;
   }
-  nodes.grid.innerHTML = boards.map(renderBoard).join("");
+  renderLive(nodes.grid, boards.map(renderBoard).join(""));
   requestAiInsights(boards);
 }
 
@@ -600,6 +609,10 @@ nodes.filter?.addEventListener("click", (event) => {
 });
 
 nodes.refresh?.addEventListener("click", () => loadRankingData({ refresh: true }));
+
+window.addEventListener("xingyun:rank-ai-toggle", () => {
+  render();
+});
 
 updateClock();
 setInterval(updateClock, 1000);

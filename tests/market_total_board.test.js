@@ -69,6 +69,7 @@ test("case-sensitive Solana contracts are never collapsed together", () => {
 test("total board accepts crypto sources and excludes all stock markets", () => {
   assert.equal(isTotalBoardSource({ group: "crypto" }), true);
   assert.equal(isTotalBoardSource({ group: "aicoin" }), true);
+  assert.equal(isTotalBoardSource({ group: "crypto", excludeFromTotal: true }), false);
   assert.equal(isTotalBoardSource({ group: "cn" }), false);
   assert.equal(isTotalBoardSource({ group: "hk" }), false);
   assert.equal(isTotalBoardSource({ group: "us" }), false);

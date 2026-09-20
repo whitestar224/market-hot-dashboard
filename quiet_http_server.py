@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
+import dragon_wave_release as strategy_release
 
 try:
     import requests
@@ -26,7 +27,7 @@ FEEDBACK_DB = ROOT / ".runtime-cache" / "dragon_wave_feedback.db"
 PRECOMPUTED_ROOT = ROOT / ".runtime-cache" / "dragon-wave-precomputed"
 PRECOMPUTE_SCRIPT = ROOT / "tools" / "precompute_dragon_wave_cases.js"
 PRECOMPUTE_CASES = ROOT / "dragon-wave-cases.js"
-PRECOMPUTE_DEFAULT_VERSION = os.getenv("DRAGON_WAVE_PRECOMPUTE_VERSION", "v89").strip()
+PRECOMPUTE_DEFAULT_VERSION = os.getenv("DRAGON_WAVE_PRECOMPUTE_VERSION", "v91").strip()
 PRECOMPUTE_PROCESS_LOCK = threading.Lock()
 PRECOMPUTE_PROCESSES = {}
 FEEDBACK_LOCK = threading.Lock()
@@ -286,9 +287,11 @@ def precomputed_lookup(query):
     manifest_path = version_root / "manifest.json"
     if not manifest_path.is_file():
         return None
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
+    manifest = strategy_release.read_manifest(PRECOMPUTED_ROOT, version)
+    if version == strategy_release.CURRENT_VERSION and not strategy_release.complete_case(
+        PRECOMPUTED_ROOT, version, pair, start, end, market, stage,
+        engine_sha256=strategy_release.ENGINE_SHA256,
+    ):
         return None
     key = "|".join((version, pair, start, end, interval, market, stage))
     record = (manifest.get("records") or {}).get(key)
@@ -338,7 +341,14 @@ def precompute_manifest_complete(version):
     manifest_path = PRECOMPUTED_ROOT / version / "manifest.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        return (manifest.get("status") or {}).get("state") == "complete"
+        status = manifest.get("status") or {}
+        if status.get("state") == "complete":
+            return True
+        # An offline full-catalog attempt with missing candles is finished, not a
+        # reason to restart the same failed work every ten seconds.
+        return version == strategy_release.CURRENT_VERSION and status.get("state") == "partial" \
+            and status.get("localOnly") is True and bool(status.get("finishedAt")) \
+            and status.get("processedCases") == status.get("totalCases") == len(historical_precompute_cases())
     except (OSError, ValueError, json.JSONDecodeError):
         return False
 
@@ -446,12 +456,58 @@ def seed_confirmed_precompute_requests(version):
     return queued
 
 
+def precompute_autostart_enabled():
+    # A separately launched full-catalog run owns its own lock and lifetime.
+    # Keep the local data/display server available without spawning competing
+    # interactive warmers or preempting the batch during this maintenance mode.
+    return os.getenv("DRAGON_WAVE_PRECOMPUTE_AUTOSTART", "1").strip().lower() not in {"0", "false", "off"}
+
+
+def precompute_process_alive(pid):
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        # os.kill is not a portable liveness probe on Windows. Query only.
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        try:
+            code = wintypes.DWORD()
+            return bool(kernel.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def ensure_precompute_running(version, force=False, preempt=False):
+    if not precompute_autostart_enabled():
+        return False
     if not PRECOMPUTED_VERSION_RE.fullmatch(version) or not PRECOMPUTE_SCRIPT.is_file():
         return False
     node = shutil.which("node.exe") or shutil.which("node")
     if not node:
         return False
+    if version == strategy_release.CURRENT_VERSION:
+        preempt = False
+        # A separately started full-case publisher owns this lock too. Do not
+        # spawn competing processes when a page requests an unfinished case.
+        try:
+            owner = json.loads((PRECOMPUTED_ROOT / f"{version}.lock").read_text(encoding="utf-8"))
+            if precompute_process_alive(int(owner["pid"])):
+                return True
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
     with PRECOMPUTE_PROCESS_LOCK:
         current = PRECOMPUTE_PROCESSES.get(version)
         if current and current["process"].poll() is None:
@@ -470,7 +526,7 @@ def ensure_precompute_running(version, force=False, preempt=False):
             current["stdout"].close()
             current["stderr"].close()
             PRECOMPUTE_PROCESSES.pop(version, None)
-        if not force and precompute_manifest_complete(version):
+        if (not force or version == strategy_release.CURRENT_VERSION) and precompute_manifest_complete(version):
             return False
         PRECOMPUTED_ROOT.mkdir(parents=True, exist_ok=True)
         stdout = (PRECOMPUTED_ROOT / f"{version}.stdout.log").open("ab", buffering=0)
@@ -480,7 +536,8 @@ def ensure_precompute_running(version, force=False, preempt=False):
             creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
         try:
             process = subprocess.Popen(
-                [node, str(PRECOMPUTE_SCRIPT), f"--version={version}"],
+                [node, str(PRECOMPUTE_SCRIPT), f"--version={version}"]
+                + (["--full-batch", "--local-only"] if version == strategy_release.CURRENT_VERSION else []),
                 cwd=str(ROOT), stdout=stdout, stderr=stderr, creationflags=creation_flags,
             )
         except OSError:
@@ -492,6 +549,8 @@ def ensure_precompute_running(version, force=False, preempt=False):
 
 
 def supervise_precompute():
+    if not precompute_autostart_enabled():
+        return
     time.sleep(1)
     seed_confirmed_precompute_requests(PRECOMPUTE_DEFAULT_VERSION)
     while True:
@@ -1108,6 +1167,21 @@ class QuietHandler(SimpleHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(error)}, 400)
             except RuntimeError as error:
                 self.send_json({"ok": False, "error": str(error)}, 502)
+            return
+        if path == "/api/dragon-wave-release":
+            try:
+                query = parse_qs(parsed.query)
+                query["version"] = [strategy_release.CURRENT_VERSION]
+                query.setdefault("interval", ["1h"])
+                precomputed_lookup(query)  # Validate all request fields without writing.
+                self.send_json(strategy_release.resolve_case(
+                    PRECOMPUTED_ROOT, query["pair"][0].upper().strip(),
+                    query["start"][0].strip(), query["end"][0].strip(),
+                    (query.get("market") or ["futures"])[0].lower().strip(),
+                    (query.get("stage") or ["active"])[0].lower().strip(),
+                ))
+            except (ValueError, KeyError) as error:
+                self.send_json({"ok": False, "error": str(error)}, 400)
             return
         if path == "/api/dragon-wave-precomputed":
             try:
