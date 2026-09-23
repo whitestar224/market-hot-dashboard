@@ -166,6 +166,7 @@ class GmgnTrenchHotBoardTests(unittest.TestCase):
             fetch_live.assert_called_once()
             self.assertEqual(fetch_live.call_args.kwargs["page_size"], 480)
             self.assertIsNone(fetch_live.call_args.kwargs["per_network_limit"])
+            self.assertTrue(fetch_live.call_args.kwargs["include_recent_rank_supplement"])
             self.assertTrue(history_path.exists())
             self.assertEqual(source["id"], "gmgn-trenches")
             self.assertTrue(source["scrollableHistory"])
@@ -187,6 +188,17 @@ class GmgnTrenchHotBoardTests(unittest.TestCase):
         row = trench_row("OLD", "OldContract123", 1_800_000_000_000)
         row.pop("filterSignals")
         self.assertEqual(server.gmgn_trench_board_rows([row]), [])
+
+    def test_base_history_is_removed_from_the_five_chain_board(self):
+        observed_at = 1_800_000_000_000
+        base = trench_row(
+            "BASEOLD",
+            "0x" + "a" * 40,
+            observed_at,
+            network="base",
+        )
+
+        self.assertEqual(server.gmgn_trench_board_rows([base], current_rows=[base]), [])
 
     def test_market_response_overlays_latest_gmgn_board_without_waiting_for_all_sources(self):
         stale = {"id": "gmgn-trenches", "rows": [{"symbol": "OLD"}]}

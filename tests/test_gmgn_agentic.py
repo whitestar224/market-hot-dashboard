@@ -10,6 +10,7 @@ from gmgn_agentic import (
     GmgnRateLimitError,
     GMGN_PUBLIC_READONLY_API_KEY,
     fetch_gmgn_migrated_trenches,
+    fetch_gmgn_recent_market_rank,
     gmgn_trench_passes_chain_filters,
     normalize_gmgn_migrated_trenches,
 )
@@ -164,6 +165,77 @@ class GmgnAgenticTests(unittest.TestCase):
 
         completed = session.post.call_args.kwargs["json"]["completed"]
         self.assertNotIn("quote_address_type", completed)
+
+    def test_recent_market_rank_supplements_all_opened_tokens_before_local_filters(self):
+        response = Mock(status_code=200)
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "code": 0,
+            "data": {
+                "rank": [
+                    {
+                        "address": "0x" + "1" * 40,
+                        "symbol": "OGNEW",
+                        "is_og": 1,
+                        "launchpad_status": 1,
+                        "open_timestamp": NOW // 1000 - 120,
+                        "market_cap": 25_000,
+                        "twitter_username": "ognew",
+                    },
+                    {
+                        "address": "0x" + "2" * 40,
+                        "symbol": "NONOG",
+                        "is_og": 0,
+                        "launchpad_status": 1,
+                        "open_timestamp": NOW // 1000 - 180,
+                        "market_cap": 30_000,
+                        "website": "https://nonog.example",
+                    },
+                    {
+                        "address": "0x" + "3" * 40,
+                        "symbol": "NOTOPEN",
+                        "launchpad_status": 0,
+                        "creation_timestamp": NOW // 1000 - 60,
+                        "market_cap": 40_000,
+                    },
+                ],
+            },
+        }
+        session = Mock()
+        session.get.return_value = response
+
+        with patch("gmgn_agentic._wait_for_readonly_slot"):
+            payload = fetch_gmgn_recent_market_rank("bsc", session=session)
+
+        params = session.get.call_args.kwargs["params"]
+        self.assertEqual(params["order_by"], "creation_timestamp")
+        self.assertEqual(params["direction"], "desc")
+        self.assertEqual(params["min_marketcap"], 10_000)
+        self.assertEqual(params["filters"], ["has_social"])
+        self.assertEqual(
+            [row["symbol"] for row in payload["data"]["completed"]],
+            ["OGNEW", "NONOG"],
+        )
+        self.assertEqual(payload["_gmgnMeta"]["sourceRoute"], "market-rank-recent-opened")
+
+    def test_recent_market_rank_forwards_age_window_for_busy_chain_backfill(self):
+        response = Mock(status_code=200)
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"code": 0, "data": {"rank": []}}
+        session = Mock()
+        session.get.return_value = response
+
+        with patch("gmgn_agentic._wait_for_readonly_slot"):
+            fetch_gmgn_recent_market_rank(
+                "solana",
+                min_created="2h",
+                max_created="6h",
+                session=session,
+            )
+
+        params = session.get.call_args.kwargs["params"]
+        self.assertEqual(params["min_created"], "2h")
+        self.assertEqual(params["max_created"], "6h")
 
     def test_arc_opened_tape_uses_official_rank_without_hardcoded_allowlists(self):
         response = Mock(status_code=200)
@@ -566,10 +638,10 @@ class GmgnAgenticTests(unittest.TestCase):
         self.assertEqual(rows[0]["filterSignals"]["quoteAddressType"], 26)
         self.assertTrue(gmgn_trench_passes_chain_filters(rows[0]))
 
-    def test_scanner_scope_is_exactly_the_six_requested_chains(self):
+    def test_scanner_scope_is_exactly_the_five_requested_chains_without_base(self):
         self.assertEqual(
             ONCHAIN_RESEARCH_DEFAULT_NETWORKS,
-            ("eth", "solana", "robinhood", "arc", "base", "bsc"),
+            ("eth", "solana", "robinhood", "arc", "bsc"),
         )
 
     def test_gmgn_covers_chain_when_binance_trenches_is_unsupported(self):

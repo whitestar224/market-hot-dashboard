@@ -26,7 +26,7 @@ from gmgn_agentic import (
     GmgnUnsupportedNetworkError,
     annotate_gmgn_non_og_exceptions,
     fetch_gmgn_migrated_trenches,
-    fetch_gmgn_non_og_market_rank,
+    fetch_gmgn_recent_market_rank,
     gmgn_api_key_status,
     gmgn_cooldown_status,
     gmgn_trench_passes_chain_filters,
@@ -83,7 +83,7 @@ TRADED_WEIGHTS = {
 }
 
 ONCHAIN_RESEARCH_SCORE_VERSION = "golden-dog-v3-cryptod-evidence"
-ONCHAIN_RESEARCH_DEFAULT_NETWORKS = ("eth", "solana", "robinhood", "arc", "base", "bsc")
+ONCHAIN_RESEARCH_DEFAULT_NETWORKS = ("eth", "solana", "robinhood", "arc", "bsc")
 ONCHAIN_RESEARCH_MEME_HINTS = frozenset(
     {
         "meme", "dog", "doge", "cat", "frog", "pepe", "inu", "shib", "baby",
@@ -1150,6 +1150,7 @@ def fetch_live_onchain_trenches(
     item_filter: Callable[[Mapping[str, Any]], bool] | None = None,
     per_network_limit: int | None = None,
     include_non_og_exceptions: bool = False,
+    include_recent_rank_supplement: bool = False,
 ) -> dict[str, Any]:
     """Read the current opened/migrated tape directly from GMGN and Binance."""
     observed = int(observed_at or _now_ms())
@@ -1166,20 +1167,41 @@ def fetch_live_onchain_trenches(
     source_status: dict[str, str] = {}
     errors: list[str] = []
     retry_after_seconds = 0
-    rank_networks = [network for network in selected_networks if network != "arc"] if include_non_og_exceptions else []
-    job_count = len(selected_networks) + len(rank_networks) + sum(
+    include_rank_supplement = include_recent_rank_supplement or include_non_og_exceptions
+    rank_jobs: list[tuple[str, str, str]] = []
+    if include_rank_supplement:
+        for network in selected_networks:
+            if network == "arc":
+                continue
+            rank_jobs.append((network, "", ""))
+            # SOL can produce more than the rank route's 100-row ceiling in a
+            # single busy hour.  Partition older launches by age so a burst
+            # cannot push the rest of GMGN's scroll history out of discovery.
+            if network == "solana":
+                rank_jobs.extend((
+                    (network, "30m", "2h"),
+                    (network, "2h", "6h"),
+                    (network, "6h", "24h"),
+                ))
+    job_count = len(selected_networks) + len(rank_jobs) + sum(
         1 for network in selected_networks if network in MEME_RUSH_CHAIN_IDS
     )
     with ThreadPoolExecutor(max_workers=max(1, min(9, job_count))) as executor:
         for network in selected_networks:
             if source_key != "binance":
                 jobs[executor.submit(fetch_gmgn_migrated_trenches, network)] = (network, "gmgn")
-                if network in rank_networks:
-                    jobs[executor.submit(fetch_gmgn_non_og_market_rank, network)] = (network, "gmgn-rank")
             if source_key != "gmgn" and network in MEME_RUSH_CHAIN_IDS:
                 jobs[executor.submit(fetch_binance_meme_rush, network, rank_types=(30,))] = (network, "binance")
             elif source_key == "binance" and network not in MEME_RUSH_CHAIN_IDS:
                 source_status[f"{network}/binance-meme-rush"] = "unsupported"
+        if source_key != "binance":
+            for network, min_created, max_created in rank_jobs:
+                jobs[executor.submit(
+                    fetch_gmgn_recent_market_rank,
+                    network,
+                    min_created=min_created,
+                    max_created=max_created,
+                )] = (network, "gmgn-rank")
         for future in as_completed(jobs):
             network, provider = jobs[future]
             provider_name = "gmgn-trenches" if provider in {"gmgn", "gmgn-rank"} else "binance-meme-rush"

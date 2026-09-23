@@ -55,6 +55,7 @@ from network_proxy import (
 from chain_ecosystem_monitor import (
     ChainEcosystemMonitor,
     ChainEcosystemStore,
+    ONCHAIN_RESEARCH_DEFAULT_NETWORKS,
     fetch_dexscreener_token,
     fetch_live_onchain_trenches,
     normalize_onchain_dexscreener,
@@ -12016,7 +12017,12 @@ def gmgn_trench_board_rows(
         "base": "BASE",
         "bsc": "BSC",
     }
-    filtered_history = [raw for raw in history_rows if gmgn_trench_passes_chain_filters(raw)]
+    filtered_history = [
+        raw for raw in history_rows
+        if clean_feed_text(raw.get("network") or raw.get("chain"), 40).lower()
+        in ONCHAIN_RESEARCH_DEFAULT_NETWORKS
+        and gmgn_trench_passes_chain_filters(raw)
+    ]
     current_contracts: set[str] = set()
     ordered_history: list[dict[str, Any]] = []
     seen_contracts: set[str] = set()
@@ -12030,10 +12036,16 @@ def gmgn_trench_board_rows(
         if (identity := gmgn_trench_history_identity(row))
     }
     if current_rows is not None:
-        realtime_current = gmgn_trench_realtime_rows(current_rows)
+        monitored_current = [
+            row for row in current_rows
+            if isinstance(row, dict)
+            and clean_feed_text(row.get("network") or row.get("chain"), 40).lower()
+            in ONCHAIN_RESEARCH_DEFAULT_NETWORKS
+        ]
+        realtime_current = gmgn_trench_realtime_rows(monitored_current)
         current_contracts = {
             identity
-            for row in current_rows
+            for row in monitored_current
             if isinstance(row, dict) and (identity := gmgn_trench_history_identity(row))
         }
         current_history = [
@@ -12101,13 +12113,14 @@ def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
     observed_at = int(time.time() * 1000)
     try:
         live_payload = fetch_live_onchain_trenches(
-            networks=("eth", "solana", "robinhood", "arc", "base", "bsc"),
+            networks=("eth", "solana", "robinhood", "arc", "bsc"),
             source="gmgn",
             page=1,
             page_size=480,
             observed_at=observed_at,
             item_filter=gmgn_trench_passes_chain_filters,
             per_network_limit=None,
+            include_recent_rank_supplement=True,
         )
     except Exception as exc:
         live_payload = {
@@ -12136,7 +12149,12 @@ def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
             else []
         )
         history_rows = merge_gmgn_trench_history(previous_rows, live_rows, observed_at=observed_at)
-        history_rows = [row for row in history_rows if gmgn_trench_passes_chain_filters(row)]
+        history_rows = [
+            row for row in history_rows
+            if clean_feed_text(row.get("network") or row.get("chain"), 40).lower()
+            in ONCHAIN_RESEARCH_DEFAULT_NETWORKS
+            and gmgn_trench_passes_chain_filters(row)
+        ]
         write_json_cache(GMGN_TRENCH_HISTORY_PATH, {
             "version": GMGN_TRENCH_HISTORY_VERSION,
             "updatedAt": observed_at,
@@ -12152,7 +12170,7 @@ def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
         id="gmgn-trenches",
         group="crypto",
         title="GMGN 战壕新币榜",
-        subtitle="六链按真实开盘时间倒序 · MC > $10K · 至少一个社交媒体",
+        subtitle="五链按真实开盘时间倒序 · MC > $10K · 至少一个社交媒体",
         accent="#9cff57",
         source_label="GMGN",
         source_name="GMGN Agent API · trenches/completed",
@@ -12186,6 +12204,7 @@ def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
                 for key, value in profile.items()
             }
             for chain, profile in GMGN_TRENCH_CHAIN_FILTERS.items()
+            if chain in ONCHAIN_RESEARCH_DEFAULT_NETWORKS
         },
     })
     return source
@@ -49088,6 +49107,8 @@ class Handler(SimpleHTTPRequestHandler):
                 page = max(1, int((query.get("page") or [1])[0]))
                 page_size = max(12, min(60, int((query.get("pageSize") or [24])[0])))
                 network = (query.get("network") or [""])[0]
+                if network and network not in ONCHAIN_RESEARCH_DEFAULT_NETWORKS:
+                    raise ValueError("该链不在当前 GMGN 战壕监控范围")
                 trench_payload = fetch_live_onchain_trenches(
                     page=page,
                     page_size=page_size,
@@ -49098,6 +49119,7 @@ class Handler(SimpleHTTPRequestHandler):
                     # profile: MC > $10K, at least one social channel, plus
                     # the safety switches enabled for the selected chain.
                     item_filter=gmgn_trench_passes_chain_filters,
+                    include_recent_rank_supplement=True,
                 )
                 self.send_json(attach_gmgn_native_trench_narrative(trench_payload))
             except (TypeError, ValueError) as exc:

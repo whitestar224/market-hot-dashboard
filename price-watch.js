@@ -1888,7 +1888,7 @@
   function onchainTrenchesTemplate(payload) {
     const items = Array.isArray(payload?.items) ? payload.items : [];
     const networks = Array.isArray(payload?.networks) && payload.networks.length
-      ? payload.networks : ["eth", "solana", "robinhood", "arc", "base", "bsc"];
+      ? payload.networks : ["eth", "solana", "robinhood", "arc", "bsc"];
     const counts = payload?.counts || {};
     const statuses = payload?.sourceStatus && typeof payload.sourceStatus === "object" ? payload.sourceStatus : {};
     const healthySources = Object.values(statuses).filter((value) => value === "ok").length;
@@ -3042,7 +3042,7 @@
       if (!quiet) statusNode.textContent = error.message;
       if (!onchainTrenchesLoaded) {
         onchainTrenchesPayload = {
-          items: [], total: 0, counts: {}, networks: ["eth", "solana", "robinhood", "arc", "base", "bsc"],
+          items: [], total: 0, counts: {}, networks: ["eth", "solana", "robinhood", "arc", "bsc"],
           sourceStatus: {}, errors: [error.message], filters: {}, page: 1, pages: 1,
         };
       }

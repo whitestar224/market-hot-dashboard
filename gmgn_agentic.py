@@ -1109,36 +1109,49 @@ def fetch_gmgn_migrated_trenches(
     return result
 
 
-def fetch_gmgn_non_og_market_rank(
+def fetch_gmgn_recent_market_rank(
     network: str,
     *,
     limit: int = 100,
+    min_created: str = "",
+    max_created: str = "",
     session: Any = None,
 ) -> dict[str, Any]:
-    """Read a small market-rank supplement for strong non-OG exceptions.
+    """Read GMGN's newest launched-token window as a Trenches supplement.
 
-    The native Trenches request correctly returns the full OG page, but that
-    predicate also hides a genuinely stronger non-OG launch before the local
-    exception rule can compare it.  GMGN's market-rank route is used only as a
-    supplemental candidate window; the same local social/risk/profile checks
-    still decide whether a row enters the board.
+    ``/v1/trenches`` exposes only the latest completed page.  During a busy
+    launch wave a token can leave that page before the next local poll, while
+    GMGN's web view still shows it in the user's accumulated scroll history.
+    The creation-time market rank is therefore merged with the native
+    completed page *before* the local MC/social/risk profile is applied.  This
+    route is a discovery supplement only: it does not relax any board filter
+    and it is not restricted by OG status.
     """
     network_key = str(network or "").strip().lower()
     chain = GMGN_TRENCHES_NETWORKS.get(network_key)
     if not chain or network_key == "arc":
         return {"code": 0, "data": {"completed": []}, "network": network_key}
     request_limit = max(1, min(100, int(limit)))
+    min_age = str(min_created or "").strip().lower()
+    max_age = str(max_created or "").strip().lower()
+    age_key = f"{min_age or 'newest'}:{max_age or 'any'}"
+    params: dict[str, Any] = {
+        "chain": chain,
+        "interval": "24h",
+        "limit": request_limit,
+        "order_by": "creation_timestamp",
+        "direction": "desc",
+        "filters": ["has_social"],
+        "min_marketcap": GMGN_TRENCH_MIN_MARKET_CAP_USD,
+    }
+    if min_age:
+        params["min_created"] = min_age
+    if max_age:
+        params["max_created"] = max_age
     result = gmgn_readonly_get(
         "/v1/market/rank",
-        cache_key=f"trenches:non-og-rank:{chain}:{request_limit}",
-        params={
-            "chain": chain,
-            "interval": "24h",
-            "limit": request_limit,
-            "order_by": "creation_timestamp",
-            "direction": "desc",
-            "filters": ["has_social"],
-        },
+        cache_key=f"trenches:recent-rank:{chain}:{request_limit}:{age_key}",
+        params=params,
         cache_ttl_seconds=max(30.0, float(os.getenv("GMGN_TRENCHES_CACHE_TTL_SECONDS", "60") or 60)),
         session=session,
     )
@@ -1153,14 +1166,12 @@ def fetch_gmgn_non_og_market_rank(
     code = api_payload.get("code", 0)
     if code not in (0, "0", None):
         message = str(api_payload.get("message") or api_payload.get("reason") or code)
-        raise RuntimeError(f"GMGN {network_key} 非 OG 补充请求失败：{message[:180]}")
+        raise RuntimeError(f"GMGN {network_key} 最近开盘补充请求失败：{message[:180]}")
     data = api_payload.get("data") if isinstance(api_payload.get("data"), Mapping) else {}
     rank_rows = data.get("rank") if isinstance(data, Mapping) else []
     completed: list[dict[str, Any]] = []
     for raw in rank_rows if isinstance(rank_rows, list) else []:
-        if not isinstance(raw, Mapping) or _optional_flag(raw.get("is_og")) is not False:
-            continue
-        if not _flag(raw.get("launchpad_status")):
+        if not isinstance(raw, Mapping) or not _flag(raw.get("launchpad_status")):
             continue
         timestamp = 0
         for key in ("open_timestamp", "creation_timestamp", "created_timestamp"):
@@ -1188,9 +1199,19 @@ def fetch_gmgn_non_og_market_rank(
         "reason": api_payload.get("reason") or "",
         "_gmgnMeta": {
             **(result.get("_gmgnMeta") if isinstance(result.get("_gmgnMeta"), Mapping) else {}),
-            "sourceRoute": "market-rank-non-og",
+            "sourceRoute": "market-rank-recent-opened",
         },
     }
+
+
+def fetch_gmgn_non_og_market_rank(
+    network: str,
+    *,
+    limit: int = 100,
+    session: Any = None,
+) -> dict[str, Any]:
+    """Backward-compatible alias for the generalized recent-open supplement."""
+    return fetch_gmgn_recent_market_rank(network, limit=limit, session=session)
 
 
 def normalize_gmgn_migrated_trenches(

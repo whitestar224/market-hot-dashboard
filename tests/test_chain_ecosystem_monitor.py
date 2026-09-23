@@ -266,6 +266,49 @@ class OnchainGoldenDogResearchTests(unittest.TestCase):
         self.assertEqual(payload["total"], 2)
         self.assertEqual({row["network"] for row in payload["items"]}, {"eth", "bsc"})
 
+    def test_live_trenches_merges_recent_rank_before_market_cap_filter(self):
+        contract = "0x" + "4" * 40
+        native_payload = {"source": "native"}
+        rank_payload = {"source": "rank"}
+
+        def normalized(payload, network, *, observed_at):
+            market_cap = 0.75 if payload is native_payload else 25_000
+            return [{
+                "network": network,
+                "contractAddress": contract,
+                "symbol": "RECOVERED",
+                "name": "Recovered launch",
+                "providers": ["gmgn-trenches"],
+                "launchStage": "migrated",
+                "poolCreatedAt": observed_at - 120_000,
+                "observedAt": observed_at,
+                "metrics": {"marketCapUsd": market_cap, "liquidityUsd": 8_000},
+            }]
+
+        with patch(
+            "chain_ecosystem_monitor.fetch_gmgn_migrated_trenches",
+            return_value=native_payload,
+        ), patch(
+            "chain_ecosystem_monitor.fetch_gmgn_recent_market_rank",
+            return_value=rank_payload,
+        ) as rank_fetch, patch(
+            "chain_ecosystem_monitor.normalize_gmgn_migrated_trenches",
+            side_effect=normalized,
+        ):
+            payload = fetch_live_onchain_trenches(
+                networks=["eth"],
+                source="gmgn",
+                observed_at=1_788_768_000_000,
+                page_size=60,
+                include_recent_rank_supplement=True,
+                item_filter=lambda row: float(row.get("metrics", {}).get("marketCapUsd") or 0) > 10_000,
+            )
+
+        rank_fetch.assert_called_once_with("eth", min_created="", max_created="")
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["items"][0]["symbol"], "RECOVERED")
+        self.assertEqual(payload["items"][0]["metrics"]["marketCapUsd"], 25_000)
+
     def test_new_pool_parser_preserves_solana_address_and_early_metrics(self):
         rows = normalize_onchain_new_pools(
             self.new_pool_payload(),
