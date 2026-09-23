@@ -309,6 +309,83 @@ class OnchainGoldenDogResearchTests(unittest.TestCase):
         self.assertEqual(payload["items"][0]["symbol"], "RECOVERED")
         self.assertEqual(payload["items"][0]["metrics"]["marketCapUsd"], 25_000)
 
+    def test_live_trenches_discovers_missing_launchpads_without_a_static_allowlist(self):
+        payloads = {
+            "native": {"kind": "native"},
+            "rank": {"kind": "rank"},
+            "unique": {"kind": "unique"},
+            "platform": {"kind": "platform"},
+        }
+
+        def fetch_native(_network, **kwargs):
+            if kwargs.get("launchpad_platforms"):
+                return payloads["platform"]
+            if kwargs.get("upstream_unique_only"):
+                return payloads["unique"]
+            return payloads["native"]
+
+        def normalized(payload, network, *, observed_at):
+            kind = payload["kind"]
+            spec = {
+                "native": ("NATIVE", "0x" + "1" * 40, "Pump.fun", 30_000, 10),
+                # The rank row discovers the platform but deliberately fails
+                # the local MC gate; the platform-specific native request must
+                # be what recovers the qualifying token.
+                "rank": ("DISCOVERY", "0x" + "2" * 40, "stonkfun", 1, 20),
+                "unique": ("OLDER", "0x" + "3" * 40, "Pump.fun", 40_000, 30),
+                "platform": ("YELLOW", "0x" + "4" * 40, "stonkfun", 50_000, 40),
+            }[kind]
+            symbol, contract, launchpad, market_cap, seconds = spec
+            row = {
+                "network": network,
+                "contractAddress": contract,
+                "symbol": symbol,
+                "name": symbol,
+                "launchpad": launchpad,
+                "providers": ["gmgn-trenches"],
+                "launchStage": "migrated",
+                "poolCreatedAt": observed_at - seconds * 1_000,
+                "observedAt": observed_at,
+                "metrics": {"marketCapUsd": market_cap, "liquidityUsd": 8_000},
+            }
+            # A full native page activates both the strict unique lane and
+            # per-platform broad lanes. Duplicate contracts keep the expected
+            # merged result compact while exercising the response ceiling.
+            return [dict(row) for _ in range(55)] if kind == "native" else [row]
+
+        with patch(
+            "chain_ecosystem_monitor.fetch_gmgn_migrated_trenches",
+            side_effect=fetch_native,
+        ) as native_fetch, patch(
+            "chain_ecosystem_monitor.fetch_gmgn_recent_market_rank",
+            return_value=payloads["rank"],
+        ), patch(
+            "chain_ecosystem_monitor.normalize_gmgn_migrated_trenches",
+            side_effect=normalized,
+        ):
+            result = fetch_live_onchain_trenches(
+                networks=["eth"],
+                source="gmgn",
+                observed_at=1_788_768_000_000,
+                page_size=60,
+                include_recent_rank_supplement=True,
+                item_filter=lambda row: float(row.get("metrics", {}).get("marketCapUsd") or 0) > 10_000,
+            )
+
+        platform_calls = [
+            call.kwargs
+            for call in native_fetch.call_args_list
+            if call.kwargs.get("launchpad_platforms")
+        ]
+        self.assertEqual(len(platform_calls), 1)
+        self.assertEqual(platform_calls[0]["launchpad_platforms"], ("stonkfun",))
+        self.assertFalse(platform_calls[0].get("upstream_unique_only", False))
+        self.assertEqual(platform_calls[0]["min_market_cap_usd"], 10_000)
+        self.assertEqual(
+            {row["symbol"] for row in result["items"]},
+            {"NATIVE", "OLDER", "YELLOW"},
+        )
+
     def test_new_pool_parser_preserves_solana_address_and_early_metrics(self):
         rows = normalize_onchain_new_pools(
             self.new_pool_payload(),

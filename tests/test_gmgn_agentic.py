@@ -166,6 +166,28 @@ class GmgnAgenticTests(unittest.TestCase):
         completed = session.post.call_args.kwargs["json"]["completed"]
         self.assertNotIn("quote_address_type", completed)
 
+    def test_native_unique_lane_accepts_dynamically_discovered_platforms(self):
+        response = Mock(status_code=200)
+        response.raise_for_status.return_value = None
+        response.json.return_value = trenches_payload()
+        session = Mock()
+        session.post.return_value = response
+
+        with patch("gmgn_agentic._wait_for_readonly_slot"):
+            fetch_gmgn_migrated_trenches(
+                "solana",
+                launchpad_platforms=("stonkfun", "stonkfun"),
+                upstream_unique_only=True,
+                min_market_cap_usd=10_000,
+                session=session,
+            )
+
+        completed = session.post.call_args.kwargs["json"]["completed"]
+        self.assertEqual(completed["launchpad_platform"], ["stonkfun"])
+        self.assertIn("img_not_duplicate", completed["filters"])
+        self.assertEqual(completed["min_marketcap"], 10_000)
+        self.assertNotIn("is_og", completed["filters"])
+
     def test_recent_market_rank_supplements_all_opened_tokens_before_local_filters(self):
         response = Mock(status_code=200)
         response.raise_for_status.return_value = None
@@ -234,8 +256,8 @@ class GmgnAgenticTests(unittest.TestCase):
             )
 
         params = session.get.call_args.kwargs["params"]
-        self.assertEqual(params["min_created"], "2h")
-        self.assertEqual(params["max_created"], "6h")
+        self.assertEqual(params["min_created"], "120m")
+        self.assertEqual(params["max_created"], "360m")
 
     def test_arc_opened_tape_uses_official_rank_without_hardcoded_allowlists(self):
         response = Mock(status_code=200)

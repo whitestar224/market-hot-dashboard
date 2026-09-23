@@ -164,7 +164,7 @@ class GmgnTrenchHotBoardTests(unittest.TestCase):
                 source = server.refresh_gmgn_trenches_hot_board()
 
             fetch_live.assert_called_once()
-            self.assertEqual(fetch_live.call_args.kwargs["page_size"], 480)
+            self.assertEqual(fetch_live.call_args.kwargs["page_size"], 2000)
             self.assertIsNone(fetch_live.call_args.kwargs["per_network_limit"])
             self.assertTrue(fetch_live.call_args.kwargs["include_recent_rank_supplement"])
             self.assertTrue(history_path.exists())

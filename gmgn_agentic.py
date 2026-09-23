@@ -1075,6 +1075,9 @@ def fetch_gmgn_migrated_trenches(
     network: str,
     *,
     limit: int = 80,
+    launchpad_platforms: tuple[str, ...] = (),
+    upstream_unique_only: bool = False,
+    min_market_cap_usd: float | None = None,
     session: Any = None,
 ) -> dict[str, Any]:
     """Fetch only GMGN's completed/graduated launchpad category."""
@@ -1085,16 +1088,48 @@ def fetch_gmgn_migrated_trenches(
     if network_key == "arc":
         return fetch_gmgn_arc_opened_rank(limit=limit, session=session)
 
+    upstream_filters = ["offchain", "onchain", *GMGN_UPSTREAM_TRENCH_FILTERS]
+    if upstream_unique_only:
+        # GMGN applies this before its 60-row response ceiling.  A separate
+        # broad request is still merged by the caller so the user's local
+        # allowance for the first 2-3 same-artwork rows remains intact.
+        upstream_filters.append("img_not_duplicate")
     section: dict[str, Any] = {
         # Match the native saved filter: retain both market origins and require
         # at least one project social channel. OG is intentionally unrestricted.
-        "filters": ["offchain", "onchain", *GMGN_UPSTREAM_TRENCH_FILTERS],
+        "filters": upstream_filters,
         "launchpad_platform_v2": True,
         "limit": max(1, min(80, int(limit))),
     }
+    platforms = tuple(dict.fromkeys(
+        str(value or "").strip()
+        for value in launchpad_platforms
+        if str(value or "").strip()
+    ))
+    if platforms:
+        # Do not keep a static platform allow-list.  The live market-rank
+        # discovery lane supplies currently active platform names, including
+        # platforms that GMGN's default Trenches set has not adopted yet.
+        section["launchpad_platform"] = list(platforms)
+    if min_market_cap_usd is not None:
+        section["min_marketcap"] = max(0.0, float(min_market_cap_usd))
+    request_variant = ""
+    if platforms or upstream_unique_only or min_market_cap_usd is not None:
+        request_variant = hashlib.sha256(json.dumps(
+            {
+                "platforms": platforms,
+                "unique": bool(upstream_unique_only),
+                "minMarketCap": section.get("min_marketcap"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")).hexdigest()[:12]
+    cache_key = f"trenches:{chain}:{section['limit']}"
+    if request_variant:
+        cache_key = f"{cache_key}:{request_variant}"
     result = gmgn_readonly_post(
         GMGN_TRENCHES_PATH,
-        cache_key=f"trenches:{chain}:{section['limit']}",
+        cache_key=cache_key,
         params={"chain": chain},
         body={"version": "v2", "completed": section},
         cache_ttl_seconds=max(30.0, float(os.getenv("GMGN_TRENCHES_CACHE_TTL_SECONDS", "60") or 60)),
@@ -1132,8 +1167,21 @@ def fetch_gmgn_recent_market_rank(
     if not chain or network_key == "arc":
         return {"code": 0, "data": {"completed": []}, "network": network_key}
     request_limit = max(1, min(100, int(limit)))
-    min_age = str(min_created or "").strip().lower()
-    max_age = str(max_created or "").strip().lower()
+    def supported_age(value: str) -> str:
+        age = str(value or "").strip().lower()
+        match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([hd])", age)
+        if not match:
+            return age
+        amount = float(match.group(1))
+        minutes = amount * (1440 if match.group(2) == "d" else 60)
+        rendered = str(int(minutes)) if minutes.is_integer() else f"{minutes:g}"
+        return f"{rendered}m"
+
+    # GMGN accepts seconds/minutes here; hour/day suffixes are silently
+    # ignored by some deployments. Normalize them before building the cache
+    # key and request so busy-chain backfill windows remain disjoint.
+    min_age = supported_age(min_created)
+    max_age = supported_age(max_created)
     age_key = f"{min_age or 'newest'}:{max_age or 'any'}"
     params: dict[str, Any] = {
         "chain": chain,

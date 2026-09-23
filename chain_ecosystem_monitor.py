@@ -22,6 +22,7 @@ from binance_agentic import (
     normalize_binance_meme_rush,
 )
 from gmgn_agentic import (
+    GMGN_TRENCH_MIN_MARKET_CAP_USD,
     GmgnRateLimitError,
     GmgnUnsupportedNetworkError,
     annotate_gmgn_non_og_exceptions,
@@ -1167,6 +1168,9 @@ def fetch_live_onchain_trenches(
     source_status: dict[str, str] = {}
     errors: list[str] = []
     retry_after_seconds = 0
+    native_platforms: dict[str, dict[str, str]] = {}
+    native_counts: dict[str, int] = {}
+    rank_platforms: dict[str, dict[str, str]] = {}
     include_rank_supplement = include_recent_rank_supplement or include_non_og_exceptions
     rank_jobs: list[tuple[str, str, str]] = []
     if include_rank_supplement:
@@ -1219,6 +1223,19 @@ def fetch_live_onchain_trenches(
                 if provider == "binance":
                     normalized = [row for row in normalized if row.get("launchStage") == "migrated"]
                 rows.extend(normalized)
+                platform_bucket = (
+                    rank_platforms if provider == "gmgn-rank"
+                    else native_platforms if provider == "gmgn"
+                    else None
+                )
+                if platform_bucket is not None:
+                    network_platforms = platform_bucket.setdefault(network, {})
+                    for row in normalized:
+                        platform = str(row.get("launchpad") or "").strip()
+                        if platform:
+                            network_platforms.setdefault(platform.casefold(), platform)
+                if provider == "gmgn":
+                    native_counts[network] = max(native_counts.get(network, 0), len(normalized))
                 # The rank supplement is part of the same GMGN chain source;
                 # keep the public status at six chains instead of exposing a
                 # second pseudo-provider in the UI.
@@ -1237,6 +1254,69 @@ def fetch_live_onchain_trenches(
             except Exception as exc:
                 source_status[status_key] = "error"
                 errors.append(f"{status_key}: {str(exc)[:180]}")
+
+    # GMGN applies its response ceiling after the upstream filters.  Read a
+    # second, server-side unique/MC-filtered lane so qualifying older rows are
+    # not displaced by a burst of low-MC launches.  Also partition the broad
+    # lane by every launchpad discovered in market-rank.  That gets past the
+    # global 60-row ceiling without forcing GMGN's strict image de-duplication,
+    # so the local policy can still keep the first 2-3 same-artwork launches.
+    # Platforms are discovered dynamically, never from a static allow-list.
+    if include_rank_supplement and source_key != "binance":
+        supplement_jobs: dict[Any, tuple[str, str]] = {}
+        supplement_specs: list[tuple[str, tuple[str, ...], bool]] = []
+        for network in selected_networks:
+            if network == "arc":
+                continue
+            defaults = native_platforms.get(network, {})
+            discovered = rank_platforms.get(network, {})
+            native_saturated = native_counts.get(network, 0) >= 55
+            if native_saturated:
+                supplement_specs.append((network, (), True))
+            for key, platform in sorted(discovered.items()):
+                if native_saturated or key not in defaults:
+                    supplement_specs.append((network, (platform,), False))
+        with ThreadPoolExecutor(max_workers=max(1, min(12, len(supplement_specs)))) as executor:
+            for network, platforms, unique_only in supplement_specs:
+                if platforms:
+                    supplement_jobs[executor.submit(
+                        fetch_gmgn_migrated_trenches,
+                        network,
+                        launchpad_platforms=platforms,
+                        min_market_cap_usd=GMGN_TRENCH_MIN_MARKET_CAP_USD,
+                    )] = (network, "gmgn-platform")
+                    continue
+                supplement_jobs[executor.submit(
+                    fetch_gmgn_migrated_trenches,
+                    network,
+                    upstream_unique_only=unique_only,
+                    min_market_cap_usd=GMGN_TRENCH_MIN_MARKET_CAP_USD,
+                )] = (network, "gmgn-unique")
+            for future in as_completed(supplement_jobs):
+                network, provider = supplement_jobs[future]
+                status_key = f"{network}/gmgn-trenches"
+                try:
+                    payload = future.result()
+                    normalized = normalize_gmgn_migrated_trenches(
+                        payload,
+                        network,
+                        observed_at=observed,
+                    )
+                    rows.extend(normalized)
+                    source_status[status_key] = "ok"
+                except GmgnRateLimitError as exc:
+                    retry_after_seconds = max(retry_after_seconds, exc.retry_after_seconds)
+                    if source_status.get(status_key) != "ok":
+                        source_status[status_key] = "rate_limited"
+                    errors.append(f"{status_key}/{provider}: {str(exc)[:180]}")
+                except GmgnUnsupportedNetworkError as exc:
+                    if source_status.get(status_key) != "ok":
+                        source_status[status_key] = "unsupported"
+                    errors.append(f"{status_key}/{provider}: {str(exc)[:180]}")
+                except Exception as exc:
+                    if source_status.get(status_key) != "ok":
+                        source_status[status_key] = "error"
+                    errors.append(f"{status_key}/{provider}: {str(exc)[:180]}")
 
     merged = merge_onchain_research_rows(rows)
     if include_non_og_exceptions:
@@ -1327,9 +1407,9 @@ def fetch_live_onchain_trenches(
         "binance": sum(1 for row in items if "Binance" in (row.get("trenchSources") or [])),
     }
     total = len(items)
-    # Public UI routes still clamp to 60. Internal history ingestion can retain
-    # all six GMGN batches (up to 80 per chain) without extra provider calls.
-    bounded_page_size = max(12, min(480, int(page_size or 24)))
+    # Public UI routes clamp to 60 before calling this function. Internal
+    # history ingestion can retain the complete merged provider tape.
+    bounded_page_size = max(12, min(2000, int(page_size or 24)))
     pages = max(1, math.ceil(total / bounded_page_size))
     page_number = min(max(1, int(page or 1)), pages)
     offset = (page_number - 1) * bounded_page_size

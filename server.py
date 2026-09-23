@@ -586,7 +586,7 @@ GMGN_TRENCH_HISTORY_RETENTION_MS = max(
 )
 GMGN_TRENCH_HISTORY_MAX_ROWS = max(
     100,
-    min(2000, int(float(os.getenv("GMGN_TRENCH_HISTORY_MAX_ROWS", "600") or "600"))),
+    min(2000, int(float(os.getenv("GMGN_TRENCH_HISTORY_MAX_ROWS", "2000") or "2000"))),
 )
 MARKET_PRIORITY_WINDOWS = {"1h": 60 * 60, "6h": 6 * 60 * 60, "24h": 24 * 60 * 60}
 MARKET_PRIORITY_HISTORY_SECONDS = 25 * 60 * 60
@@ -12116,7 +12116,7 @@ def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
             networks=("eth", "solana", "robinhood", "arc", "bsc"),
             source="gmgn",
             page=1,
-            page_size=480,
+            page_size=2000,
             observed_at=observed_at,
             item_filter=gmgn_trench_passes_chain_filters,
             per_network_limit=None,
