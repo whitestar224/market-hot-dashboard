@@ -64,6 +64,7 @@ class ChainEcosystemScoringTests(unittest.TestCase):
                 "honeypot": False,
             },
             "metrics": {
+                "marketCapUsd": 50_000,
                 "liquidityUsd": 35_000,
                 "volumeH1Usd": 20_000,
                 "transactionsH1": 60,

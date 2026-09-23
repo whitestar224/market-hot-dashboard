@@ -12108,7 +12108,6 @@ def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
             observed_at=observed_at,
             item_filter=gmgn_trench_passes_chain_filters,
             per_network_limit=None,
-            include_non_og_exceptions=True,
         )
     except Exception as exc:
         live_payload = {
@@ -12153,7 +12152,7 @@ def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
         id="gmgn-trenches",
         group="crypto",
         title="GMGN 战壕新币榜",
-        subtitle="六链按真实开盘时间倒序 · 同步 GMGN 仅看 OG · 原生刷量标记过滤",
+        subtitle="六链按真实开盘时间倒序 · MC > $10K · 至少一个社交媒体",
         accent="#9cff57",
         source_label="GMGN",
         source_name="GMGN Agent API · trenches/completed",
@@ -49096,11 +49095,9 @@ class Handler(SimpleHTTPRequestHandler):
                     source="gmgn",
                     query=(query.get("q") or [""])[0],
                     # Keep the live Trenches tab aligned with the saved GMGN
-                    # profile.  The predicate runs after normalization, so a
-                    # high-performing non-OG exception can still pass while
-                    # ordinary non-OG rows remain hidden.
+                    # profile: MC > $10K, at least one social channel, plus
+                    # the safety switches enabled for the selected chain.
                     item_filter=gmgn_trench_passes_chain_filters,
-                    include_non_og_exceptions=True,
                 )
                 self.send_json(attach_gmgn_native_trench_narrative(trench_payload))
             except (TypeError, ValueError) as exc:

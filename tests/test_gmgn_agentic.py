@@ -149,6 +149,8 @@ class GmgnAgenticTests(unittest.TestCase):
         self.assertFalse(result["_gmgnMeta"]["personalKeyUsed"])
         self.assertEqual(set(request.kwargs["json"]), {"version", "completed"})
         self.assertEqual(request.kwargs["json"]["completed"]["limit"], 12)
+        self.assertIn("has_social", request.kwargs["json"]["completed"]["filters"])
+        self.assertNotIn("is_og", request.kwargs["json"]["completed"]["filters"])
 
     def test_robinhood_request_does_not_pin_gmgn_quote_type_ids(self):
         response = Mock(status_code=200)
@@ -184,9 +186,8 @@ class GmgnAgenticTests(unittest.TestCase):
         self.assertNotIn("quote_address_type", params)
         self.assertNotIn("launchpad_platform", params)
         self.assertIn("has_social", params["filters"])
-        # Keep the native OG predicate in the request.  Arc deployments that
-        # ignore it are still protected by the local profile check.
-        self.assertIn("is_og", params["filters"])
+        self.assertNotIn("is_og", params["filters"])
+        self.assertNotIn("not_wash_trading", params["filters"])
 
         rows = normalize_gmgn_migrated_trenches(payload, "arc", observed_at=NOW)
         self.assertEqual([row["contractAddress"] for row in rows], [ARC_TIGRINO])
@@ -378,6 +379,7 @@ class GmgnAgenticTests(unittest.TestCase):
                         "logo": "https://cdn.example.test/sendr.png?v=1",
                         "twitter": "https://x.com/sendr",
                         "is_og": 1,
+                        "usd_market_cap": 50_000,
                         "image_duplicate_count": 2,
                     },
                     {
@@ -387,6 +389,7 @@ class GmgnAgenticTests(unittest.TestCase):
                         "logo": "https://cdn.example.test/sendr.png?v=2",
                         "twitter": "https://x.com/sen",
                         "is_og": 1,
+                        "usd_market_cap": 50_000,
                     },
                     {
                         "address": "0x" + "3" * 40,
@@ -394,6 +397,7 @@ class GmgnAgenticTests(unittest.TestCase):
                         "logo": "https://cdn.example.test/unique.png",
                         "twitter": "https://x.com/unique",
                         "is_og": 1,
+                        "usd_market_cap": 50_000,
                         "dup_image": 1,
                     },
                 ],
@@ -414,35 +418,28 @@ class GmgnAgenticTests(unittest.TestCase):
         self.assertTrue(gmgn_trench_passes_chain_filters(rows[2]))
         self.assertIn("图片重复 2", rows[1]["filterWarnings"])
 
-    def test_non_og_can_enter_when_batch_market_data_beats_og_baseline(self):
-        def token(address, symbol, *, is_og, liquidity, volume, swaps, holders, buys, sells):
+    def test_og_status_does_not_affect_the_saved_market_cap_and_social_filter(self):
+        def token(address, symbol, *, is_og, market_cap):
             return {
                 "address": address,
                 "symbol": symbol,
                 "logo": f"https://cdn.example.test/{symbol}.png",
                 "twitter": f"https://x.com/{symbol.lower()}",
                 "is_og": is_og,
-                "liquidity": liquidity,
-                "volume_1h": volume,
-                "swaps_1h": swaps,
-                "holder_count": holders,
-                "buys_1h": buys,
-                "sells_1h": sells,
+                "usd_market_cap": market_cap,
             }
 
         payload = {"code": 0, "data": {"completed": [
-            token("0x" + "4" * 40, "OGBASE", is_og=1, liquidity=1_000, volume=1_000, swaps=5, holders=8, buys=3, sells=2),
-            token("0x" + "5" * 40, "STRONG", is_og=0, liquidity=250_000, volume=1_200_000, swaps=1_200, holders=3_500, buys=800, sells=400),
+            token("0x" + "4" * 40, "OGBASE", is_og=1, market_cap=50_000),
+            token("0x" + "5" * 40, "NONOG", is_og=0, market_cap=50_000),
+            token("0x" + "6" * 40, "TOOSMALL", is_og=0, market_cap=10_000),
         ]}}
 
         rows = normalize_gmgn_migrated_trenches(payload, "bsc", observed_at=NOW)
 
-        strong = next(row for row in rows if row["symbol"] == "STRONG")
-        self.assertTrue(strong["filterSignals"]["nonOgException"])
-        self.assertTrue(gmgn_trench_passes_chain_filters(strong))
-        weak = dict(strong)
-        weak["filterSignals"] = {**strong["filterSignals"], "nonOgException": False}
-        self.assertFalse(gmgn_trench_passes_chain_filters(weak))
+        self.assertTrue(gmgn_trench_passes_chain_filters(next(row for row in rows if row["symbol"] == "OGBASE")))
+        self.assertTrue(gmgn_trench_passes_chain_filters(next(row for row in rows if row["symbol"] == "NONOG")))
+        self.assertFalse(gmgn_trench_passes_chain_filters(next(row for row in rows if row["symbol"] == "TOOSMALL")))
 
     def test_six_chain_trench_profiles_match_saved_gmgn_filters(self):
         def row(network, **overrides):
@@ -460,14 +457,20 @@ class GmgnAgenticTests(unittest.TestCase):
                 "socialCount": 1,
             }
             signals.update(overrides)
-            return {"network": network, "launchpad": "native", "dexId": "dex", "filterSignals": signals}
+            return {
+                "network": network,
+                "launchpad": "native",
+                "dexId": "dex",
+                "filterSignals": signals,
+                "metrics": {"marketCapUsd": 50_000},
+            }
 
         for network in ("solana", "bsc", "robinhood", "base", "eth", "arc"):
             self.assertTrue(gmgn_trench_passes_chain_filters(row(network)), network)
 
         self.assertTrue(gmgn_trench_passes_chain_filters(row("solana", imageDuplicateCount=2)))
         self.assertFalse(gmgn_trench_passes_chain_filters(row("solana", imageDuplicateCount=4)))
-        self.assertFalse(gmgn_trench_passes_chain_filters(row("bsc", washTrading=True)))
+        self.assertTrue(gmgn_trench_passes_chain_filters(row("bsc", washTrading=True)))
         self.assertFalse(gmgn_trench_passes_chain_filters(row("robinhood", honeypot=True)))
         # These Base security switches are optional in the native profile;
         # missing/negative values do not hide a row unless the user enables
@@ -480,15 +483,15 @@ class GmgnAgenticTests(unittest.TestCase):
         # classified the token as rat trading. BPACK is visible in the source
         # UI with a small ratio and must not be silently removed here.
         self.assertTrue(gmgn_trench_passes_chain_filters(row("arc", ratTraderRate=0.0468)))
-        self.assertFalse(gmgn_trench_passes_chain_filters(row("arc", ratWashTrading=True)))
+        self.assertTrue(gmgn_trench_passes_chain_filters(row("arc", ratWashTrading=True)))
         self.assertFalse(gmgn_trench_passes_chain_filters(row("arc", socialCount=0)))
-        self.assertFalse(gmgn_trench_passes_chain_filters(row("arc", isOg=False)))
+        self.assertTrue(gmgn_trench_passes_chain_filters(row("arc", isOg=False)))
         rapid = row("solana")
         rapid["launchpad"] = "RapidLaunch"
         self.assertFalse(gmgn_trench_passes_chain_filters(rapid))
         self.assertFalse(gmgn_trench_passes_chain_filters({"network": "eth"}))
 
-    def test_missing_optional_negative_signals_do_not_hide_bsc_or_robinhood(self):
+    def test_unchecked_wash_signals_do_not_hide_bsc_or_robinhood(self):
         # GMGN omits some negative flags on parts of the BSC/Robinhood tape.
         # Absence means "not reported", not "the bad condition is present".
         base_signals = {
@@ -501,16 +504,17 @@ class GmgnAgenticTests(unittest.TestCase):
             "creationTool": "",
         }
         for network in ("bsc", "robinhood"):
-            row = {"network": network, "launchpad": "native", "dexId": "dex", "filterSignals": {**base_signals, "socialCount": 1}}
+            row = {"network": network, "launchpad": "native", "dexId": "dex", "filterSignals": {**base_signals, "socialCount": 1}, "metrics": {"marketCapUsd": 50_000}}
             self.assertTrue(gmgn_trench_passes_chain_filters(row), network)
 
-        flagged = {"network": "bsc", "launchpad": "native", "dexId": "dex", "filterSignals": {**base_signals, "socialCount": 1, "washTrading": True}}
-        self.assertFalse(gmgn_trench_passes_chain_filters(flagged))
+        flagged = {"network": "bsc", "launchpad": "native", "dexId": "dex", "filterSignals": {**base_signals, "socialCount": 1, "washTrading": True}, "metrics": {"marketCapUsd": 50_000}}
+        self.assertTrue(gmgn_trench_passes_chain_filters(flagged))
 
     def test_all_six_saved_profiles_require_at_least_one_social_channel(self):
         for network, profile in gmgn_agentic.GMGN_TRENCH_CHAIN_FILTERS.items():
             self.assertTrue(profile.get("requireSocial"), network)
-            self.assertTrue(profile.get("onlyOG"), network)
+            self.assertNotIn("onlyOG", profile)
+            self.assertEqual(profile.get("minMarketCapUsd"), 10_000)
         row = {
             "network": "eth",
             "launchpad": "native",
@@ -521,10 +525,17 @@ class GmgnAgenticTests(unittest.TestCase):
                 "imageDuplicateCount": 0,
                 "socialCount": 0,
             },
+            "metrics": {"marketCapUsd": 50_000},
         }
         self.assertFalse(gmgn_trench_passes_chain_filters(row))
         row["filterSignals"]["socialCount"] = 1
         self.assertTrue(gmgn_trench_passes_chain_filters(row))
+        row["metrics"]["marketCapUsd"] = 10_000
+        self.assertFalse(gmgn_trench_passes_chain_filters(row))
+        row["metrics"]["marketCapUsd"] = 10_000.01
+        self.assertTrue(gmgn_trench_passes_chain_filters(row))
+        row["metrics"].clear()
+        self.assertFalse(gmgn_trench_passes_chain_filters(row))
 
     def test_flybook_quote_group_26_passes_robinhood_risk_filters(self):
         payload = {
@@ -543,6 +554,7 @@ class GmgnAgenticTests(unittest.TestCase):
                     "quote_address_type": 26,
                     "launchpad_platform": "bankr",
                     "twitter": "https://x.com/flybook",
+                    "usd_market_cap": 50_000,
                     "open_timestamp": NOW // 1000,
                 }],
             },

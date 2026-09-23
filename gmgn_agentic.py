@@ -39,17 +39,16 @@ GMGN_TRENCHES_NETWORKS = {
 # disappearing before risk checks. Optional negative signals reject an item
 # only when GMGN explicitly reports the bad condition; positive requirements
 # remain strict.
-GMGN_TRENCH_FILTER_PROFILE_VERSION = 2
+GMGN_TRENCH_FILTER_PROFILE_VERSION = 3
 # These are native GMGN filter field names (not token/launchpad allow-lists).
 # Keep them shared by all six monitored chains so API results and historical
 # rows cannot bypass the saved Trenches profile.
-GMGN_REQUIRED_TRENCH_FILTERS = ("has_social", "is_og")
-# Keep the upstream request aligned with the native GMGN checkbox.  Omitting
-# ``is_og`` here is not equivalent to “only OG locally”: the API returns the
-# newest mixed rows first, so an 80-row page can contain only a handful of OG
-# projects and the local board then incorrectly shrinks to a few dozen.  The
-# native filter must be applied at the source to receive the full OG page.
-GMGN_UPSTREAM_TRENCH_FILTERS = ("has_social", "is_og")
+GMGN_REQUIRED_TRENCH_FILTERS = ("has_social",)
+# The saved GMGN profile no longer enables “仅看 OG”.  Request the complete
+# social-enabled tape, then apply the market-cap floor and the chain-specific
+# safety switches locally so both OG and non-OG opportunities are eligible.
+GMGN_UPSTREAM_TRENCH_FILTERS = ("has_social",)
+GMGN_TRENCH_MIN_MARKET_CAP_USD = 10_000.0
 # A non-OG token may override the saved checkbox only when its live market
 # data is materially stronger than the OG baseline in the same GMGN batch.
 # These are adaptive thresholds, not a symbol/contract allow-list.
@@ -66,27 +65,21 @@ GMGN_MAX_DUPLICATE_FAMILY_SIZE = 3
 GMGN_TRENCH_CHAIN_FILTERS: dict[str, dict[str, Any]] = {
     "solana": {
         "imageNotDuplicate": True,
-        "excludeDeveloperWashTrading": True,
-        "excludeRatWashTrading": True,
         "requireSocial": True,
-        "onlyOG": True,
+        "minMarketCapUsd": GMGN_TRENCH_MIN_MARKET_CAP_USD,
         "excludeLaunchpads": ("uxento", "rapidlaunch"),
     },
     "bsc": {
         "imageNotDuplicate": True,
-        "excludeDeveloperWashTrading": True,
-        "excludeRatWashTrading": True,
         "requireSocial": True,
-        "onlyOG": True,
+        "minMarketCapUsd": GMGN_TRENCH_MIN_MARKET_CAP_USD,
         "excludeLaunchpads": ("uxento", "rapidlaunch"),
     },
     "robinhood": {
         "imageNotDuplicate": True,
-        "excludeDeveloperWashTrading": True,
-        "excludeRatWashTrading": True,
         "notHoneypot": True,
         "requireSocial": True,
-        "onlyOG": True,
+        "minMarketCapUsd": GMGN_TRENCH_MIN_MARKET_CAP_USD,
         "excludeLaunchpads": ("uxento", "rapidlaunch"),
     },
     # The native saved profile only enables “not honeypot” here.  The UI's
@@ -97,20 +90,18 @@ GMGN_TRENCH_CHAIN_FILTERS: dict[str, dict[str, Any]] = {
         "imageNotDuplicate": True,
         "notHoneypot": True,
         "requireSocial": True,
-        "onlyOG": True,
+        "minMarketCapUsd": GMGN_TRENCH_MIN_MARKET_CAP_USD,
     },
     "eth": {
         "imageNotDuplicate": True,
         "requireSocial": True,
-        "onlyOG": True,
+        "minMarketCapUsd": GMGN_TRENCH_MIN_MARKET_CAP_USD,
     },
     "arc": {
         "imageNotDuplicate": True,
-        "excludeDeveloperWashTrading": True,
-        "excludeRatWashTrading": True,
         "notHoneypot": True,
         "requireSocial": True,
-        "onlyOG": True,
+        "minMarketCapUsd": GMGN_TRENCH_MIN_MARKET_CAP_USD,
         "excludeLaunchpads": ("uxento", "rapidlaunch"),
     },
 }
@@ -121,13 +112,11 @@ GMGN_TRENCH_CHAIN_FILTERS: dict[str, dict[str, Any]] = {
 GMGN_ARC_RANK_FILTERS = (
     "not_honeypot",
     "not_image_dup",
-    "not_wash_trading",
     "has_social",
-    "is_og",
 )
-# Send the complete native profile to the rank route as well.  Some Arc
-# deployments currently ignore ``is_og`` server-side; normalize the returned
-# rows locally as a safety net, but do not omit the predicate from requests.
+# Send the complete native profile to the rank route as well.  The market-cap
+# floor remains a local check because the public route does not expose one
+# stable cross-chain parameter for that threshold.
 GMGN_ARC_UPSTREAM_RANK_FILTERS = GMGN_ARC_RANK_FILTERS
 GMGN_READONLY_HEADERS = {
     "Accept": "application/json",
@@ -455,6 +444,22 @@ def _row_social_count(row: Mapping[str, Any], signals: Mapping[str, Any]) -> int
     return 0
 
 
+def _row_market_cap_usd(row: Mapping[str, Any]) -> float | None:
+    """Read the actual market-cap field without silently substituting FDV."""
+    metrics = row.get("metrics")
+    metrics = metrics if isinstance(metrics, Mapping) else {}
+    for value in (
+        metrics.get("marketCapUsd"),
+        row.get("marketCapUsd"),
+        row.get("market_cap"),
+        row.get("marketCap"),
+    ):
+        parsed = _number(value)
+        if parsed is not None:
+            return max(0.0, parsed)
+    return None
+
+
 def gmgn_trench_performance_score(row: Mapping[str, Any]) -> float:
     """Score observable market strength for the non-OG exception.
 
@@ -560,14 +565,12 @@ def gmgn_trench_passes_chain_filters(row: Mapping[str, Any]) -> bool:
 
     if profile.get("requireSocial") and _row_social_count(row, signals) < 1:
         return False
-    if profile.get("onlyOG"):
-        # Native GMGN uses ``is_og === true`` for this checkbox.  Unknown
-        # values must not be treated as OG, otherwise stale history would
-        # silently bypass the newly enabled profile requirement.
-        is_og = signals.get("isOg")
-        if is_og is None:
-            is_og = signals.get("is_og")
-        if is_og is not True and not (is_og is False and _gmgn_non_og_exception(row)):
+    min_market_cap = _number(profile.get("minMarketCapUsd"))
+    if min_market_cap is not None:
+        market_cap = _row_market_cap_usd(row)
+        # “MC 大于 10K” is strict: an unknown value or exactly $10K does not
+        # meet the saved filter.
+        if market_cap is None or market_cap <= min_market_cap:
             return False
 
     if profile.get("imageNotDuplicate"):
@@ -1083,8 +1086,8 @@ def fetch_gmgn_migrated_trenches(
         return fetch_gmgn_arc_opened_rank(limit=limit, session=session)
 
     section: dict[str, Any] = {
-        # Match the native saved filter: retain both market origins, require at
-        # least one project social channel, and request the complete OG page.
+        # Match the native saved filter: retain both market origins and require
+        # at least one project social channel. OG is intentionally unrestricted.
         "filters": ["offchain", "onchain", *GMGN_UPSTREAM_TRENCH_FILTERS],
         "launchpad_platform_v2": True,
         "limit": max(1, min(80, int(limit))),
