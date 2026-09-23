@@ -64,6 +64,33 @@ def sample_payload():
 
 
 class ChainEcosystemAiTests(unittest.TestCase):
+    def test_cached_chain_view_is_paginated_without_opening_scan_store(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(server, "PERSIST_CACHE_DIR", Path(temp_dir)):
+            key = "chain-ecosystem-view-v4-test"
+            selected = [
+                {"symbol": f"T{index:02d}", "selectedScore": 100 - index, "contractAddress": f"0x{index:040x}"}
+                for index in range(25)
+            ]
+            history = [{"symbol": f"H{index:02d}"} for index in range(25)]
+            server.write_json_cache(server.api_cache_path(key), {
+                "ok": True,
+                "dailyResearch": {"selected": selected, "recommendationHistory": history},
+                "_cache": {"updatedAt": 1},
+            })
+
+            payload = server.cached_chain_ecosystem_view(
+                key,
+                research_page=2,
+                research_history_page=2,
+            )
+
+        self.assertEqual(len(payload["dailyResearch"]["selected"]), 12)
+        self.assertEqual(payload["dailyResearch"]["pagination"]["page"], 2)
+        self.assertEqual(len(payload["dailyResearch"]["recommendationHistory"]), 12)
+        self.assertEqual(payload["dailyResearch"]["historyPagination"]["page"], 2)
+        self.assertTrue(payload["_skipIdentityEnrichment"])
+        self.assertTrue(payload["_cache"]["stale"])
+
     def test_high_potential_block_alert_opens_research_page_not_exchange(self):
         row = {"network": "bsc", "contractAddress": "0x" + "a" * 40, "symbol": "DOG"}
         analysis = {
@@ -71,6 +98,26 @@ class ChainEcosystemAiTests(unittest.TestCase):
             "summary": "题材和买方加速度共振，但合约审计阻断执行", "risk": "权限风险未解除",
             "frameworkAssessment": {
                 "version": server.FRAMEWORK_VERSION,
+                "metaFamily": "源事件 → 当前CA", "metaRole": "First Real Leader",
+                "metaExpansion": "0-1h建档，1-6h扩散", "survivalLabel": "strong-hold",
+                "survivalAssessment": "成交、新买方与流动性共同保持",
+                "mechanismStrength": 60, "carrierStrength": 79, "longTermStage": "LT1",
+                "thesisMemory": {"coreThesis": "题材与买方共振", "terminalVision": "形成文化资产",
+                    "milestones": ["持币扩散"], "tokenValueCapture": "当前CA承载交易共识",
+                    "invalidation": "买方与叙事同步衰减", "reactivationConditions": ["新事实与资金转强"]},
+                "lifelines": {"project": "来源持续", "narrative": "注意力扩散", "token": "买方承接", "liquidity": "退出可用"},
+                "reactivationEvidence": [],
+                "personCatalyst": {"status": "none"},
+                "marketMainline": {"status": "uncertain", "asOf": 1800000000000,
+                    "primaryThemes": [], "phase": "unclear", "leaders": [], "capitalAttention": "", "evidence": [],
+                    "candidateRelation": "independent-catalyst", "relationReason": "市场主线证据不足，当前按独立催化研究",
+                    "nextTrigger": "跨资产资金共振", "invalidation": "催化失效"},
+                "hotspotOpportunity": {"eventId": "dog-event", "eventName": "DOG 热点",
+                    "relation": "independent-hotspot", "priority": "P1", "override": True,
+                    "identityConclusion": "非官方社区部署，未冒充官方",
+                    "opportunityConclusion": "热点映射与买方承接成立",
+                    "executionConclusion": "权限风险导致执行阻断",
+                    "nextTrigger": "权限风险解除", "invalidation": "热点与买方同步衰减"},
                 "potentialTier": "golden-dog", "opportunityScore": 86, "leaderScore": 75,
                 "attentionState": "A6", "attentionTransition": "A5→A6，买方承接",
                 "transitionTrigger": "TR_BUYER_RESPONSE",
@@ -93,6 +140,31 @@ class ChainEcosystemAiTests(unittest.TestCase):
         self.assertIn("仅研究，不可直接执行", payload["body"])
         self.assertIn("price-watch.html?mode=chains", payload["url"])
         self.assertNotIn("web3.binance.com", payload["url"])
+
+    def test_chatgpt_research_copy_uses_symbol_instead_of_project_name(self):
+        row = {"network": "solana", "contractAddress": "Chat111", "symbol": "CHAT", "name": "Chat Project"}
+        analysis = {
+            "researchRoute": server.CHATGPT_RESEARCH_ROUTE,
+            "alertDecision": "alert",
+            "alertReason": "聊天按完整投研体系判断值得提醒",
+            "popupTitle": "Chat Project 出现新催化",
+            "popupBody": "Chat Project 官方动作与买方承接共振；流动性偏薄；等待第二轮扩散。",
+            "popupSpeech": "链上投研提醒，CHAT 出现新的可验证催化。",
+            "verdict": "watch", "confidence": 40, "evidenceStatus": "partial",
+            "frameworkAssessment": {},
+        }
+        with patch.object(server, "launch_desktop_alert", side_effect=lambda payload: payload) as launch:
+            result = server.send_fast_onchain_alert(
+                row, analysis, {"key": "solana:Chat111", "first_seen_at": 1000, "analyzed_at": 4000},
+            )
+
+        self.assertEqual(result["title"], "CHAT 出现新催化")
+        self.assertTrue(result["title"].startswith("CHAT"))
+        self.assertIn("CHAT 官方动作", result["body"])
+        self.assertNotIn("Chat Project", result["title"] + result["body"])
+        self.assertEqual(result["speech"], "")
+        self.assertEqual(result["sourceType"], "onchain-chatgpt-research")
+        launch.assert_called_once()
 
     def test_live_trench_ai_subject_uses_gmgn_facts_without_claiming_social_verification(self):
         row = {
@@ -129,6 +201,26 @@ class ChainEcosystemAiTests(unittest.TestCase):
                               "invalidation": "若合约不是新闻对应标的，或无法验证商品交易功能，应撤回判断。"},
                 "frameworkAssessment": {
                     "version": server.FRAMEWORK_VERSION,
+                    "metaFamily": "商品上链事件 → 当前CA", "metaRole": "First Tradable",
+                    "metaExpansion": "0-1h建档，家族扩散待观察", "survivalLabel": "divergence",
+                    "survivalAssessment": "成交已出现，但持续买方和退出深度待验证",
+                    "mechanismStrength": 70, "carrierStrength": 58, "longTermStage": "LT1",
+                    "thesisMemory": {"coreThesis": "商品交易上链", "terminalVision": "形成链上商品交易入口",
+                        "milestones": ["验证产品交付"], "tokenValueCapture": "代币价值承接仍待核验",
+                        "invalidation": "身份错误或产品无法验证", "reactivationConditions": ["真实用户和收入出现"]},
+                    "lifelines": {"project": "产品待验证", "narrative": "新闻催化", "token": "当前CA待核验", "liquidity": "流动性部分可用"},
+                    "reactivationEvidence": [],
+                    "personCatalyst": {"status": "none"},
+                    "marketMainline": {"status": "uncertain", "asOf": 1800000000000,
+                        "primaryThemes": [], "phase": "unclear", "leaders": [], "capitalAttention": "", "evidence": [],
+                        "candidateRelation": "independent-catalyst", "relationReason": "批次市场证据不足，商品上链事件按独立催化研究",
+                        "nextTrigger": "同赛道资金共振", "invalidation": "事件与当前CA映射失败"},
+                    "hotspotOpportunity": {"eventId": "rwa-event", "eventName": "商品上链热点",
+                        "relation": "independent-hotspot", "priority": "P1", "override": True,
+                        "identityConclusion": "官方性待核验，不作为机会否决项",
+                        "opportunityConclusion": "事件映射与早期成交形成承接",
+                        "executionConclusion": "执行许可保持 CAUTION 并独立审计",
+                        "nextTrigger": "跨源扩散和买方继续增加", "invalidation": "事件映射或买方承接失败"},
                     "potentialTier": "leader", "candidatePath": "rwa-mechanism-leader", "currentStage": "S5",
                     "attentionState": "A5", "previousAttentionState": "A4",
                     "attentionTransition": "A4→A5，新闻事件开始映射到当前CA",
@@ -154,6 +246,8 @@ class ChainEcosystemAiTests(unittest.TestCase):
             self.assertIn("Firstness", prompt)
             self.assertIn("Quote Migration", prompt)
             self.assertIn("执行许可", prompt)
+            self.assertIn("marketMainlineContext", prompt)
+            self.assertIn("先给整批同一个市场主线判断", prompt)
             self.assertIn("群友明确提及同一CA", prompt)
             self.assertIn("重复转发不算独立证据", prompt)
             self.assertNotIn("不超过16个", prompt)
@@ -161,7 +255,15 @@ class ChainEcosystemAiTests(unittest.TestCase):
             self.assertTrue(settings["_codexWebSearch"])
             self.assertEqual(settings["_codexModel"], "gpt-6-astra")
             self.assertEqual(settings["_codexReasoningEffort"], "high")
-            return {"choices": [{"message": {"content": json.dumps({"items": [item]}, ensure_ascii=False)}}], "_provider": "test"}
+            return {"choices": [{"message": {"content": json.dumps({
+                "marketMainline": {
+                    "status": "active", "asOf": 1800000000000,
+                    "primaryThemes": ["RWA 商品上链"], "phase": "accelerating",
+                    "leaders": ["RWA 龙头"], "capitalAttention": "同赛道成交和流动性迁入",
+                    "evidence": ["多个同赛道资产成交扩张", "商品上链事件持续出现"],
+                },
+                "items": [item],
+            }, ensure_ascii=False)}}], "_provider": "test"}
         with patch.object(server, "system_llm_settings", return_value={}), patch.object(server, "deepseek_enabled", return_value=True), patch.object(server, "deepseek_chat", side_effect=response):
             result = server.analyze_fast_onchain_candidates([row])[item["key"]]
             self.assertEqual(result["evidenceRefs"], ["story"])
@@ -169,6 +271,8 @@ class ChainEcosystemAiTests(unittest.TestCase):
             self.assertEqual(result["narrative"], item["narrative"])
             self.assertEqual(result["frameworkAssessment"]["potentialTier"], "leader")
             self.assertEqual(result["frameworkAssessment"]["executionPermission"], "CAUTION")
+            self.assertEqual(result["frameworkAssessment"]["marketMainline"]["primaryThemes"], ["RWA 商品上链"])
+            self.assertEqual(result["frameworkAssessment"]["marketMainline"]["candidateRelation"], "independent-catalyst")
             row.pop("researchEvidence")
             item["evidenceStatus"] = "supported"
             result = server.analyze_fast_onchain_candidates([row])[item["key"]]
@@ -269,7 +373,10 @@ class ChainEcosystemAiTests(unittest.TestCase):
             "funnel": {"discovered": 99, "selected": 1},
             "reviewQueue": {"pending": 4},
         }
-        with patch.object(server, "fetch_gmgn_trenches_hot_board", return_value={
+        with patch.object(server, "onchain_research_mode_payload", return_value={
+            "mode": "deep", "label": "慢速模式", "providerLabel": "Codex + 完整投研体系",
+            "description": "完整判断", "updatedAt": 0,
+        }), patch.object(server, "fetch_gmgn_trenches_hot_board", return_value={
             "rows": [fresh, stale, filtered],
             "updatedAt": day_start + 300_000,
             "sourceStatus": {"solana": "ok"},
@@ -278,9 +385,10 @@ class ChainEcosystemAiTests(unittest.TestCase):
 
         self.assertEqual([row["symbol"] for row in result["selected"]], ["FRESH"])
         self.assertTrue(result["gmgnTrenchOnly"])
-        self.assertEqual(result["researchSourceLabel"], "GMGN 战壕今日新币 · V4.4精选")
+        self.assertEqual(result["researchSourceLabel"], "GMGN 战壕今日新币 · ChatGPT 聊天实时 V4.9 投研")
         self.assertEqual(result["funnel"]["discovered"], 1)
         self.assertEqual(result["selectedTotal"], 1)
+        self.assertTrue(result["trenchCandidatePool"][0]["gmgnTrenchBoardMember"])
 
     def test_gmgn_trench_research_public_list_requires_v44_selection(self):
         day = "2026-09-20"
@@ -295,7 +403,10 @@ class ChainEcosystemAiTests(unittest.TestCase):
             "selectedScore": 88,
             "metrics": {"liquidityUsd": 35_000},
         }
-        with patch.object(server, "fetch_gmgn_trenches_hot_board", return_value={
+        with patch.object(server, "onchain_research_mode_payload", return_value={
+            "mode": "deep", "label": "慢速模式", "providerLabel": "Codex + 完整投研体系",
+            "description": "完整判断", "updatedAt": 0,
+        }), patch.object(server, "fetch_gmgn_trenches_hot_board", return_value={
             "rows": [fresh],
             "updatedAt": day_start + 300_000,
             "sourceStatus": {"solana": "ok"},
@@ -312,8 +423,63 @@ class ChainEcosystemAiTests(unittest.TestCase):
             result = server.attach_gmgn_trench_research(raw)
 
         self.assertEqual([row["symbol"] for row in result["selected"]], ["FRESH"])
-        self.assertEqual(result["researchSystem"], "onchain-fast-v4.4")
+        self.assertEqual(result["researchSystem"], "codex-v48-realtime")
         self.assertTrue(result["fastResearchManaged"])
+
+    def test_rapid_mode_declares_jev_primary(self):
+        with patch.object(server, "read_json_cache", return_value={
+            "version": 3, "mode": "rapid", "updatedAt": 123,
+        }):
+            payload = server.onchain_research_mode_payload()
+
+        self.assertEqual(payload["mode"], "rapid")
+        self.assertEqual(payload["providerLabel"], "JEV 快速主判")
+        self.assertIn("JEV 负责快速主判", payload["description"])
+        self.assertNotIn("临时兜底", payload["description"])
+
+    def test_gmgn_trench_research_rapid_mode_exposes_jev_primary_positive_decision(self):
+        day = "2026-09-20"
+        day_start = int(server.time.mktime(server.time.strptime(day, "%Y-%m-%d")) * 1000)
+        fresh = {
+            "network": "solana",
+            "contractAddress": "RapidTrench333333333333333333333333333333333",
+            "symbol": "RAPID",
+            "name": "Rapid Trench",
+            "poolCreatedAt": day_start + 60_000,
+            "decision": "shortlisted",
+            "selectedScore": 86,
+            "metrics": {"liquidityUsd": 42_000},
+            "rapidDecision": {
+                "version": server.RAPID_DECISION_VERSION,
+                "priority": "deep-research",
+                "confidence": 0.87,
+                "goodCandidateProbability": 0.9,
+                "modelCount": 1,
+                "comparisonStatus": "jev-only",
+            },
+        }
+        key = server.onchain_candidate_key(fresh)
+        rapid_config = {
+            "mode": "rapid", "label": "快速模式", "providerLabel": "JEV 快速主判",
+            "description": "快速判断", "updatedAt": 0,
+        }
+        with patch.object(server, "onchain_research_mode_payload", return_value=rapid_config), patch.object(
+            server, "fetch_gmgn_trenches_hot_board", return_value={
+                "rows": [fresh], "updatedAt": day_start + 300_000, "sourceStatus": {"solana": "ok"},
+            },
+        ), patch.object(server.ONCHAIN_FAST_RESEARCH, "ingest"), patch.object(
+            server.ONCHAIN_FAST_RESEARCH, "attach", return_value={"selected": [], "provisional": [], "reviewQueue": {}},
+        ), patch.object(server.ONCHAIN_FAST_RESEARCH, "_query", return_value=[{
+            "key": key, "status": "rapid-ready", "analyzed_at": 0,
+            "candidate_json": json.dumps(fresh), "analysis_json": "{}",
+        }]):
+            raw = server.gmgn_trench_daily_research_payload({}, research_day=day, now_ms=day_start + 600_000)
+            result = server.attach_gmgn_trench_research(raw)
+
+        self.assertEqual([row["symbol"] for row in result["selected"]], ["RAPID"])
+        self.assertEqual(result["selected"][0]["researchTier"], "rapid-recommended")
+        self.assertEqual(result["researchSystem"], "jev-primary-rapid-v1")
+        self.assertEqual(result["researchMode"], "rapid")
 
     def test_chain_research_prompt_uses_evidence_chain_instead_of_price_chasing(self):
         prompt = server.chain_ecosystem_ai_prompt([{"index": 1, "key": "research:solana:abc", "type": "research_candidate", "facts": {}}])

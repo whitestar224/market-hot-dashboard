@@ -2093,6 +2093,72 @@ test("a washed first test can use direct candle expansion for the red second-bre
   assert.ok(hints[0].evidence.some((item) => item.includes("价格运动确认强于首次试盘")));
 });
 
+test("a washed first test exposes its reference high before the second breakout", () => {
+  const candles = Array.from({ length: 7 }, (_, index) => candle(index, {
+    open: 99.45,
+    high: 99.9,
+    low: 99.2,
+    close: 99.6,
+    volume: 100,
+  }));
+  candles[2] = candle(2, { open: 99.7, high: 100.3, low: 99.45, close: 100.05, volume: 100 });
+  candles[3] = candle(3, { open: 100.02, high: 100.08, low: 99.2, close: 99.5, volume: 88 });
+  candles[6] = candle(6, { open: 96.9, high: 97.3, low: 96.8, close: 97.1, volume: 112 });
+  const first = {
+    id: "quiet-first-before-recross",
+    interval: "1h",
+    index: 2,
+    time: candles[2].time,
+    decisionTime: candles[2].time,
+    status: "buy",
+    foundationTypes: ["base"],
+    auxiliaryTypes: ["previousHigh"],
+    consolidationBreakout: true,
+    crossedLevel: true,
+    openedBeyondTrigger: false,
+    outerEdgeConfirmed: true,
+    outerEdgeScore: 86,
+    consolidationBars: 25,
+    ceilingAge: 8,
+    platformTouchGroups: 3,
+    horizontalLaunchHasPriorAdvance: true,
+    horizontalLaunchPostSelloffRecovery: false,
+    horizontalLaunchUrgent: false,
+    horizontalLaunchInsufficientEdgeDwell: false,
+    triggerPrice: 100,
+    level: 100,
+    stop: 95,
+    motherStructureNoise: false,
+    highLevelDistribution: false,
+    riskStructureShape: null,
+    relativeVolume: 0.92,
+    orderFlowScore: 44,
+    klineVelocity: 0.4,
+    certaintyScore: 84,
+    rhythmScore: 74,
+    sentimentScore: 70,
+    score: 84,
+    pattern: "盘整突破 + 横盘起飞 + 突破前高",
+    patternKey: "base",
+    reasons: [],
+    evidence: [],
+  };
+
+  const prearms = Engine.buildSecondaryBreakoutPrearms(
+    [first],
+    candles,
+    { atr: Array(candles.length).fill(0.8) },
+    "1h",
+  );
+
+  assert.equal(prearms.length, 1);
+  assert.equal(prearms[0].secondaryBreakoutPrearm, true);
+  assert.equal(prearms[0].primaryAttemptId, first.id);
+  assert.equal(prearms[0].triggerPrice, 100.3);
+  assert.equal(prearms[0].certaintyScore, 90);
+  assert.match(prearms[0].pattern, /二次突破预判/);
+});
+
 test("a stopped valid platform may use a hierarchy-filtered recross only as a red alert", () => {
   const candles = Array.from({ length: 8 }, (_, index) => candle(index, {
     open: 99.6,

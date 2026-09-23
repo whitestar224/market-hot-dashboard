@@ -215,6 +215,31 @@ class AlertDeliveryStore:
         with self.db() as db:
             db.execute("UPDATE deliveries SET state='suppressed',token='',closed=1,reason=?,updated=? WHERE id=?", (reason, time.time(), identity))
 
+    def suppress_matching(self, predicate, reason):
+        """Suppress every live outbox row whose decoded payload matches."""
+        now = time.time()
+        matched = []
+        with self.db() as db:
+            rows = db.execute(
+                "SELECT id,payload FROM deliveries "
+                "WHERE state IN ('pending','starting') OR (state='displayed' AND closed=0)"
+            ).fetchall()
+            for row in rows:
+                try:
+                    payload = json.loads(row['payload'])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if isinstance(payload, dict) and predicate(payload):
+                    matched.append(int(row['id']))
+            if matched:
+                placeholders = ','.join('?' for _ in matched)
+                db.execute(
+                    f"UPDATE deliveries SET state='suppressed',token='',closed=1,reason=?,updated=? "
+                    f"WHERE id IN ({placeholders})",
+                    (reason, now, *matched),
+                )
+        return matched
+
     def mark_read(self, identity):
         with self.db() as db:
             return bool(db.execute("UPDATE deliveries SET read_at=?,updated=?,closed=1,token='',state=CASE WHEN state IN ('pending','starting') THEN 'read' ELSE state END WHERE id=?", (time.time(), time.time(), identity)).rowcount)

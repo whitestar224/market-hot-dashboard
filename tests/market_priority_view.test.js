@@ -129,3 +129,18 @@ test("all eligible crypto boards render exchange-native AI narratives with provi
   assert.match(css, /\.binance-ai-narrative:hover \.binance-ai-narrative-tooltip/);
   assert.match(css, /\.binance-ai-narrative:focus-visible \.binance-ai-narrative-tooltip/);
 });
+
+test("Binance gainers card switches between spot and futures without duplicating the board", () => {
+  const gainers = fs.readFileSync(path.join(root, "gainers.html"), "utf8");
+  const rankings = fs.readFileSync(path.join(root, "rankings.js"), "utf8");
+  assert.match(rankings, /BINANCE_GAINERS_MODE_KEY/);
+  assert.match(rankings, /"binance-gainers": "spot"/);
+  assert.match(rankings, /"binance-futures-gainers": "futures"/);
+  assert.match(rankings, /data-binance-gainers-mode/);
+  assert.match(rankings, /现货涨幅榜/);
+  assert.match(rankings, /合约涨幅榜/);
+  assert.match(rankings, /state\.binanceGainersMode/);
+  assert.match(gainers, /rankings\.js\?v=20/);
+  assert.match(server, /def fetch_binance_futures_gainers\(\)/);
+  assert.match(server, /"binance-futures-gainers"/);
+});

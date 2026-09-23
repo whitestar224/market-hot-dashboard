@@ -142,6 +142,31 @@ class NewContractMonitorPriorityTests(unittest.TestCase):
         self.assertTrue(opened["structure1mEnabled"])
         self.assertEqual(server.price_structure_1m_override_for_symbol("NEW"), 1)
 
+    def test_monitor_pool_entry_day_auto_enables_one_minute_until_beijing_midnight(self):
+        entered_at = self.china_ms(2026, 9, 23, 15, 40)
+        same_day = self.china_ms(2026, 9, 23, 23, 59)
+        next_day = self.china_ms(2026, 9, 24, 0, 0)
+        item = {
+            "symbol": "TAKE",
+            "monitorPoolEnteredAt": entered_at,
+            "structure1mOverride": -1,
+        }
+
+        active = server.price_structure_1m_state(item, now_ms=same_day)
+        expired = server.price_structure_1m_state(item, now_ms=next_day)
+        manual_off = server.price_structure_1m_state(
+            {**item, "structure1mOverride": 0},
+            now_ms=same_day,
+        )
+
+        self.assertTrue(active["enabled"])
+        self.assertEqual(active["mode"], "auto-pool-day")
+        self.assertEqual(active["label"], "入池当天自动开启")
+        self.assertFalse(expired["enabled"])
+        self.assertEqual(expired["mode"], "auto-off")
+        self.assertFalse(manual_off["enabled"])
+        self.assertEqual(manual_off["mode"], "manual-off")
+
     def test_each_structure_interval_switch_is_independent_and_persistent(self):
         five_closed = server.set_price_structure_interval_override("NEW", "5m", False)
         self.assertFalse(five_closed["structureIntervalStates"]["5m"]["enabled"])

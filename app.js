@@ -752,7 +752,7 @@ function gmgnTrenchSocialLinks(row) {
 }
 
 function renderGmgnTrenchTool({ kind, label, href = "", tooltip = "", disabled = false, statusId = "", xHandle = "", symbol = "", publishedAt = 0 }) {
-  const icons = { ai: "✦", wallet: "▣", x: "𝕏", web: "◎", gmgn: "↗" };
+  const icons = { person: "人", ai: "✦", wallet: "▣", x: "𝕏", web: "◎", gmgn: "↗" };
   const tag = href ? "a" : "button";
   const linkAttrs = href ? `href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer"` : 'type="button"';
   const xAttrs = kind === "x"
@@ -845,7 +845,7 @@ function renderGmgnTrenchRow(row, source, index) {
     ? `<i class="gmgn-trench-risk-note" title="${escapeHtml(filterWarnings.join(" · "))}">风险</i>` : "";
   const researchMark = row?.researchMark && typeof row.researchMark === "object" ? row.researchMark : null;
   const researchMarkTitle = researchMark ? [
-    researchMark.label || "V4.4 好标的",
+    researchMark.label || "V4.9 好标的",
     researchMark.potentialLabel,
     [researchMark.attentionState, researchMark.currentStage].filter(Boolean).join(" / "),
     Number(researchMark.opportunityScore) > 0 ? `机会分 ${Math.round(Number(researchMark.opportunityScore))}` : "",
@@ -855,7 +855,17 @@ function renderGmgnTrenchRow(row, source, index) {
     researchMark.executionPermission ? `执行许可 ${researchMark.executionPermission}` : ""
   ].filter(Boolean).join(" · ") : "";
   const researchBadge = researchMark
-    ? `<i class="gmgn-trench-research-badge" title="${escapeHtml(researchMarkTitle)}">${escapeHtml(researchMark.label || "V4.4 好标的")}</i>`
+    ? `<i class="gmgn-trench-research-badge" title="${escapeHtml(researchMarkTitle)}">${escapeHtml(researchMark.label || "V4.9 好标的")}</i>`
+    : "";
+  const personSignal = row?.personSignal && typeof row.personSignal === "object" ? row.personSignal : null;
+  const personName = String(personSignal?.personName || personSignal?.personHandle || "重要人物").trim();
+  const personAction = String(personSignal?.actionLabel || "点名").trim();
+  const personTooltip = personSignal ? `
+    <b>${escapeHtml(personName)} · ${escapeHtml(personAction)} ${escapeHtml(symbol)}</b>
+    <p>${escapeHtml(personSignal.postText || personSignal.quoteText || "已捕捉到与该战壕新币直接相关的原始人物动态。")}</p>
+    <small>${escapeHtml(personSignal.personRole || "重要人物")} · 置信度 ${Math.round(Number(personSignal.confidence) || 0)}% · 已进入 V4.9 快速投研</small>` : "";
+  const personBadge = personSignal
+    ? `<i class="gmgn-trench-person-badge" title="${escapeHtml(`${personName} ${personAction}`)}">人物${escapeHtml(personAction)}</i>`
     : "";
   const aiCopy = narrative
     || (!binanceAiSupported
@@ -871,6 +881,12 @@ function renderGmgnTrenchRow(row, source, index) {
     <small>${narrative ? "来源：热门榜同款 Binance AI 接口" : "最新 10 个按需读取 · 正负结果均缓存"}</small>`;
   const xTooltip = socials.x ? renderGmgnTrenchXTooltip(symbol, socials.original) : "";
   const tools = [
+    personSignal ? renderGmgnTrenchTool({
+      kind: "person",
+      label: `查看 ${personName} 的${personAction}信号`,
+      href: safeExternalUrl(personSignal.postUrl),
+      tooltip: personTooltip
+    }) : "",
     renderGmgnTrenchTool({ kind: "ai", label: `查看 ${symbol} 的币安 AI 叙事`, tooltip: aiTooltip }),
     binanceWallet ? renderGmgnTrenchTool({
       kind: "wallet",
@@ -903,6 +919,7 @@ function renderGmgnTrenchRow(row, source, index) {
               ? `<a class="gmgn-trench-token-link" ${binanceWalletAttrs} title="在币安钱包交易 ${escapeHtml(symbol)}"><strong>${escapeHtml(symbol)}</strong><span>${escapeHtml(name)}</span></a>`
               : `<span class="gmgn-trench-token-link is-static"><strong>${escapeHtml(symbol)}</strong><span>${escapeHtml(name)}</span></span>`}
             ${researchBadge}
+            ${personBadge}
             ${filterWarningBadge}
           </div>
           <div class="gmgn-trench-subline">

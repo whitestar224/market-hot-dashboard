@@ -139,6 +139,35 @@ class DurableDeliveryTests(unittest.TestCase):
         self.store.mark_read(identity)
         self.assertIsNone(self.store.pending(now=self.now))
 
+    def test_suppress_matching_cancels_only_live_matching_rows(self):
+        matching = self.store.admit(
+            {'key': 'price-watch:dragon-wave:HIVE:15m:1', 'excludeSymbol': 'HIVE'},
+            ['matching'], 100, now=self.now,
+        )['deliveryId']
+        kept = self.store.admit(
+            {'key': 'price-watch:dragon-wave:KEEP:15m:1', 'excludeSymbol': 'KEEP'},
+            ['kept'], 100, now=self.now + 1,
+        )['deliveryId']
+        historical = self.store.admit(
+            {'key': 'price-watch:structure-first:HIVE:1h:old', 'excludeSymbol': 'HIVE'},
+            ['historical'], 100, now=self.now + 2,
+        )['deliveryId']
+        with self.store.db() as db:
+            db.execute(
+                "UPDATE deliveries SET state='displayed',closed=1 WHERE id=?",
+                (historical,),
+            )
+
+        suppressed = self.store.suppress_matching(
+            lambda payload: payload.get('excludeSymbol') == 'HIVE',
+            'removed',
+        )
+
+        self.assertEqual(suppressed, [matching])
+        self.assertEqual(self.store.get(matching)['state'], 'suppressed')
+        self.assertEqual(self.store.get(kept)['state'], 'pending')
+        self.assertEqual(self.store.get(historical)['state'], 'displayed')
+
     def test_old_opportunity_not_revived_but_kept_in_records(self):
         identity = self.admit(ttl=30)
         self.store.sweep(now=self.now+31)

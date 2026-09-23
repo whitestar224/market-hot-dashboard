@@ -30,3 +30,6 @@ wechatauto_logs/
 
 # Temporary browser/API extraction chunks.
 tmp_*.js
+
+# Runtime temp data
+tmp/

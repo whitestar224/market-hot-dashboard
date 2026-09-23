@@ -5392,6 +5392,124 @@
     return hints;
   }
 
+  function buildSecondaryBreakoutPrearms(items, candles, indicators, interval, confirmedHints = []) {
+    const rows = Array.isArray(candles) ? candles : [];
+    const currentIndex = rows.length - 1;
+    if (currentIndex < 2) return [];
+    const currentRow = rows[currentIndex];
+    const atrValues = indicators?.atr || [];
+    const maximumBarsByInterval = {
+      "1m": 45,
+      "5m": 36,
+      "15m": 32,
+      "1h": 30,
+      "4h": 18,
+      "1d": 12,
+    };
+    const confirmedPrimaryIds = new Set((Array.isArray(confirmedHints) ? confirmedHints : [])
+      .map((hint) => hint?.primaryAttemptId)
+      .filter(Boolean));
+    const attempts = (Array.isArray(items) ? items : [])
+      .filter((item) => item?.status !== "filtered"
+        && item?.status !== "candidate"
+        && item?.crossedLevel === true
+        && item?.openedBeyondTrigger !== true)
+      .filter((item) => assessExecutionHierarchy(item).permit)
+      .filter((item) => !confirmedPrimaryIds.has(item.id))
+      .sort((left, right) => right.index - left.index || (right.score || 0) - (left.score || 0));
+    const prearms = [];
+    attempts.forEach((first) => {
+      const barsApart = currentIndex - first.index;
+      const maximumBars = Math.min(
+        maximumBarsByInterval[interval] || 32,
+        Math.max(8, Math.round((first.consolidationBars || 24) * 0.9)),
+      );
+      if (barsApart < 2 || barsApart > maximumBars) return;
+      if ((first.relativeVolume || 0) >= 1.15 || (first.orderFlowScore || 0) >= 66) return;
+      const atrValue = Math.max(atrValues[currentIndex - 1] || first.atrAtDecision || 0, 1e-8);
+      // 当前K只是报价承载体。回踩必须在它之前完成，避免尚未完成的同一根K
+      // 同时被解释为“洗回”和“准备二穿”。
+      const completedBetween = rows.slice(first.index + 1, currentIndex);
+      if (!completedBetween.length) return;
+      const trigger = Number(first.triggerPrice || first.level);
+      const washIndex = completedBetween.findIndex((row) => (
+        row.close <= trigger - atrValue * 0.03
+        || row.low <= trigger - atrValue * 0.08
+      ));
+      if (washIndex < 0) return;
+      const lowerLine = first.triangleLines?.lower;
+      const lowerSlope = Number.isFinite(lowerLine?.startIndex)
+        && Number.isFinite(lowerLine?.endIndex)
+        && lowerLine.endIndex !== lowerLine.startIndex
+        ? (lowerLine.endPrice - lowerLine.startPrice) / (lowerLine.endIndex - lowerLine.startIndex)
+        : null;
+      const lifecycleRows = rows.slice(first.index + 1, currentIndex + 1);
+      const structureHeld = lifecycleRows.every((row, offset) => {
+        const rowIndex = first.index + 1 + offset;
+        const structuralFloor = Number.isFinite(lowerSlope)
+          ? lowerLine.startPrice + lowerSlope * (
+            Math.min(rowIndex, lowerLine.endIndex) - lowerLine.startIndex
+          )
+          : Number(first.stop || trigger - atrValue * 2) - atrValue * 1.15;
+        return row.low > structuralFloor - atrValue * 0.35;
+      });
+      if (!structureHeld) return;
+      const referenceRows = rows.slice(first.index, first.index + 1 + washIndex);
+      const referenceHigh = Math.max(...referenceRows.map((row) => row.high));
+      if (!Number.isFinite(referenceHigh) || referenceHigh <= 0) return;
+      const postWashRows = rows.slice(first.index + 2 + washIndex, currentIndex);
+      const alreadyReclaimed = postWashRows.some((row, offset) => {
+        const prior = rows[first.index + 1 + washIndex + offset];
+        return prior?.close <= referenceHigh + atrValue * 0.03
+          && row.open < referenceHigh + atrValue * 0.04
+          && row.high >= referenceHigh + atrValue * 0.04
+          && row.close > referenceHigh
+          && row.close > row.open;
+      });
+      if (alreadyReclaimed || currentRow.close > referenceHigh) return;
+      const certaintyScore = Math.max(90, Math.round(Number(first.certaintyScore || 0)));
+      prearms.push({
+        ...first,
+        id: `${first.id}-secondary-breakout-prearm`,
+        index: currentIndex,
+        time: currentRow.time,
+        decisionTime: currentRow.time,
+        status: "secondary-prearm",
+        secondaryBreakoutPrearm: true,
+        alertOnly: true,
+        executionAllowed: false,
+        primaryAttemptId: first.id,
+        primaryAttemptTime: first.time,
+        primaryAttemptIndex: first.index,
+        secondaryReferenceHigh: referenceHigh,
+        secondaryWashBars: washIndex + 1,
+        triggerPrice: referenceHigh,
+        level: referenceHigh,
+        price: currentRow.close,
+        certaintyScore,
+        manualCertaintyGrade: certaintyScore >= 95 ? "A+" : "A",
+        pattern: `二次突破预判 · ${String(first.pattern || "盘整突破").replace(/^二次突破预判\s*·\s*/, "")}`,
+        featureCutoff: Number(currentRow.time) - 1,
+        evidence: [...new Set([
+          ...(first.evidence || []),
+          `第一次缩量试盘后已完成回踩，母结构仍有效，继续盯同一参考高点 ${referenceHigh.toFixed(8)}`,
+          "进入参考高点下方3%后提前提示；真正二次上穿仍由独立红色提示确认",
+          "二次突破预判只进入提醒层，不是绿色正式买点，也不进入自动执行",
+        ])],
+      });
+    });
+    return prearms.reduce((selected, item) => {
+      const duplicate = selected.some((existing) => (
+        Math.abs(existing.triggerPrice - item.triggerPrice) <= Math.max(
+          atrValues[currentIndex - 1] || 0,
+          1e-8,
+        ) * 0.35
+      ));
+      if (!duplicate) selected.push(item);
+      return selected;
+    }, []);
+  }
+
   function structureLifecycleDecision(signals, evaluation, candles, index, atrValue) {
     const memoryBars = Math.max(240, Math.min(2_000, Math.round((evaluation.consolidationBars || 32) * 20)));
     const evaluationStructureStart = evaluation.triangleLines?.upper?.startIndex
@@ -6355,6 +6473,13 @@
       interval,
       [...signals, ...cleanedRejected],
     );
+    const secondaryBreakoutPrearms = buildSecondaryBreakoutPrearms(
+      signals,
+      candles,
+      indicators,
+      interval,
+      secondaryBreakoutHints,
+    );
     const executableSignals = signals.filter((signal) => !secondaryBreakoutHints.some((hint) => (
       hint.index === signal.index
       && Math.abs((hint.triggerPrice || hint.level) - (signal.triggerPrice || signal.level))
@@ -6425,6 +6550,7 @@
       pending,
       retainedCandidates,
       secondaryBreakoutHints,
+      secondaryBreakoutPrearms,
       rejected: cleanedRejected,
       structures: stableStructures,
       regime: {
@@ -6437,6 +6563,7 @@
         pendingCount: pending.length,
         retainedCandidateCount: retainedCandidates.length,
         secondaryBreakoutHintCount: secondaryBreakoutHints.length,
+        secondaryBreakoutPrearmCount: secondaryBreakoutPrearms.length,
         rejectedCount: cleanedRejected.length,
         lastPrice: last >= 0 ? closes[last] : 0,
       },
@@ -8535,6 +8662,7 @@
       }
       const keptSignals = [];
       const keptPending = [];
+      const keptSecondaryPrearms = [];
       const downgraded = [];
       const contextualPromotions = (result.rejected || [])
         .filter((signal) => signal.unorderedRepairStillActive !== true)
@@ -8824,16 +8952,19 @@
       };
       sourceSignals.forEach((signal) => gateItem(signal, keptSignals));
       (result.pending || []).forEach((signal) => gateItem(signal, keptPending));
+      (result.secondaryBreakoutPrearms || []).forEach((signal) => gateItem(signal, keptSecondaryPrearms));
       const rejected = [...sourceRejected, ...downgraded].sort((a, b) => a.time - b.time);
       return {
         ...result,
         signals: keptSignals,
         pending: keptPending,
+        secondaryBreakoutPrearms: keptSecondaryPrearms,
         rejected,
         stats: {
           ...result.stats,
           signalCount: keptSignals.length,
           pendingCount: keptPending.length,
+          secondaryBreakoutPrearmCount: keptSecondaryPrearms.length,
           rejectedCount: rejected.length,
         },
       };
@@ -8847,6 +8978,7 @@
     const keptSignals = [];
     const keptPending = [];
     const keptSecondaryHints = [];
+    const keptSecondaryPrearms = [];
     const demoted = [];
     const canonicalHorizontalSignal = (signal) => {
       const hasPreviousHigh = (signal.auxiliaryTypes || []).includes("previousHigh")
@@ -8883,6 +9015,7 @@
     (result.signals || []).forEach((signal) => route(signal, keptSignals));
     (result.pending || []).forEach((signal) => route(signal, keptPending));
     (result.secondaryBreakoutHints || []).forEach((signal) => route(signal, keptSecondaryHints));
+    (result.secondaryBreakoutPrearms || []).forEach((signal) => route(signal, keptSecondaryPrearms));
     const rejected = [...(result.rejected || []), ...demoted]
       .sort((a, b) => a.time - b.time || a.index - b.index);
     return {
@@ -8890,6 +9023,7 @@
       signals: keptSignals,
       pending: keptPending,
       secondaryBreakoutHints: keptSecondaryHints,
+      secondaryBreakoutPrearms: keptSecondaryPrearms,
       rejected,
       // 防止旧缓存、人工反馈快照或未来代码改动再次把非白名单斜线带回
       // 1分钟盘面。手动画线数据独立保存，不受这里影响。
@@ -8899,6 +9033,7 @@
         signalCount: keptSignals.length,
         pendingCount: keptPending.length,
         secondaryBreakoutHintCount: keptSecondaryHints.length,
+        secondaryBreakoutPrearmCount: keptSecondaryPrearms.length,
         rejectedCount: rejected.length,
       },
     };
@@ -8950,6 +9085,7 @@
     isExceptionalShockBoxAscendingTriangleIgnition,
     assessExecutionHierarchy,
     buildSecondaryBreakoutHints,
+    buildSecondaryBreakoutPrearms,
     detectTriangle,
     detectDescendingTrendline,
     detectLongConvergence,

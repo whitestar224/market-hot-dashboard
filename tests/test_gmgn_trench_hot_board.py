@@ -156,17 +156,19 @@ class GmgnTrenchHotBoardTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as temp_dir:
             history_path = Path(temp_dir) / "gmgn-history.json"
+            fast_research = Mock()
             with (
                 patch.object(server, "GMGN_TRENCH_HISTORY_PATH", history_path),
                 patch.object(server, "fetch_live_onchain_trenches", return_value=payload) as fetch_live,
                 patch.object(server.time, "time", return_value=observed_at / 1000),
+                patch.object(server, "ONCHAIN_FAST_RESEARCH", fast_research),
             ):
                 source = server.refresh_gmgn_trenches_hot_board()
 
             fetch_live.assert_called_once()
             self.assertEqual(fetch_live.call_args.kwargs["page_size"], 2000)
             self.assertIsNone(fetch_live.call_args.kwargs["per_network_limit"])
-            self.assertTrue(fetch_live.call_args.kwargs["include_recent_rank_supplement"])
+            self.assertFalse(fetch_live.call_args.kwargs["include_recent_rank_supplement"])
             self.assertTrue(history_path.exists())
             self.assertEqual(source["id"], "gmgn-trenches")
             self.assertTrue(source["scrollableHistory"])
@@ -183,6 +185,38 @@ class GmgnTrenchHotBoardTests(unittest.TestCase):
             self.assertEqual(source["aiProvider"], "binance")
             self.assertEqual(source["aiPolicy"], "visible-latest-10-cached")
             self.assertEqual(source["currentFetchedCount"], 1)
+            self.assertEqual(source["incrementalResearchIngested"], 1)
+            ingested = fast_research.ingest.call_args.args[0]
+            self.assertEqual(len(ingested), 1)
+            self.assertEqual(ingested[0]["symbol"], "NEW")
+            self.assertTrue(ingested[0]["gmgnTrenchBoardMember"])
+            self.assertTrue(ingested[0]["boardResearchRequired"])
+
+    def test_refresh_submits_only_live_board_not_historical_tape(self):
+        observed_at = 1_800_000_000_000
+        payload = {
+            "ok": True,
+            "items": [trench_row("ONCE", "SoLaNaContractOnce", observed_at)],
+            "sourceStatus": {"solana/gmgn-trenches": "ok"},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fast_research = Mock()
+            with (
+                patch.object(server, "GMGN_TRENCH_HISTORY_PATH", Path(temp_dir) / "gmgn-history.json"),
+                patch.object(server, "fetch_live_onchain_trenches", return_value=payload),
+                patch.object(server.time, "time", return_value=observed_at / 1000),
+                patch.object(server, "ONCHAIN_FAST_RESEARCH", fast_research),
+            ):
+                first = server.refresh_gmgn_trenches_hot_board()
+                second = server.refresh_gmgn_trenches_hot_board()
+
+        self.assertEqual(first["incrementalResearchIngested"], 1)
+        self.assertEqual(second["incrementalResearchIngested"], 1)
+        self.assertEqual(fast_research.ingest.call_count, 2)
+        self.assertTrue(all(
+            call.args[0][0]["symbol"] == "ONCE"
+            for call in fast_research.ingest.call_args_list
+        ))
 
     def test_unprofiled_history_is_not_displayed(self):
         row = trench_row("OLD", "OldContract123", 1_800_000_000_000)
@@ -222,7 +256,7 @@ class GmgnTrenchHotBoardTests(unittest.TestCase):
             "summaryRows": [trench_row("PICK", contract, observed_at)],
         }
         mark = {
-            "label": "V4.4 好标的",
+            "label": "V4.9 好标的",
             "potentialTier": "leader",
             "summary": "链外注意力与独立买方同步承接",
             "nextTrigger": "跨社区传播继续扩大",
@@ -233,7 +267,7 @@ class GmgnTrenchHotBoardTests(unittest.TestCase):
             result = server.attach_v44_research_marks_to_gmgn_trenches(source)
 
         self.assertNotIn("researchMark", source["rows"][0])
-        self.assertEqual(result["rows"][0]["researchMark"]["label"], "V4.4 好标的")
+        self.assertEqual(result["rows"][0]["researchMark"]["label"], "V4.9 好标的")
         self.assertEqual(result["summaryRows"][0]["researchMark"]["potentialTier"], "leader")
 
     def test_current_snapshot_filters_reused_artwork_like_gmgn_avatar_filter(self):

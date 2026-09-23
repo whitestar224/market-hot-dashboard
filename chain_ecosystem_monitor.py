@@ -8,7 +8,7 @@ import re
 import sqlite3
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -85,6 +85,10 @@ TRADED_WEIGHTS = {
 
 ONCHAIN_RESEARCH_SCORE_VERSION = "golden-dog-v3-cryptod-evidence"
 ONCHAIN_RESEARCH_DEFAULT_NETWORKS = ("eth", "solana", "robinhood", "arc", "bsc")
+GMGN_TRENCH_LIVE_FETCH_DEADLINE_SECONDS = max(
+    6.0,
+    float(os.getenv("GMGN_TRENCH_LIVE_FETCH_DEADLINE_SECONDS", "14") or "14"),
+)
 ONCHAIN_RESEARCH_MEME_HINTS = frozenset(
     {
         "meme", "dog", "doge", "cat", "frog", "pepe", "inu", "shib", "baby",
@@ -1190,7 +1194,8 @@ def fetch_live_onchain_trenches(
     job_count = len(selected_networks) + len(rank_jobs) + sum(
         1 for network in selected_networks if network in MEME_RUSH_CHAIN_IDS
     )
-    with ThreadPoolExecutor(max_workers=max(1, min(9, job_count))) as executor:
+    executor = ThreadPoolExecutor(max_workers=max(1, min(9, job_count)))
+    try:
         for network in selected_networks:
             if source_key != "binance":
                 jobs[executor.submit(fetch_gmgn_migrated_trenches, network)] = (network, "gmgn")
@@ -1206,54 +1211,78 @@ def fetch_live_onchain_trenches(
                     min_created=min_created,
                     max_created=max_created,
                 )] = (network, "gmgn-rank")
-        for future in as_completed(jobs):
-            network, provider = jobs[future]
+        completed_futures: set[Any] = set()
+        pending_futures = set(jobs)
+        deadline_at = time.monotonic() + GMGN_TRENCH_LIVE_FETCH_DEADLINE_SECONDS
+        while pending_futures:
+            remaining = deadline_at - time.monotonic()
+            if remaining <= 0:
+                break
+            done, pending_futures = wait(
+                pending_futures,
+                timeout=remaining,
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                break
+            for future in done:
+                completed_futures.add(future)
+                network, provider = jobs[future]
+                provider_name = "gmgn-trenches" if provider in {"gmgn", "gmgn-rank"} else "binance-meme-rush"
+                status_key = f"{network}/{provider_name}"
+                try:
+                    payload = future.result()
+                    gmgn_meta = payload.get("_gmgnMeta") if provider in {"gmgn", "gmgn-rank"} and isinstance(payload, Mapping) else {}
+                    if not isinstance(gmgn_meta, Mapping):
+                        gmgn_meta = {}
+                    normalized = (
+                        normalize_gmgn_migrated_trenches(payload, network, observed_at=observed)
+                        if provider in {"gmgn", "gmgn-rank"}
+                        else normalize_binance_meme_rush(payload, network, observed_at=observed)
+                    )
+                    if provider == "binance":
+                        normalized = [row for row in normalized if row.get("launchStage") == "migrated"]
+                    rows.extend(normalized)
+                    platform_bucket = (
+                        rank_platforms if provider == "gmgn-rank"
+                        else native_platforms if provider == "gmgn"
+                        else None
+                    )
+                    if platform_bucket is not None:
+                        network_platforms = platform_bucket.setdefault(network, {})
+                        for row in normalized:
+                            platform = str(row.get("launchpad") or "").strip()
+                            if platform:
+                                network_platforms.setdefault(platform.casefold(), platform)
+                    if provider == "gmgn":
+                        native_counts[network] = max(native_counts.get(network, 0), len(normalized))
+                    # The rank supplement is part of the same GMGN chain source;
+                    # keep the public status at six chains instead of exposing a
+                    # second pseudo-provider in the UI.
+                    source_status[status_key] = "ok"
+                    retry_after_seconds = max(
+                        retry_after_seconds,
+                        int(_safe_float(gmgn_meta.get("retryAfterSeconds")) or 0),
+                    )
+                except GmgnRateLimitError as exc:
+                    source_status[status_key] = "rate_limited"
+                    retry_after_seconds = max(retry_after_seconds, exc.retry_after_seconds)
+                    errors.append(f"{status_key}: {str(exc)[:180]}")
+                except GmgnUnsupportedNetworkError as exc:
+                    source_status[status_key] = "unsupported"
+                    errors.append(f"{status_key}: {str(exc)[:180]}")
+                except Exception as exc:
+                    source_status[status_key] = "error"
+                    errors.append(f"{status_key}: {str(exc)[:180]}")
+        for future, (network, provider) in jobs.items():
+            if future in completed_futures:
+                continue
             provider_name = "gmgn-trenches" if provider in {"gmgn", "gmgn-rank"} else "binance-meme-rush"
             status_key = f"{network}/{provider_name}"
-            try:
-                payload = future.result()
-                gmgn_meta = payload.get("_gmgnMeta") if provider in {"gmgn", "gmgn-rank"} and isinstance(payload, Mapping) else {}
-                if not isinstance(gmgn_meta, Mapping):
-                    gmgn_meta = {}
-                normalized = (
-                    normalize_gmgn_migrated_trenches(payload, network, observed_at=observed)
-                    if provider in {"gmgn", "gmgn-rank"}
-                    else normalize_binance_meme_rush(payload, network, observed_at=observed)
-                )
-                if provider == "binance":
-                    normalized = [row for row in normalized if row.get("launchStage") == "migrated"]
-                rows.extend(normalized)
-                platform_bucket = (
-                    rank_platforms if provider == "gmgn-rank"
-                    else native_platforms if provider == "gmgn"
-                    else None
-                )
-                if platform_bucket is not None:
-                    network_platforms = platform_bucket.setdefault(network, {})
-                    for row in normalized:
-                        platform = str(row.get("launchpad") or "").strip()
-                        if platform:
-                            network_platforms.setdefault(platform.casefold(), platform)
-                if provider == "gmgn":
-                    native_counts[network] = max(native_counts.get(network, 0), len(normalized))
-                # The rank supplement is part of the same GMGN chain source;
-                # keep the public status at six chains instead of exposing a
-                # second pseudo-provider in the UI.
-                source_status[status_key] = "ok"
-                retry_after_seconds = max(
-                    retry_after_seconds,
-                    int(_safe_float(gmgn_meta.get("retryAfterSeconds")) or 0),
-                )
-            except GmgnRateLimitError as exc:
-                source_status[status_key] = "rate_limited"
-                retry_after_seconds = max(retry_after_seconds, exc.retry_after_seconds)
-                errors.append(f"{status_key}: {str(exc)[:180]}")
-            except GmgnUnsupportedNetworkError as exc:
-                source_status[status_key] = "unsupported"
-                errors.append(f"{status_key}: {str(exc)[:180]}")
-            except Exception as exc:
-                source_status[status_key] = "error"
-                errors.append(f"{status_key}: {str(exc)[:180]}")
+            source_status.setdefault(status_key, "timeout")
+            errors.append(f"{status_key}: request still running after {GMGN_TRENCH_LIVE_FETCH_DEADLINE_SECONDS:g}s")
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
     # GMGN applies its response ceiling after the upstream filters.  Read a
     # second, server-side unique/MC-filtered lane so qualifying older rows are

@@ -72,12 +72,18 @@ from qq_onebot_bridge import start_qq_onebot_bridge, stop_qq_onebot_bridge
 from monitor_buy import MonitorBuyService, chain_id as monitor_buy_chain_id
 from event_flow import EventFlowStore, article_alias
 from alert_delivery import AlertDeliveryStore
+from monitor_exclusion_db import persist_global_monitor_exclusion
 from prior_high_monitor import analyze_prior_high
 from news_trade_explanations import ExplanationService, context_for as explanation_context, research_key as explanation_key
 from newsflash_sources import aggregate_newsflash, source_family
 from event_flow_window import attention_evidence, attention_window, STAGES as ATTENTION_STAGES
 from listing_alerts import attach_inventory as attach_listing_inventory, observe_listings, asset_key as listing_asset_key
-from onchain_fast_research import FastResearch, NARRATIVE_VERSION, NEWS_TRIGGER_VERSION, ResearchCapacityBusy, story_text, paginate_research, formal_research_worthy, candidate_key as onchain_candidate_key
+from onchain_fast_research import (
+    CHATGPT_RESEARCH_ROUTE, FastResearch, NARRATIVE_VERSION, NEWS_TRIGGER_VERSION,
+    ResearchCapacityBusy, story_text, paginate_research, formal_research_worthy,
+    promote_resonance_priority, chatgpt_positive_alert_decision,
+    candidate_key as onchain_candidate_key,
+)
 from onchain_research_framework import (
     FRAMEWORK_VERSION,
     FRAMEWORK_OUTPUT_SCHEMA,
@@ -86,7 +92,16 @@ from onchain_research_framework import (
     golden_leader_alert_decision,
     normalize_framework_assessment,
 )
+from rapid_decision_compare import RAPID_DECISION_VERSION, analyze_rapid_candidates
+from jev_decision import JEV_SEMANTIC_VERSION, analyze_jev_person_semantics
 from smart_money_monitor import CHAIN_META as SMART_MONEY_CHAIN_META, SmartMoneyMonitor
+from trench_person_signals import (
+    EXCLUDED_IMPORTANT_HANDLES,
+    important_person_sources,
+    match_person_post,
+    person_relevance_score,
+    token_identity as trench_person_token_identity,
+)
 from contextlib import closing, contextmanager, nullcontext
 from wechat_group_monitor import (
     WechatDeliveryUncertainError,
@@ -344,6 +359,7 @@ CODEX_CLI_CHAT_CA_LOCK = threading.BoundedSemaphore(2)
 CODEX_CLI_WALLET_ANALYSIS_LOCK = threading.BoundedSemaphore(1)
 CODEX_CLI_ONCHAIN_LIVE_LOCK = threading.BoundedSemaphore(2)
 CODEX_CLI_ONCHAIN_HISTORY_LOCK = threading.BoundedSemaphore(1)
+CODEX_CLI_ONCHAIN_HOURLY_LOCK = threading.BoundedSemaphore(5)
 CODEX_CLI_EXPLANATION_SEARCH_LOCK = threading.BoundedSemaphore(1)
 CODEX_CLI_EXPLANATION_REVIEW_LOCK = threading.BoundedSemaphore(1)
 CODEX_CLI_GLOBAL_HOTSPOT_LOCK = threading.BoundedSemaphore(1)
@@ -465,6 +481,66 @@ X_KOL_PRIORITY_RSS_MIRRORS = max(
 X_KOL_PRIORITY_LOCK = threading.Lock()
 X_KOL_PRIORITY_STARTED = False
 X_KOL_PRIORITY_WAKE = threading.Event()
+TRENCH_PERSON_SIGNAL_LOCK = threading.RLock()
+TRENCH_PERSON_WATCH_LOCK = threading.Lock()
+TRENCH_PERSON_SEMANTIC_LOCK = threading.RLock()
+TRENCH_PERSON_WATCH_STARTED = False
+TRENCH_PERSON_WATCH_NEXT_DUE: dict[str, float] = {}
+TRENCH_PERSON_WATCH_FAILURES: dict[str, int] = {}
+TRENCH_PERSON_LAST_ALERT_AT: dict[str, int] = {}
+TRENCH_PERSON_ALERT_NOT_BEFORE_MS = int(time.time() * 1000)
+TRENCH_PERSON_ALERT_MAX_AGE_MS = max(
+    60_000,
+    int(float(os.getenv("TRENCH_PERSON_ALERT_MAX_AGE_SECONDS", "600") or "600") * 1000),
+)
+TRENCH_PERSON_ALERT_PERSON_COOLDOWN_MS = max(
+    60_000,
+    int(float(os.getenv("TRENCH_PERSON_ALERT_PERSON_COOLDOWN_SECONDS", "600") or "600") * 1000),
+)
+TRENCH_PERSON_REQUEST_MIN_INTERVAL_SECONDS = max(
+    30.0,
+    float(os.getenv("TRENCH_PERSON_REQUEST_MIN_INTERVAL_SECONDS", "45") or "45"),
+)
+TRENCH_PERSON_SOURCE_LIMIT = max(
+    80,
+    min(500, int(os.getenv("TRENCH_PERSON_SOURCE_LIMIT", "300") or "300")),
+)
+TRENCH_PERSON_DEFAULT_REFRESH_SECONDS = max(
+    5 * 60.0,
+    float(os.getenv("TRENCH_PERSON_DEFAULT_REFRESH_SECONDS", "600") or "600"),
+)
+TRENCH_PERSON_SECONDARY_REFRESH_SECONDS = max(
+    15 * 60.0,
+    float(os.getenv("TRENCH_PERSON_SECONDARY_REFRESH_SECONDS", "3600") or "3600"),
+)
+TRENCH_PERSON_OFFICIAL_REFRESH_SECONDS = max(
+    10 * 60.0,
+    float(os.getenv("TRENCH_PERSON_OFFICIAL_REFRESH_SECONDS", "1800") or "1800"),
+)
+TRENCH_PERSON_RELEVANT_REFRESH_SECONDS = max(
+    90.0,
+    float(os.getenv("TRENCH_PERSON_RELEVANT_REFRESH_SECONDS", "120") or "120"),
+)
+TRENCH_PERSON_POST_MAX_AGE_MS = max(
+    60 * 60_000,
+    int(float(os.getenv("TRENCH_PERSON_POST_MAX_AGE_SECONDS", "21600") or "21600") * 1000),
+)
+TRENCH_PERSON_TOKEN_LOOKBACK_MS = max(
+    6 * 60 * 60_000,
+    int(float(os.getenv("TRENCH_PERSON_TOKEN_LOOKBACK_HOURS", "72") or "72") * 60 * 60_000),
+)
+TRENCH_PERSON_SEMANTIC_CACHE_TTL_MS = max(
+    60 * 60_000,
+    int(float(os.getenv("TRENCH_PERSON_SEMANTIC_CACHE_HOURS", "168") or "168") * 60 * 60_000),
+)
+TRENCH_PERSON_SEMANTIC_RETRY_MS = max(
+    30_000,
+    int(float(os.getenv("TRENCH_PERSON_SEMANTIC_RETRY_SECONDS", "120") or "120") * 1000),
+)
+TRENCH_PERSON_SEMANTIC_MIN_CONFIDENCE = max(
+    0.5,
+    min(0.99, float(os.getenv("TRENCH_PERSON_SEMANTIC_MIN_CONFIDENCE", "0.72") or "0.72")),
+)
 LOCAL_TRANSLATION_PROCESS: subprocess.Popen | None = None
 AICOIN_CDP_RELAUNCH_LOCK = threading.Lock()
 SITE_ALERT_FUTURE_TOLERANCE_MS = 10 * 60 * 1000
@@ -495,6 +571,7 @@ ONCHAIN_RANK_DESKTOP_ALERT_SOURCE_IDS = {
 SECONDARY_RANK_LEADER_ALLOWED_SOURCE_IDS = {
     "binance",
     "binance-gainers",
+    "binance-futures-gainers",
     "okx",
     "okx-gainers",
     "okx-turnover",
@@ -740,7 +817,7 @@ ROTATION_MAX_CANDIDATES = 8
 ROTATION_AI_MIN_CONFIDENCE = max(0, min(100, int(float(os.getenv("ROTATION_AI_MIN_CONFIDENCE", "60") or "60"))))
 ROTATION_AI_INCREMENT_BATCH_SIZE = max(1, min(30, int(float(os.getenv("ROTATION_AI_INCREMENT_BATCH_SIZE", "20") or "20"))))
 PRICE_STRUCTURE_CACHE_TTL_SECONDS = 180
-PRICE_STRUCTURE_STRATEGY_VERSION = "v90"
+PRICE_STRUCTURE_STRATEGY_VERSION = "v91"
 PRICE_STRUCTURE_NEW_COIN_MAX_AGE_DAYS = 14
 PRICE_STRUCTURE_DEEP_DRAWDOWN_PCT = 70.0
 PRICE_STRUCTURE_REPRICING_LOOKBACK_BARS = 192
@@ -781,11 +858,19 @@ PRICE_STRUCTURE_PREARM_INTERVAL_SECONDS = max(
 )
 PRICE_STRUCTURE_PREARM_DISTANCE_PCT = max(
     0.05,
-    float(os.getenv("PRICE_STRUCTURE_PREARM_DISTANCE_PCT", "0.8") or "0.8"),
+    float(os.getenv("PRICE_STRUCTURE_PREARM_DISTANCE_PCT", "3") or "3"),
 )
 PRICE_STRUCTURE_PREARM_MAX_OVERSHOOT_PCT = max(
     0.05,
     float(os.getenv("PRICE_STRUCTURE_PREARM_MAX_OVERSHOOT_PCT", "0.35") or "0.35"),
+)
+PRICE_STRUCTURE_OBSERVATION_MAX_OVERSHOOT_PCT = max(
+    PRICE_STRUCTURE_PREARM_MAX_OVERSHOOT_PCT,
+    float(os.getenv("PRICE_STRUCTURE_OBSERVATION_MAX_OVERSHOOT_PCT", "1.5") or "1.5"),
+)
+PRICE_STRUCTURE_SIGNAL_MAX_OVERSHOOT_PCT = max(
+    PRICE_STRUCTURE_OBSERVATION_MAX_OVERSHOOT_PCT,
+    float(os.getenv("PRICE_STRUCTURE_SIGNAL_MAX_OVERSHOOT_PCT", "2") or "2"),
 )
 PRICE_STRUCTURE_PREARM_FORECAST_MINUTES = max(
     1.0,
@@ -877,6 +962,11 @@ PRICE_STRUCTURE_PREARM_STATUS: dict[str, Any] = {
     "candidates": 0,
     "quotes": 0,
     "alerts": 0,
+    "candidateSources": {},
+    "quoteFailures": 0,
+    "skipReasons": {},
+    "elapsedMs": 0,
+    "lastDecisions": [],
 }
 PRICE_STRUCTURE_PROVIDER_PREFERENCE: dict[str, str] = {}
 PRICE_STRUCTURE_PROVIDER_PROBE_CURSOR: dict[str, int] = {}
@@ -946,6 +1036,13 @@ PRICE_STRUCTURE_TIMEFRAME_POOL = ThreadPoolExecutor(
     ),
     thread_name_prefix="market-timeframe",
 )
+PRICE_STRUCTURE_ENTRY_DAY_TIMEFRAME_POOL = ThreadPoolExecutor(
+    max_workers=max(
+        6,
+        min(16, int(os.getenv("PRICE_STRUCTURE_ENTRY_DAY_TIMEFRAME_WORKERS", "12") or "12")),
+    ),
+    thread_name_prefix="entry-day-timeframe",
+)
 PRICE_STRUCTURE_QUOTE_POOL = ThreadPoolExecutor(
     max_workers=max(
         2,
@@ -984,6 +1081,7 @@ SHARED_EXECUTORS = (
     X_KOL_RSS_SOURCE_POOL,
     X_KOL_RSS_MIRROR_POOL,
     PRICE_STRUCTURE_TIMEFRAME_POOL,
+    PRICE_STRUCTURE_ENTRY_DAY_TIMEFRAME_POOL,
     PRICE_STRUCTURE_QUOTE_POOL,
     PRICE_WATCH_REALTIME_POOL,
     MARKET_SOURCE_POOL,
@@ -1022,6 +1120,9 @@ OKX_FUTURES_CACHE_PATH = PERSIST_CACHE_DIR / "okx_futures_hot.json"
 OKX_DEX_SOURCE_CACHE_PATH = PERSIST_CACHE_DIR / "okx_dex_source.json"
 GMGN_TRENCH_HISTORY_PATH = PERSIST_CACHE_DIR / "gmgn_trenches_received_history.json"
 GMGN_TRENCH_HISTORY_VERSION = 3
+TRENCH_PERSON_SIGNAL_PATH = PERSIST_CACHE_DIR / "gmgn_trench_person_signals.json"
+TRENCH_PERSON_WATCH_STATE_PATH = PERSIST_CACHE_DIR / "gmgn_trench_person_watch.json"
+TRENCH_PERSON_SEMANTIC_CACHE_PATH = PERSIST_CACHE_DIR / "gmgn_trench_person_semantic_cache.json"
 THS_SOURCE_CACHE_PATH = PERSIST_CACHE_DIR / "ths_hot_source.json"
 WECHAT_ACCOUNT_CACHE_PATH = PERSIST_CACHE_DIR / "wechat_accounts.json"
 WECHAT_SOURCE_ALIAS_CACHE_PATH = PERSIST_CACHE_DIR / "wechat_source_aliases.json"
@@ -1045,6 +1146,8 @@ DESKTOP_ALERT_DELIVERIES: dict[int, dict[str, Any]] = {}
 ROTATION_AI_CACHE_PATH = PERSIST_CACHE_DIR / "rotation_ai_leaders.json"
 ROTATION_ALERT_STATE_PATH = PERSIST_CACHE_DIR / "rotation_alert_state.json"
 CHAIN_ECOSYSTEM_AI_CACHE_PATH = PERSIST_CACHE_DIR / "chain_ecosystem_ai_analysis.json"
+ONCHAIN_RESEARCH_MODE_STATE_PATH = PERSIST_CACHE_DIR / "onchain_research_mode.json"
+ONCHAIN_RESEARCH_MODE_LOCK = threading.Lock()
 SELF_OPTIMIZATION_STATE_PATH = PERSIST_CACHE_DIR / "self_optimization_state.json"
 SELF_OPTIMIZATION_WORK_ROOT = PERSIST_CACHE_DIR / "self-optimization"
 AICOIN_PAYLOAD_TOKEN_PATH = PERSIST_CACHE_DIR / "aicoin_payload_token.txt"
@@ -1084,7 +1187,7 @@ CHAIN_ECOSYSTEM_MONITOR.store.identity_observer = MONITOR_BUY.identities.observe
 AUTH_SESSION_COOKIE = "xys_session"
 AUTH_SESSION_DAYS = 7
 AUTH_PASSWORD_ITERATIONS = 240_000
-AUTH_DB_LOCK = threading.Lock()
+AUTH_DB_LOCK = threading.RLock()
 AUTH_LOGIN_LOCK = threading.Lock()
 AUTH_LOGIN_ATTEMPTS: dict[str, list[float]] = {}
 AUTH_PHONE_LOCK = threading.Lock()
@@ -1564,6 +1667,63 @@ def read_json_cache(path: Path) -> dict[str, Any]:
         return {}
 
 
+def normalize_onchain_research_mode(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in {"rapid", "deep", "hourly"} else "hourly"
+
+
+def onchain_research_mode_payload() -> dict[str, Any]:
+    with ONCHAIN_RESEARCH_MODE_LOCK:
+        state = read_json_cache(ONCHAIN_RESEARCH_MODE_STATE_PATH)
+    # Version 2 had only rapid/deep and defaulted to rapid.  The V4.9 hourly
+    # rollout intentionally migrates that old implicit setting once; any new
+    # explicit selection is stored with version 3 and remains sticky.
+    mode = normalize_onchain_research_mode(
+        state.get("mode") if int(safe_float(state.get("version"), 0)) >= 3 else "hourly"
+    )
+    if mode == "deep":
+        return {
+            "mode": mode,
+            "label": "ChatGPT 聊天实时深研",
+            "providerLabel": "专用聊天 + V4.9 完整投研",
+            "description": "新币按 20–50 个一批派送到专用 ChatGPT 聊天联网研究；聊天决定是否弹窗。",
+            "updatedAt": int(safe_float(state.get("updatedAt"), 0)),
+        }
+    if mode == "hourly":
+        return {
+            "mode": mode,
+            "label": "ChatGPT 聊天每小时深研",
+            "providerLabel": "专用聊天每小时 + V4.9 完整投研",
+            "description": "默认汇总上一小时战壕新币，按 20–50 个一批派送到专用聊天；聊天判断值得时直接弹窗。",
+            "updatedAt": int(safe_float(state.get("updatedAt"), 0)),
+        }
+    return {
+        "mode": mode,
+        "label": "快速模式",
+        "providerLabel": "JEV 快速主判",
+        "description": "JEV 负责快速主判，不等待聊天深研。",
+        "updatedAt": int(safe_float(state.get("updatedAt"), 0)),
+    }
+
+
+def set_onchain_research_mode(value: Any) -> dict[str, Any]:
+    requested = str(value or "").strip().lower()
+    if requested not in {"rapid", "deep", "hourly"}:
+        raise ValueError("判断模式只能选择快速实时、ChatGPT 聊天实时深研或每小时深研")
+    previous = onchain_research_mode_payload()["mode"]
+    updated_at = int(time.time() * 1000)
+    with ONCHAIN_RESEARCH_MODE_LOCK:
+        write_json_cache(ONCHAIN_RESEARCH_MODE_STATE_PATH, {
+            "mode": requested,
+            "version": 3,
+            "updatedAt": updated_at,
+        })
+    fast_research = globals().get("ONCHAIN_FAST_RESEARCH")
+    if fast_research is not None and previous != requested:
+        fast_research.on_decision_mode_changed(requested)
+    return {"ok": True, "changed": previous != requested, **onchain_research_mode_payload()}
+
+
 def cleanup_runtime_ephemeral_files(
     cache_dir: Path | None = None,
     *,
@@ -1885,6 +2045,8 @@ def init_auth_db() -> None:
                 gainers_first_seen_at INTEGER NOT NULL DEFAULT 0,
                 binance_gainers_last_seen_at INTEGER NOT NULL DEFAULT 0,
                 binance_gainers_rank INTEGER NOT NULL DEFAULT 0,
+                binance_futures_gainers_last_seen_at INTEGER NOT NULL DEFAULT 0,
+                binance_futures_gainers_rank INTEGER NOT NULL DEFAULT 0,
                 okx_gainers_last_seen_at INTEGER NOT NULL DEFAULT 0,
                 okx_gainers_rank INTEGER NOT NULL DEFAULT 0,
                 personal_x_mentioned_at INTEGER NOT NULL DEFAULT 0,
@@ -1972,6 +2134,8 @@ def init_auth_db() -> None:
             "gainers_first_seen_at": "gainers_first_seen_at INTEGER NOT NULL DEFAULT 0",
             "binance_gainers_last_seen_at": "binance_gainers_last_seen_at INTEGER NOT NULL DEFAULT 0",
             "binance_gainers_rank": "binance_gainers_rank INTEGER NOT NULL DEFAULT 0",
+            "binance_futures_gainers_last_seen_at": "binance_futures_gainers_last_seen_at INTEGER NOT NULL DEFAULT 0",
+            "binance_futures_gainers_rank": "binance_futures_gainers_rank INTEGER NOT NULL DEFAULT 0",
             "okx_gainers_last_seen_at": "okx_gainers_last_seen_at INTEGER NOT NULL DEFAULT 0",
             "okx_gainers_rank": "okx_gainers_rank INTEGER NOT NULL DEFAULT 0",
             "personal_x_mentioned_at": "personal_x_mentioned_at INTEGER NOT NULL DEFAULT 0",
@@ -4272,6 +4436,32 @@ def cached_api_payload(key: str, fetcher, ttl_seconds: int = 60, *, force_refres
     return refresh_api_cache_now(key, fetcher)
 
 
+def cached_chain_ecosystem_view(
+    key: str,
+    *,
+    research_page: int = 1,
+    research_history_page: int = 1,
+    ttl_seconds: int = 10,
+) -> dict[str, Any]:
+    """Return the already-built research view without touching the 1.2 GB scan store.
+
+    The chain monitor and hourly research workers own cache rebuilding. A page
+    read must remain bounded even while those workers hold SQLite write locks.
+    Binance Wallet links are derived from each row's exact chain and CA in the
+    browser, so this response intentionally skips whole-payload buy preflight.
+    """
+    cached_payload = read_json_cache(api_cache_path(key))
+    if not cached_payload:
+        return {}
+    age = time.time() - payload_cache_time(cached_payload)
+    payload = with_cache_meta(key, cached_payload, stale=age > max(1, int(ttl_seconds)))
+    research = payload.get("dailyResearch") if isinstance(payload.get("dailyResearch"), dict) else {}
+    research["historyPage"] = max(1, int(research_history_page))
+    payload["dailyResearch"] = paginate_research(research, max(1, int(research_page)))
+    payload["_skipIdentityEnrichment"] = True
+    return payload
+
+
 def clean_feed_text(value: Any, limit: int = 420) -> str:
     if value is None:
         return ""
@@ -5721,23 +5911,44 @@ def normalize_x_source(value: Any) -> dict[str, Any] | None:
     return source
 
 
+def merge_x_kol_manual_source_payloads(*payloads: Any) -> list[dict[str, Any]]:
+    """Merge legacy/manual stores by handle while letting newer stores win."""
+    merged: dict[str, dict[str, Any]] = {}
+    for payload in payloads:
+        raw_sources = payload.get("sources") if isinstance(payload, dict) else []
+        if not isinstance(raw_sources, list):
+            continue
+        for raw in raw_sources:
+            source = normalize_x_source(raw)
+            if source:
+                merged[source["id"]] = source
+    return list(merged.values())[:80]
+
+
 def load_x_kol_sources(user: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     target_user = user or admin_user()
     if target_user:
         migrate_x_kol_sources_to_db(target_user)
-        payload = load_user_payload(target_user, USER_SCOPE_X_KOL_SOURCES)
-    else:
-        payload = read_json_cache(X_KOL_SOURCES_PATH)
-    raw_sources = payload.get("sources") if isinstance(payload.get("sources"), list) else []
-    sources: list[dict[str, Any]] = []
-    seen = set()
-    for raw in raw_sources:
-        source = normalize_x_source(raw)
-        if not source or source["id"] in seen:
-            continue
-        seen.add(source["id"])
-        sources.append(source)
-    return sources[:80]
+        database_payload = load_user_payload(target_user, USER_SCOPE_X_KOL_SOURCES)
+        legacy_payloads: list[dict[str, Any]] = []
+        if target_user.get("role") == "admin" and X_KOL_SOURCES_PATH.exists():
+            legacy_payloads.append(read_json_cache(X_KOL_SOURCES_PATH))
+        user_path = x_kol_sources_path(target_user)
+        if user_path.exists():
+            legacy_payloads.append(read_json_cache(user_path))
+        sources = merge_x_kol_manual_source_payloads(*legacy_payloads, database_payload)
+        database_sources = merge_x_kol_manual_source_payloads(database_payload)
+        # Older builds wrote either the global JSON file, a user JSON file, or
+        # the database. Reconcile them once without allowing a stale copy to
+        # overwrite a newer record for the same handle.
+        if sources != database_sources:
+            healed = {"sources": sources, "updatedAt": int(time.time() * 1000)}
+            save_user_payload(target_user, USER_SCOPE_X_KOL_SOURCES, healed)
+            write_json_cache(user_path, healed)
+            if target_user.get("role") == "admin":
+                write_json_cache(X_KOL_SOURCES_PATH, healed)
+        return sources
+    return merge_x_kol_manual_source_payloads(read_json_cache(X_KOL_SOURCES_PATH))
 
 
 def x_kol_priority_handles() -> tuple[str, ...]:
@@ -6230,15 +6441,53 @@ def save_dragon_wave_feedback_for_user(user: dict[str, Any], incoming: Any) -> d
     return merged
 
 
+def x_kol_system_person_sources() -> list[dict[str, Any]]:
+    """Expose the shared low-frequency person roster without duplicating polling."""
+    return [
+        {
+            **source,
+            "avatar": x_kol_avatar_url(source.get("handle")),
+            "systemManaged": True,
+            "readOnly": True,
+            "sourceGroup": "人物源",
+            "createdAt": 0,
+        }
+        for source in important_person_sources()
+        if source.get("enabled") is not False
+    ]
+
+
+def x_kol_sources_for_view(
+    user: dict[str, Any] | None = None,
+    *,
+    manual_sources: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    manual = list(manual_sources) if manual_sources is not None else load_x_kol_sources(user)
+    manual_handles = {
+        normalize_x_handle(source.get("handle")).casefold()
+        for source in manual
+        if normalize_x_handle(source.get("handle"))
+    }
+    system = [
+        source
+        for source in x_kol_system_person_sources()
+        if normalize_x_handle(source.get("handle")).casefold() not in manual_handles
+    ]
+    return [*manual, *system]
+
+
 def x_kol_sources_payload(user: dict[str, Any] | None = None) -> dict[str, Any]:
-    sources = load_x_kol_sources(user)
+    manual_sources = load_x_kol_sources(user)
+    sources = x_kol_sources_for_view(user, manual_sources=manual_sources)
     return {
         "ok": True,
-        "exists": user_payload_exists(user, USER_SCOPE_X_KOL_SOURCES) if user else bool(sources),
+        "exists": bool(manual_sources),
         "sources": sources,
         "categories": [{"id": category_id, "label": label} for category_id, label in X_KOL_CATEGORIES],
         "sourceCount": len(sources),
         "enabledCount": sum(1 for source in sources if source.get("enabled") is not False),
+        "manualSourceCount": len(manual_sources),
+        "systemSourceCount": len(sources) - len(manual_sources),
         "hasToken": bool(x_kol_token()),
         "rssFallback": x_rss_templates(),
         "updatedAt": int(time.time() * 1000),
@@ -6249,18 +6498,23 @@ def save_x_kol_sources_payload(payload: dict[str, Any], user: dict[str, Any] | N
     raw_sources = payload.get("sources") if isinstance(payload.get("sources"), list) else []
     sources: list[dict[str, Any]] = []
     seen = set()
-    for raw in raw_sources[:80]:
+    for raw in raw_sources:
+        if not isinstance(raw, dict) or raw.get("systemManaged") is True:
+            continue
         source = normalize_x_source(raw)
         if not source or source["id"] in seen:
             continue
         seen.add(source["id"])
         sources.append(source)
+        if len(sources) >= 80:
+            break
     saved = {
         "sources": sources,
         "updatedAt": int(time.time() * 1000),
     }
     if user:
         save_user_payload(user, USER_SCOPE_X_KOL_SOURCES, saved)
+        write_json_cache(x_kol_sources_path(user), saved)
     else:
         write_json_cache(X_KOL_SOURCES_PATH, saved)
     if user and user.get("role") == "admin":
@@ -6275,12 +6529,16 @@ def save_x_kol_sources_payload(payload: dict[str, Any], user: dict[str, Any] | N
     except Exception:
         pass
     wake_x_kol_realtime_worker(user)
+    view_sources = x_kol_sources_for_view(user, manual_sources=sources)
     return {
         "ok": True,
-        **saved,
+        "sources": view_sources,
+        "updatedAt": saved["updatedAt"],
         "categories": [{"id": category_id, "label": label} for category_id, label in X_KOL_CATEGORIES],
-        "sourceCount": len(sources),
-        "enabledCount": sum(1 for source in sources if source.get("enabled") is not False),
+        "sourceCount": len(view_sources),
+        "enabledCount": sum(1 for source in view_sources if source.get("enabled") is not False),
+        "manualSourceCount": len(sources),
+        "systemSourceCount": len(view_sources) - len(sources),
         "hasToken": bool(x_kol_token()),
     }
 
@@ -7713,9 +7971,61 @@ def x_kol_fetch_priority_rss_source(source: dict[str, Any]) -> dict[str, Any]:
     return rss_payload
 
 
+def x_kol_shared_person_activity(
+    view_sources: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Project the shared person watcher cache into X tracking with no new request."""
+    document = trench_person_activity_document()
+    by_handle = {
+        normalize_x_handle(source.get("handle")).casefold(): source
+        for source in view_sources
+        if normalize_x_handle(source.get("handle"))
+    }
+    health_rows = document.get("sourceHealth") if isinstance(document.get("sourceHealth"), dict) else {}
+    states: list[dict[str, Any]] = []
+    for health in health_rows.values():
+        if not isinstance(health, dict):
+            continue
+        handle = normalize_x_handle(health.get("handle")).casefold()
+        source = by_handle.get(handle)
+        if not source:
+            continue
+        states.append({
+            **source,
+            **health,
+            "id": source["id"],
+            "handle": source["handle"],
+            "displayName": source.get("displayName") or health.get("displayName") or source["handle"],
+            "provider": health.get("provider") or "shared-person-watch",
+            "sharedWatcher": True,
+        })
+
+    items: list[dict[str, Any]] = []
+    for raw in document.get("recentPosts") if isinstance(document.get("recentPosts"), list) else []:
+        if not isinstance(raw, dict):
+            continue
+        person_source = raw.get("_personSource") if isinstance(raw.get("_personSource"), dict) else {}
+        handle = normalize_x_handle(raw.get("handle") or person_source.get("handle")).casefold()
+        source = by_handle.get(handle)
+        if not source:
+            continue
+        item = dict(raw)
+        item.pop("_personSource", None)
+        item.update({
+            "sourceId": source["id"],
+            "handle": source["handle"],
+            "sourceName": source.get("displayName") or source["handle"],
+            "provider": item.get("provider") or "shared-person-watch",
+            "sharedWatcher": True,
+        })
+        items.append(item)
+    return states, items
+
+
 def x_kol_feed_payload(user: dict[str, Any] | None = None) -> dict[str, Any]:
     sources = load_x_kol_sources(user)
     enabled_sources = [source for source in sources if source.get("enabled") is not False]
+    view_sources = x_kol_sources_for_view(user, manual_sources=sources)
     token = x_kol_token()
     paid_api_enabled = x_kol_official_api_enabled()
     paid_rest_poll_enabled = x_kol_official_rest_poll_enabled()
@@ -7755,6 +8065,17 @@ def x_kol_feed_payload(user: dict[str, Any] | None = None) -> dict[str, Any]:
         source_states.append(result["source"])
         items.extend(result["items"])
 
+    # The system person roster is already polled by one serial, rate-limited
+    # watcher. Reuse its cache here instead of fanning out another 200+ reads.
+    person_states, person_items = x_kol_shared_person_activity(view_sources)
+    state_map = {
+        str(source.get("id") or source.get("handle") or ""): source
+        for source in [*person_states, *source_states]
+        if isinstance(source, dict)
+    }
+    source_states = list(state_map.values())
+    items.extend(person_items)
+
     cutoff = int(time.time() * 1000) - X_KOL_RETENTION_MS
     unique_items: dict[str, dict[str, Any]] = {}
     for item in items:
@@ -7767,9 +8088,12 @@ def x_kol_feed_payload(user: dict[str, Any] | None = None) -> dict[str, Any]:
         "ok": True,
         "sources": source_states,
         "items": sorted_items,
-        "sourceCount": len(sources),
-        "enabledCount": len(enabled_sources),
-        "provider": "x-api" if paid_rest_poll_enabled else "rss",
+        "sourceCount": len(view_sources),
+        "enabledCount": sum(1 for source in view_sources if source.get("enabled") is not False),
+        "manualSourceCount": len(sources),
+        "manualEnabledCount": len(enabled_sources),
+        "systemSourceCount": len(view_sources) - len(sources),
+        "provider": "x-api" if paid_rest_poll_enabled else "rss+shared-person-watch",
         "hasToken": bool(token),
         "paidApiEnabled": paid_api_enabled,
         "paidRestPollingEnabled": paid_rest_poll_enabled,
@@ -9424,6 +9748,7 @@ EXCHANGE_AI_NARRATIVE_MAX_ITEMS = 24
 EXCHANGE_AI_NARRATIVE_ALLOWED_SOURCES = {
     "binance",
     "binance-gainers",
+    "binance-futures-gainers",
     "binance-wallet-hot",
     "okx",
     "okx-gainers",
@@ -9440,6 +9765,7 @@ EXCHANGE_AI_NARRATIVE_ALLOWED_SOURCES = {
 EXCHANGE_AI_SYMBOL_IDENTITY_SOURCES = {
     "binance",
     "binance-gainers",
+    "binance-futures-gainers",
     "okx",
     "okx-gainers",
     "okx-turnover",
@@ -12109,18 +12435,761 @@ def gmgn_trench_board_rows(
     return rows
 
 
+def trench_person_semantic_cache_key(signal: dict[str, Any]) -> str:
+    payload = "|".join((
+        JEV_SEMANTIC_VERSION,
+        clean_feed_text(signal.get("tokenIdentity"), 260),
+        normalize_x_handle(signal.get("personHandle")).casefold(),
+        clean_feed_text(signal.get("postId"), 120),
+        clean_feed_text(signal.get("postText"), 1800),
+        clean_feed_text(signal.get("quoteText"), 1200),
+    ))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def trench_person_semantic_state(row: dict[str, Any], signal: dict[str, Any]) -> dict[str, Any]:
+    original = row.get("xOriginal") if isinstance(row.get("xOriginal"), dict) else {}
+    context = row.get("narrativeContext") if isinstance(row.get("narrativeContext"), dict) else {}
+    links = context.get("links") if isinstance(context.get("links"), dict) else {}
+    narrative = clean_feed_text(
+        row.get("binanceAiNarrative")
+        or row.get("exchangeAiNarrative")
+        or context.get("description")
+        or row.get("description"),
+        600,
+    )
+    return {
+        "task": "Determine semantic reference between an X post and one exact crypto token.",
+        "person": {
+            "name": clean_feed_text(signal.get("personName"), 80),
+            "handle": normalize_x_handle(signal.get("personHandle")),
+            "role": clean_feed_text(signal.get("personRole"), 100),
+            "action": clean_feed_text(signal.get("actionType"), 30),
+        },
+        "post": {
+            "author_text": clean_feed_text(signal.get("postText"), 1800),
+            "quoted_or_reposted_text": clean_feed_text(signal.get("quoteText"), 1200),
+            "url": clean_feed_text(signal.get("postUrl"), 500),
+        },
+        "target_token": {
+            "chain": clean_feed_text(row.get("network") or row.get("chain"), 40),
+            "contract": clean_feed_text(row.get("contractAddress") or row.get("address"), 180),
+            "symbol": clean_feed_text(row.get("symbol"), 60),
+            "name": clean_feed_text(row.get("name"), 180),
+            "official_x": normalize_x_handle(original.get("handle") or original.get("url") or links.get("twitter")),
+            "website": clean_feed_text(links.get("website") or row.get("website"), 500),
+            "ai_narrative": narrative,
+        },
+        "retrieval_evidence": {
+            "type": clean_feed_text(signal.get("matchType"), 40),
+            "identity_status": clean_feed_text(signal.get("identityStatus"), 80),
+        },
+    }
+
+
+def trench_person_ai_semantic_assessments(
+    pairs: list[tuple[dict[str, Any], dict[str, Any]]],
+) -> dict[str, dict[str, Any]]:
+    """Run every recalled relationship through Jev; unavailable/uncertain fails closed."""
+    if not pairs:
+        return {}
+    now_ms = int(time.time() * 1000)
+    with TRENCH_PERSON_SEMANTIC_LOCK:
+        stored = read_json_cache(TRENCH_PERSON_SEMANTIC_CACHE_PATH)
+    cached_items = stored.get("items") if isinstance(stored.get("items"), dict) else {}
+    output: dict[str, dict[str, Any]] = {}
+    requests_to_run: list[dict[str, Any]] = []
+    signals_by_cache_key: dict[str, dict[str, Any]] = {}
+
+    for row, signal in pairs:
+        cache_key = trench_person_semantic_cache_key(signal)
+        signals_by_cache_key[cache_key] = signal
+        cached = cached_items.get(cache_key) if isinstance(cached_items.get(cache_key), dict) else {}
+        cached_at = int(safe_float(cached.get("analyzedAt"), 0))
+        cache_ttl = (
+            TRENCH_PERSON_SEMANTIC_CACHE_TTL_MS
+            if cached.get("status") in {"confirmed", "rejected"}
+            else TRENCH_PERSON_SEMANTIC_RETRY_MS
+        )
+        if cached_at and now_ms - cached_at < cache_ttl and cached.get("version") == JEV_SEMANTIC_VERSION:
+            output[clean_feed_text(signal.get("key"), 180)] = dict(cached)
+            continue
+        requests_to_run.append({
+            "key": cache_key,
+            "state": trench_person_semantic_state(row, signal),
+        })
+
+    decisions = analyze_jev_person_semantics(requests_to_run) if requests_to_run else {}
+    cache_changed = False
+    for request_row in requests_to_run:
+        cache_key = request_row["key"]
+        signal = signals_by_cache_key[cache_key]
+        raw = decisions.get(cache_key) if isinstance(decisions.get(cache_key), dict) else {}
+        choice = clean_feed_text(raw.get("choice"), 30).lower()
+        confidence = max(0.0, min(1.0, safe_float(raw.get("confidence"), 0)))
+        confirmed = choice == "related" and confidence >= TRENCH_PERSON_SEMANTIC_MIN_CONFIDENCE
+        status = "confirmed" if confirmed else "rejected" if choice in {"unrelated", "uncertain", "related"} else "unavailable"
+        assessment = {
+            "version": JEV_SEMANTIC_VERSION,
+            "status": status,
+            "related": confirmed,
+            "choice": choice or "unavailable",
+            "confidence": round(confidence, 4),
+            "probabilities": dict(raw.get("probabilities")) if isinstance(raw.get("probabilities"), dict) else {},
+            "reason": clean_feed_text(raw.get("reason"), 300),
+            "provider": "JEV 快速语义模型",
+            "model": clean_feed_text(raw.get("model"), 100),
+            "analyzedAt": int(safe_float(raw.get("analyzedAt"), now_ms)),
+        }
+        cached_items[cache_key] = assessment
+        output[clean_feed_text(signal.get("key"), 180)] = dict(assessment)
+        cache_changed = True
+
+    if cache_changed:
+        ordered = sorted(
+            (
+                (key, value) for key, value in cached_items.items()
+                if isinstance(value, dict)
+                and now_ms - int(safe_float(value.get("analyzedAt"), 0)) <= TRENCH_PERSON_SEMANTIC_CACHE_TTL_MS
+            ),
+            key=lambda pair: int(safe_float(pair[1].get("analyzedAt"), 0)),
+            reverse=True,
+        )[:5000]
+        with TRENCH_PERSON_SEMANTIC_LOCK:
+            write_json_cache(TRENCH_PERSON_SEMANTIC_CACHE_PATH, {
+                "version": 1,
+                "updatedAt": now_ms,
+                "items": dict(ordered),
+            })
+    return output
+
+
+def trench_person_signal_record_valid(signal: dict[str, Any]) -> bool:
+    handle = normalize_x_handle(signal.get("personHandle")).casefold()
+    if not handle or handle in EXCLUDED_IMPORTANT_HANDLES:
+        return False
+    if signal.get("semanticDecisionVersion") == JEV_SEMANTIC_VERSION:
+        return bool(signal.get("semanticRelated"))
+    # Pre-AI person links are no longer trusted.  This also removes historical
+    # homonym false positives such as OPEN, CRA and MONITOR from overlays.
+    return False
+
+
+def trench_person_signal_document() -> dict[str, Any]:
+    with TRENCH_PERSON_SIGNAL_LOCK:
+        payload = read_json_cache(TRENCH_PERSON_SIGNAL_PATH)
+    items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    valid_items = [dict(row) for row in items if isinstance(row, dict) and trench_person_signal_record_valid(row)]
+    if len(valid_items) != len(items):
+        with TRENCH_PERSON_SIGNAL_LOCK:
+            write_json_cache(TRENCH_PERSON_SIGNAL_PATH, {
+                "version": 1,
+                "updatedAt": int(time.time() * 1000),
+                "items": valid_items,
+            })
+    return {
+        "version": 1,
+        "updatedAt": int(safe_float(payload.get("updatedAt"), 0)),
+        "items": valid_items,
+    }
+
+
+def persist_trench_person_signal(signal: dict[str, Any]) -> bool:
+    """Persist one verified relationship edge and report whether it is new."""
+    key = clean_feed_text(signal.get("key"), 120)
+    if not key:
+        return False
+    now_ms = int(time.time() * 1000)
+    cutoff = now_ms - 30 * 24 * 60 * 60_000
+    with TRENCH_PERSON_SIGNAL_LOCK:
+        payload = read_json_cache(TRENCH_PERSON_SIGNAL_PATH)
+        previous = payload.get("items") if isinstance(payload.get("items"), list) else []
+        by_key = {
+            clean_feed_text(row.get("key"), 120): dict(row)
+            for row in previous
+            if isinstance(row, dict)
+            and trench_person_signal_record_valid(row)
+            and clean_feed_text(row.get("key"), 120)
+            and int(safe_float(row.get("observedAt") or row.get("publishedAt"), now_ms)) >= cutoff
+        }
+        is_new = key not in by_key
+        by_key[key] = {**signal, "observedAt": int(safe_float(signal.get("observedAt"), now_ms))}
+        items = sorted(
+            by_key.values(),
+            key=lambda row: (
+                int(safe_float(row.get("publishedAt"), 0)),
+                int(safe_float(row.get("observedAt"), 0)),
+            ),
+            reverse=True,
+        )[:1200]
+        write_json_cache(TRENCH_PERSON_SIGNAL_PATH, {
+            "version": 1,
+            "updatedAt": now_ms,
+            "items": items,
+        })
+    return is_new
+
+
+def trench_person_signals_by_token() -> dict[str, list[dict[str, Any]]]:
+    by_token: dict[str, list[dict[str, Any]]] = {}
+    for signal in trench_person_signal_document()["items"]:
+        identity = clean_feed_text(signal.get("tokenIdentity"), 260)
+        if identity:
+            by_token.setdefault(identity, []).append(signal)
+    return by_token
+
+
+def attach_trench_person_signals(payload: dict[str, Any]) -> dict[str, Any]:
+    """Overlay person evidence on live/history responses without mutating caches."""
+    if not isinstance(payload, dict):
+        return payload
+    by_token = trench_person_signals_by_token()
+    if not by_token:
+        return payload
+    result = dict(payload)
+    for field in ("items", "rows", "summaryRows"):
+        original_rows = payload.get(field) if isinstance(payload.get(field), list) else []
+        if not original_rows:
+            continue
+        annotated: list[dict[str, Any]] = []
+        for raw in original_rows:
+            if not isinstance(raw, dict):
+                continue
+            row = dict(raw)
+            identity = trench_person_token_identity(row)
+            signals = [dict(signal) for signal in by_token.get(identity, [])[:6]]
+            if signals:
+                row["personSignal"] = signals[0]
+                row["personSignals"] = signals
+                row["personSignalCount"] = len(by_token.get(identity, []))
+            annotated.append(row)
+        result[field] = annotated
+    return result
+
+
+def trench_person_recent_rows(*, now_ms: int | None = None) -> list[dict[str, Any]]:
+    current = int(now_ms or time.time() * 1000)
+    stored = read_json_cache(GMGN_TRENCH_HISTORY_PATH)
+    rows = stored.get("items") if isinstance(stored.get("items"), list) else []
+    recent = []
+    for raw in rows:
+        if not isinstance(raw, dict) or not trench_person_token_identity(raw):
+            continue
+        timestamp = int(safe_float(raw.get("poolCreatedAt") or raw.get("receivedAt"), 0))
+        if 0 < timestamp < 10_000_000_000:
+            timestamp *= 1000
+        if timestamp and current - timestamp <= TRENCH_PERSON_TOKEN_LOOKBACK_MS:
+            recent.append(dict(raw))
+    recent.sort(key=lambda row: int(safe_float(row.get("poolCreatedAt") or row.get("receivedAt"), 0)), reverse=True)
+    return recent[:480]
+
+
+def trench_person_activity_document() -> dict[str, Any]:
+    with TRENCH_PERSON_WATCH_LOCK:
+        payload = read_json_cache(TRENCH_PERSON_WATCH_STATE_PATH)
+    posts = payload.get("recentPosts") if isinstance(payload.get("recentPosts"), list) else []
+    return {
+        "version": 1,
+        "updatedAt": int(safe_float(payload.get("updatedAt"), 0)),
+        "recentPosts": [dict(row) for row in posts if isinstance(row, dict)],
+        "sourceHealth": dict(payload.get("sourceHealth")) if isinstance(payload.get("sourceHealth"), dict) else {},
+    }
+
+
+def trench_person_record_source_health(
+    source: dict[str, Any],
+    source_state: dict[str, Any],
+    *,
+    failures: int,
+    refresh_seconds: float,
+) -> None:
+    """Persist lightweight source telemetry even when a timeline returns no posts."""
+    source_id = clean_feed_text(source.get("id"), 120)
+    if not source_id:
+        return
+    now_ms = int(time.time() * 1000)
+    with TRENCH_PERSON_WATCH_LOCK:
+        stored = read_json_cache(TRENCH_PERSON_WATCH_STATE_PATH)
+        health = dict(stored.get("sourceHealth")) if isinstance(stored.get("sourceHealth"), dict) else {}
+        health[source_id] = {
+            "handle": normalize_x_handle(source.get("handle")),
+            "displayName": clean_feed_text(source.get("displayName"), 80),
+            "status": clean_feed_text(source_state.get("status") or "error", 20),
+            "provider": clean_feed_text(source_state.get("upstreamSource") or source_state.get("provider"), 40),
+            "lastCheckAt": int(safe_float(source_state.get("lastCheckAt"), now_ms)),
+            "lastOkAt": int(safe_float(source_state.get("lastOkAt"), 0)),
+            "itemsReturned": int(safe_float(source_state.get("itemsReturned"), 0)),
+            "failures": failures,
+            "nextDueAt": now_ms + int(max(0.0, refresh_seconds) * 1000),
+            "error": clean_feed_text(source_state.get("error"), 160),
+        }
+        # Keep only the latest telemetry for the bounded watch roster.
+        ordered_health = dict(sorted(
+            health.items(),
+            key=lambda pair: int(safe_float((pair[1] or {}).get("lastCheckAt"), 0)),
+            reverse=True,
+        )[:TRENCH_PERSON_SOURCE_LIMIT])
+        write_json_cache(TRENCH_PERSON_WATCH_STATE_PATH, {
+            "version": 1,
+            "updatedAt": now_ms,
+            "recentPosts": stored.get("recentPosts") if isinstance(stored.get("recentPosts"), list) else [],
+            "sourceHealth": ordered_health,
+        })
+
+
+def trench_person_store_activity(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    now_ms = int(time.time() * 1000)
+    source_rows = payload.get("sources") if isinstance(payload.get("sources"), list) else []
+    source_by_id = {
+        clean_feed_text(source.get("id"), 120): source
+        for source in source_rows
+        if isinstance(source, dict) and clean_feed_text(source.get("id"), 120)
+    }
+    incoming: list[dict[str, Any]] = []
+    for raw in payload.get("items") if isinstance(payload.get("items"), list) else []:
+        if not isinstance(raw, dict):
+            continue
+        if clean_feed_text(raw.get("entryType"), 30).lower() in {
+            "replied_to", "reply", "replied", "comment",
+        }:
+            continue
+        published = int(safe_float(raw.get("publishedAt"), 0))
+        if 0 < published < 10_000_000_000:
+            published *= 1000
+        if not published or not 0 <= now_ms - published <= TRENCH_PERSON_POST_MAX_AGE_MS:
+            continue
+        source = source_by_id.get(clean_feed_text(raw.get("sourceId"), 120), {})
+        category = normalize_x_kol_category(
+            raw.get("category") or source.get("category"),
+            handle=raw.get("handle") or source.get("handle"),
+            display_name=raw.get("sourceName") or source.get("displayName"),
+            keywords=source.get("keywords"),
+        )
+        if category not in {"celebrity", "notable", "founder", "project_official"} and not str(source.get("id") or "").startswith("trench-person:"):
+            continue
+        item = dict(raw)
+        item["publishedAt"] = published
+        item["_personSource"] = {
+            **source,
+            "handle": normalize_x_handle(raw.get("handle") or source.get("handle")),
+            "displayName": clean_feed_text(raw.get("sourceName") or source.get("displayName"), 80),
+            "category": category,
+        }
+        incoming.append(item)
+    if not incoming:
+        return []
+
+    cutoff = now_ms - TRENCH_PERSON_POST_MAX_AGE_MS
+    with TRENCH_PERSON_WATCH_LOCK:
+        stored = read_json_cache(TRENCH_PERSON_WATCH_STATE_PATH)
+        previous = stored.get("recentPosts") if isinstance(stored.get("recentPosts"), list) else []
+        merged: dict[str, dict[str, Any]] = {}
+        for row in [*previous, *incoming]:
+            if not isinstance(row, dict):
+                continue
+            published = int(safe_float(row.get("publishedAt"), 0))
+            if published < cutoff:
+                continue
+            source = row.get("_personSource") if isinstance(row.get("_personSource"), dict) else {}
+            handle = normalize_x_handle(row.get("handle") or source.get("handle")).casefold()
+            post_id = clean_feed_text(row.get("tweetId") or row.get("id") or row.get("url"), 300)
+            if handle and post_id:
+                merged[f"{handle}:{post_id}"] = dict(row)
+        posts = sorted(
+            merged.values(),
+            key=lambda row: int(safe_float(row.get("publishedAt"), 0)),
+            reverse=True,
+        )[:160]
+        write_json_cache(TRENCH_PERSON_WATCH_STATE_PATH, {
+            "version": 1,
+            "updatedAt": now_ms,
+            "recentPosts": posts,
+            "sourceHealth": dict(stored.get("sourceHealth")) if isinstance(stored.get("sourceHealth"), dict) else {},
+        })
+    return incoming
+
+
+def trench_person_signal_market_rank(row: dict[str, Any]) -> tuple[float, float, int]:
+    metrics = row.get("metrics") if isinstance(row.get("metrics"), dict) else {}
+    return (
+        safe_float(metrics.get("liquidityUsd"), 0),
+        safe_float(metrics.get("volumeH1Usd") or metrics.get("volumeH24Usd"), 0),
+        int(safe_float(row.get("poolCreatedAt") or row.get("receivedAt"), 0)),
+    )
+
+
+def apply_trench_person_signal_to_research(row: dict[str, Any], signal: dict[str, Any]) -> None:
+    fast_research = globals().get("ONCHAIN_FAST_RESEARCH")
+    if fast_research is None:
+        return
+    enriched = dict(row)
+    identity_status = clean_feed_text(signal.get("identityStatus"), 60)
+    identity_note = (
+        "人物动态明确给出当前合约地址"
+        if identity_status == "person-x-contract-explicit"
+        else "人物互动命中该币官方 X；CA 来自 GMGN 战壕，仍需核验是否为唯一官方合约"
+        if identity_status in {"person-x-official-handle", "person-x-follow-verified"}
+        else "人物原帖精确命中币名/代号；CA 来自 GMGN 战壕，存在同名映射风险"
+    )
+    text = alert_body_join(signal.get("postText"), signal.get("quoteText"))
+    observed_at = int(safe_float(signal.get("observedAt"), int(time.time() * 1000)))
+    enriched.update({
+        "personSignal": dict(signal),
+        "researchEvidence": {
+            "source": f"X人物动态 · {clean_feed_text(signal.get('personName'), 80)}",
+            "url": clean_feed_text(signal.get("postUrl"), 900),
+            "publishedAt": int(safe_float(signal.get("publishedAt"), observed_at)),
+            "text": clean_feed_text(text, 1800),
+            "identityStatus": identity_status,
+            "identityNote": identity_note,
+        },
+        "newsObservedAt": observed_at,
+        "newsSignal": {
+            "version": NEWS_TRIGGER_VERSION,
+            "tier": "news-triggered",
+            "source": "X人物动态",
+            "title": f"{signal.get('personName')} {signal.get('actionLabel')} {signal.get('tokenSymbol')}",
+            "url": clean_feed_text(signal.get("postUrl"), 900),
+            "publishedAt": int(safe_float(signal.get("publishedAt"), observed_at)),
+            "observedAt": observed_at,
+            "identityStatus": identity_status,
+            "reason": "战壕新币出现可核验的重要人物原始动作，已立即进入 V4.9 快速投研",
+        },
+        "narrativeFallbackEligible": True,
+        "reasons": list(dict.fromkeys([
+            f"人物信号：{signal.get('personName')} {signal.get('actionLabel')} {signal.get('tokenSymbol')}",
+            *(row.get("reasons") or []),
+        ]))[:6],
+    })
+    fast_research.ingest([enriched], match_recent_news=False)
+
+
+def send_trench_person_signal_alert(signal: dict[str, Any]) -> dict[str, Any]:
+    symbol = clean_feed_text(signal.get("tokenSymbol") or signal.get("tokenName") or "战壕新币", 50)
+    person = clean_feed_text(signal.get("personName") or signal.get("personHandle") or "重要人物", 80)
+    action = clean_feed_text(signal.get("actionLabel") or "点名", 20)
+    verified = clean_feed_text(signal.get("identityStatus"), 60) in {
+        "person-x-contract-explicit", "person-x-official-handle", "person-x-follow-verified",
+    }
+    return launch_desktop_alert({
+        "key": clean_feed_text(signal.get("key"), 180),
+        "eventFlowKey": clean_feed_text(signal.get("key"), 180),
+        "kind": "链上投研 · 人物信号",
+        "source": "战壕人物动态追踪",
+        "sourceLabel": "人",
+        "sourceId": "trench-person-signal",
+        "sourceType": "trench-person-signal",
+        "title": f"人物{action}：{person} × {symbol}",
+        "body": (
+            f"{signal.get('personRole') or '重要人物'} · "
+            f"{'CA/官方 X 已匹配' if verified else '币名命中，CA 待复核'} · "
+            f"JEV 语义确认 {round(safe_float(signal.get('semanticConfidence'), 0) * 100)}%"
+        ),
+        "url": clean_feed_text(signal.get("postUrl"), 900),
+        "contractAddress": clean_feed_text(signal.get("contractAddress"), 180),
+        "chain": clean_feed_text(signal.get("network"), 40),
+        "time": int(safe_float(signal.get("publishedAt") or signal.get("observedAt"), int(time.time() * 1000))),
+        "expiresAt": int(time.time() * 1000) + 10 * 60_000,
+        "priority": "人物原始动作",
+        "queuePriority": 760,
+        "speech": f"人物信号，{person}{action}战壕新币{symbol}，已进入快速投研",
+        "originalText": clean_feed_text(signal.get("postText"), 1800),
+        "quoteText": clean_feed_text(signal.get("quoteText"), 1200),
+        "authorHandle": clean_feed_text(signal.get("personHandle"), 80),
+    })
+
+
+def trench_person_signal_is_live_for_alert(signal: dict[str, Any], *, now_ms: int) -> bool:
+    published_at = int(safe_float(signal.get("publishedAt"), 0))
+    if 0 < published_at < 10_000_000_000:
+        published_at *= 1000
+    if not published_at or published_at < TRENCH_PERSON_ALERT_NOT_BEFORE_MS:
+        return False
+    age = now_ms - published_at
+    if age < -60_000 or age > TRENCH_PERSON_ALERT_MAX_AGE_MS:
+        return False
+    handle = normalize_x_handle(signal.get("personHandle")).casefold()
+    return bool(handle) and now_ms - TRENCH_PERSON_LAST_ALERT_AT.get(handle, 0) >= TRENCH_PERSON_ALERT_PERSON_COOLDOWN_MS
+
+
+def process_trench_person_activity(
+    posts: list[dict[str, Any]],
+    rows: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    candidates = rows if isinstance(rows, list) else trench_person_recent_rows()
+    emitted: list[dict[str, Any]] = []
+    alert_candidates: list[dict[str, Any]] = []
+    now_ms = int(time.time() * 1000)
+    for item in posts:
+        if not isinstance(item, dict):
+            continue
+        source = item.get("_personSource") if isinstance(item.get("_personSource"), dict) else {}
+        if normalize_x_handle(source.get("handle") or item.get("handle")).casefold() in EXCLUDED_IMPORTANT_HANDLES:
+            continue
+        matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for row in candidates:
+            signal = match_person_post(row, item, source, semantic_prefilter=False)
+            if signal:
+                matches.append((row, signal))
+        grouped: dict[tuple[str, str], list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+        for row, signal in matches:
+            group_key = (
+                clean_feed_text(signal.get("tokenSymbol") or signal.get("tokenName"), 80).casefold(),
+                clean_feed_text(signal.get("matchType"), 40),
+            )
+            grouped.setdefault(group_key, []).append((row, signal))
+        selected_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for group in grouped.values():
+            group.sort(key=lambda pair: trench_person_signal_market_rank(pair[0]), reverse=True)
+            row, signal = group[0]
+            signal["identityAmbiguous"] = len({trench_person_token_identity(pair[0]) for pair in group}) > 1
+            signal["observedAt"] = now_ms
+            if signal["identityAmbiguous"]:
+                signal["confidence"] = min(84, int(safe_float(signal.get("confidence"), 0)))
+            selected_pairs.append((row, signal))
+
+        # Lexical/identity matching above is recall-only.  Every candidate must
+        # pass Jev's fast semantic classification before it can become a
+        # signal, research input, popup or spoken alert.
+        assessments = trench_person_ai_semantic_assessments(selected_pairs)
+        for row, signal in selected_pairs:
+            assessment = assessments.get(clean_feed_text(signal.get("key"), 180), {})
+            if not assessment.get("related"):
+                continue
+            signal.update({
+                "semanticDecisionVersion": clean_feed_text(assessment.get("version"), 100),
+                "semanticStatus": clean_feed_text(assessment.get("status"), 30),
+                "semanticRelated": True,
+                "semanticConfidence": round(safe_float(assessment.get("confidence"), 0), 4),
+                "semanticChoice": clean_feed_text(assessment.get("choice"), 30),
+                "semanticReason": clean_feed_text(assessment.get("reason"), 300),
+                "semanticProvider": clean_feed_text(assessment.get("provider"), 80),
+                "semanticModel": clean_feed_text(assessment.get("model"), 100),
+            })
+            is_new = persist_trench_person_signal(signal)
+            if not is_new:
+                continue
+            emitted.append(signal)
+            try:
+                apply_trench_person_signal_to_research(row, signal)
+            except Exception as exc:
+                print(f"Trench person research handoff failed: {safe_monitor_error(exc)}", file=sys.stderr)
+            if (
+                int(safe_float(signal.get("confidence"), 0)) >= 90
+                and safe_float(signal.get("semanticConfidence"), 0) >= TRENCH_PERSON_SEMANTIC_MIN_CONFIDENCE
+                and not signal.get("identityAmbiguous")
+            ):
+                alert_candidates.append(signal)
+
+    # One person can have several historical posts or one post can ambiguously
+    # touch several symbols. Persist and research them all, but never burst a
+    # stack of popups: only the freshest high-confidence live signal per person
+    # is eligible, followed by a per-person cooldown.
+    best_by_person: dict[str, dict[str, Any]] = {}
+    for signal in alert_candidates:
+        handle = normalize_x_handle(signal.get("personHandle")).casefold()
+        current = best_by_person.get(handle)
+        score = (
+            int(safe_float(signal.get("publishedAt"), 0)),
+            int(safe_float(signal.get("confidence"), 0)),
+        )
+        current_score = (
+            int(safe_float((current or {}).get("publishedAt"), 0)),
+            int(safe_float((current or {}).get("confidence"), 0)),
+        )
+        if handle and (current is None or score > current_score):
+            best_by_person[handle] = signal
+    for handle, signal in best_by_person.items():
+        if not trench_person_signal_is_live_for_alert(signal, now_ms=now_ms):
+            continue
+        try:
+            send_trench_person_signal_alert(signal)
+            TRENCH_PERSON_LAST_ALERT_AT[handle] = now_ms
+        except Exception as exc:
+            print(f"Trench person popup failed: {safe_monitor_error(exc)}", file=sys.stderr)
+    return emitted
+
+
+def ingest_trench_person_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    incoming = trench_person_store_activity(payload)
+    return process_trench_person_activity(incoming) if incoming else []
+
+
+def reevaluate_trench_person_recent_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    posts = trench_person_activity_document()["recentPosts"]
+    return process_trench_person_activity(posts, rows=rows) if posts and rows else []
+
+
+def trench_person_watch_sources() -> list[dict[str, Any]]:
+    saved = [source for source in load_x_kol_sources(None) if source.get("enabled") is not False]
+    # Expanding the roster does not expand concurrency: the watch loop still
+    # performs one public read per global interval and rotates due sources.
+    return important_person_sources(saved)[:TRENCH_PERSON_SOURCE_LIMIT]
+
+
+def trench_person_fetch_public_source(source: dict[str, Any]) -> dict[str, Any]:
+    """Use exactly one free public read per cycle; alternate provider after failures."""
+    failures = TRENCH_PERSON_WATCH_FAILURES.get(clean_feed_text(source.get("id"), 120), 0)
+    if failures % 2:
+        return x_kol_fetch_public_timeline(source)
+    return x_kol_fetch_fxtwitter_timeline(source)
+
+
+def trench_person_poll_once() -> dict[str, Any]:
+    now = time.monotonic()
+    rows = trench_person_recent_rows()
+    sources = trench_person_watch_sources()
+    due = [source for source in sources if now >= TRENCH_PERSON_WATCH_NEXT_DUE.get(source["id"], 0.0)]
+    if not due:
+        return {"ok": True, "idle": True, "sourceCount": len(sources)}
+    ranked_due: list[tuple[float, str, dict[str, Any], int]] = []
+    for candidate in due:
+        relevance = person_relevance_score(candidate, rows)
+        tier = str(candidate.get("watchTier") or "secondary").strip().lower()
+        tier_boost = {"primary": 600.0, "official": 300.0, "secondary": 0.0}.get(tier, 0.0)
+        scheduled = TRENCH_PERSON_WATCH_NEXT_DUE.get(candidate["id"])
+        never_checked = scheduled is None
+        relevance_boost = 1800.0 if relevance and never_checked else 60.0 if relevance else 0.0
+        first_check_boost = 120.0 if never_checked else 0.0
+        # Lower effective due time wins. New relevant sources are checked first,
+        # then the unvisited core/project roster; already-hot sources cannot
+        # permanently starve the rest of the expanded watch list.
+        effective_due = (
+            (now if never_checked else float(scheduled))
+            - tier_boost
+            - relevance_boost
+            - first_check_boost
+        )
+        ranked_due.append((effective_due, candidate["id"], candidate, relevance))
+    ranked_due.sort(key=lambda item: (item[0], item[1]))
+    _effective_due, _source_id, source, relevance_score = ranked_due[0]
+    result = trench_person_fetch_public_source(source)
+    source_state = result.get("source") if isinstance(result.get("source"), dict) else {}
+    ok = source_state.get("status") == "ok"
+    failures = 0 if ok else TRENCH_PERSON_WATCH_FAILURES.get(source["id"], 0) + 1
+    TRENCH_PERSON_WATCH_FAILURES[source["id"]] = failures
+    relevant = relevance_score > 0
+    tier = str(source.get("watchTier") or "secondary").strip().lower()
+    tier_refresh = (
+        TRENCH_PERSON_DEFAULT_REFRESH_SECONDS
+        if tier == "primary"
+        else TRENCH_PERSON_OFFICIAL_REFRESH_SECONDS
+        if tier == "official"
+        else TRENCH_PERSON_SECONDARY_REFRESH_SECONDS
+    )
+    refresh = TRENCH_PERSON_RELEVANT_REFRESH_SECONDS if relevant else tier_refresh
+    if failures:
+        refresh = min(60 * 60.0, max(refresh, 60.0 * (2 ** min(failures, 5))))
+    TRENCH_PERSON_WATCH_NEXT_DUE[source["id"]] = now + refresh
+    trench_person_record_source_health(
+        source,
+        source_state,
+        failures=failures,
+        refresh_seconds=refresh,
+    )
+    payload = {
+        "ok": ok,
+        "sources": [{**source, **source_state, "personRole": source.get("personRole")}],
+        "items": result.get("items") if isinstance(result.get("items"), list) else [],
+        "updatedAt": int(time.time() * 1000),
+    }
+    emitted = ingest_trench_person_payload(payload)
+    return {
+        "ok": ok,
+        "source": source["handle"],
+        "relevant": relevant,
+        "items": len(payload["items"]),
+        "signals": len(emitted),
+        "nextDueSeconds": int(refresh),
+    }
+
+
+def trench_person_watch_loop() -> None:
+    while not SERVER_SHUTDOWN_EVENT.is_set():
+        try:
+            trench_person_poll_once()
+        except Exception as exc:
+            print(f"Trench person watch recovering: {safe_monitor_error(exc)}", file=sys.stderr)
+        if SERVER_SHUTDOWN_EVENT.wait(TRENCH_PERSON_REQUEST_MIN_INTERVAL_SECONDS):
+            return
+
+
+def start_trench_person_watch_monitor() -> None:
+    global TRENCH_PERSON_WATCH_STARTED
+    with TRENCH_PERSON_WATCH_LOCK:
+        if TRENCH_PERSON_WATCH_STARTED:
+            return
+        TRENCH_PERSON_WATCH_STARTED = True
+    threading.Thread(
+        target=trench_person_watch_loop,
+        name="gmgn-trench-person-watch",
+        daemon=True,
+    ).start()
+
+
+def gmgn_trench_research_candidate(
+    raw: dict[str, Any],
+    *,
+    current_ms: int,
+    research_label: str = "GMGN 战壕新币",
+) -> dict[str, Any] | None:
+    """Convert one visible GMGN trench row into a durable research candidate."""
+    if not isinstance(raw, dict):
+        return None
+    contract = clean_feed_text(raw.get("contractAddress"), 160)
+    network = clean_feed_text(raw.get("network") or raw.get("chain"), 40).lower()
+    if not contract or network not in ONCHAIN_RESEARCH_DEFAULT_NETWORKS:
+        return None
+    created_at = int(safe_float(raw.get("poolCreatedAt"), 0))
+    if 0 < created_at < 10_000_000_000:
+        created_at *= 1000
+    received_at = int(safe_float(raw.get("receivedAt") or raw.get("firstSeenAt"), current_ms))
+    observed_at = int(safe_float(
+        raw.get("observedAt") or raw.get("lastSeenAt") or raw.get("receivedAt"),
+        current_ms,
+    ))
+    metrics = raw.get("metrics") if isinstance(raw.get("metrics"), dict) else {}
+    h1_missing = not any(safe_float(metrics.get(key), 0) > 0 for key in (
+        "volumeH1Usd", "transactionsH1", "buysH1", "sellsH1",
+    ))
+    row = dict(raw)
+    row.update({
+        "network": network,
+        # This exact marker is the membership boundary for the visible board.
+        # It grants research review only; the chat verdict still controls alerts.
+        "gmgnTrenchBoardMember": True,
+        "boardResearchRequired": True,
+        "poolCreatedAt": created_at,
+        # Local receipt time, rather than an old provider launch timestamp,
+        # defines the continuous incremental stream.
+        "firstSeenAt": received_at,
+        "observedAt": observed_at,
+        "providers": list(dict.fromkeys(["gmgn-trenches", *(raw.get("providers") or [])])),
+        "researchTier": "gmgn-trench-new",
+        "researchSource": "GMGN 战壕",
+        "researchSourceLabel": research_label,
+        "narrativeFallbackEligible": h1_missing,
+        "reasons": list(dict.fromkeys([
+            "GMGN 战壕榜首次收录，进入投研判断",
+            *(raw.get("reasons") or []),
+        ]))[:6],
+        "risks": list(raw.get("risks") or [])[:6],
+    })
+    return row
+
+
 def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
     observed_at = int(time.time() * 1000)
     try:
         live_payload = fetch_live_onchain_trenches(
-            networks=("eth", "solana", "robinhood", "arc", "bsc"),
+            networks=ONCHAIN_RESEARCH_DEFAULT_NETWORKS,
             source="gmgn",
             page=1,
             page_size=2000,
             observed_at=observed_at,
             item_filter=gmgn_trench_passes_chain_filters,
             per_network_limit=None,
-            include_recent_rank_supplement=True,
+            include_recent_rank_supplement=False,
         )
     except Exception as exc:
         live_payload = {
@@ -12162,8 +13231,45 @@ def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
             "items": history_rows,
         })
 
+    # Re-evaluate the bounded public-person activity window after the tape is
+    # persisted.  This may call semantic AI and must not block the fresh-board
+    # cache from being written.
+    def replay_trench_person_activity(rows: list[dict[str, Any]]) -> None:
+        try:
+            reevaluate_trench_person_recent_activity(rows)
+        except Exception as exc:
+            print(f"Trench person activity replay deferred: {safe_monitor_error(exc)}", file=sys.stderr)
+
+    threading.Thread(
+        target=replay_trench_person_activity,
+        args=(list(history_rows),),
+        daemon=True,
+        name="gmgn-trench-person-replay",
+    ).start()
+
     rows = gmgn_trench_board_rows(history_rows, current_rows=live_rows)
     current_display_rows = gmgn_trench_board_rows(live_rows, current_rows=live_rows)
+    # The current visible board is the source of truth for the incremental
+    # research stream. Submit the live snapshot (never the historical tape):
+    # FastResearch upgrades previously generic rows, suppresses pre-cutoff
+    # backlog, and durably deduplicates already admitted members.
+    research_ingested = 0
+    research_ingest_error = ""
+    if current_display_rows:
+        research_candidates = [
+            candidate
+            for raw in current_display_rows
+            for candidate in [gmgn_trench_research_candidate(raw, current_ms=observed_at)]
+            if candidate is not None
+        ]
+        fast_research = globals().get("ONCHAIN_FAST_RESEARCH")
+        if research_candidates and fast_research is not None:
+            try:
+                fast_research.ingest(research_candidates, match_recent_news=True)
+                research_ingested = len(research_candidates)
+            except Exception as exc:
+                research_ingest_error = safe_monitor_error(exc)
+                print(f"GMGN trench incremental ingest deferred: {research_ingest_error}", file=sys.stderr)
     source_status = live_payload.get("sourceStatus") if isinstance(live_payload.get("sourceStatus"), dict) else {}
     online_count = sum(1 for value in source_status.values() if value == "ok")
     source = source_template(
@@ -12190,6 +13296,8 @@ def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
         "currentFetchedCount": int(safe_float(live_payload.get("unfilteredTotal"), len(raw_live_rows))),
         "historyScope": "local-received",
         "historyUpdatedAt": observed_at,
+        "incrementalResearchIngested": research_ingested,
+        "incrementalResearchError": research_ingest_error,
         "live": bool(live_payload.get("ok")),
         "rateLimited": bool(live_payload.get("rateLimited")),
         "retryAfterSeconds": int(safe_float(live_payload.get("retryAfterSeconds"))),
@@ -12211,7 +13319,7 @@ def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
 
 
 def load_v44_research_marks(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Load only complete, positive V4.4 research decisions for visible trench CAs."""
+    """Load only complete, positive V4.9 research decisions for visible trench CAs."""
     keys = list(dict.fromkeys(
         onchain_candidate_key({
             "network": row.get("network") or row.get("chain"),
@@ -12242,7 +13350,7 @@ def load_v44_research_marks(rows: list[dict[str, Any]]) -> dict[str, dict[str, A
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
         # "好标的" is intentionally stricter than an observation candidate:
-        # it needs the full V4.4 ledgers, supported evidence and a strong verdict.
+        # it needs the full V4.9 ledgers, supported evidence and a strong verdict.
         if candidate.get("decision") != "shortlisted" or analysis.get("verdict") != "strong":
             continue
         if not formal_research_worthy(analysis):
@@ -12250,7 +13358,7 @@ def load_v44_research_marks(rows: list[dict[str, Any]]) -> dict[str, dict[str, A
         framework = analysis.get("frameworkAssessment") if isinstance(analysis.get("frameworkAssessment"), dict) else {}
         tier = clean_feed_text(framework.get("potentialTier"), 30)
         marks[record["key"]] = {
-            "label": "V4.4 好标的",
+            "label": "V4.9 好标的",
             "potentialTier": tier,
             "potentialLabel": {
                 "leader": "龙头潜力",
@@ -12350,6 +13458,12 @@ def gmgn_trench_daily_research_payload(
         ))
         row.update({
             "network": network,
+            # This marker is the membership boundary for the visible
+            # "GMGN 战壕新币榜".  Other scanners may also use the
+            # gmgn-trenches provider (including chains not shown here), but
+            # they must never enter this board's ChatGPT research stream.
+            "gmgnTrenchBoardMember": True,
+            "boardResearchRequired": True,
             "poolCreatedAt": created_at,
             "firstSeenAt": int(safe_float(raw.get("firstSeenAt") or raw.get("receivedAt"), created_at)),
             "observedAt": int(safe_float(raw.get("observedAt") or raw.get("lastSeenAt") or raw.get("receivedAt"), current_ms)),
@@ -12357,8 +13471,8 @@ def gmgn_trench_daily_research_payload(
             "decision": decision,
             "researchTier": "gmgn-trench-new",
             "researchSource": "GMGN 战壕",
-            "researchSourceLabel": "GMGN 战壕今日新币",
-            "narrativeFallbackEligible": h1_missing,
+        "researchSourceLabel": "GMGN 战壕今日新币",
+        "narrativeFallbackEligible": h1_missing,
             "reasons": list(dict.fromkeys([
                 f"GMGN 战壕 {day} 新币 · {decision}",
                 *(raw.get("reasons") or []),
@@ -12375,7 +13489,7 @@ def gmgn_trench_daily_research_payload(
         onchain_candidate_key(row),
     ))
     selected = candidates[:24]
-    # Feed the complete, chain-filtered GMGN tape into the durable V4.4
+    # Feed the complete, chain-filtered GMGN tape into the durable V4.9
     # research lane.  The 24-row slice above is only a bounded hand-off for
     # the response; final selection is made by FastResearch after its own
     # quantitative screen and AI/framework review.
@@ -12406,6 +13520,14 @@ def gmgn_trench_daily_research_payload(
         "newsTriggered": 0,
         "sameSymbolSuppressed": 0,
     })
+    mode_config = onchain_research_mode_payload()
+    mode_source_label = (
+        "GMGN 战壕今日新币 · JEV 快速主判"
+        if mode_config["mode"] == "rapid"
+        else "GMGN 战壕今日新币 · ChatGPT 聊天每小时 V4.9 投研"
+        if mode_config["mode"] == "hourly"
+        else "GMGN 战壕今日新币 · ChatGPT 聊天实时 V4.9 投研"
+    )
     return {
         **previous,
         "day": day,
@@ -12422,7 +13544,9 @@ def gmgn_trench_daily_research_payload(
         "fastResearchManaged": False,
         "gmgnTrenchOnly": True,
         "researchSource": "gmgn-trenches",
-        "researchSourceLabel": "GMGN 战壕今日新币 · V4.4精选",
+        "researchSourceLabel": mode_source_label,
+        "researchMode": mode_config["mode"],
+        "researchModeConfig": mode_config,
         "researchSourceCount": len(candidates),
         "trenchCandidatePool": candidates,
         "trenchResearchIngestedAt": research_ingested_at,
@@ -12433,7 +13557,7 @@ def gmgn_trench_daily_research_payload(
 
 
 def attach_gmgn_trench_research(research: dict[str, Any]) -> dict[str, Any]:
-    """Expose only GMGN trench coins that passed the durable V4.4 lane.
+    """Expose GMGN trench coins selected by the active decision lane.
 
     ``gmgn_trench_daily_research_payload`` deliberately returns a private
     candidate pool so the background lane can screen every current-day row.
@@ -12454,11 +13578,24 @@ def attach_gmgn_trench_research(research: dict[str, Any]) -> dict[str, Any]:
         for row in pool
         if onchain_candidate_key(row)
     }
+    mode_config = onchain_research_mode_payload()
+    rapid_mode = mode_config["mode"] == "rapid"
+    source_label = (
+        "GMGN 战壕今日新币 · JEV 快速主判"
+        if rapid_mode
+        else "GMGN 战壕今日新币 · ChatGPT 聊天每小时 V4.9 投研"
+        if mode_config["mode"] == "hourly"
+        else "GMGN 战壕今日新币 · ChatGPT 聊天实时 V4.9 投研"
+    )
+    pool_by_key = {onchain_candidate_key(row): row for row in pool if onchain_candidate_key(row)}
     base = dict(research)
     base["selected"] = pool
     base["provisional"] = []
     base["watching"] = []
     base["fastResearchManaged"] = False
+    base["researchMode"] = mode_config["mode"]
+    base["researchModeConfig"] = mode_config
+    base["researchSourceLabel"] = source_label
 
     fast_research = globals().get("ONCHAIN_FAST_RESEARCH")
     if fast_research is None:
@@ -12470,9 +13607,11 @@ def attach_gmgn_trench_research(research: dict[str, Any]) -> dict[str, Any]:
             "provisionalTotal": 0,
             "fastResearchManaged": True,
             "researchAnalysisStatus": "unavailable",
-            "researchSourceLabel": "GMGN 战壕今日新币 · V4.4精选",
+            "researchSourceLabel": source_label,
+            "researchMode": mode_config["mode"],
+            "researchModeConfig": mode_config,
             "trenchCandidatePool": None,
-            "errors": [*(base.get("errors") or []), "V4.4 投研服务尚未启动"][:12],
+            "errors": [*(base.get("errors") or []), f"{mode_config['providerLabel']}判断服务尚未启动"][:12],
         }
 
     # A cached source can predate the ingest marker after a process restart.
@@ -12494,9 +13633,11 @@ def attach_gmgn_trench_research(research: dict[str, Any]) -> dict[str, Any]:
             "provisionalTotal": 0,
             "fastResearchManaged": True,
             "researchAnalysisStatus": "unavailable",
-            "researchSourceLabel": "GMGN 战壕今日新币 · V4.4精选",
+            "researchSourceLabel": source_label,
+            "researchMode": mode_config["mode"],
+            "researchModeConfig": mode_config,
             "trenchCandidatePool": None,
-            "errors": [*(base.get("errors") or []), f"V4.4 投研读取失败：{safe_monitor_error(exc)}"][:12],
+            "errors": [*(base.get("errors") or []), f"{mode_config['providerLabel']}判断读取失败：{safe_monitor_error(exc)}"][:12],
         }
 
     # FastResearch.attach aggregates the whole durable day queue.  Scope the
@@ -12512,6 +13653,8 @@ def attach_gmgn_trench_research(research: dict[str, Any]) -> dict[str, Any]:
         "narrativeResonance": 0,
     }
     job_counts_from_store = False
+    pool_jobs: list[dict[str, Any]] = []
+    parsed_pool_jobs: list[tuple[dict[str, Any], dict[str, Any]]] = []
     if pool_keys and hasattr(fast_research, "_query"):
         try:
             placeholders = ",".join("?" for _ in pool_keys)
@@ -12519,6 +13662,7 @@ def attach_gmgn_trench_research(research: dict[str, Any]) -> dict[str, Any]:
                 f"SELECT key,status,analyzed_at,candidate_json,analysis_json FROM onchain_fast_jobs WHERE key IN ({placeholders})",
                 tuple(pool_keys),
             )
+            pool_jobs = jobs
             job_counts_from_store = True
             for job in jobs:
                 try:
@@ -12526,6 +13670,7 @@ def attach_gmgn_trench_research(research: dict[str, Any]) -> dict[str, Any]:
                     analysis = json.loads(job.get("analysis_json") or "{}")
                 except (TypeError, ValueError, json.JSONDecodeError):
                     candidate, analysis = {}, {}
+                parsed_pool_jobs.append((job, candidate))
                 if candidate.get("decision") == "shortlisted":
                     job_counts["quantified"] += 1
                 if candidate.get("narrativeFallbackApplied") or candidate.get("newsSignal"):
@@ -12544,28 +13689,58 @@ def attach_gmgn_trench_research(research: dict[str, Any]) -> dict[str, Any]:
                     elif not formal_research_worthy(analysis):
                         job_counts["needsEvidence"] += 1
         except Exception:
-            # A telemetry failure must not block the actual V4.4 result.
+            # A telemetry failure must not block the actual V4.9 result.
             pass
 
-    # Only formal V4.4 recommendations enter the main list.  Keep the
-    # quantitative breakout lane visible as structure confirmation, but never
-    # treat it as an AI-selected recommendation or popup trigger.
-    formal = [
-        row for row in (evaluated.get("selected") if isinstance(evaluated, dict) else [])
-        if isinstance(row, dict)
-        and onchain_candidate_key(row) in pool_keys
-        and row.get("researchTier") == "ai-recommended"
-    ]
+    # Fast mode is a complete JEV decision lane. Slow mode exposes a complete
+    # V4.9 research result.
+    if rapid_mode:
+        formal = []
+        for job, candidate in parsed_pool_jobs:
+            rapid = candidate.get("rapidDecision") if isinstance(candidate.get("rapidDecision"), dict) else {}
+            if (rapid.get("version") != RAPID_DECISION_VERSION
+                    or rapid.get("priority") != "deep-research"
+                    or int(safe_float(rapid.get("modelCount"), 0)) < 1):
+                continue
+            key = clean_feed_text(job.get("key"), 240)
+            row = {**candidate, **dict(pool_by_key.get(key) or {})}
+            row.update({
+                "rapidDecision": rapid,
+                "jevDecision": candidate.get("jevDecision") or rapid.get("jev") or {},
+                "rapidAnalyzedAt": int(safe_float(candidate.get("rapidAnalyzedAt") or rapid.get("analyzedAt"), 0)),
+                "researchTier": "rapid-recommended",
+                "researchMode": "rapid",
+                "fastResearch": True,
+                "aiAnalysisStatus": "rapid-ready",
+            })
+            formal.append(row)
+    else:
+        formal = [
+            row for row in (evaluated.get("selected") if isinstance(evaluated, dict) else [])
+            if isinstance(row, dict)
+            and onchain_candidate_key(row) in pool_keys
+            and row.get("researchTier") == "ai-recommended"
+        ]
     provisional = [
-        row for row in (evaluated.get("provisional") if isinstance(evaluated, dict) else [])
+        {**row, "researchMode": mode_config["mode"]}
+        for row in (evaluated.get("provisional") if isinstance(evaluated, dict) else [])
         if isinstance(row, dict) and onchain_candidate_key(row) in pool_keys
     ]
-    formal.sort(key=lambda row: (
-        -safe_float((row.get("aiAnalysis") or {}).get("frameworkAssessment", {}).get("opportunityScore"), 0),
-        -safe_float(row.get("selectedScore"), 0),
-        -safe_float(row.get("poolCreatedAt"), 0),
-        onchain_candidate_key(row),
-    ))
+    if rapid_mode:
+        formal.sort(key=lambda row: (
+            -safe_float((row.get("rapidDecision") or {}).get("goodCandidateProbability"), 0),
+            -safe_float((row.get("rapidDecision") or {}).get("confidence"), 0),
+            -safe_float(row.get("selectedScore"), 0),
+            -safe_float(row.get("poolCreatedAt"), 0),
+            onchain_candidate_key(row),
+        ))
+    else:
+        formal.sort(key=lambda row: (
+            -safe_float((row.get("aiAnalysis") or {}).get("frameworkAssessment", {}).get("opportunityScore"), 0),
+            -safe_float(row.get("selectedScore"), 0),
+            -safe_float(row.get("poolCreatedAt"), 0),
+            onchain_candidate_key(row),
+        ))
     eligible_quantified = job_counts["quantified"] or sum(
         1 for row in pool if str(row.get("decision") or "").lower() == "shortlisted"
     )
@@ -12577,11 +13752,20 @@ def attach_gmgn_trench_research(research: dict[str, Any]) -> dict[str, Any]:
         "provisional": len(provisional),
         "pending": job_counts["pending"] if job_counts_from_store else max(0, eligible_quantified - len(formal) - len(provisional)),
         "unavailable": job_counts["unavailable"],
-        "filteredByAi": job_counts["filteredByAi"],
-        "needsEvidence": job_counts["needsEvidence"],
+        "filteredByAi": 0 if rapid_mode else job_counts["filteredByAi"],
+        "needsEvidence": 0 if rapid_mode else job_counts["needsEvidence"],
         "upgrading": job_counts["upgrading"],
         "narrativeResonance": job_counts["narrativeResonance"],
     })
+    if rapid_mode:
+        review["rapidWatch"] = sum(
+            1 for _, candidate in parsed_pool_jobs
+            if clean_feed_text((candidate.get("rapidDecision") or {}).get("priority"), 30) == "watch"
+        )
+        review["rapidRejected"] = sum(
+            1 for _, candidate in parsed_pool_jobs
+            if clean_feed_text((candidate.get("rapidDecision") or {}).get("priority"), 30) == "reject"
+        )
     funnel = dict(research.get("funnel") or {})
     funnel.update({
         "discovered": len(pool),
@@ -12592,8 +13776,12 @@ def attach_gmgn_trench_research(research: dict[str, Any]) -> dict[str, Any]:
         "provisional": len(provisional),
     })
     errors = list(research.get("errors") or [])[:12]
+    rapid_analyzed = sum(
+        1 for _, candidate in parsed_pool_jobs
+        if clean_feed_text((candidate.get("rapidDecision") or {}).get("version"), 100) == RAPID_DECISION_VERSION
+    ) if rapid_mode else 0
     research_analysis_status = (
-        "ready" if formal
+        "ready" if formal or (rapid_mode and rapid_analyzed)
         else "unavailable"
         if job_counts_from_store and eligible_quantified and job_counts["unavailable"] >= eligible_quantified
         else "pending" if eligible_quantified else "screened"
@@ -12611,10 +13799,16 @@ def attach_gmgn_trench_research(research: dict[str, Any]) -> dict[str, Any]:
         "reviewQueue": review,
         "fastResearchManaged": True,
         "gmgnTrenchOnly": True,
-        "researchSystem": "onchain-fast-v4.4",
+        "researchSystem": (
+            "jev-primary-rapid-v1" if rapid_mode
+            else "codex-v48-hourly" if mode_config["mode"] == "hourly"
+            else "codex-v48-realtime"
+        ),
+        "researchMode": mode_config["mode"],
+        "researchModeConfig": mode_config,
         "researchAnalysisStatus": research_analysis_status,
         "researchSource": "gmgn-trenches",
-        "researchSourceLabel": "GMGN 战壕今日新币 · V4.4精选",
+        "researchSourceLabel": source_label,
         "researchSourceCount": len(pool),
         "trenchCandidateCount": len(pool),
         "trenchCandidatePool": None,
@@ -12622,14 +13816,17 @@ def attach_gmgn_trench_research(research: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def fetch_gmgn_trenches_hot_board() -> dict[str, Any]:
+def fetch_gmgn_trenches_hot_board(*, force_refresh: bool = False, attach_overlays: bool = True) -> dict[str, Any]:
     """Serve one persisted tape and refresh it at most once per protected window."""
     source = cached_api_payload(
         "gmgn-trenches-hot-board-v8",
         refresh_gmgn_trenches_hot_board,
         GMGN_TRENCH_BOARD_REFRESH_SECONDS,
+        force_refresh=force_refresh,
     )
-    return attach_v44_research_marks_to_gmgn_trenches(source)
+    if not attach_overlays:
+        return source
+    return attach_trench_person_signals(attach_v44_research_marks_to_gmgn_trenches(source))
 
 
 def ave_hot_all_rows(source: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -12866,6 +14063,78 @@ def fetch_binance_gainers() -> dict[str, Any]:
         status="ok" if rows else "unavailable",
         empty_title="Binance 涨幅榜当前为空",
         empty_message="已请求 Binance 官网产品行情，但没有得到可展示的正涨幅 USDT 交易对。",
+    )
+
+
+def fetch_binance_futures_gainers() -> dict[str, Any]:
+    response = requests.get(
+        "https://fapi.binance.com/fapi/v1/ticker/24hr",
+        headers={"User-Agent": HEADERS["User-Agent"], "Accept": "application/json"},
+        # This public endpoint is reachable directly on the dashboard host.
+        # Bypass a stale desktop proxy so one stopped proxy app cannot freeze
+        # or empty the futures ranking during startup.
+        proxies={"http": "", "https": ""},
+        timeout=18,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    candidates: list[dict[str, Any]] = []
+    for item in payload if isinstance(payload, list) else []:
+        if not isinstance(item, dict):
+            continue
+        pair = clean_feed_text(item.get("symbol"), 40).upper()
+        if not pair.endswith("USDT"):
+            continue
+        asset = pair[:-4]
+        if not asset or is_excluded_crypto_asset(asset):
+            continue
+        last = safe_float(item.get("lastPrice"))
+        change = safe_float(item.get("priceChangePercent"))
+        quote_volume = safe_float(item.get("quoteVolume"))
+        if last <= 0 or change <= 0:
+            continue
+        candidates.append({
+            "symbol": asset,
+            "pair": pair,
+            "last": last,
+            "change": change,
+            "amount": quote_volume,
+            "icon": crypto_icon_url(asset),
+        })
+    candidates.sort(
+        key=lambda item: (safe_float(item.get("change")), safe_float(item.get("amount"))),
+        reverse=True,
+    )
+    rows = [
+        {
+            "rank": index,
+            "symbol": item["symbol"],
+            "name": item["pair"],
+            "icon": item["icon"],
+            "price": price_usd(item["last"]),
+            "change": pct(item["change"]),
+            "heat": max(1, round((11 - index) / 10 * 100)),
+            "amount": item["amount"],
+            "turnover": money_usd(item["amount"]) if item["amount"] else "--",
+            "tags": ["Binance", "U本位永续", "24h 合约涨幅榜"],
+            "note": "Binance Futures · USDT 永续合约",
+            "marketType": "futures",
+            "url": f"https://www.binance.com/zh-CN/futures/{item['pair']}",
+        }
+        for index, item in enumerate(candidates[:10], 1)
+    ]
+    return source_template(
+        id="binance-futures-gainers",
+        group="crypto",
+        title="Binance 合约涨幅榜",
+        subtitle="Binance U本位合约 24h 行情，按涨幅排序，已过滤 BTC / ETH / BNB / 稳定币",
+        accent="#f4b740",
+        source_label="BN",
+        source_name="Binance Futures 24hr ticker gainers",
+        rows=rows,
+        status="ok" if rows else "unavailable",
+        empty_title="Binance 合约涨幅榜当前为空",
+        empty_message="已请求 Binance U本位合约公开行情，但没有得到可展示的正涨幅交易对。",
     )
 
 
@@ -16635,9 +17904,19 @@ def market_payload() -> dict[str, Any]:
 
 def market_hot_response_payload(*, force_refresh: bool = False) -> dict[str, Any]:
     """Serve the composite cache while keeping the independent GMGN board fresh."""
-    payload = cached_api_payload("market-hot", market_payload, 60, force_refresh=force_refresh)
+    if force_refresh:
+        cached_payload = read_json_cache(api_cache_path("market-hot"))
+        if cached_payload:
+            trigger_api_refresh("market-hot", market_payload)
+            payload = with_cache_meta("market-hot", cached_payload, stale=True)
+        else:
+            payload = cached_api_payload("market-hot", market_payload, 60, force_refresh=False)
+    else:
+        payload = cached_api_payload("market-hot", market_payload, 60, force_refresh=False)
     try:
-        latest_gmgn = fetch_gmgn_trenches_hot_board()
+        if force_refresh:
+            trigger_api_refresh("gmgn-trenches-hot-board-v8", refresh_gmgn_trenches_hot_board)
+        latest_gmgn = fetch_gmgn_trenches_hot_board(force_refresh=False, attach_overlays=False)
     except Exception:
         return payload
     if not source_has_rows(latest_gmgn):
@@ -18249,7 +19528,8 @@ def codex_cli_prompt(messages: list[dict[str, str]], *, web_search=False) -> str
 @contextmanager
 def codex_cli_analysis_slot(deadline: float | None = None, *, lane: str = "default"):
     slot = {"wallet": CODEX_CLI_WALLET_ANALYSIS_LOCK, "onchain-live": CODEX_CLI_ONCHAIN_LIVE_LOCK,
-            "onchain-history": CODEX_CLI_ONCHAIN_HISTORY_LOCK, "explanations-search": CODEX_CLI_EXPLANATION_SEARCH_LOCK,
+            "onchain-history": CODEX_CLI_ONCHAIN_HISTORY_LOCK, "onchain-hourly": CODEX_CLI_ONCHAIN_HOURLY_LOCK,
+            "explanations-search": CODEX_CLI_EXPLANATION_SEARCH_LOCK,
             "explanations-review": CODEX_CLI_EXPLANATION_REVIEW_LOCK,
             "global-hotspot": CODEX_CLI_GLOBAL_HOTSPOT_LOCK,
             "chat-ca": CODEX_CLI_CHAT_CA_LOCK}.get(lane,
@@ -18480,16 +19760,24 @@ def ai_startup_reconnect_once() -> dict[str, Any]:
         if not isinstance(deepseek_extract_json(content), dict) or not str(content).strip():
             raise RuntimeError("AI 启动探测未返回有效 JSON")
         clear_ai_failure_cooldowns()
-        requeued = ONCHAIN_FAST_RESEARCH.retry_unavailable_after_ai_reconnect()
         provider = "codex-cli" if response.get("_provider") == "codex-cli" else clean_model_provider(settings.get("provider"))
         result = {
             "status": "ready",
             "provider": provider or "ai",
             "attemptedAt": attempted_at,
             "completedAt": int(time.time() * 1000),
-            "requeued": int(requeued or 0),
+            "requeued": 0,
             "error": "",
         }
+        # Connectivity and backlog maintenance are separate facts. Publish
+        # readiness before waiting for the large scan-store lock so the UI does
+        # not remain stuck on “checking” while hourly research is writing.
+        with AI_STARTUP_RECONNECT_LOCK:
+            AI_STARTUP_RECONNECT_STATE.update(result)
+        try:
+            result["requeued"] = int(ONCHAIN_FAST_RESEARCH.retry_unavailable_after_ai_reconnect() or 0)
+        except Exception as retry_exc:
+            result["requeueError"] = safe_error_text(str(retry_exc))
         print(f"AI startup reconnect: ready provider={result['provider']} requeued={result['requeued']}", flush=True)
     except Exception as exc:
         cooldown = max(30, min(3600, int(safe_float(env_value("CODEX_CLI_FAILURE_COOLDOWN", "300"), 300))))
@@ -20456,6 +21744,7 @@ def gainers_rankings_payload() -> dict[str, Any]:
     sources = []
     fetchers = [
         ("binance-gainers", fetch_binance_gainers),
+        ("binance-futures-gainers", fetch_binance_futures_gainers),
         ("okx-gainers", fetch_okx_gainers),
         ("okx-dex-gainers", fetch_okx_dex_gainers),
         ("bitget-gainers", fetch_bitget_gainers),
@@ -21215,6 +22504,18 @@ def desktop_alert_price_watch_suppression_reason(
 def desktop_alert_runtime_suppression_reason(
     item: dict[str, Any], *, pending: bool, now: float | None = None
 ) -> str:
+    if clean_feed_text(item.get("sourceType"), 40) == "trench-person-signal":
+        handle = normalize_x_handle(item.get("authorHandle")).casefold()
+        if handle in EXCLUDED_IMPORTANT_HANDLES:
+            return "该账号已从人物源移除"
+        if pending:
+            event_ms = alert_event_ms(item.get("time"))
+            queued_ms = alert_event_ms(item.get("queuedAt"))
+            current_ms = int((time.time() if now is None else now) * 1000)
+            if queued_ms and queued_ms < TRENCH_PERSON_ALERT_NOT_BEFORE_MS:
+                return "历史人物动态不补弹"
+            if event_ms and current_ms - event_ms > TRENCH_PERSON_ALERT_MAX_AGE_MS:
+                return "人物动态已超过实时播报窗口"
     return (
         desktop_alert_political_military_reason(item)
         or desktop_alert_price_watch_suppression_reason(item, pending=pending, now=now)
@@ -21437,6 +22738,7 @@ def desktop_alert_monitor_symbol(item: dict[str, Any]) -> str:
         "oversold",
         "dragon-wave",
         "dragon-wave-secondary",
+        "dragon-wave-secondary-prearm",
         "dragon-wave-prearm",
         "structure-first",
     }:
@@ -21641,6 +22943,7 @@ def desktop_alert_delivery_tick() -> None:
             normalized, pending=True, now=now
         )
         if ((symbol and price_structure_symbol_excluded(symbol))
+                or (symbol and price_monitor_row_has_cold_archive(normalized))
                 or desktop_alert_source_is_muted(normalized) or suppression_reason):
             reason = suppression_reason or '来源已静音或标的已被移出监控'
             ALERT_DELIVERY_STORE.suppress(row['id'], reason)
@@ -22044,6 +23347,7 @@ def price_watch_manual_discovery_rows() -> list[dict[str, Any]]:
         source_dir / "turnover-rankings_aicoin.json",
         source_dir / "market-hot_binance.json",
         source_dir / "gainers-rankings_binance-gainers.json",
+        source_dir / "gainers-rankings_binance-futures-gainers.json",
         source_dir / "market-hot_okx.json",
         source_dir / "market-hot_bitget.json",
         PERSIST_CACHE_DIR / "api_new-coin-rankings.json",
@@ -22092,6 +23396,7 @@ def price_watch_manual_asset_resolution(value: Any) -> dict[str, Any]:
         identity_fields = (
             "onchain_contract_address", "new_contract_source", "aicoin_last_seen_at",
             "binance_wallet_hot_last_seen_at", "binance_gainers_last_seen_at",
+            "binance_futures_gainers_last_seen_at",
             "okx_gainers_last_seen_at", "opportunity_first_seen_at", "personal_x_mentioned_at",
         )
         trusted_identity = any(row.get(field) for field in identity_fields)
@@ -23197,6 +24502,7 @@ def sync_price_watch_ave_candidates(
               AND binance_wallet_hot_last_seen_at = 0
               AND gainers_first_seen_at = 0
               AND binance_gainers_last_seen_at = 0
+              AND binance_futures_gainers_last_seen_at = 0
               AND okx_gainers_last_seen_at = 0
               AND personal_x_mentioned_at = 0
               AND new_contract_listed_at = 0
@@ -23443,6 +24749,7 @@ def price_watch_gainers_active(
         first_seen_at >= current_ms - GAINERS_MONITOR_PROMOTION_SECONDS * 1000
         and (
             int(item.get("binance_gainers_last_seen_at") or 0) > 0
+            or int(item.get("binance_futures_gainers_last_seen_at") or 0) > 0
             or int(item.get("okx_gainers_last_seen_at") or 0) > 0
         )
         and int(item.get("dismissed_until") or 0) < current_ms
@@ -23460,6 +24767,7 @@ def sync_price_watch_gainers_candidates(
         sources = []
         fetchers = (
             ("binance-gainers", fetch_binance_gainers),
+            ("binance-futures-gainers", fetch_binance_futures_gainers),
             ("okx-gainers", fetch_okx_gainers),
         )
         pending = {
@@ -23481,10 +24789,14 @@ def sync_price_watch_gainers_candidates(
         if not isinstance(source, dict) or str(source.get("status") or "").lower() != "ok":
             continue
         source_id = clean_feed_text(source.get("id"), 40)
-        if source_id not in {"binance-gainers", "okx-gainers"}:
+        if source_id not in {"binance-gainers", "binance-futures-gainers", "okx-gainers"}:
             continue
         successful_source_ids.add(source_id)
-        source_label = "Binance 涨幅榜" if source_id == "binance-gainers" else "OKX 涨幅榜"
+        source_label = {
+            "binance-gainers": "Binance 涨幅榜",
+            "binance-futures-gainers": "Binance 合约涨幅榜",
+            "okx-gainers": "OKX 涨幅榜",
+        }[source_id]
         rows = source.get("rows") if isinstance(source.get("rows"), list) else []
         leader_row = next(
             (
@@ -23521,6 +24833,8 @@ def sync_price_watch_gainers_candidates(
                 "pairHint": pair_hint,
                 "binanceLastSeenAt": 0,
                 "binanceRank": 0,
+                "binanceFuturesLastSeenAt": 0,
+                "binanceFuturesRank": 0,
                 "okxLastSeenAt": 0,
                 "okxRank": 0,
             },
@@ -23532,6 +24846,9 @@ def sync_price_watch_gainers_candidates(
         if source_id == "binance-gainers":
             item["binanceLastSeenAt"] = now_value
             item["binanceRank"] = 1
+        elif source_id == "binance-futures-gainers":
+            item["binanceFuturesLastSeenAt"] = now_value
+            item["binanceFuturesRank"] = 1
         else:
             item["okxLastSeenAt"] = now_value
             item["okxRank"] = 1
@@ -23546,6 +24863,7 @@ def sync_price_watch_gainers_candidates(
             SELECT * FROM price_watch_assets
             WHERE gainers_first_seen_at > 0
                OR binance_gainers_last_seen_at > 0
+               OR binance_futures_gainers_last_seen_at > 0
                OR okx_gainers_last_seen_at > 0
             """
         ).fetchall()
@@ -23555,6 +24873,9 @@ def sync_price_watch_gainers_candidates(
             if (
                 "binance-gainers" in successful_source_ids
                 and int(row["binance_gainers_last_seen_at"] or 0) > 0
+            ) or (
+                "binance-futures-gainers" in successful_source_ids
+                and int(row["binance_futures_gainers_last_seen_at"] or 0) > 0
             ) or (
                 "okx-gainers" in successful_source_ids
                 and int(row["okx_gainers_last_seen_at"] or 0) > 0
@@ -23568,6 +24889,18 @@ def sync_price_watch_gainers_candidates(
                     binance_gainers_rank = 0,
                     updated_at = ?
                 WHERE binance_gainers_last_seen_at > 0 OR binance_gainers_rank > 0
+                """,
+                (now_value,),
+            )
+        if "binance-futures-gainers" in successful_source_ids:
+            conn.execute(
+                """
+                UPDATE price_watch_assets
+                SET binance_futures_gainers_last_seen_at = 0,
+                    binance_futures_gainers_rank = 0,
+                    updated_at = ?
+                WHERE binance_futures_gainers_last_seen_at > 0
+                   OR binance_futures_gainers_rank > 0
                 """,
                 (now_value,),
             )
@@ -23596,9 +24929,10 @@ def sync_price_watch_gainers_candidates(
                     symbol, name, icon, pair_hint, manual_pinned,
                     gainers_first_seen_at,
                     binance_gainers_last_seen_at, binance_gainers_rank,
+                    binance_futures_gainers_last_seen_at, binance_futures_gainers_rank,
                     okx_gainers_last_seen_at, okx_gainers_rank,
                     status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                 ON CONFLICT(symbol) DO UPDATE SET
                     name = CASE WHEN excluded.name != '' THEN excluded.name ELSE price_watch_assets.name END,
                     icon = CASE WHEN excluded.icon != '' THEN excluded.icon ELSE price_watch_assets.icon END,
@@ -23616,6 +24950,15 @@ def sync_price_watch_gainers_candidates(
                         WHEN excluded.binance_gainers_last_seen_at > 0 THEN excluded.binance_gainers_rank
                         ELSE price_watch_assets.binance_gainers_rank
                     END,
+                    binance_futures_gainers_last_seen_at = MAX(
+                        price_watch_assets.binance_futures_gainers_last_seen_at,
+                        excluded.binance_futures_gainers_last_seen_at
+                    ),
+                    binance_futures_gainers_rank = CASE
+                        WHEN excluded.binance_futures_gainers_last_seen_at > 0
+                        THEN excluded.binance_futures_gainers_rank
+                        ELSE price_watch_assets.binance_futures_gainers_rank
+                    END,
                     okx_gainers_last_seen_at = MAX(
                         price_watch_assets.okx_gainers_last_seen_at,
                         excluded.okx_gainers_last_seen_at
@@ -23630,6 +24973,7 @@ def sync_price_watch_gainers_candidates(
                     item["symbol"], item["name"], item["icon"], item["pairHint"],
                     first_seen_at,
                     item["binanceLastSeenAt"], item["binanceRank"],
+                    item["binanceFuturesLastSeenAt"], item["binanceFuturesRank"],
                     item["okxLastSeenAt"], item["okxRank"],
                     now_value, now_value,
                 ),
@@ -23641,6 +24985,7 @@ def sync_price_watch_gainers_candidates(
                 updated_at = ?
             WHERE gainers_first_seen_at > 0
               AND binance_gainers_last_seen_at = 0
+              AND binance_futures_gainers_last_seen_at = 0
               AND okx_gainers_last_seen_at = 0
             """,
             (now_value,),
@@ -23714,6 +25059,8 @@ def price_monitor_latest_source_at(row: sqlite3.Row | dict[str, Any] | None) -> 
         int(safe_float(item.get("binanceWalletHotLastSeenAt"), 0)),
         int(safe_float(item.get("binance_gainers_last_seen_at"), 0)),
         int(safe_float(item.get("binanceGainersLastSeenAt"), 0)),
+        int(safe_float(item.get("binance_futures_gainers_last_seen_at"), 0)),
+        int(safe_float(item.get("binanceFuturesGainersLastSeenAt"), 0)),
         int(safe_float(item.get("okx_gainers_last_seen_at"), 0)),
         int(safe_float(item.get("okxGainersLastSeenAt"), 0)),
         int(safe_float(item.get("personal_x_mentioned_at"), 0)),
@@ -23746,6 +25093,7 @@ def price_monitor_retention_source_observations(
         ))),
         ("gainers", max(
             int(safe_float(item.get("binance_gainers_last_seen_at") or item.get("binanceGainersLastSeenAt"), 0)),
+            int(safe_float(item.get("binance_futures_gainers_last_seen_at") or item.get("binanceFuturesGainersLastSeenAt"), 0)),
             int(safe_float(item.get("okx_gainers_last_seen_at") or item.get("okxGainersLastSeenAt"), 0)),
         )),
         ("personal-x", int(safe_float(item.get("personal_x_mentioned_at") or item.get("personalXMentionedAt"), 0))),
@@ -24146,6 +25494,7 @@ def filter_price_monitor_cold_archives(
     rows: list[dict[str, Any]],
     *,
     now_ms: int | None = None,
+    persist_retention_transitions: bool = True,
 ) -> list[dict[str, Any]]:
     if not rows:
         return []
@@ -24222,7 +25571,7 @@ def filter_price_monitor_cold_archives(
             reentries[identity["key"]] = source_at
         else:
             blocked.add(identity["key"])
-    if temporary_arms:
+    if temporary_arms and persist_retention_transitions:
         with AUTH_DB_LOCK, auth_db() as conn:
             for identity_key, details in temporary_arms.items():
                 encoded = json.dumps(details, ensure_ascii=False, separators=(",", ":"))
@@ -24236,7 +25585,7 @@ def filter_price_monitor_cold_archives(
                     PRICE_MONITOR_RETENTION_ARCHIVES[identity_key]["details_json"] = json.dumps(
                         details, ensure_ascii=False, separators=(",", ":")
                     )
-    if reentries:
+    if reentries and persist_retention_transitions:
         with AUTH_DB_LOCK, auth_db() as conn:
             for identity_key, source_at in reentries.items():
                 conn.execute(
@@ -24256,6 +25605,16 @@ def filter_price_monitor_cold_archives(
         row for row, identity in zip(rows, identities)
         if identity["key"] not in blocked
     ]
+
+
+def price_monitor_row_has_cold_archive(row: sqlite3.Row | dict[str, Any] | None) -> bool:
+    """Fast final gate for scans that started before a temporary removal."""
+    identity = price_monitor_retention_identity(row)
+    if not identity["symbol"]:
+        return False
+    with PRICE_MONITOR_RETENTION_ARCHIVES_LOCK:
+        state = PRICE_MONITOR_RETENTION_ARCHIVES.get(identity["key"])
+        return bool(state and int(state.get("archived_at") or 0) > 0)
 
 
 def cold_archive_price_monitor_symbols(
@@ -24387,25 +25746,25 @@ def temporarily_exclude_monitor_symbol(value: Any, *, source_pool: str = "price-
         state = PRICE_MONITOR_RETENTION_ARCHIVES.get(identity["key"])
         if state is not None:
             state["details_json"] = encoded
-    with DESKTOP_ALERT_LOCK:
-        retained_alerts = [
-            item for item in DESKTOP_ALERT_QUEUE
-            if desktop_alert_monitor_symbol(item) != symbol
-        ]
-        DESKTOP_ALERT_QUEUE.clear()
-        DESKTOP_ALERT_QUEUE.extend(retained_alerts)
-        DESKTOP_ALERT_QUEUE_WAKE.set()
+    with PRICE_STRUCTURE_CACHE_LOCK:
+        PRICE_STRUCTURE_CACHE.clear()
+    alert_cleanup = suppress_desktop_alerts_for_monitor_symbol(symbol)
     return {
         "ok": True,
         "symbol": symbol,
         "mode": "temporary",
         "archivedAt": now_ms,
+        "alertsSuppressed": alert_cleanup,
         "restoreRule": "leave_then_reenter_source_or_manual_add",
         "message": f"{symbol} 已暂时移出监控池",
     }
 
 
-def price_watch_active_rows(*, bypass_process_lock: bool = False) -> list[dict[str, Any]]:
+def price_watch_active_rows(
+    *,
+    bypass_process_lock: bool = False,
+    persist_retention_transitions: bool = True,
+) -> list[dict[str, Any]]:
     now_ms = int(time.time() * 1000)
     cutoff_ms = now_ms - PRICE_WATCH_RETENTION_SECONDS * 1000
     gainers_cutoff_ms = now_ms - GAINERS_MONITOR_PROMOTION_SECONDS * 1000
@@ -24447,7 +25806,11 @@ def price_watch_active_rows(*, bypass_process_lock: bool = False) -> list[dict[s
                 OR (assets.binance_wallet_hot_last_seen_at >= ? AND assets.dismissed_until < ?)
                 OR (
                      assets.gainers_first_seen_at >= ?
-                     AND (assets.binance_gainers_last_seen_at > 0 OR assets.okx_gainers_last_seen_at > 0)
+                     AND (
+                          assets.binance_gainers_last_seen_at > 0
+                          OR assets.binance_futures_gainers_last_seen_at > 0
+                          OR assets.okx_gainers_last_seen_at > 0
+                     )
                      AND assets.dismissed_until < ?
                 )
                 OR (
@@ -24480,7 +25843,11 @@ def price_watch_active_rows(*, bypass_process_lock: bool = False) -> list[dict[s
                 cutoff_ms, cutoff_ms,
             ),
         ).fetchall()
-    return filter_price_monitor_cold_archives([dict(row) for row in rows], now_ms=now_ms)
+    return filter_price_monitor_cold_archives(
+        [dict(row) for row in rows],
+        now_ms=now_ms,
+        persist_retention_transitions=persist_retention_transitions,
+    )
 
 
 def price_watch_new_contract_prior_high_source_approved(row: sqlite3.Row | dict[str, Any] | None) -> bool:
@@ -24573,6 +25940,7 @@ def price_watch_public_item(row: dict[str, Any]) -> dict[str, Any]:
     )
     gainers_first_seen_at = int(row.get("gainers_first_seen_at") or 0)
     binance_gainers_last_seen_at = int(row.get("binance_gainers_last_seen_at") or 0)
+    binance_futures_gainers_last_seen_at = int(row.get("binance_futures_gainers_last_seen_at") or 0)
     okx_gainers_last_seen_at = int(row.get("okx_gainers_last_seen_at") or 0)
     gainers_active = price_watch_gainers_active(row, now_ms=now_ms)
     opportunity_active = bool(row.get("opportunity_active"))
@@ -24657,6 +26025,10 @@ def price_watch_public_item(row: dict[str, Any]) -> dict[str, Any]:
             if ave_hot_active and ave_hot_last_seen_at >= max(last_seen_at, binance_wallet_last_seen_at)
             else "aicoin"
             if aicoin_active
+            else "binance-futures-gainers"
+            if gainers_active and binance_futures_gainers_last_seen_at >= max(
+                binance_gainers_last_seen_at, okx_gainers_last_seen_at
+            )
             else "binance-gainers"
             if gainers_active and binance_gainers_last_seen_at >= okx_gainers_last_seen_at
             else "okx-gainers"
@@ -24690,6 +26062,8 @@ def price_watch_public_item(row: dict[str, Any]) -> dict[str, Any]:
         ),
         "binanceGainersLastSeenAt": binance_gainers_last_seen_at,
         "binanceGainersRank": int(row.get("binance_gainers_rank") or 0),
+        "binanceFuturesGainersLastSeenAt": binance_futures_gainers_last_seen_at,
+        "binanceFuturesGainersRank": int(row.get("binance_futures_gainers_rank") or 0),
         "okxGainersLastSeenAt": okx_gainers_last_seen_at,
         "okxGainersRank": int(row.get("okx_gainers_rank") or 0),
         "chain": onchain_chain,
@@ -24886,88 +26260,13 @@ def restore_confirmed_price_structure_reentries_db(
     return set()
 
 
-def exclude_monitor_symbol_globally(value: Any, *, source_pool: str = "") -> dict[str, Any]:
-    """Exclude a symbol from every price/structure monitor through one durable registry."""
+def suppress_desktop_alerts_for_monitor_symbol(value: Any) -> dict[str, int]:
+    """Cancel queued and live popup work after an explicit permanent exclusion."""
     symbol = price_structure_monitor_symbol(value)
     if not symbol:
-        raise ValueError("币种代码无效")
-    now_ms = int(time.time() * 1000)
-    with AUTH_DB_LOCK, auth_db() as conn:
-        conn.execute(
-            """
-            INSERT INTO price_structure_exclusions (
-                symbol, excluded_at, absent_at, absent_confirmations,
-                last_absent_at, updated_at
-            ) VALUES (?, ?, 0, 0, 0, ?)
-            ON CONFLICT(symbol) DO UPDATE SET
-                excluded_at = excluded.excluded_at,
-                absent_at = 0,
-                absent_confirmations = 0,
-                last_absent_at = 0,
-                updated_at = excluded.updated_at
-            """,
-            (symbol, now_ms, now_ms),
-        )
-        conn.execute(
-            """
-            UPDATE price_watch_assets
-            SET manual_pinned = 0,
-                prior_high_excluded_at = ?,
-                prior_high_absent_at = 0,
-                opportunity_active = 0,
-                opportunity_manual_removed_at = ?,
-                dismissed_until = CASE
-                    WHEN dismissed_until > ? THEN dismissed_until
-                    ELSE ?
-                END,
-                updated_at = ?
-            WHERE symbol = ?
-            """,
-            (
-                now_ms,
-                now_ms,
-                now_ms + PRICE_WATCH_RETENTION_SECONDS * 1000,
-                now_ms + PRICE_WATCH_RETENTION_SECONDS * 1000,
-                now_ms,
-                symbol,
-            ),
-        )
-        for table in (
-            "price_watch_alert_state",
-            "price_watch_oversold_alert_state",
-            "price_watch_fib_alert_state",
-            "price_watch_first_confirmations",
-            "price_structure_observation_alert_state",
-        ):
-            conn.execute(f"DELETE FROM {table} WHERE symbol = ?", (symbol,))
-
-    # Serialize with structure snapshot commits. A scan that started before the
-    # click must not write this symbol back after the durable tombstone exists.
-    with PRICE_STRUCTURE_REFRESH_LOCK:
-        with PRICE_STRUCTURE_CACHE_LOCK:
-            PRICE_STRUCTURE_CACHE.clear()
-        snapshot = read_json_cache(PRICE_STRUCTURE_SNAPSHOT_PATH)
-        payload = snapshot.get("payload") if isinstance(snapshot.get("payload"), dict) else {}
-        if payload:
-            filtered_payload = price_structure_payload_without_symbols(payload, {symbol})
-            if filtered_payload is not payload:
-                write_json_cache(PRICE_STRUCTURE_SNAPSHOT_PATH, {
-                    **snapshot,
-                    "savedAt": now_ms,
-                    "payload": filtered_payload,
-                })
-    with NEW_COIN_LOW_LOCK:
-        hydrate_new_coin_low_snapshot()
-        removed_new_low = NEW_COIN_LOW_ITEMS.pop(symbol, None)
-        if removed_new_low is not None:
-            write_json_cache(NEW_COIN_LOW_SNAPSHOT_PATH, {
-                "savedAt": now_ms,
-                "items": list(NEW_COIN_LOW_ITEMS.values()),
-            })
-
-    # Remove every queued price/structure popup for the symbol, regardless of
-    # which pool created it. The worker also checks the registry before launch.
+        return {"queued": 0, "durable": 0, "active": 0}
     with DESKTOP_ALERT_LOCK:
+        queued_before = len(DESKTOP_ALERT_QUEUE)
         retained_alerts = [
             item for item in DESKTOP_ALERT_QUEUE
             if desktop_alert_monitor_symbol(item) != symbol
@@ -24975,6 +26274,116 @@ def exclude_monitor_symbol_globally(value: Any, *, source_pool: str = "") -> dic
         DESKTOP_ALERT_QUEUE.clear()
         DESKTOP_ALERT_QUEUE.extend(retained_alerts)
         DESKTOP_ALERT_QUEUE_WAKE.set()
+    suppressed_ids = set(ALERT_DELIVERY_STORE.suppress_matching(
+        lambda payload: desktop_alert_monitor_symbol(payload) == symbol,
+        "标的已被永久移出监控系统",
+    ))
+    active_processes = []
+    with DESKTOP_ALERT_LOCK:
+        for identity, active in list(DESKTOP_ALERT_DELIVERIES.items()):
+            if identity not in suppressed_ids:
+                continue
+            process = active.get("process")
+            if desktop_alert_process_is_running(process):
+                active_processes.append(process)
+    for process in active_processes:
+        try:
+            process.terminate()
+        except Exception:
+            continue
+    return {
+        "queued": queued_before - len(retained_alerts),
+        "durable": len(suppressed_ids),
+        "active": len(active_processes),
+    }
+
+
+def cleanup_excluded_monitor_symbol_snapshots(
+    symbol: str,
+    now_ms: int,
+    structure_snapshot_path: Path,
+    new_low_snapshot_path: Path,
+) -> None:
+    """Remove stale disk/in-memory snapshots without delaying the exclusion click."""
+    try:
+        with PRICE_STRUCTURE_REFRESH_LOCK:
+            snapshot = read_json_cache(structure_snapshot_path)
+            payload = snapshot.get("payload") if isinstance(snapshot.get("payload"), dict) else {}
+            if payload:
+                filtered_payload = price_structure_payload_without_symbols(payload, {symbol})
+                if filtered_payload is not payload:
+                    write_price_structure_snapshot(structure_snapshot_path, {
+                        **snapshot,
+                        "savedAt": now_ms,
+                        "payload": filtered_payload,
+                    })
+        with NEW_COIN_LOW_LOCK:
+            snapshot = read_json_cache(new_low_snapshot_path)
+            disk_items = snapshot.get("items") if isinstance(snapshot.get("items"), list) else []
+            filtered_items = [
+                item for item in disk_items
+                if not isinstance(item, dict)
+                or price_structure_monitor_symbol(item.get("symbol")) != symbol
+            ]
+            removed_new_low = None
+            if new_low_snapshot_path == NEW_COIN_LOW_SNAPSHOT_PATH:
+                removed_new_low = NEW_COIN_LOW_ITEMS.pop(symbol, None)
+                if NEW_COIN_LOW_ITEMS:
+                    filtered_items = list(NEW_COIN_LOW_ITEMS.values())
+            if removed_new_low is not None or len(filtered_items) != len(disk_items):
+                write_price_structure_snapshot(new_low_snapshot_path, {
+                    "savedAt": now_ms,
+                    "items": filtered_items,
+                })
+    except Exception as exc:
+        print(
+            f"Excluded monitor snapshot cleanup failed for {symbol}: {safe_error_text(str(exc))}",
+            file=sys.stderr,
+        )
+
+
+def queue_excluded_monitor_symbol_snapshot_cleanup(symbol: str, now_ms: int) -> bool:
+    structure_snapshot_path = PRICE_STRUCTURE_SNAPSHOT_PATH
+    new_low_snapshot_path = NEW_COIN_LOW_SNAPSHOT_PATH
+    needs_cleanup = bool(
+        structure_snapshot_path.exists()
+        or new_low_snapshot_path.exists()
+        or symbol in NEW_COIN_LOW_ITEMS
+    )
+    if not needs_cleanup:
+        return False
+    threading.Thread(
+        target=cleanup_excluded_monitor_symbol_snapshots,
+        args=(symbol, now_ms, structure_snapshot_path, new_low_snapshot_path),
+        name=f"exclude-monitor-cleanup-{symbol[:20].lower()}",
+        daemon=True,
+    ).start()
+    return True
+
+
+def exclude_monitor_symbol_globally(value: Any, *, source_pool: str = "") -> dict[str, Any]:
+    """Exclude a symbol from every price/structure monitor through one durable registry."""
+    symbol = price_structure_monitor_symbol(value)
+    if not symbol:
+        raise ValueError("币种代码无效")
+    now_ms = int(time.time() * 1000)
+    # This is a tiny authoritative transaction. SQLite/WAL provides the write
+    # serialization, so a user click must not wait behind unrelated work that
+    # holds the broad application database mutex.
+    persist_global_monitor_exclusion(
+        AUTH_DB_PATH,
+        symbol,
+        now_ms,
+        PRICE_WATCH_RETENTION_SECONDS * 1000,
+    )
+
+    # The tombstone is already durable and every read/alert path checks it.
+    # Clear hot memory now, then move potentially contended snapshot rewriting
+    # off the request so the UI receives an immediate acknowledgement.
+    with PRICE_STRUCTURE_CACHE_LOCK:
+        PRICE_STRUCTURE_CACHE.clear()
+    alert_cleanup = suppress_desktop_alerts_for_monitor_symbol(symbol)
+    cleanup_pending = queue_excluded_monitor_symbol_snapshot_cleanup(symbol, now_ms)
     return {
         "ok": True,
         "symbol": symbol,
@@ -24983,6 +26392,8 @@ def exclude_monitor_symbol_globally(value: Any, *, source_pool: str = "") -> dic
         "structureEnabled": False,
         "priorHighEnabled": False,
         "opportunityEnabled": False,
+        "alertsSuppressed": alert_cleanup,
+        "cleanupPending": cleanup_pending,
         "restoreRule": "manual_readd_only",
         "message": f"{symbol} 已从整个监控系统剔除",
     }
@@ -26627,17 +28038,23 @@ def run_dragon_wave_monitor_strategy(
     return result
 
 
-def price_structure_excluded_symbols() -> set[str]:
-    with AUTH_DB_LOCK, auth_db() as conn:
+def price_structure_excluded_symbols(*, bypass_process_lock: bool = False) -> set[str]:
+    process_lock = nullcontext() if bypass_process_lock else AUTH_DB_LOCK
+    with process_lock, auth_db() as conn:
         rows = conn.execute("SELECT symbol FROM price_structure_exclusions").fetchall()
     return {price_structure_monitor_symbol(row["symbol"]) for row in rows if row["symbol"]}
 
 
-def price_structure_symbol_excluded(value: Any) -> bool:
+def price_structure_symbol_excluded(
+    value: Any,
+    *,
+    bypass_process_lock: bool = False,
+) -> bool:
     symbol = price_structure_monitor_symbol(value)
     if not symbol:
         return False
-    with AUTH_DB_LOCK, auth_db() as conn:
+    process_lock = nullcontext() if bypass_process_lock else AUTH_DB_LOCK
+    with process_lock, auth_db() as conn:
         row = conn.execute(
             "SELECT 1 FROM price_structure_exclusions WHERE symbol = ?",
             (symbol,),
@@ -26676,9 +28093,10 @@ def reconcile_price_structure_exclusions(
     *,
     source_is_current: bool,
     now_ms: int | None = None,
+    bypass_process_lock: bool = False,
 ) -> set[str]:
     """Manual exclusions are durable across every feed, interval and restart."""
-    return price_structure_excluded_symbols()
+    return price_structure_excluded_symbols(bypass_process_lock=bypass_process_lock)
 
 
 def exclude_price_structure_symbol(value: Any) -> dict[str, Any]:
@@ -26774,6 +28192,26 @@ def price_structure_priority_context(row: dict[str, Any], *, now_ms: int | None 
     return None
 
 
+def price_structure_monitor_pool_entered_at(item: dict[str, Any]) -> int:
+    explicit = int(safe_float(
+        item.get("monitorPoolEnteredAt") or item.get("monitor_pool_entered_at"),
+        0,
+    ))
+    if explicit > 0:
+        return explicit
+    candidates = [
+        int(safe_float(item.get("aicoinFirstSeenAt") or item.get("aicoin_first_seen_at"), 0)),
+        int(safe_float(
+            item.get("wallet4hFirstSeenAt") or item.get("binance_wallet_hot_first_seen_at"),
+            0,
+        )),
+        int(safe_float(item.get("gainersFirstSeenAt") or item.get("gainers_first_seen_at"), 0)),
+        int(safe_float(item.get("personalXMentionedAt") or item.get("personal_x_mentioned_at"), 0)),
+    ]
+    positive = [value for value in candidates if value > 0]
+    return min(positive) if positive else 0
+
+
 def price_structure_1m_state(item: dict[str, Any], *, now_ms: int | None = None) -> dict[str, Any]:
     now_value = int(now_ms or time.time() * 1000)
     raw_override = item.get("structure1mOverride", item.get("structure_1m_override", -1))
@@ -26803,6 +28241,15 @@ def price_structure_1m_state(item: dict[str, Any], *, now_ms: int | None = None)
     )
     if personal_focus:
         return {"enabled": True, "override": -1, "mode": "auto-focus", "label": "重点关注自动开启"}
+    monitor_pool_entered_at = price_structure_monitor_pool_entered_at(item)
+    local_day_start = price_monitor_retention_local_day_start_ms(now_value)
+    if local_day_start <= monitor_pool_entered_at <= now_value:
+        return {
+            "enabled": True,
+            "override": -1,
+            "mode": "auto-pool-day",
+            "label": "入池当天自动开启",
+        }
     return {"enabled": False, "override": -1, "mode": "auto-off", "label": "按原规则关闭"}
 
 
@@ -26947,6 +28394,7 @@ def price_structure_watch_rows() -> list[dict[str, Any]]:
     excluded_symbols = reconcile_price_structure_exclusions(
         current_symbols,
         source_is_current=str(source.get("status") or "").lower() == "ok" and bool(current_symbols),
+        bypass_process_lock=True,
     )
     now_ms = int(time.time() * 1000)
     priority_cutoff = now_ms - PRICE_WATCH_RETENTION_SECONDS * 1000
@@ -26954,21 +28402,45 @@ def price_structure_watch_rows() -> list[dict[str, Any]]:
     # AiCoin's saved source may contain historical rows without contract fields.
     # Resolve those symbols through their current persisted identity once, then
     # prevent an archived contract from bypassing retention through that cache.
-    with AUTH_DB_LOCK, auth_db() as conn:
+    # This is a read-only membership snapshot. SQLite already coordinates the
+    # read with writers, so the time-sensitive structure loop must not wait on
+    # unrelated work holding the broad auth/database mutex.
+    with auth_db() as conn:
         persisted_rows = [dict(row) for row in conn.execute("SELECT * FROM price_watch_assets").fetchall()]
+    persisted_by_symbol = {
+        price_structure_monitor_symbol(row.get("symbol")): row
+        for row in persisted_rows
+        if price_structure_monitor_symbol(row.get("symbol"))
+    }
     persisted_symbols = {
         price_structure_monitor_symbol(row.get("symbol")) for row in persisted_rows
     } - {""}
     visible_persisted_symbols = {
         price_structure_monitor_symbol(row.get("symbol"))
-        for row in filter_price_monitor_cold_archives(persisted_rows, now_ms=now_ms)
+        for row in filter_price_monitor_cold_archives(
+            persisted_rows,
+            now_ms=now_ms,
+            persist_retention_transitions=False,
+        )
     } - {""}
     cold_archived_symbols = persisted_symbols - visible_persisted_symbols
+    # Activity is refreshed by the dedicated price-watch/new-coin workers. The
+    # three-second structure loop consumes that cache and must never fan out a
+    # fresh network request for hundreds of on-chain identities.
     wallet_rows = filter_price_monitor_rows_by_activity(
-        binance_wallet_4h_structure_rows(now_ms=now_ms)
+        binance_wallet_4h_structure_rows(now_ms=now_ms),
+        allow_refresh=False,
+        persist_retention_transitions=False,
     )
     wallet_by_symbol = price_structure_wallet_rows_by_symbol(wallet_rows)
-    active_rows = filter_price_monitor_rows_by_activity(price_watch_active_rows())
+    active_rows = filter_price_monitor_rows_by_activity(
+        price_watch_active_rows(
+            bypass_process_lock=True,
+            persist_retention_transitions=False,
+        ),
+        allow_refresh=False,
+        persist_retention_transitions=False,
+    )
     active_by_symbol = {
         price_structure_monitor_symbol(row.get("symbol")): row
         for row in active_rows
@@ -26987,6 +28459,7 @@ def price_structure_watch_rows() -> list[dict[str, Any]]:
         if not symbol or symbol in seen or symbol in excluded_symbols or symbol in cold_archived_symbols:
             return False
         db_row = active_by_symbol.get(symbol, {})
+        persisted_row = persisted_by_symbol.get(symbol, {})
         wallet_row = wallet_by_symbol.get(symbol, {})
         merged = {**wallet_row, **db_row, **raw_row}
         aicoin_last_seen_at = int(merged.get("aicoin_last_seen_at") or 0)
@@ -26997,6 +28470,7 @@ def price_structure_watch_rows() -> list[dict[str, Any]]:
             gainers_first_seen_at >= gainers_cutoff
             and (
                 int(merged.get("binance_gainers_last_seen_at") or 0) > 0
+                or int(merged.get("binance_futures_gainers_last_seen_at") or 0) > 0
                 or int(merged.get("okx_gainers_last_seen_at") or 0) > 0
             )
         )
@@ -27028,8 +28502,36 @@ def price_structure_watch_rows() -> list[dict[str, Any]]:
             membership_sources.append("币安钱包4H")
         if gainers_active and int(merged.get("binance_gainers_last_seen_at") or 0) > 0:
             membership_sources.append("Binance涨幅榜")
+        if gainers_active and int(merged.get("binance_futures_gainers_last_seen_at") or 0) > 0:
+            membership_sources.append("Binance合约涨幅榜")
         if gainers_active and int(merged.get("okx_gainers_last_seen_at") or 0) > 0:
             membership_sources.append("OKX涨幅榜")
+        monitor_pool_entry_times: list[int] = []
+        if symbol in current_symbols or aicoin_last_seen_at >= priority_cutoff:
+            monitor_pool_entry_times.append(int(
+                safe_float(
+                    merged.get("aicoin_first_seen_at")
+                    or persisted_row.get("aicoin_first_seen_at"),
+                    now_ms,
+                )
+            ))
+        if personal_x_mentioned_at >= priority_cutoff:
+            monitor_pool_entry_times.append(personal_x_mentioned_at)
+        if wallet_last_seen_at >= priority_cutoff:
+            monitor_pool_entry_times.append(int(
+                safe_float(
+                    wallet_row.get("firstSeenAt")
+                    or merged.get("binance_wallet_hot_first_seen_at")
+                    or persisted_row.get("binance_wallet_hot_first_seen_at"),
+                    now_ms,
+                )
+            ))
+        if gainers_active:
+            monitor_pool_entry_times.append(gainers_first_seen_at)
+        monitor_pool_entered_at = min(
+            (value for value in monitor_pool_entry_times if value > 0),
+            default=0,
+        )
         market_activity = merged.get("marketActivity") if isinstance(merged.get("marketActivity"), dict) else {}
         if wallet_last_seen_at >= priority_cutoff and not market_activity:
             market_activity = {
@@ -27049,6 +28551,7 @@ def price_structure_watch_rows() -> list[dict[str, Any]]:
             "name": merged.get("name") or symbol,
             "icon": merged.get("icon") or crypto_icon_url(symbol),
             "monitorPool": "aicoin-x-wallet",
+            "monitorPoolEnteredAt": monitor_pool_entered_at,
             "structureMembershipSources": membership_sources,
             "marketActivity": market_activity,
             "chain": resolved_identity.get("chain") or "",
@@ -27623,7 +29126,7 @@ def price_structure_membership_sources(item: dict[str, Any] | None) -> list[str]
     return list(dict.fromkeys(
         clean_feed_text(source, 30) for source in sources
         if clean_feed_text(source, 30) in {
-            "AiCoin", "个人X", "币安钱包4H", "Binance涨幅榜", "OKX涨幅榜",
+            "AiCoin", "个人X", "币安钱包4H", "Binance涨幅榜", "Binance合约涨幅榜", "OKX涨幅榜",
         }
     ))
 
@@ -27736,6 +29239,7 @@ def fetch_price_structure_item(
         "symbol": symbol,
         "adaptiveContext": adaptive_context,
         "structure1mOverride": row.get("structure1mOverride", row.get("structure_1m_override", -1)),
+        "monitorPoolEnteredAt": row.get("monitorPoolEnteredAt", row.get("monitor_pool_entered_at", 0)),
     })
     interval_overrides = parse_price_structure_interval_overrides(
         row.get("structureIntervalOverrides", row.get("structure_interval_overrides_json", {}))
@@ -27745,6 +29249,7 @@ def fetch_price_structure_item(
         "adaptiveContext": adaptive_context,
         "structure1mOverride": one_minute_state["override"],
         "structureIntervalOverrides": interval_overrides,
+        "monitorPoolEnteredAt": row.get("monitorPoolEnteredAt", row.get("monitor_pool_entered_at", 0)),
     })
     errors: list[str] = []
     request_timeout = 4.0 if fast_provider_probe else 8.0
@@ -27872,9 +29377,24 @@ def fetch_price_structure_item(
             "HTX": "HTX Futures",
             "Aster": "Aster Futures",
         }.get(clean_feed_text(row.get("newCoinSource"), 30), "")
+    entry_day_one_minute = bool(
+        not new_coin_low_pool and one_minute_state.get("mode") == "auto-pool-day"
+    )
     if row.get("contractAddress"):
         preferred_provider = "Binance Wallet K线"
-    if preferred_provider:
+    if entry_day_one_minute:
+        # A symbol may carry an on-chain CA and still have a liquid Binance
+        # futures contract (TAKE is one example). During its one-day 1-minute
+        # window, try that low-latency venue first and keep the exact-CA wallet
+        # feed second for on-chain-only assets.
+        providers.sort(
+            key=lambda provider: (
+                0 if provider[0] == "Binance Futures"
+                else 1 if provider[0] == "Binance Wallet K线"
+                else 2
+            )
+        )
+    elif preferred_provider:
         providers.sort(key=lambda provider: 0 if provider[0] == preferred_provider else 1)
     provider_count = len(providers)
     if fast_provider_probe:
@@ -27894,8 +29414,12 @@ def fetch_price_structure_item(
             )
             for values in requested_timeframes:
                 requests_by_key[values[0]] = values[mapping_index]
+            timeframe_pool = (
+                PRICE_STRUCTURE_ENTRY_DAY_TIMEFRAME_POOL
+                if entry_day_one_minute else PRICE_STRUCTURE_TIMEFRAME_POOL
+            )
             timeframe_futures = {
-                PRICE_STRUCTURE_TIMEFRAME_POOL.submit(
+                timeframe_pool.submit(
                     fetcher,
                     fetcher_value,
                     2 if allow_short_history or provider_allows_short_history else 30,
@@ -27924,7 +29448,7 @@ def fetch_price_structure_item(
             missing_keys = [key for key in requests_by_key if key not in fetched_by_key]
             if contract_address and fetched_by_key and missing_keys:
                 fallback_futures = {
-                    PRICE_STRUCTURE_TIMEFRAME_POOL.submit(
+                    timeframe_pool.submit(
                         price_structure_candles_from_onchain_fallbacks,
                         symbol,
                         contract_address,
@@ -27996,6 +29520,7 @@ def fetch_price_structure_item(
                 "name": row.get("name") or symbol,
                 "icon": row.get("icon") or crypto_icon_url(symbol),
                 "monitorPool": row.get("monitorPool") or "",
+                "monitorPoolEnteredAt": int(safe_float(row.get("monitorPoolEnteredAt"), 0)),
                 "structureMembershipSources": row.get("structureMembershipSources") if isinstance(row.get("structureMembershipSources"), list) else [],
                 "marketActivity": row.get("marketActivity") if isinstance(row.get("marketActivity"), dict) else {},
                 "chain": clean_feed_text(row.get("chain"), 40),
@@ -28054,6 +29579,7 @@ def fetch_price_structure_item(
         "name": row.get("name") or symbol,
         "icon": row.get("icon") or crypto_icon_url(symbol),
         "monitorPool": row.get("monitorPool") or "",
+        "monitorPoolEnteredAt": int(safe_float(row.get("monitorPoolEnteredAt"), 0)),
         "structureMembershipSources": row.get("structureMembershipSources") if isinstance(row.get("structureMembershipSources"), list) else [],
         "marketActivity": row.get("marketActivity") if isinstance(row.get("marketActivity"), dict) else {},
         "chain": clean_feed_text(row.get("chain"), 40),
@@ -28247,6 +29773,12 @@ def price_structure_signal_actionable_now(signal: dict[str, Any], item: dict[str
     checked_at = int(safe_float(item.get("checkedAt"), 0)) or int(time.time() * 1000)
     if decision_time <= 0 or checked_at < decision_time:
         return False
+    current_price = safe_float(item.get("currentPrice"), 0)
+    trigger_price = safe_float(signal.get("triggerPrice") or signal.get("price"), 0)
+    if current_price > 0 and trigger_price > 0:
+        overshoot_pct = (current_price / trigger_price - 1) * 100
+        if overshoot_pct > PRICE_STRUCTURE_SIGNAL_MAX_OVERSHOOT_PCT:
+            return False
     interval = clean_feed_text(signal.get("interval"), 10).lower()
     try:
         candle_ms = price_structure_interval_ms(interval)
@@ -28262,7 +29794,12 @@ def launch_price_structure_strategy_alerts(item: dict[str, Any]) -> int:
     symbol = price_structure_monitor_symbol(item.get("symbol"))
     signals = item.get("signals") if isinstance(item.get("signals"), list) else []
     alert_hints = item.get("alertHints") if isinstance(item.get("alertHints"), list) else []
-    if not symbol or (not signals and not alert_hints) or price_structure_symbol_excluded(symbol):
+    if (
+        not symbol
+        or (not signals and not alert_hints)
+        or price_structure_symbol_excluded(symbol, bypass_process_lock=True)
+        or price_monitor_row_has_cold_archive(item)
+    ):
         return 0
     child_ids = {
         str(signal.get("lowerTimeframeTriggerId") or "")
@@ -28313,6 +29850,8 @@ def launch_price_structure_strategy_alerts(item: dict[str, Any]) -> int:
             "title": f"{symbol} {label} 起爆买点",
             "body": body,
             "url": alert_url,
+            "chain": clean_feed_text(item.get("chain"), 40),
+            "contractAddress": clean_feed_text(item.get("contractAddress"), 180),
             "time": alerted_at,
             "priority": "一级·正式买点",
             "speech": f"龙头策略买点提醒，{symbol}，{label}。",
@@ -28364,6 +29903,8 @@ def launch_price_structure_strategy_alerts(item: dict[str, Any]) -> int:
             "title": f"{symbol} {label} 二次突破提示",
             "body": body,
             "url": alert_url,
+            "chain": clean_feed_text(item.get("chain"), 40),
+            "contractAddress": clean_feed_text(item.get("contractAddress"), 180),
             "time": alerted_at,
             "priority": "二级·防洗提示",
             "speech": f"防洗二次突破提示，{symbol}，{label}，防止试突破洗出后踏空。",
@@ -28383,9 +29924,33 @@ def price_structure_frame_is_observation(frame: dict[str, Any] | None) -> bool:
         return False
     if safe_float(frame.get("confidence"), 0) <= 0 and not isinstance(frame.get("pending"), dict):
         return False
+    # A secondary-breakout hint is an alert in its own right. It must never be
+    # relabelled as a newly discovered structure merely because its dedicated
+    # alert has already fallen outside the live/chase window.
+    if isinstance(frame.get("signal"), dict) or isinstance(frame.get("alertHint"), dict):
+        return False
     # A pending setup is already a detected structure. The separate pre-arm
     # path still decides when it becomes an urgent buy alert.
-    return not isinstance(frame.get("signal"), dict)
+    return True
+
+
+def price_structure_observation_actionable_now(
+    frame: dict[str, Any],
+    item: dict[str, Any],
+) -> bool:
+    """Reject a first-seen structure after price has already left its entry area."""
+
+    if not price_structure_frame_is_observation(frame):
+        return False
+    pending = frame.get("pending") if isinstance(frame.get("pending"), dict) else {}
+    trigger_price = safe_float(pending.get("triggerPrice") or frame.get("resistance"), 0)
+    current_price = safe_float(item.get("currentPrice"), 0)
+    if current_price > 0 and trigger_price > 0:
+        overshoot_pct = (current_price / trigger_price - 1) * 100
+        if overshoot_pct > PRICE_STRUCTURE_OBSERVATION_MAX_OVERSHOOT_PCT:
+            return False
+    bars_ago = int(safe_float(pending.get("barsAgo") or frame.get("barsAgo"), 0))
+    return bars_ago <= 1
 
 
 def claim_price_structure_observation_alert(
@@ -28444,7 +30009,8 @@ def launch_price_structure_first_observation_alerts(
     symbol = price_structure_monitor_symbol(item.get("symbol"))
     if (
         not symbol
-        or price_structure_symbol_excluded(symbol)
+        or price_structure_symbol_excluded(symbol, bypass_process_lock=True)
+        or price_monitor_row_has_cold_archive(item)
     ):
         return 0
     previous_frames = {
@@ -28468,7 +30034,7 @@ def launch_price_structure_first_observation_alerts(
     membership_label, provider_label = price_structure_alert_source_labels(item)
     launched = 0
     for frame in item.get("frames") if isinstance(item.get("frames"), list) else []:
-        if not isinstance(frame, dict) or not price_structure_frame_is_observation(frame):
+        if not isinstance(frame, dict) or not price_structure_observation_actionable_now(frame, item):
             continue
         interval = clean_feed_text(frame.get("key"), 10)
         previous_was_observation = price_structure_frame_is_observation(previous_frames.get(interval))
@@ -28512,6 +30078,8 @@ def launch_price_structure_first_observation_alerts(
             "title": f"{symbol} {label} 首次结构观察",
             "body": body,
             "url": alert_url,
+            "chain": clean_feed_text(item.get("chain"), 40),
+            "contractAddress": clean_feed_text(item.get("contractAddress"), 180),
             "time": int(time.time() * 1000),
             "priority": "一级·首次结构",
             "excludeEndpoint": f"http://127.0.0.1:{local_port}/api/price-structures",
@@ -28540,6 +30108,26 @@ def price_structure_latest_snapshot_payload() -> dict[str, Any]:
     snapshot = read_json_cache(PRICE_STRUCTURE_SNAPSHOT_PATH)
     payload = snapshot.get("payload") if isinstance(snapshot.get("payload"), dict) else {}
     return price_structure_payload_without_symbols(payload, excluded_symbols)
+
+
+def price_structure_frame_is_prearm_watchable(frame: dict[str, Any] | None) -> bool:
+    """Return whether a live frame owns a level worth watching every second."""
+
+    if not isinstance(frame, dict) or isinstance(frame.get("signal"), dict):
+        return False
+    if isinstance(frame.get("alertHint"), dict):
+        return False
+    pending = frame.get("pending") if isinstance(frame.get("pending"), dict) else None
+    if pending:
+        certainty = int(safe_float(pending.get("certainty") or frame.get("confidence"), 0))
+        grade = clean_feed_text(pending.get("grade") or "", 8).upper()
+        trigger_price = safe_float(pending.get("triggerPrice") or pending.get("price"), 0)
+        return certainty >= 90 and grade in {"A", "A+"} and trigger_price > 0
+    return bool(
+        clean_feed_text(frame.get("stage"), 24) == "结构观察"
+        and safe_float(frame.get("confidence"), 0) >= 90
+        and safe_float(frame.get("resistance"), 0) > 0
+    )
 
 
 def price_structure_prearm_candidates(now_ms: int | None = None) -> list[dict[str, Any]]:
@@ -28572,15 +30160,44 @@ def price_structure_prearm_candidates(now_ms: int | None = None) -> list[dict[st
         if not symbol or symbol in excluded_symbols:
             continue
         for frame in frames:
-            if not isinstance(frame, dict) or frame.get("signal"):
+            if not price_structure_frame_is_prearm_watchable(frame):
                 continue
+            interval = clean_feed_text(frame.get("key"), 10)
             pending = frame.get("pending") if isinstance(frame.get("pending"), dict) else None
+            source_type = "pending"
             if not pending:
-                continue
+                # Stable A/A+ structure resistance is useful before a formal
+                # pending candle exists. Feed that level to the one-second
+                # quote watcher so fast news-driven moves do not have to wait
+                # for the parent 1h candle to close.
+                if (
+                    isinstance(frame.get("alertHint"), dict)
+                    or clean_feed_text(frame.get("stage"), 24) != "结构观察"
+                ):
+                    continue
+                structure_confidence = int(safe_float(frame.get("confidence"), 0))
+                structure_trigger = safe_float(frame.get("resistance"), 0)
+                structure_pattern = clean_feed_text(frame.get("pattern") or "结构压力", 100)
+                if structure_confidence < 90 or structure_trigger <= 0:
+                    continue
+                structure_identity = hashlib.sha256(
+                    f"{interval}:{structure_trigger:.12g}:{structure_pattern}".encode("utf-8")
+                ).hexdigest()[:12]
+                pending = {
+                    "id": f"structure-watch:{interval}:{structure_identity}",
+                    "interval": interval,
+                    "label": frame.get("label") or interval,
+                    "pattern": structure_pattern,
+                    "certainty": structure_confidence,
+                    "grade": "A+" if structure_confidence >= 95 else "A",
+                    "triggerPrice": structure_trigger,
+                    "decisionTime": int(safe_float(frame.get("decisionTime"), 0)) or checked_at,
+                }
+                source_type = "structure-resistance"
             certainty = int(safe_float(pending.get("certainty") or frame.get("confidence"), 0))
             grade = clean_feed_text(pending.get("grade") or "", 8).upper()
             trigger_price = safe_float(pending.get("triggerPrice") or pending.get("price"), 0)
-            interval = clean_feed_text(pending.get("interval") or frame.get("key"), 10)
+            interval = clean_feed_text(pending.get("interval") or interval, 10)
             if (
                 not price_structure_broadcast_allowed(item, interval)
                 or not price_structure_alert_interval_allowed(item, interval)
@@ -28613,9 +30230,16 @@ def price_structure_prearm_candidates(now_ms: int | None = None) -> list[dict[st
                 "certainty": certainty,
                 "grade": grade,
                 "multiTimeframeConfluence": bool(pending.get("multiTimeframeConfluence")),
+                "secondaryBreakoutPrearm": bool(pending.get("secondaryBreakoutPrearm")),
+                "primaryAttemptId": clean_feed_text(pending.get("primaryAttemptId"), 180),
                 "decisionTime": int(safe_float(pending.get("decisionTime") or pending.get("time"), 0)),
                 "checkedAt": checked_at,
                 "broadcastEligibility": item.get("broadcastEligibility"),
+                "sourceType": (
+                    "secondary-breakout-prearm"
+                    if pending.get("secondaryBreakoutPrearm")
+                    else source_type
+                ),
             })
     return candidates
 
@@ -28796,10 +30420,16 @@ def launch_price_structure_prearm_alert(
     quote: dict[str, Any],
 ) -> dict[str, Any]:
     symbol = price_structure_monitor_symbol(candidate.get("symbol"))
-    if not symbol or price_structure_symbol_excluded(symbol):
+    if (
+        not symbol
+        or price_structure_symbol_excluded(symbol)
+        or price_monitor_row_has_cold_archive(candidate)
+    ):
         return {"ok": True, "skipped": True, "reason": "structure monitor excluded"}
+    secondary_prearm = bool(candidate.get("secondaryBreakoutPrearm"))
+    replay_kind = "secondary-prearm" if secondary_prearm else "prearm"
     if price_structure_replay_alert_is_suppressed(
-        price_structure_replay_alert_key("prearm", symbol, candidate)
+        price_structure_replay_alert_key(replay_kind, symbol, candidate)
     ):
         return {"ok": True, "skipped": True, "reason": "stale replay baseline"}
     if not price_structure_broadcast_allowed(candidate, clean_feed_text(candidate.get("interval"), 10)):
@@ -28849,6 +30479,8 @@ def launch_price_structure_prearm_alert(
         stage = "5分钟内加速预判"
     else:
         stage = "临界预判"
+    if secondary_prearm:
+        stage = f"二次突破预判 · {stage}"
     distance_text = (
         f"盘中已触及触发价，超出 {abs(distance_pct):.2f}%"
         if crossed
@@ -28873,11 +30505,19 @@ def launch_price_structure_prearm_alert(
         quote.get("provider") or candidate.get("provider"),
     )
     return launch_desktop_alert({
-        "key": f"price-watch:dragon-wave-prearm:{symbol}:{candidate.get('id')}",
+        "key": (
+            f"price-watch:dragon-wave-secondary-prearm:{symbol}:{candidate.get('id')}"
+            if secondary_prearm
+            else f"price-watch:dragon-wave-prearm:{symbol}:{candidate.get('id')}"
+        ),
         "kind": "价格监控",
         "source": "币种价格监控",
         "sourceLabel": "P",
-        "title": f"{symbol} {label} 起爆预判",
+        "title": (
+            f"{symbol} {label} 二次突破预判"
+            if secondary_prearm
+            else f"{symbol} {label} 起爆预判"
+        ),
         "body": " · ".join([
             stage,
             pattern,
@@ -28891,10 +30531,12 @@ def launch_price_structure_prearm_alert(
             "尚未收线",
         ]),
         "url": alert_url,
+        "chain": clean_feed_text(candidate.get("chain"), 40),
+        "contractAddress": clean_feed_text(candidate.get("contractAddress"), 180),
         "time": int(time.time() * 1000),
         "priority": "一级·提前预判",
         "speech": (
-            f"一级优先，{symbol}，{label}起爆预判，{stage}，{distance_text}，"
+            f"一级优先，{symbol}，{label}{'二次突破预判' if secondary_prearm else '起爆预判'}，{stage}，{distance_text}，"
             f"{eta_text}，确定性{grade}，尚未收线，请立即关注。"
         ),
         "sound": "urgent",
@@ -28903,12 +30545,27 @@ def launch_price_structure_prearm_alert(
 
 
 def price_structure_prearm_monitor_once() -> dict[str, Any]:
+    started = time.perf_counter()
     candidates = price_structure_prearm_candidates()
     if not candidates:
-        result = {"ok": True, "candidates": 0, "quotes": 0, "alerts": 0}
+        result = {
+            "ok": True,
+            "candidates": 0,
+            "quotes": 0,
+            "alerts": 0,
+            "candidateSources": {},
+            "quoteFailures": 0,
+            "skipReasons": {},
+            "elapsedMs": int((time.perf_counter() - started) * 1000),
+            "lastDecisions": [],
+        }
         with PRICE_STRUCTURE_PREARM_STATUS_LOCK:
             PRICE_STRUCTURE_PREARM_STATUS.update({**result, "lastRunAt": int(time.time() * 1000)})
         return result
+    candidate_sources: dict[str, int] = {}
+    for candidate in candidates:
+        source_type = clean_feed_text(candidate.get("sourceType") or "pending", 40)
+        candidate_sources[source_type] = candidate_sources.get(source_type, 0) + 1
     first_by_symbol: dict[str, dict[str, Any]] = {}
     for candidate in candidates:
         first_by_symbol.setdefault(str(candidate["symbol"]), candidate)
@@ -28923,15 +30580,35 @@ def price_structure_prearm_monitor_once() -> dict[str, Any]:
         except Exception:
             quotes[futures[future]] = {}
     alerts = 0
+    skip_reasons: dict[str, int] = {}
+    decisions: list[dict[str, Any]] = []
     for candidate in candidates:
-        result = launch_price_structure_prearm_alert(candidate, quotes.get(str(candidate["symbol"]), {}))
-        if result.get("queued"):
+        alert_result = launch_price_structure_prearm_alert(
+            candidate, quotes.get(str(candidate["symbol"]), {})
+        )
+        if alert_result.get("queued"):
             alerts += 1
+            decision = "queued"
+        else:
+            decision = clean_feed_text(alert_result.get("reason") or "not queued", 80)
+            skip_reasons[decision] = skip_reasons.get(decision, 0) + 1
+        decisions.append({
+            "symbol": candidate.get("symbol"),
+            "interval": candidate.get("interval"),
+            "sourceType": candidate.get("sourceType") or "pending",
+            "decision": decision,
+            "distancePct": alert_result.get("distancePct"),
+        })
     result = {
         "ok": True,
         "candidates": len(candidates),
         "quotes": len([quote for quote in quotes.values() if quote]),
         "alerts": alerts,
+        "candidateSources": candidate_sources,
+        "quoteFailures": len([symbol for symbol in first_by_symbol if not quotes.get(symbol)]),
+        "skipReasons": skip_reasons,
+        "elapsedMs": int((time.perf_counter() - started) * 1000),
+        "lastDecisions": decisions[:24],
     }
     with PRICE_STRUCTURE_PREARM_STATUS_LOCK:
         PRICE_STRUCTURE_PREARM_STATUS.update({**result, "lastRunAt": int(time.time() * 1000)})
@@ -28949,6 +30626,8 @@ def price_structure_cache_key(rows: list[dict[str, Any]]) -> str:
             clean_feed_text(row.get("chain"), 40).casefold(),
             clean_feed_text(row.get("contractAddress"), 180).casefold(),
             str(int(safe_float(row.get("structure1mOverride"), -1))),
+            str(int(safe_float(row.get("monitorPoolEnteredAt"), 0))),
+            "1" if bool(row.get("structure1mEnabled")) else "0",
             json.dumps(
                 parse_price_structure_interval_overrides(row.get("structureIntervalOverrides", {})),
                 sort_keys=True,
@@ -29399,7 +31078,12 @@ def price_structure_onchain_activity_state(
 PRICE_MONITOR_ACTIVITY_STATES: dict[tuple[str, str, str], dict[str, Any]] = {}
 
 
-def filter_price_monitor_rows_by_activity(rows: list[dict[str, Any]], *, allow_refresh: bool = True) -> list[dict[str, Any]]:
+def filter_price_monitor_rows_by_activity(
+    rows: list[dict[str, Any]],
+    *,
+    allow_refresh: bool = True,
+    persist_retention_transitions: bool = True,
+) -> list[dict[str, Any]]:
     """Apply the $10m gate to CEX contracts, never as an on-chain CA hard floor."""
     global PRICE_MONITOR_ACTIVITY_SUMMARY, PRICE_MONITOR_ACTIVITY_STATES
     activity = fetch_new_coin_low_market_activity() if allow_refresh else (NEW_COIN_LOW_ACTIVITY_CACHE[1] if NEW_COIN_LOW_ACTIVITY_CACHE else {})
@@ -29566,6 +31250,8 @@ def filter_price_monitor_rows_by_activity(rows: list[dict[str, Any]], *, allow_r
             source_names = []
             if int(safe_float(row.get("binance_gainers_last_seen_at"), 0)) > 0:
                 source_names.append("Binance涨幅榜")
+            if int(safe_float(row.get("binance_futures_gainers_last_seen_at"), 0)) > 0:
+                source_names.append("Binance合约涨幅榜")
             if int(safe_float(row.get("okx_gainers_last_seen_at"), 0)) > 0:
                 source_names.append("OKX涨幅榜")
             state = {
@@ -29595,7 +31281,11 @@ def filter_price_monitor_rows_by_activity(rows: list[dict[str, Any]], *, allow_r
         PRICE_MONITOR_ACTIVITY_STATES = dict(list(PRICE_MONITOR_ACTIVITY_STATES.items())[-8_000:])
     if allow_refresh and retention_rows:
         record_price_monitor_retention_failures(retention_rows, now_ms=now_ms)
-    return filter_price_monitor_cold_archives(filtered, now_ms=now_ms)
+    return filter_price_monitor_cold_archives(
+        filtered,
+        now_ms=now_ms,
+        persist_retention_transitions=persist_retention_transitions,
+    )
 
 
 def new_coin_low_inventory_rows(*, force_refresh: bool = False) -> list[dict[str, Any]]:
@@ -30016,7 +31706,7 @@ def refresh_price_structure_strategy_monitor_item(
     """Fetch one leader concurrently, then serialize only the snapshot commit."""
     fresh_item = fetch_price_structure_item(row, fast_provider_probe=True)
     with PRICE_STRUCTURE_REFRESH_LOCK:
-        excluded_symbols = price_structure_excluded_symbols()
+        excluded_symbols = price_structure_excluded_symbols(bypass_process_lock=True)
         symbol = price_structure_monitor_symbol(fresh_item.get("symbol"))
         if not symbol or symbol in excluded_symbols:
             return {
@@ -31287,13 +32977,18 @@ def price_watch_explicit_market_source(row: dict[str, Any] | None) -> str:
     binance_seen = int(safe_float(
         item.get("binance_gainers_last_seen_at") or item.get("binanceGainersLastSeenAt"), 0
     ))
+    binance_futures_seen = int(safe_float(
+        item.get("binance_futures_gainers_last_seen_at")
+        or item.get("binanceFuturesGainersLastSeenAt"), 0
+    ))
     okx_seen = int(safe_float(
         item.get("okx_gainers_last_seen_at") or item.get("okxGainersLastSeenAt"), 0
     ))
-    if binance_seen or okx_seen:
-        if binance_seen == okx_seen:
+    if binance_seen or binance_futures_seen or okx_seen:
+        binance_latest = max(binance_seen, binance_futures_seen)
+        if binance_latest == okx_seen:
             return hinted if hinted in {"binance", "okx"} else ""
-        return "binance" if binance_seen > okx_seen else "okx"
+        return "binance" if binance_latest > okx_seen else "okx"
     return hinted
 
 
@@ -33680,11 +35375,11 @@ def price_structure_monitor_next_rows(
         for item in snapshot_items
         if isinstance(item, dict) and price_structure_monitor_symbol(item.get("symbol"))
     }
-    pending_symbols = {
+    prearm_symbols = {
         symbol
         for symbol, item in snapshots.items()
         if any(
-            isinstance(frame, dict) and isinstance(frame.get("pending"), dict)
+            price_structure_frame_is_prearm_watchable(frame)
             for frame in (item.get("frames") if isinstance(item.get("frames"), list) else [])
         )
     }
@@ -33702,16 +35397,31 @@ def price_structure_monitor_next_rows(
             and (last_checked <= 0 or effective_now - last_checked >= refresh_seconds * 1000)
         )
 
+    pool_entry_day_rows = [
+        row for row in rows
+        if clean_feed_text(row.get("structure1mMode"), 30) == "auto-pool-day"
+        and eligible(row, PRICE_STRUCTURE_PRIORITY_REFRESH_SECONDS)
+    ]
+    pool_entry_day_rows.sort(
+        key=lambda row: (checked_at(row), price_structure_monitor_symbol(row.get("symbol")))
+    )
+    pool_entry_day_symbols = {
+        price_structure_monitor_symbol(row.get("symbol")) for row in pool_entry_day_rows
+    }
     priority_rows = [
         row for row in rows
-        if (
-            price_structure_monitor_symbol(row.get("symbol")) in pending_symbols
+        if price_structure_monitor_symbol(row.get("symbol")) not in pool_entry_day_symbols
+        and (
+            price_structure_monitor_symbol(row.get("symbol")) in prearm_symbols
             or bool(row.get("personalXPriority"))
         )
         and eligible(row, PRICE_STRUCTURE_PRIORITY_REFRESH_SECONDS)
     ]
     priority_rows.sort(key=lambda row: (checked_at(row), price_structure_monitor_symbol(row.get("symbol"))))
-    priority_symbols = {price_structure_monitor_symbol(row.get("symbol")) for row in priority_rows}
+    priority_symbols = {
+        *pool_entry_day_symbols,
+        *(price_structure_monitor_symbol(row.get("symbol")) for row in priority_rows),
+    }
     regular_rows = [
         row for row in rows
         if price_structure_monitor_symbol(row.get("symbol")) not in priority_symbols
@@ -33719,9 +35429,24 @@ def price_structure_monitor_next_rows(
     ]
     regular_rows.sort(key=lambda row: (checked_at(row), price_structure_monitor_symbol(row.get("symbol"))))
 
-    priority_quota = min(len(priority_rows), max(1, slots // 2)) if priority_rows else 0
-    selected = priority_rows[:priority_quota]
+    # Same-day pool entries have only one trading day of automatic 1-minute
+    # coverage. Give them their own worker quota so a long personal-X/prearm
+    # backlog cannot delay a newly admitted symbol for hours.
+    pool_entry_day_quota = (
+        min(len(pool_entry_day_rows), max(1, slots // 2))
+        if pool_entry_day_rows else 0
+    )
+    selected = pool_entry_day_rows[:pool_entry_day_quota]
+    remaining_slots = max(0, slots - len(selected))
+    priority_quota = min(len(priority_rows), max(1, remaining_slots // 2)) if priority_rows else 0
+    selected.extend(priority_rows[:priority_quota])
     selected.extend(regular_rows[:max(0, slots - len(selected))])
+    if len(selected) < slots:
+        selected.extend(
+            pool_entry_day_rows[
+                pool_entry_day_quota:pool_entry_day_quota + slots - len(selected)
+            ]
+        )
     if len(selected) < slots:
         selected.extend(priority_rows[priority_quota:priority_quota + slots - len(selected)])
     return selected
@@ -37175,6 +38900,10 @@ def publish_x_kol_realtime_payload(
             source_url=item.get("url") or "",
             observed_at=int(safe_float(item.get("publishedAt"))) or int(time.time() * 1000),
         )
+    try:
+        ingest_trench_person_payload(payload)
+    except Exception as exc:
+        print(f"Trench person signal ingest deferred: {safe_monitor_error(exc)}", file=sys.stderr)
     return published
 
 
@@ -37201,7 +38930,11 @@ def x_kol_overlay_official_stream_status(payload: dict[str, Any]) -> dict[str, A
     health = x_kol_official_stream_health_snapshot()
     now_ms = int(time.time() * 1000)
     last_connected_at = int(safe_float(health.get("lastConnectedAt")) or 0)
-    enabled_count = int(safe_float(payload.get("enabledCount")) or len(payload.get("sources") or []))
+    enabled_count = int(
+        safe_float(payload.get("manualEnabledCount"))
+        or safe_float(payload.get("enabledCount"))
+        or len(payload.get("sources") or [])
+    )
     target_count = int(safe_float(health.get("targetCount")) or 0)
     recently_connected = bool(
         health.get("rulesReady")
@@ -37224,14 +38957,16 @@ def x_kol_overlay_official_stream_status(payload: dict[str, Any]) -> dict[str, A
         "sources": [
             {
                 **source,
-                "status": "ok",
-                "provider": "x-stream",
-                "error": "",
-                "upstreamError": "",
-                "limited": False,
-                "streamConnected": connected,
-                "streamReconnecting": not connected,
-                "lastOkAt": last_connected_at or now_ms,
+                **({
+                    "status": "ok",
+                    "provider": "x-stream",
+                    "error": "",
+                    "upstreamError": "",
+                    "limited": False,
+                    "streamConnected": connected,
+                    "streamReconnecting": not connected,
+                    "lastOkAt": last_connected_at or now_ms,
+                } if not source.get("sharedWatcher") else {}),
             }
             for source in source_states
             if isinstance(source, dict)
@@ -45137,7 +46872,7 @@ def chain_ecosystem_attach_ai(
     payload = dict(source_payload)
     daily_research = payload.get("dailyResearch") if isinstance(payload.get("dailyResearch"), dict) else {}
     # GMGN Trenches owns the daily new-token desk.  Its private candidate pool
-    # is evaluated by the same durable V4.4 lane as the rest of the project;
+    # is evaluated by the same durable V4.9 lane as the rest of the project;
     # only formal AI-selected rows cross the public research boundary.
     payload["dailyResearch"] = (
         attach_gmgn_trench_research(daily_research)
@@ -45287,10 +47022,72 @@ def chain_ecosystem_attach_ai(
     return payload
 
 
+def onchain_market_mainline_context(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build one shared as-of context so the model judges the market before each token."""
+    now_ms = int(time.time() * 1000)
+    hotspot = global_hotspot_snapshot()
+    events = sorted(
+        (event for event in hotspot.get("events", []) if isinstance(event, dict)),
+        key=lambda event: int(safe_float(event.get("occurredAt"), 0)),
+        reverse=True,
+    )[:8]
+    universe = next((
+        row.get("_marketMainlineUniverse") for row in rows
+        if isinstance(row, dict) and isinstance(row.get("_marketMainlineUniverse"), list)
+    ), None)
+    market_rows = universe if universe else rows
+    batch_assets = []
+    for row in market_rows[:80]:
+        if not isinstance(row, dict):
+            continue
+        metrics = row.get("metrics") if isinstance(row.get("metrics"), dict) else {}
+        batch_assets.append({
+            "network": clean_feed_text(row.get("network"), 40),
+            "symbol": clean_feed_text(row.get("symbol"), 50),
+            "name": clean_feed_text(row.get("name"), 100),
+            "marketCapUsd": round(safe_float(metrics.get("marketCapUsd"), 0), 2),
+            "liquidityUsd": round(safe_float(metrics.get("liquidityUsd"), 0), 2),
+            "volumeH1Usd": round(safe_float(metrics.get("volumeH1Usd"), 0), 2),
+            "volumeH24Usd": round(safe_float(metrics.get("volumeH24Usd"), 0), 2),
+            "transactionsH1": int(safe_float(metrics.get("transactionsH1"), 0)),
+            "ageMinutes": round(safe_float(row.get("ageMinutes"), 0), 1),
+            "providers": [clean_feed_text(value, 60) for value in (row.get("providers") or [])[:6]],
+        })
+    return {
+        "asOf": now_ms,
+        "scope": "本轮同一小时战壕增量（实时模式为当前批次）+ 最近48小时已核验全网热点；它不是完整市场行情，证据不足必须标uncertain",
+        "hotspotEvents": [{
+            "title": clean_feed_text(event.get("title"), 240),
+            "summary": clean_feed_text(event.get("summary"), 700),
+            "entities": [clean_feed_text(value, 80) for value in (event.get("entityNames") or [])[:8]],
+            "searchTerms": [clean_feed_text(value, 80) for value in (event.get("searchTerms") or [])[:8]],
+            "occurredAt": int(safe_float(event.get("occurredAt"), 0)),
+            "url": clean_feed_text(event.get("primaryUrl"), 800),
+        } for event in events],
+        "batchAssets": batch_assets,
+        "rules": [
+            "先给整批同一个市场主线判断，再逐币判断候选关系",
+            "候选自己的名称、简介或单次涨幅不能单独证明它属于市场主线",
+            "没有跨资产、资金、事件和注意力的组合证据时status=uncertain",
+        ],
+    }
+
+
 def analyze_fast_onchain_candidates(rows: list[dict[str, Any]], *, lane="onchain-history") -> dict[str, dict[str, Any]]:
     settings = system_llm_settings()
     if not deepseek_enabled(settings):
         raise RuntimeError("AI 暂不可用；保留初筛结果和待分析合约")
+    # Slow mode is an independent Codex judgement. Do not leak an earlier JEV
+    # rapid opinion into the prompt and create an anchor.
+    decision_mode = onchain_research_mode_payload()["mode"]
+    rapid_decisions = {} if decision_mode in {"deep", "hourly"} else {
+        onchain_candidate_key(row): row.get("rapidDecision")
+        for row in rows
+        if isinstance(row.get("rapidDecision"), dict)
+    }
+    decision_fields = () if decision_mode in {"deep", "hourly"} else (
+        "rapidDecision", "jevDecision",
+    )
     model_rows = [{
         "index": index, "key": onchain_candidate_key(row), "type": "research_candidate",
         "facts": {key: row.get(key) for key in (
@@ -45298,11 +47095,15 @@ def analyze_fast_onchain_candidates(rows: list[dict[str, Any]], *, lane="onchain
             "poolCreatedAt", "firstSeenAt", "metrics", "reasons", "risks", "providers",
             "researchEvidence", "narrativeContext", "launchFacts", "walletProfile",
             "crossValidation", "sameSymbolRole", "sameSymbolLeaderReason", "observedAt",
-            "quoteAsset", "frameworkSnapshot", "narrativeFallbackEligible",
+            "quoteAsset", "frameworkSnapshot", "personSignal", "narrativeFallbackEligible",
             "narrativeFallbackApplied",
+            *decision_fields,
         )},
     } for index, row in enumerate(rows, 1)]
     for model_row, row in zip(model_rows, rows):
+        rapid_decision = rapid_decisions.get(model_row["key"])
+        if isinstance(rapid_decision, dict):
+            model_row["facts"]["rapidDecision"] = rapid_decision
         sources = []
         evidence = row.get("researchEvidence") or {}
         if story_text(evidence):
@@ -45320,6 +47121,26 @@ def analyze_fast_onchain_candidates(rows: list[dict[str, Any]], *, lane="onchain
         for index, reason in enumerate(row.get("reasons") or []):
             if reason.startswith("外部线索：") and "链上创建事件" not in reason and "快讯明确题材" not in reason:
                 sources.append({"id": f"clue-{index}", "source": "unverified-clue", "content": reason[:600]})
+        person_signal = row.get("personSignal") if isinstance(row.get("personSignal"), dict) else {}
+        if person_signal.get("postText"):
+            sources.append({
+                "id": "person-author",
+                "source": clean_feed_text(person_signal.get("personName") or person_signal.get("personHandle") or "人物/官方原帖", 120),
+                "url": clean_feed_text(person_signal.get("postUrl"), 800),
+                "content": clean_feed_text(person_signal.get("postText"), 1800),
+                "actionType": clean_feed_text(person_signal.get("actionType") or person_signal.get("actionLabel"), 40),
+                "attribution": "author-own-text",
+                "semanticConfidence": round(safe_float(person_signal.get("semanticConfidence"), 0), 4),
+                "semanticReason": clean_feed_text(person_signal.get("semanticReason"), 500),
+            })
+        if person_signal.get("quoteText"):
+            sources.append({
+                "id": "person-quote",
+                "source": "被引用内容",
+                "url": clean_feed_text(person_signal.get("postUrl"), 800),
+                "content": clean_feed_text(person_signal.get("quoteText"), 1400),
+                "attribution": "quoted-object-not-author-opinion",
+            })
         chat_validation = row.get("crossValidation") if isinstance(row.get("crossValidation"), dict) else {}
         for index, chat_item in enumerate(chat_validation.get("evidence") or []):
             if not isinstance(chat_item, dict) or not chat_item.get("content"):
@@ -45347,7 +47168,7 @@ def analyze_fast_onchain_candidates(rows: list[dict[str, Any]], *, lane="onchain
         "缺少题材、交易退出或合约身份证据时最多watch，不凭名称、涨幅或量化分判强。"
         "无原始叙事资料时evidenceStatus=insufficient，不得从币名、买卖笔数推导文化传播或独立买方。"
         "evidenceStatus=partial表示有具体题材线索但验证不完整，supported表示已提供交叉证据，均非收益保证。"
-        "只返回JSON：{items:[{key,verdict,confidence,narrativeStrength,summary,catalyst,risk,nextFocus,"
+        "只返回JSON：{marketMainline:{status,asOf,primaryThemes,phase,leaders,capitalAttention,evidence},items:[{key,verdict,confidence,narrativeStrength,summary,catalyst,risk,nextFocus,"
         "identitySummary,evidenceStatus,evidenceRefs,narrative:{thesis,attention,evidence,invalidation}}]}。"
         "key照抄，分数0-100，evidenceRefs只能引用输入sources中的id。summary用30-70字给具体结论；"
         "identitySummary先用一句大白话回答‘这个CA到底是谁’：链、币名、发行平台/社区归属、核心叙事主题、"
@@ -45356,11 +47177,25 @@ def analyze_fast_onchain_candidates(rows: list[dict[str, Any]], *, lane="onchain
         "缺失验证与失效条件（什么变化会推翻判断），每段40-120个中文字。资料不足就明确缺什么，禁止用套话填字数。"
         "区分来源声称、已观察事实和你的推断；不要把官网声称当成功能交付，不凭名称声称关联知名项目。"
         "催化、风险、下一步各20-60字，以中文输出，英文仅用于专名。"
+        + ("JEV 是快速主判，不是市场事实、收益预测或最终证据，你必须独立核对，不能照抄其结论。" if decision_mode == "rapid" else "")
         + FULL_FRAMEWORK_PROMPT
         + "每条结果还必须返回frameworkAssessment，字段严格按用户消息中的schema。"
     )}, {"role": "user", "content": json.dumps({"rows": model_rows}, ensure_ascii=False, separators=(",", ":"))}]
     messages[1]["content"] = json.dumps(
-        {"rows": model_rows, "frameworkAssessmentSchema": FRAMEWORK_OUTPUT_SCHEMA},
+        {
+            "marketMainlineContext": onchain_market_mainline_context(rows),
+            "marketMainlineSchema": {
+                "status": "active|uncertain|none",
+                "asOf": "沿用输入时间截面",
+                "primaryThemes": ["当前1–3条主线；证据不足可为空"],
+                "phase": "emerging|accelerating|consensus|crowded|rotating|fading|unclear",
+                "leaders": ["代表资产/项目及领先依据"],
+                "capitalAttention": "资金、成交、流动性和注意力迁移",
+                "evidence": ["跨资产/资金/事件证据"],
+            },
+            "rows": model_rows,
+            "frameworkAssessmentSchema": FRAMEWORK_OUTPUT_SCHEMA,
+        },
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -45371,17 +47206,35 @@ def analyze_fast_onchain_candidates(rows: list[dict[str, Any]], *, lane="onchain
         "_codexModel": env_value("CODEX_CLI_ONCHAIN_MODEL", "gpt-6-astra"),
         "_codexReasoningEffort": env_value("CODEX_CLI_ONCHAIN_REASONING_EFFORT", "high")})
     parsed = deepseek_extract_json(response.get("choices", [{}])[0].get("message", {}).get("content", ""))
+    batch_mainline = parsed.get("marketMainline") if isinstance(parsed.get("marketMainline"), dict) else {}
     allowed = {row["key"] for row in model_rows}
     results = {}
     for item in parsed.get("items", []):
         if not isinstance(item, dict) or item.get("key") not in allowed:
             continue
+        if batch_mainline and isinstance(item.get("frameworkAssessment"), dict):
+            item_framework = dict(item["frameworkAssessment"])
+            item_mainline = item_framework.get("marketMainline") if isinstance(item_framework.get("marketMainline"), dict) else {}
+            item_framework["marketMainline"] = {
+                **batch_mainline,
+                **{key: item_mainline.get(key) for key in (
+                    "candidateRelation", "relationReason", "nextTrigger", "invalidation",
+                ) if item_mainline.get(key) is not None},
+            }
+            item["frameworkAssessment"] = item_framework
         analysis = normalize_chain_ecosystem_ai_analysis(item)
         if analysis:
             subject = next(row for row in model_rows if row["key"] == item["key"])
             source_ids = {source["id"] for source in subject["sources"]}
             analysis["evidenceRefs"] = [ref for ref in analysis["evidenceRefs"] if ref in source_ids]
             analysis["narrativeVersion"] = NARRATIVE_VERSION
+            analysis["analysisDepth"] = (
+                "hourly-v48" if lane == "onchain-hourly"
+                else "deep-web" if lane == "onchain-history"
+                else "realtime-review"
+            )
+            if isinstance(rapid_decisions.get(item["key"]), dict):
+                analysis["rapidDecision"] = rapid_decisions[item["key"]]
             narrative = analysis.get("narrative") or {}
             if not all(narrative.get(field) for field in ("thesis", "attention", "evidence", "invalidation")):
                 # Incomplete responses retry; never silently accept a four-word slogan.
@@ -45398,8 +47251,8 @@ def analyze_fast_onchain_candidates(rows: list[dict[str, Any]], *, lane="onchain
                 analysis["frameworkAssessment"] = normalize_framework_assessment({})
                 analysis["frameworkAssessment"]["version"] = ""
             if analysis["verdict"] in {"strong", "watch"} and not framework_assessment_complete(analysis):
-                # A recommendation-shaped answer without the V4.4 attention,
-                # mapping and leader ledgers is incomplete and must retry.
+                # A recommendation-shaped answer without the V4.9 Meta,
+                # survival and long-term ledgers is incomplete and must retry.
                 continue
             analysis["provider"] = response.get("_provider") or clean_model_provider(settings.get("provider"))
             results[item["key"]] = analysis
@@ -45408,23 +47261,43 @@ def analyze_fast_onchain_candidates(rows: list[dict[str, Any]], *, lane="onchain
 
 def send_fast_onchain_alert(row: dict[str, Any], analysis: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
     symbol = clean_feed_text(row.get("symbol") or row.get("name"), 40)
+    project_name = clean_feed_text(row.get("name"), 80)
     network = clean_feed_text(row.get("network"), 30)
     elapsed = max(0, int(job["analyzed_at"] - job["first_seen_at"]) // 1000)
+    is_chatgpt_route = analysis.get("researchRoute") == CHATGPT_RESEARCH_ROUTE
     decision = golden_leader_alert_decision(row, analysis)
-    if not decision["eligible"]:
+    if is_chatgpt_route:
+        if not chatgpt_positive_alert_decision(analysis):
+            return {"ok": False, "suppressed": True,
+                    "reason": analysis.get("alertReason") or "仅弹正向且值得看的标的"}
+    elif not decision["eligible"]:
         return {"ok": False, "suppressed": True, "reason": decision["reason"]}
     framework = analysis.get("frameworkAssessment") or {}
     permission = decision["executionPermission"]
     execution_note = "执行许可" if permission == "ALLOW" else "仅研究，不可直接执行" if permission == "BLOCK" else "需补审后再决定"
     local_port = env_value("PORT") or env_value("XINGYUN_PORT") or "8765"
     local_url = f"http://127.0.0.1:{local_port}/price-watch.html?mode=chains"
+
+    def symbol_first_popup_text(value: Any, *, title: bool = False) -> str:
+        rendered = clean_feed_text(value, 700)
+        if symbol and project_name and symbol.casefold() != project_name.casefold():
+            rendered = re.sub(re.escape(project_name), symbol, rendered, flags=re.I)
+        if title and symbol and not re.match(rf"^{re.escape(symbol)}(?:\b|\s|[：:·-])", rendered, re.I):
+            rendered = f"{symbol} · {rendered}" if rendered else f"{symbol} 值得关注"
+        return rendered
+
+    chat_popup_title = symbol_first_popup_text(analysis.get("popupTitle"), title=True)
+    chat_popup_body = symbol_first_popup_text(analysis.get("popupBody"))
     return launch_desktop_alert({
-        "key": f"onchain-v44-potential:{job['key']}:{decision['potentialTier']}",
-        "eventFlowKey": f"onchain-v44-potential:{job['key']}",
-        "kind": "链上投研 · V4.4潜力", "source": "链上投研", "sourceLabel": "研",
-        "sourceType": "onchain-v44-potential",
-        "title": f"{decision['label']}：{symbol}",
-        "body": (
+        "key": (f"onchain-chatgpt-research:{job['key']}" if is_chatgpt_route
+                else f"onchain-v48-potential:{job['key']}:{decision['potentialTier']}"),
+        "eventFlowKey": (f"onchain-chatgpt-research:{job['key']}" if is_chatgpt_route
+                         else f"onchain-v48-potential:{job['key']}"),
+        "kind": "链上投研 · ChatGPT判断" if is_chatgpt_route else "链上投研 · V4.9潜力",
+        "source": "链上投研", "sourceLabel": "研",
+        "sourceType": "onchain-chatgpt-research" if is_chatgpt_route else "onchain-v48-potential",
+        "title": chat_popup_title if is_chatgpt_route else f"{decision['label']}：{symbol}",
+        "body": chat_popup_body if is_chatgpt_route else (
             f"{network} · 机会 {decision['opportunityScore']} / 龙头 {decision['leaderScore']} · "
             f"{framework.get('primaryDriver') or analysis.get('summary') or '驱动待核验'} · "
             f"{permission}（{execution_note}）· 风险 {decision['riskScore']} · "
@@ -45433,8 +47306,10 @@ def send_fast_onchain_alert(row: dict[str, Any], analysis: dict[str, Any], job: 
         "url": local_url,
         "contractAddress": clean_feed_text(row.get("contractAddress"), 180),
         "chain": network,
-        "time": int(job["analyzed_at"]), "priority": decision["label"], "queuePriority": 180,
-        "speech": f"链上投研发现{decision['label']}，{symbol}。{execution_note}。{framework.get('primaryDriver') or analysis.get('summary') or ''}",
+        "time": int(job["analyzed_at"]),
+        "priority": "聊天投研精选" if is_chatgpt_route else decision["label"], "queuePriority": 180,
+        "speech": ("" if is_chatgpt_route
+                   else f"链上投研发现{decision['label']}，{symbol}。{execution_note}。{framework.get('primaryDriver') or analysis.get('summary') or ''}"),
     })
 
 
@@ -45478,11 +47353,18 @@ def send_fast_onchain_news_resonance_alert(
 
 ONCHAIN_FAST_RESEARCH = FastResearch(CHAIN_ECOSYSTEM_MONITOR.store, analyze_fast_onchain_candidates, send_fast_onchain_alert,
     realtime_analyzer=lambda rows: analyze_fast_onchain_candidates(rows, lane="onchain-live"),
+    hourly_analyzer=lambda rows: analyze_fast_onchain_candidates(rows, lane="onchain-hourly"),
     candidate_enricher=lambda row: global_hotspot_enrich_candidate(
         row,
         allow_narrative_fallback=bool(row.get("narrativeFallbackEligible")),
     ),
-    resonance_sink=send_fast_onchain_news_resonance_alert)
+    resonance_sink=send_fast_onchain_news_resonance_alert,
+    rapid_analyzer=analyze_rapid_candidates,
+    mode_provider=lambda: onchain_research_mode_payload()["mode"],
+    hourly_settle_ms=max(0, int(safe_float(env_value("ONCHAIN_HOURLY_RESEARCH_SETTLE_SECONDS", "300"), 300) * 1000)),
+    hourly_batch_size=max(1, int(safe_float(env_value("ONCHAIN_HOURLY_RESEARCH_BATCH_SIZE", "4"), 4))),
+    hourly_max_rows=max(1, int(safe_float(env_value("ONCHAIN_HOURLY_RESEARCH_MAX_ROWS", "96"), 96))),
+    hourly_concurrency=max(1, int(safe_float(env_value("ONCHAIN_HOURLY_RESEARCH_CONCURRENCY", "2"), 2))))
 
 
 def news_trade_search_terms(query: Any) -> list[str]:
@@ -46031,7 +47913,7 @@ def global_hotspot_enrich_candidate(
     allow_narrative_fallback: bool = False,
 ) -> dict[str, Any]:
     row = dict(candidate)
-    if row.get("decision") == "filtered" or not clean_feed_text(row.get("contractAddress"), 96):
+    if not clean_feed_text(row.get("contractAddress"), 96):
         return row
     current_ms = int(now_ms or time.time() * 1000)
     event = global_hotspot_match_event(row, snapshot or global_hotspot_snapshot(), now_ms=current_ms)
@@ -46080,12 +47962,11 @@ def global_hotspot_enrich_candidate(
         active = True
         row["narrativeFallbackApplied"] = True
         row["reasons"] = list(dict.fromkeys([
-            "1小时成交数据尚未形成：改用 GMGN 叙事资料与热点共振送入 V4.4 复核",
+            "1小时成交数据尚未形成：改用 GMGN 叙事资料与热点共振送入 V4.9 复核",
             *(row.get("reasons") or []),
         ]))[:5]
     if liquid and active:
-        row["decision"] = "shortlisted"
-        row["selectedScore"] = max(62, int(safe_float(row.get("selectedScore"), 0)))
+        row = promote_resonance_priority(row, source="全网热点共振")
         row["newsObservedAt"] = current_ms
         row["newsSignal"] = {
             "version": NEWS_TRIGGER_VERSION,
@@ -49119,13 +51000,25 @@ class Handler(SimpleHTTPRequestHandler):
                     # profile: MC > $10K, at least one social channel, plus
                     # the safety switches enabled for the selected chain.
                     item_filter=gmgn_trench_passes_chain_filters,
-                    include_recent_rank_supplement=True,
+                    include_recent_rank_supplement=False,
                 )
-                self.send_json(attach_gmgn_native_trench_narrative(trench_payload))
+                self.send_json(attach_trench_person_signals(attach_gmgn_native_trench_narrative(trench_payload)))
             except (TypeError, ValueError) as exc:
                 self.send_json({"ok": False, "items": [], "error": str(exc)}, status=400)
             except Exception as exc:
                 self.send_json({"ok": False, "items": [], "error": safe_monitor_error(exc)}, status=502)
+            return
+        if parsed.path == "/api/onchain-research-mode":
+            if not self.request_is_local_or_admin():
+                self.send_json({"ok": False, "error": "仅限本机或管理员查看投研判断模式"}, status=403)
+                return
+            self.send_json({"ok": True, **onchain_research_mode_payload()})
+            return
+        if parsed.path == "/api/onchain-research/chatgpt/status":
+            if not self.request_is_local_or_admin():
+                self.send_json({"ok": False, "error": "仅限本机查看聊天投研队列"}, status=403)
+                return
+            self.send_json(ONCHAIN_FAST_RESEARCH.chatgpt_research_status())
             return
         if parsed.path == "/api/chain-ecosystem":
             try:
@@ -49146,6 +51039,7 @@ class Handler(SimpleHTTPRequestHandler):
                             "provider": settings.get("provider"),
                             "model": settings.get("model"),
                             "available": deepseek_enabled(settings),
+                            "researchMode": onchain_research_mode_payload()["mode"],
                         },
                         sort_keys=True,
                     ).encode("utf-8")
@@ -49161,6 +51055,37 @@ class Handler(SimpleHTTPRequestHandler):
                         research_day=research_day,
                     )
                     return source_payload
+
+                research_page = int((query.get("researchPage") or [1])[0])
+                research_history_page = int((query.get("researchHistoryPage") or [1])[0])
+                cached_view = cached_chain_ecosystem_view(
+                    view_cache_key,
+                    research_page=research_page,
+                    research_history_page=research_history_page,
+                )
+                if cached_view:
+                    refresh_needed = bool(force_refresh or (cached_view.get("_cache") or {}).get("stale"))
+                    self.send_json(cached_view)
+                    response_sent_at = time.perf_counter()
+                    if refresh_needed:
+                        def rebuild_chain_ecosystem_view() -> dict[str, Any]:
+                            fresh_source = refresh_api_cache_now(source_cache_key, build_chain_ecosystem_source)
+                            return chain_ecosystem_attach_ai(fresh_source, settings)
+
+                        # Start expensive SQLite/AI reconstruction only after the
+                        # cached response is on the wire. Requests stay instant
+                        # while one deduplicated background rebuild is running.
+                        trigger_api_refresh(view_cache_key, rebuild_chain_ecosystem_view)
+                    if response_sent_at - request_started_at >= 2:
+                        print(
+                            "Chain ecosystem cached API timing: "
+                            f"settings={settings_ready_at - request_started_at:.3f}s "
+                            f"send={response_sent_at - settings_ready_at:.3f}s "
+                            f"total={response_sent_at - request_started_at:.3f}s",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    return
 
                 if force_refresh and read_json_cache(api_cache_path(source_cache_key)):
                     trigger_api_refresh(source_cache_key, build_chain_ecosystem_source)
@@ -49178,9 +51103,10 @@ class Handler(SimpleHTTPRequestHandler):
                 payload = cached_api_payload(view_cache_key, build_chain_ecosystem_view, 10)
                 analysis_ready_at = time.perf_counter()
                 research = payload.get("dailyResearch") or {}
-                research["historyPage"] = int((query.get("researchHistoryPage") or [1])[0])
-                payload["dailyResearch"] = paginate_research(research, int((query.get("researchPage") or [1])[0]))
+                research["historyPage"] = research_history_page
+                payload["dailyResearch"] = paginate_research(research, research_page)
                 page_ready_at = time.perf_counter()
+                payload["_skipIdentityEnrichment"] = True
                 self.send_json(payload)
                 response_sent_at = time.perf_counter()
                 if response_sent_at - request_started_at >= 2:
@@ -49213,6 +51139,7 @@ class Handler(SimpleHTTPRequestHandler):
                     # Raw quantitative rows must not masquerade as AI recommendations.
                     fallback["dailyResearch"] = {**fallback.get("dailyResearch", {}), "selected": [], "watching": []}
                 fallback["dailyResearch"] = paginate_research(fallback.get("dailyResearch") or {})
+                fallback["_skipIdentityEnrichment"] = True
                 self.send_json(fallback, status=200 if fallback.get("selectedChain") else 502)
             return
         if parsed.path == "/api/aster-contracts":
@@ -49400,6 +51327,98 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         route = parsed.path.rstrip("/")
         if not self.validate_post_request(route):
+            return
+        if route == "/api/onchain-research-mode":
+            if not self.request_is_local_or_admin() or not self.request_origin_allowed() or self.headers.get("Origin") == "null":
+                self.send_json({"ok": False, "error": "仅限本机页面切换投研判断模式"}, status=403)
+                return
+            try:
+                request_payload = self.read_json()
+                self.send_json(set_onchain_research_mode(request_payload.get("mode")))
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": safe_monitor_error(exc)}, status=400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": safe_monitor_error(exc)}, status=502)
+            return
+        if route == "/api/onchain-research/chatgpt/claim":
+            if not self.request_is_local_or_admin() or not self.request_origin_allowed():
+                self.send_json({"ok": False, "error": "仅限本机派送聊天投研任务"}, status=403)
+                return
+            try:
+                request_payload = self.read_json()
+                self.send_json(ONCHAIN_FAST_RESEARCH.claim_chatgpt_research_batch(
+                    limit=request_payload.get("limit"),
+                    max_concurrent=request_payload.get("maxConcurrent"),
+                    target_thread_id=request_payload.get("targetThreadId") or "",
+                    target_thread_title=request_payload.get("targetThreadTitle") or "",
+                ))
+            except (TypeError, ValueError) as exc:
+                self.send_json({"ok": False, "error": safe_monitor_error(exc)}, status=400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": safe_monitor_error(exc)}, status=502)
+            return
+        if route == "/api/onchain-research/chatgpt/sent":
+            if not self.request_is_local_or_admin() or not self.request_origin_allowed():
+                self.send_json({"ok": False, "error": "仅限本机确认聊天投研派送"}, status=403)
+                return
+            try:
+                request_payload = self.read_json()
+                self.send_json(ONCHAIN_FAST_RESEARCH.mark_chatgpt_research_sent(
+                    request_payload.get("batchId"), request_payload.get("claimToken"),
+                    target_thread_id=request_payload.get("threadId") or request_payload.get("targetThreadId") or "",
+                    target_thread_title=request_payload.get("threadTitle") or request_payload.get("targetThreadTitle") or "",
+                    framework_ready=bool(request_payload.get("frameworkReady")),
+                ))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": safe_monitor_error(exc)}, status=502)
+            return
+        if route == "/api/onchain-research/chatgpt/result":
+            if not self.request_is_local_or_admin() or not self.request_origin_allowed():
+                self.send_json({"ok": False, "error": "仅限本机回写聊天投研结果"}, status=403)
+                return
+            try:
+                request_payload = self.read_json()
+                self.send_json(ONCHAIN_FAST_RESEARCH.complete_chatgpt_research_batch(
+                    request_payload.get("batchId"), request_payload.get("claimToken"),
+                    request_payload.get("items"), raw_response=request_payload.get("rawResponse") or "",
+                ))
+            except (TypeError, ValueError) as exc:
+                self.send_json({"ok": False, "error": safe_monitor_error(exc)}, status=400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": safe_monitor_error(exc)}, status=502)
+            return
+        if route == "/api/onchain-research/chatgpt/result-and-claim":
+            if not self.request_is_local_or_admin() or not self.request_origin_allowed():
+                self.send_json({"ok": False, "error": "仅限本机回写并续领聊天投研任务"}, status=403)
+                return
+            try:
+                request_payload = self.read_json()
+                self.send_json(ONCHAIN_FAST_RESEARCH.complete_and_claim_chatgpt_research_batch(
+                    request_payload.get("batchId"), request_payload.get("claimToken"),
+                    request_payload.get("items"),
+                    raw_response=request_payload.get("rawResponse") or "",
+                    limit=request_payload.get("limit"),
+                    max_concurrent=request_payload.get("maxConcurrent"),
+                    target_thread_id=request_payload.get("threadId") or request_payload.get("targetThreadId") or "",
+                    target_thread_title=request_payload.get("threadTitle") or request_payload.get("targetThreadTitle") or "",
+                ))
+            except (TypeError, ValueError) as exc:
+                self.send_json({"ok": False, "error": safe_monitor_error(exc)}, status=400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": safe_monitor_error(exc)}, status=502)
+            return
+        if route == "/api/onchain-research/chatgpt/fail":
+            if not self.request_is_local_or_admin() or not self.request_origin_allowed():
+                self.send_json({"ok": False, "error": "仅限本机回写聊天投研失败状态"}, status=403)
+                return
+            try:
+                request_payload = self.read_json()
+                self.send_json(ONCHAIN_FAST_RESEARCH.fail_chatgpt_research_batch(
+                    request_payload.get("batchId"), request_payload.get("claimToken"),
+                    request_payload.get("error"),
+                ))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": safe_monitor_error(exc)}, status=502)
             return
         if route == "/api/onchain-trenches/ai":
             if not self.request_is_local_or_admin() or not self.request_origin_allowed() or self.headers.get("Origin") == "null":
@@ -49890,24 +51909,26 @@ class Handler(SimpleHTTPRequestHandler):
                 payload = self.read_json()
                 action = str(payload.get("action") or "").strip().lower()
                 if action in {"exclude", "remove", "exclude_structure"}:
-                    self.send_json(exclude_price_structure_symbol(payload.get("symbol")))
+                    result = exclude_price_structure_symbol(payload.get("symbol"))
                 elif action in {"temporary_exclude", "temporary_remove"}:
-                    self.send_json(temporarily_exclude_monitor_symbol(
+                    result = temporarily_exclude_monitor_symbol(
                         payload.get("symbol"), source_pool="structure"
-                    ))
+                    )
                 elif action in {"set_1m", "toggle_1m"}:
-                    self.send_json(set_price_structure_1m_override(
+                    result = set_price_structure_1m_override(
                         payload.get("symbol"),
                         payload.get("enabled"),
-                    ))
+                    )
                 elif action in {"set_interval", "toggle_interval"}:
-                    self.send_json(set_price_structure_interval_override(
+                    result = set_price_structure_interval_override(
                         payload.get("symbol"),
                         payload.get("interval"),
                         payload.get("enabled"),
-                    ))
+                    )
                 else:
                     self.send_json({"ok": False, "error": "unsupported action"}, status=400)
+                    return
+                self.send_json({**result, "_skipIdentityEnrichment": True})
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=400)
             except Exception as exc:
@@ -49918,21 +51939,24 @@ class Handler(SimpleHTTPRequestHandler):
                 payload = self.read_json()
                 action = str(payload.get("action") or "").strip().lower()
                 if action == "add":
-                    self.send_json(queue_price_watch_symbol_add(payload.get("symbol"), payload.get("name")))
+                    result = queue_price_watch_symbol_add(payload.get("symbol"), payload.get("name"))
                 elif action == "remove":
-                    self.send_json(remove_price_watch_symbol(payload.get("symbol")))
+                    result = remove_price_watch_symbol(payload.get("symbol"))
                 elif action in {"confirm", "confirm_signal"}:
-                    self.send_json(confirm_price_watch_signal(payload.get("symbol"), payload.get("episode")))
+                    result = confirm_price_watch_signal(payload.get("symbol"), payload.get("episode"))
                 elif action in {"exclude_prior_high", "remove_prior_high"}:
-                    self.send_json(exclude_price_watch_prior_high(payload.get("symbol")))
+                    result = exclude_price_watch_prior_high(payload.get("symbol"))
                 elif action in {"temporary_exclude", "temporary_remove"}:
-                    self.send_json(temporarily_exclude_monitor_symbol(
+                    result = temporarily_exclude_monitor_symbol(
                         payload.get("symbol"), source_pool="price-watch"
-                    ))
+                    )
                 elif action == "refresh":
                     self.send_json(sync_price_watch_monitor())
+                    return
                 else:
                     self.send_json({"ok": False, "error": "unsupported action"}, status=400)
+                    return
+                self.send_json({**result, "_skipIdentityEnrichment": True})
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=400)
             except Exception as exc:
@@ -50251,6 +52275,10 @@ def main():
         # warmup below. Start it first so push delivery is not delayed by remote
         # feeds, while keeping all inbound Discord monitoring permanently absent.
         threading.Timer(1.0, start_discord_newsflash_bridge, args=(args.host, args.port)).start()
+        # Person actions are time-sensitive. Start this lightweight, rate-limited
+        # watcher before the slower market cache warmup so it cannot be delayed
+        # by GMGN/Binance refreshes during startup.
+        start_trench_person_watch_monitor()
         threading.Thread(target=warm_runtime_cache, daemon=True).start()
         warm_api_response_cache()
         start_x_kol_priority_monitor()

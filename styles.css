@@ -1121,6 +1121,35 @@ select option {
   padding-left: 7px;
 }
 
+.board-head-actions.is-binance-gainers-head {
+  align-items: center;
+  gap: 6px;
+}
+
+.board-head-actions.is-binance-gainers-head .board-period-control {
+  grid-template-columns: auto minmax(88px, auto);
+}
+
+.board-head-actions.is-binance-gainers-head .board-period-control select {
+  min-width: 94px;
+  padding-right: 22px;
+  padding-left: 7px;
+}
+
+.is-binance-gainers-board .board-head {
+  gap: 8px;
+}
+
+.is-binance-gainers-board .board-head h3 {
+  font-size: 17px;
+  white-space: nowrap;
+}
+
+.is-binance-gainers-board .board-period-control > span {
+  padding-right: 6px;
+  padding-left: 6px;
+}
+
 .board-period-control {
   display: grid;
   grid-template-columns: auto minmax(78px, auto);
@@ -1747,6 +1776,20 @@ select option {
   box-shadow: 0 0 12px rgba(255, 197, 70, 0.16);
 }
 
+.gmgn-trench-person-badge {
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  border: 1px solid rgba(255, 197, 70, 0.52);
+  border-radius: 999px;
+  color: #ffdf74;
+  font-size: 8px;
+  font-style: normal;
+  font-weight: 950;
+  line-height: 1.35;
+  white-space: nowrap;
+  background: rgba(255, 197, 70, 0.1);
+}
+
 .gmgn-trench-name span {
   color: rgba(241, 234, 215, 0.46);
   font-size: 10px;
@@ -1868,6 +1911,18 @@ select option {
 
 .gmgn-trench-tool.is-wallet {
   color: #ffc546;
+}
+
+.gmgn-trench-tool.is-person {
+  color: #ffdf74;
+  border-color: rgba(255, 197, 70, 0.42);
+  background: rgba(255, 197, 70, 0.08);
+}
+
+.gmgn-trench-tool.is-person .gmgn-trench-popover {
+  width: min(390px, calc(100vw - 42px));
+  border-color: rgba(255, 197, 70, 0.42);
+  background: rgba(29, 26, 16, 0.985);
 }
 
 .gmgn-trench-tool.is-disabled {
@@ -6880,6 +6935,12 @@ a:not(.nav-link):not(.action-link):not(.action-button):focus {
   background: rgba(255, 105, 93, 0.055);
 }
 
+.xwatch-source-row.is-system {
+  grid-template-columns: 48px minmax(0, 1fr);
+  border-color: rgba(156, 255, 87, 0.16);
+  background: rgba(156, 255, 87, 0.035);
+}
+
 .xwatch-source-row[data-state="recovering"] {
   border-color: rgba(246, 187, 72, 0.42);
   background: rgba(246, 187, 72, 0.055);
@@ -6980,6 +7041,16 @@ a:not(.nav-link):not(.action-link):not(.action-button):focus {
   color: #9fb6ff;
   border-color: rgba(159, 182, 255, 0.38);
   background: rgba(159, 182, 255, 0.09);
+}
+
+.xwatch-system-badge {
+  padding: 2px 6px;
+  border: 1px solid rgba(156, 255, 87, 0.36);
+  border-radius: 999px;
+  color: #9cff57;
+  background: rgba(156, 255, 87, 0.08);
+  font-size: 10px;
+  font-weight: 900;
 }
 
 .xwatch-source-main b,
@@ -13610,6 +13681,13 @@ button.onchain-trench-social-button {
   background: rgba(241, 234, 215, 0.025);
 }
 
+.onchain-trench-social-tool.is-person > .onchain-trench-social-button {
+  color: #ffdf74;
+  border-color: rgba(255, 197, 70, 0.58);
+  background: rgba(255, 197, 70, 0.11);
+  box-shadow: 0 0 12px rgba(255, 197, 70, 0.1);
+}
+
 .onchain-trench-hover-card {
   position: absolute;
   top: calc(100% + 9px);
@@ -13710,6 +13788,23 @@ button.onchain-trench-social-button {
   color: rgba(245, 241, 230, 0.48);
   font-size: 8px;
   line-height: 1.55;
+}
+
+.onchain-trench-hover-card.is-person-card {
+  width: min(420px, calc(100vw - 72px));
+  border-color: rgba(255, 197, 70, 0.42);
+  background: #1b1a12;
+}
+
+.onchain-trench-hover-card.is-person-card::before {
+  border-color: rgba(255, 197, 70, 0.42) transparent transparent rgba(255, 197, 70, 0.42);
+}
+
+.onchain-trench-hover-card.is-person-card > small {
+  display: block;
+  margin-bottom: 8px;
+  color: rgba(255, 226, 122, 0.68);
+  font-size: 9px;
 }
 
 .onchain-trench-price {
@@ -14498,6 +14593,86 @@ div.onchain-trench-ai {
 
 .onchain-research-head .onchain-research-recall b {
   color: var(--amber);
+}
+
+.onchain-research-mode-switch {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(360px, 0.85fr);
+  gap: 12px;
+  align-items: center;
+  margin: 0 14px;
+  padding: 10px 12px;
+  border: 1px solid rgba(246, 187, 72, 0.24);
+  border-radius: 7px;
+  background: linear-gradient(100deg, rgba(246, 187, 72, 0.08), rgba(35, 201, 154, 0.035));
+}
+
+.onchain-research-mode-switch > div:first-child {
+  min-width: 0;
+}
+
+.onchain-research-mode-switch > div:first-child b,
+.onchain-research-mode-switch > div:first-child span {
+  display: block;
+}
+
+.onchain-research-mode-switch > div:first-child b {
+  margin-bottom: 3px;
+  color: var(--amber);
+  font-size: 11px;
+}
+
+.onchain-research-mode-switch > div:first-child span {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.onchain-research-mode-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.onchain-research-mode-options button {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  text-align: left;
+  background: rgba(0, 0, 0, 0.24);
+  cursor: pointer;
+}
+
+.onchain-research-mode-options button b {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.onchain-research-mode-options button span {
+  overflow: hidden;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.onchain-research-mode-options button.active {
+  border-color: rgba(246, 187, 72, 0.78);
+  color: #171107;
+  background: linear-gradient(135deg, #ffd16a, var(--amber));
+  box-shadow: 0 0 0 1px rgba(246, 187, 72, 0.16);
+}
+
+.onchain-research-mode-options button.active b {
+  color: #171107;
+}
+
+.onchain-research-mode-options button:disabled {
+  cursor: wait;
+  opacity: 0.65;
 }
 
 .onchain-research-networks {
@@ -19241,6 +19416,10 @@ div.onchain-trench-ai {
 
   .onchain-research-head .onchain-research-recall {
     grid-column: 1 / -1;
+  }
+
+  .onchain-research-mode-switch {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .onchain-research-funnel {

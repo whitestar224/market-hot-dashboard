@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from alert_delivery import AlertDeliveryStore, VisibleTimer
 from alert_audio import speech_script
+from monitor_exclusion_db import persist_global_monitor_exclusion
 
 
 def popup_is_uncovered(root) -> bool:
@@ -98,6 +99,7 @@ AUTO_CLOSE_MS = max(
 )
 MIN_AUTO_CLOSE_MS = 60 * 1000
 MAX_AUTO_CLOSE_MS = 2 * 60 * 60 * 1000
+MONITOR_EXCLUSION_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
 
 
 def clamp_text(value: object, limit: int) -> str:
@@ -329,6 +331,51 @@ def post_price_watch_exclusion(
     if not isinstance(payload, dict) or not payload.get("ok"):
         raise RuntimeError(str(payload.get("error") if isinstance(payload, dict) else "剔除失败"))
     return payload
+
+
+def local_monitor_db_path() -> Path:
+    configured = str(os.getenv("XINGYUN_RUNTIME_DIR") or "").strip()
+    runtime_dir = Path(configured).expanduser().resolve() if configured else ROOT / ".runtime-cache"
+    return runtime_dir / "xingyunshe_auth.db"
+
+
+def alert_monitor_symbol(payload: dict) -> str:
+    explicit = str(payload.get("excludeSymbol") or payload.get("confirmSymbol") or "").strip().upper()
+    if explicit:
+        return explicit
+    parts = str(payload.get("key") or "").split(":")
+    if len(parts) < 2 or parts[0].casefold() != "price-watch":
+        return ""
+    special = {
+        "fib", "oversold", "dragon-wave", "dragon-wave-secondary",
+        "dragon-wave-secondary-prearm", "dragon-wave-prearm", "structure-first",
+    }
+    index = 2 if len(parts) > 2 and parts[1].casefold() in special else 1
+    return parts[index].strip().upper() if len(parts) > index else ""
+
+
+def persist_local_permanent_exclusion(symbol: str, delivery_metadata: dict | None = None) -> dict:
+    """Write the tombstone outside the busy monitor process, then close live outbox rows."""
+    safe_symbol = str(symbol or "").strip().upper()
+    if not re.fullmatch(r"[^\s:]{1,32}", safe_symbol):
+        raise ValueError("币种代码无效")
+    now_ms = int(time.time() * 1000)
+    persist_global_monitor_exclusion(
+        local_monitor_db_path(),
+        safe_symbol,
+        now_ms,
+        MONITOR_EXCLUSION_RETENTION_MS,
+        timeout_seconds=0.75,
+    )
+    suppressed = []
+    metadata = delivery_metadata if isinstance(delivery_metadata, dict) else {}
+    if metadata.get("db"):
+        store = AlertDeliveryStore(metadata["db"])
+        suppressed = store.suppress_matching(
+            lambda item: alert_monitor_symbol(item) == safe_symbol,
+            "标的已被永久移出监控系统",
+        )
+    return {"ok": True, "symbol": safe_symbol, "excludedAt": now_ms, "suppressed": len(suppressed)}
 
 
 def payload_image_path(payload: dict) -> tuple[Path | None, Path | None]:
@@ -823,10 +870,21 @@ def show_popup(payload: dict, slot: int) -> int:
             return
         exclusion_state["running"] = True
         exclusion_state["mode"] = "temporary" if selected_action == "temporary_exclude" else "permanent"
-        exclude_btn.configure(text="剔除中", state="disabled")
+        exclude_btn.configure(text="剔除已提交", state="disabled")
         close_btn.configure(state="disabled")
+        # The request keeps retrying in this process, but the operator should
+        # not have to stare at a blocked popup while a busy monitor server gets
+        # CPU time.  Withdraw instead of destroying so the worker can finish.
+        root.after(120, lambda: root.withdraw() if exclusion_state["running"] and not closing else None)
 
         def worker() -> None:
+            if exclusion_state["mode"] == "permanent":
+                try:
+                    persist_local_permanent_exclusion(exclude_symbol, payload.get("_delivery"))
+                    root.after(0, lambda: show_exclusion(True))
+                    return
+                except Exception as exc:
+                    print(f"local permanent exclusion is falling back to HTTP: {exc}", file=sys.stderr)
             attempt = 0
             while exclusion_state["running"] and not closing:
                 try:

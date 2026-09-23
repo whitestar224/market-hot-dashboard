@@ -2,6 +2,7 @@ import gc
 import tempfile
 import time
 import unittest
+from collections import deque
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,17 +11,25 @@ import server
 
 class PriceWatchPriorHighExclusionTests(unittest.TestCase):
     def setUp(self):
-        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        handle.close()
-        self.db_path = Path(handle.name)
+        self.runtime_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.runtime_dir.name) / "auth.db"
         self.original_db_path = server.AUTH_DB_PATH
         server.AUTH_DB_PATH = self.db_path
         server.init_auth_db()
+        self.runtime_patchers = [
+            patch.object(server, "ALERT_DELIVERY_STORE", server.AlertDeliveryStore(Path(self.runtime_dir.name) / "alerts.sqlite")),
+            patch.object(server, "DESKTOP_ALERT_QUEUE", deque()),
+            patch.object(server, "DESKTOP_ALERT_DELIVERIES", {}),
+        ]
+        for patcher in self.runtime_patchers:
+            patcher.start()
 
     def tearDown(self):
+        for patcher in reversed(self.runtime_patchers):
+            patcher.stop()
         server.AUTH_DB_PATH = self.original_db_path
         gc.collect()
-        self.db_path.unlink(missing_ok=True)
+        self.runtime_dir.cleanup()
 
     def insert_asset(self, symbol="TEST"):
         now_ms = int(time.time() * 1000)

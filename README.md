@@ -47,7 +47,7 @@
 
 ### 本地后台稳定运行
 
-Windows 双击 `启动后台服务.cmd`（或 `python service_guard.py start`），后台守护独立运行，关闭启动窗口不会停止服务。使用 `停止后台服务.cmd` 明确停止，守护不会重新拉起；`查看服务状态.cmd` 查看运行状态。
+桌面版启动时会随项目服务一并启用守护：后端异常退出会在原端口自动恢复，退出桌面项目时守护和后端同时停止，不需要另装计划任务或单独运行守护。仅在不启动桌面端、需要浏览器模式时，才使用 `启动后台服务.cmd`；该窗口就是项目服务本身，关闭后不会遗留独立守护。`停止后台服务.cmd` 和 `查看服务状态.cmd` 分别用于停止与查看该模式。
 
 守护只管理自己启动的服务进程：意外退出按 2–60 秒退避恢复；启动宽限 180 秒后，连续 6 次存活探测失败才重启。探测不等待数据库、行情或 AI。重复启动会提示端口占用，不会抢占其他服务或重复启动监控。日志按大小轮换，保存在 `.runtime-cache/service/`。直接运行 `python server.py` 仍可用于前台调试，但不带进程守护。断电、系统休眠或外部终止守护本身仍会中断运行，不能保证绝对不停机。
 
@@ -73,6 +73,8 @@ Windows 双击 `启动后台服务.cmd`（或 `python service_guard.py start`）
 - **GMGN 热搜榜**：热门榜页面直接读取 GMGN Hot Search API，支持综合榜、`1m / 5m / 1h / 6h / 24h` 周期，以及 ETH、SOL、Robinhood、ARC、Base、BSC 等链切换；榜单保留币种头像、合约、价格、热度、流动性和成交数据。
 - **GMGN 战壕**：监控中心单独提供战壕子页面，只读取 GMGN 的已迁移 / Completed 项目，按开盘时间从新到旧滚动展示，默认首屏 10 个，并保留服务运行期间接收过的历史新币。六条链分别使用对应筛选条件后再合并展示；支持的链上标的点击币种名称或币安图标即可直达对应的 Binance Web3 合约页，沿用当前浏览器已有登录会话，不读取或传输本机 token。
 - **叙事与原帖**：战壕标的旁显示币安 AI 叙事分析入口；X 图标、网页链接、媒体和搜索入口按需展示，鼠标悬停 X 图标时才加载对应原帖与媒体，避免一次性请求过多。
+- **人物信号**：对战壕新币的重要人物点名、转发、引用和可核验关注记录做事件先行匹配；回复/评论不纳入。来源收敛为 49 位可能直接引发币价、板块或全市场剧烈波动的核心人物，同时保留 80 个项目、交易所、公链及钱包官方账号；普通 CEO、一般研究者、普通议员不进入人物弹窗通道。所有候选关系都必须经过 JEV 快速语义判断，确认原始动作确实指向该币后才进入 V4.9 人物催化账、投研和播报；普通词、工具、公司、同名项目、评论区和被引用者的话不会因字符串相同而误报。战壕页和热门榜的“人”图标悬停可查原始动态。
+- **市场主线**：每轮扫链先基于同一时间截面的跨资产强弱、成交与流动性迁移、链上资金、独立事件/产品催化和跨平台注意力，识别当下 1–3 条主线及 emerging / accelerating / consensus / crowded / rotating / fading 阶段；再判断每个新币是主线龙头、主线成员、分支扩散、补涨、独立催化、逆主线、蹭热点或尚不确定。主线不是白名单，独立强催化仍可入选，主线标的也不能绕过身份、龙头、买盘、生存率和执行风险。
 - **限频与故障恢复**：GMGN 公共只读请求使用全局最小间隔、按链缓存、过期缓存和 429 冷却；页面刷新、分页和多标签页不会重复请求同一份数据。网络或限频时，热搜榜可展示最后成功数据，战壕页面明确标记当前在线来源状态。
 - **播报策略**：GMGN 热门榜新进只更新榜单和历史，不触发桌面弹窗或语音播报；榜单数据、头像和手动查看功能不受影响。GMGN 战壕也不会因为单纯进入榜单就自动发出交易提醒。
 
@@ -242,7 +244,10 @@ X 官方 API 当前按费用政策默认硬停用，日常追踪使用 RSS、FxT
 - `CODEX_CLI_TIMEOUT` / `CODEX_CLI_FAILURE_COOLDOWN`：Codex CLI 超时和失败熔断时间，默认为 90 秒和 300 秒。
 - `CODEX_CLI_MODEL` / `CODEX_CLI_REASONING_EFFORT`：备用模型与推理强度，默认使用 `gpt-5.6-luna` 和 `low`。
 - `CODEX_CLI_CA_MODEL` / `CODEX_CLI_CA_REASONING_EFFORT`：群聊新 CA 的身份与叙事检索专用配置，默认使用 `gpt-6-astra` 和 `high`；该通道开启只读联网搜索、不设固定分析时限，完成前页面保持“分析中”。
-- `CODEX_CLI_ONCHAIN_MODEL` / `CODEX_CLI_ONCHAIN_REASONING_EFFORT`：扫链新币的完整 V4.3 投研专用配置，默认使用 `gpt-6-astra` 和 `high`；仅对进入研究队列的候选开启只读联网检索，不给每个原始垃圾池消耗高智能分析。本地通道使用已登录 Codex 账户额度，并非离线免费模型。
+- `TYPESAFE_API_KEY` / `TYPESAFE_DEFAULT_MODEL`：JEV 是快速判断通道的主模型，默认 `jev-latest`；只要 JEV 可用，最终优先级和展示结论都以 JEV 为准。Key 只保存在忽略提交的本地 `.env`，请求由后端直连 `api.typesafe.ai`，不会下发到浏览器；新币主判使用 `JEV_DECISION_TIMEOUT_SECONDS` / `JEV_DECISION_CONCURRENCY`，人物推文与币种的语义指向使用独立的 `JEV_SEMANTIC_TIMEOUT_SECONDS` / `JEV_SEMANTIC_CONCURRENCY`（默认 10 秒、串行 1）。后者按“推文 + 合约”缓存，普通词、工具、公司或同名项目不会因为字符串相同而成为人物信号；AI 不可用或不确定时默认不弹窗。
+- `rapid_decision_training.py`：从持久化的 V4.9 深研结果导出按发现时间切分的训练 JSONL，不随机打散，防止未来数据穿越。标签不足时仅积累和影子对比；达到 300 条且每类至少 30 条后才训练下游校准器。
+- `CODEX_CLI_ONCHAIN_MODEL` / `CODEX_CLI_ONCHAIN_REASONING_EFFORT`：Codex 完整 V4.9 深研默认使用 `gpt-6-astra` 和 `high` 并开启只读联网检索。投研页同时保留“快速实时（JEV 主判）”“Codex 实时深研”“Codex 每小时深研”三档，默认是每小时档；旧版二档设置会自动迁移到该默认值，之后的手动选择会持久保存。V4.9 XMind 保存在 `C:\Users\ZhuanZ1\Desktop\交易\社区\框架\链上投研体系_V4.9.xmind`，旧版文件保留不覆盖。
+- `ONCHAIN_HOURLY_RESEARCH_SETTLE_SECONDS` / `ONCHAIN_HOURLY_RESEARCH_BATCH_SIZE` / `ONCHAIN_HOURLY_RESEARCH_CONCURRENCY` / `ONCHAIN_HOURLY_RESEARCH_MAX_ROWS`：每小时档默认在整点后等待 300 秒，只领取上一封闭小时首次接收的 GMGN 战壕新币；默认两路 Codex 并发、每路每批 4 个，持续跑完并持久记录小时游标。并发可配置为 1–5 路，重启不会重复完成批次，Codex 暂忙则保留重试。`ONCHAIN_HOURLY_RESEARCH_ALERT_MAX_AGE_MINUTES` 默认 90 分钟，只允许当前上一小时的高潜结果提醒，历史补算不补弹窗。
 - `CODEX_CLI_EXPLANATION_MODEL` / `CODEX_CLI_EXPLANATION_REASONING_EFFORT` / `CODEX_CLI_EXPLANATION_TIMEOUT_SECONDS`：解释推文专用配置，默认 `gpt-5.6-sol`、`medium`；比普通后台分析提高一档，但不使用更高的 Astra / high 档位。超时默认值为 `0`，表示后台不设固定分析上限，完成后再显示结果。
 - `CODEX_CLI_MAX_ROWS_PER_REQUEST`：每批最多交给 Codex CLI 解析的榜单行数，默认 24；页面按批次渐进回填，避免后面的榜单被遗漏或整页长时间等待。
 - `SELF_OPTIMIZATION_INTERVAL_SECONDS`：系统只读自检间隔，默认 1800 秒；`SELF_OPTIMIZATION_SUGGESTION_COOLDOWN_SECONDS` 控制同类建议的去重冷却期。
@@ -268,6 +273,7 @@ X 官方 API 当前按费用政策默认硬停用，日常追踪使用 RSS、FxT
 - `GMGN_READONLY_MIN_INTERVAL_SECONDS`：所有 GMGN 公共只读请求的全局最小间隔，默认 1 秒。
 - `GMGN_TRENCHES_CACHE_TTL_SECONDS`：战壕按链复用缓存的时间，默认 60 秒；翻页、筛选和多标签页不会重复打到 GMGN。
 - `GMGN_READONLY_STALE_SECONDS`：热搜等低频榜单在限频或网络异常时允许继续展示最后成功数据的时间，默认 600 秒。战壕实时数据不读磁盘旧响应。429 冷却状态会保存在 `.runtime-cache`，服务重启不会立即再次撞限频。
+- `TRENCH_PERSON_REQUEST_MIN_INTERVAL_SECONDS`：人物动态公开源的全局最小请求间隔，默认 45 秒，每次只读一个账号；49 位核心人物与 80 个官方账号仍保持单请求串行，不会按账号数并发放大。核心人物、项目官方分层轮转，与当前战壕币叙事直接相关的来源优先，未访问来源有公平调度保护，失败时指数退避。所有召回关系都必须再经过 Jev 快速语义判断；`TRENCH_PERSON_SEMANTIC_CACHE_HOURS` 默认缓存 168 小时，失败重试间隔默认 120 秒，避免同一推文与合约反复请求。可用 `TRENCH_PERSON_SOURCE_LIMIT`、`TRENCH_PERSON_DEFAULT_REFRESH_SECONDS`、`TRENCH_PERSON_OFFICIAL_REFRESH_SECONDS`、`TRENCH_PERSON_SECONDARY_REFRESH_SECONDS`、`TRENCH_PERSON_RELEVANT_REFRESH_SECONDS` 和 `TRENCH_PERSON_POST_MAX_AGE_SECONDS` 调整。该通道只用免费公开时间线，不会扩大已限定为个人账号的 X 付费 API 权限。
 - `ONCHAIN_RESEARCH_ENRICH_LIMIT`：每条链每轮交给 DEX Screener 补全的数据量，默认 90。
 - `ONCHAIN_BSC_RPC_URLS`：BSC 只读 RPC 备用节点列表；每 5 秒增量读取 Flap / Four.meme 的创建事件，保存区块游标，失败后从原位置继续补读。
 - `XINGYUN_DISABLE_CHAIN_ECOSYSTEM_MONITOR`：设为 `1` 可暂停链上投研后台扫描。
@@ -275,9 +281,9 @@ X 官方 API 当前按费用政策默认硬停用，日常追踪使用 RSS、FxT
 
 ## 链上投研
 
-在“监控 → 链上投研”中可查看三阶段公链列表、L0-L3 细分市场、每个市场 Top5、潜在发币池及证据来源。新币通过最近新池列表、BSC 发射平台创建事件、群聊/X 合约线索增量进入后台。系统按“链 + 合约”去重；首次发现、首次筛选、AI 完成时间独立记录。行情尚未收录的合约保留重试，收到成交数据后再分流 Meme / 项目候选。所有初筛达标标的进入持久化 AI 队列，不受前 8 名、前 40 名或发现后 15 分钟截止影响；每批最多 2 个，兼顾最早等待与新证据。极强量价且经双行情源确认的候选会先进入“链上爆发 · 叙事待核验”，但不触发正式精选弹窗。AI 首判不再设置分析时长上限，完成后再展示；一分钟只作为观测指标，不再中断分析。
+在“监控 → 链上投研”中可查看三阶段公链列表、L0-L3 细分市场、每个市场 Top5、潜在发币池及证据来源。今日投研严格以页面 GMGN 战壕榜的新币为候选池，并提供三种并存模式：快速实时、Codex 实时深研、Codex 每小时深研。V4.9 会对每个 CA 反查最近 0–72 小时强热点，并把官方身份、热点炒作机会、执行安全拆成三本独立账；非官方但高度贴合热点且有真实买盘/传播/入口承接的标的可升级为 P0/P1 并参与龙头竞争，但不能越过致命执行风险。普通结果静默入档，只有体系明确判断真正值得看的正向标的才弹窗，投研弹窗不做语音。
 
-研究清单只展示 AI 复核且有具体叙事证据的标的，每页 12 个，显示总数并可翻页；分页不裁掉候选或影响后台分析。每个候选先生成整套 V4.3 事实快照，再进行联网深研：覆盖公链语境、资产身份与报价资产、最早交易场所、S0-S8/SX 状态迁移、Firstness、Blue Box P0 首个官方资产、多路径龙头路由、母案例信号、最小注意力单元、四类新颖性、跨形态接力、分发继承、首批付费买家、资金根与加速度、动态龙头、Quote Migration、非 MEME 机制路由、身份/时间/供应审计、Action Window、历史类比和可证伪条件。完整研究卡把发现分、状态加分、元叙事分、机会分、龙头分、执行分与风险分分账展示。量化初筛、纯放量或币名联想不能单独构成推荐。无依据、AI 淘汰及尚未分析只显示统计；推荐撤回保留原结论与原因。结果持久复用，行情刷新不重跑 AI，来源或状态发生实质变化才触发增量复核；旧版短评只做一次升级。
+研究清单只展示 AI 复核且有具体叙事证据的标的，每页 12 个，显示总数并可翻页；分页不裁掉候选或影响后台分析。每个候选先生成整套 V4.9 事实快照，再进行联网深研：新增 Hotspot-Derived CA、0–72h 热点双向扫描、Mapping Fit、P0/P1 hotspot override、同热点全量竞争 CA 与动态 Current Real Leader，同时继续覆盖市场主线、人物催化、Meta 家族、生存率、四条生命线、执行和风险。官方性只决定身份描述，不再否决热点机会；假官方与致命合约风险仍由独立账本阻断执行。
 
 律动快讯明确提及某链代币时，会把同链同名且有行情的候选加入题材复核。新闻未给合约时明确标为关联待核验，不能仅凭同名推定官方身份；这些待核验关系不会触发强机会弹窗。桌面弹窗只允许证据受支持、完整研究卡明确判定为“大金狗潜力”或“龙头潜力”，且机会分、龙头分和解释完整度同时过线的候选；普通 strong、watch、纯量价爆发、资料不足和重复机会不播报。机会与执行风险相互独立：高潜候选即使因合约风险被标为 BLOCK 也可作研究提醒，但弹窗会明确显示“仅研究，不可直接执行”，并打开本地投研页而不是交易页。
 

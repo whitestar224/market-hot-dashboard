@@ -1,13 +1,27 @@
 const rankingMode = document.body.dataset.rankingMode === "turnover" ? "turnover" : "gainers";
 const RANKING_API = rankingMode === "gainers" ? "/api/gainers-rankings" : "/api/turnover-rankings";
 const MARKET_CACHE_KEY = "xingyunshe:market-hot:payload:v2";
-const RANKING_CACHE_KEY = `xingyunshe:ranking:${rankingMode}:payload:v4`;
+const RANKING_CACHE_KEY = `xingyunshe:ranking:${rankingMode}:payload:v5`;
+const BINANCE_GAINERS_MODE_KEY = "xingyunshe:gainers:binance-market:v1";
+const BINANCE_GAINERS_SOURCE_MODES = Object.freeze({
+  "binance-gainers": "spot",
+  "binance-futures-gainers": "futures"
+});
+
+function storedBinanceGainersMode() {
+  try {
+    return localStorage.getItem(BINANCE_GAINERS_MODE_KEY) === "futures" ? "futures" : "spot";
+  } catch {
+    return "spot";
+  }
+}
 
 const state = {
   filter: "all",
   query: "",
   rows: [],
   sources: [],
+  binanceGainersMode: storedBinanceGainersMode(),
   isLoading: false,
   lastRequestedAt: 0
 };
@@ -311,6 +325,12 @@ function isStockGroup(group) {
   return group === "hk" || group === "us" || group === "cn";
 }
 
+function sourceMatchesBinanceGainersMode(source) {
+  if (rankingMode !== "gainers") return true;
+  const sourceMode = BINANCE_GAINERS_SOURCE_MODES[String(source?.id || "")];
+  return !sourceMode || sourceMode === state.binanceGainersMode;
+}
+
 function displayAssetName(row) {
   return isStockGroup(row?.group) ? row.name || row.symbol || "--" : row.symbol || row.name || "--";
 }
@@ -331,7 +351,9 @@ function rowMatchesQuery(row) {
 }
 
 function rankedRows(scope = "all") {
-  let rows = state.rows.filter(rowMatchesQuery);
+  let rows = state.rows
+    .filter((row) => sourceMatchesBinanceGainersMode({ id: row.sourceId }))
+    .filter(rowMatchesQuery);
   if (scope === "crypto") rows = rows.filter((row) => row.group === "crypto" || row.group === "aicoin");
   else if (scope === "stock") rows = rows.filter((row) => isStockGroup(row.group));
   else if (scope !== "all") rows = rows.filter((row) => row.group === scope);
@@ -349,6 +371,7 @@ function rankedRows(scope = "all") {
 }
 
 function sourceMatchesFilter(source) {
+  if (!sourceMatchesBinanceGainersMode(source)) return false;
   if (state.filter === "all") return true;
   if (state.filter === "crypto") return source.group === "crypto" || source.group === "aicoin";
   if (state.filter === "stock") return isStockGroup(source.group);
@@ -400,7 +423,8 @@ function buildSourceBoards() {
         subtitle: sourceSubtitle(source),
         sourceLabel: source.sourceLabel,
         rows,
-        accent: source.accent || "#f6bb48"
+        accent: source.accent || "#f6bb48",
+        binanceGainersMode: BINANCE_GAINERS_SOURCE_MODES[String(source.id || "")] || ""
       };
     });
 }
@@ -496,14 +520,27 @@ function renderBoard(board, index) {
     ? board.rows.map((row, rowIndex) => renderRow(row, rowIndex, board)).join("")
     : `<div class="empty-state"><b>${modeConfig.empty}</b><span>可以切换市场筛选或刷新榜单。</span></div>`;
 
+  const headAction = board.binanceGainersMode
+    ? `<div class="board-head-actions is-binance-gainers-head">
+        <label class="board-period-control" aria-label="切换币安涨幅榜市场">
+          <span>市场</span>
+          <select data-binance-gainers-mode>
+            <option value="spot"${state.binanceGainersMode === "spot" ? " selected" : ""}>现货涨幅榜</option>
+            <option value="futures"${state.binanceGainersMode === "futures" ? " selected" : ""}>合约涨幅榜</option>
+          </select>
+        </label>
+        <strong>${board.rows.length || "--"}</strong>
+      </div>`
+    : `<strong>${board.rows.length || "--"}</strong>`;
+
   return `
-    <article class="board-card ranking-board" data-live-key="board:${escapeHtml(board.id || board.title)}" style="--accent: ${board.accent}; --delay: ${index * 45}ms">
+    <article class="board-card ranking-board${board.binanceGainersMode ? " is-binance-gainers-board" : ""}" data-live-key="board:${escapeHtml(board.id || board.title)}" style="--accent: ${board.accent}; --delay: ${index * 45}ms">
       <header class="board-head">
         <div>
           <p>${modeConfig.title}</p>
           <h3>${escapeHtml(board.title)}</h3>
         </div>
-        <strong>${board.rows.length || "--"}</strong>
+        ${headAction}
       </header>
       ${renderLeaderAnalysis(board)}
       <div class="rows">
@@ -609,6 +646,18 @@ nodes.filter?.addEventListener("click", (event) => {
 });
 
 nodes.refresh?.addEventListener("click", () => loadRankingData({ refresh: true }));
+
+nodes.grid?.addEventListener("change", (event) => {
+  const select = event.target.closest("select[data-binance-gainers-mode]");
+  if (!select) return;
+  state.binanceGainersMode = select.value === "futures" ? "futures" : "spot";
+  try {
+    localStorage.setItem(BINANCE_GAINERS_MODE_KEY, state.binanceGainersMode);
+  } catch {
+    // Local preference is optional.
+  }
+  render();
+});
 
 window.addEventListener("xingyun:rank-ai-toggle", () => {
   render();

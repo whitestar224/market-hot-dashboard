@@ -107,6 +107,8 @@ function compactSignal(signal, interval, lastIndex) {
     adaptiveMode: String(signal.adaptiveMode || ""),
     adaptiveLabel: String(signal.adaptiveLabel || ""),
     secondaryBreakoutHint: signal.secondaryBreakoutHint === true,
+    secondaryBreakoutPrearm: signal.secondaryBreakoutPrearm === true,
+    primaryAttemptId: String(signal.primaryAttemptId || ""),
     alertOnly: signal.alertOnly === true,
     barsAgo: Math.max(0, lastIndex - finite(signal.index)),
   };
@@ -118,16 +120,19 @@ function monitorFrame(result) {
   const fresh = (item) => finite(item?.index) >= lastIndex - 1;
   const buy = latest((result.signals || []).filter(fresh));
   const secondaryHint = latest((result.secondaryBreakoutHints || []).filter(fresh));
+  const secondaryPrearm = latest((result.secondaryBreakoutPrearms || []).filter(fresh));
   const pending = latest((result.pending || []).filter(fresh));
   const structure = latest((result.structures || []).filter((item) => {
     const endIndex = finite(item.endIndex ?? item.index);
     return endIndex >= lastIndex - 2;
   }));
-  const selected = buy || secondaryHint || pending || structure;
+  const selected = buy || secondaryHint || secondaryPrearm || pending || structure;
   const stage = buy
     ? (buy.multiTimeframeConfluence ? "多周期A+起爆" : "买点触发")
     : secondaryHint
       ? "二次突破提示"
+    : secondaryPrearm
+      ? "二次突破预判"
     : pending
       ? "预备起爆"
       : structure
@@ -151,6 +156,8 @@ function monitorFrame(result) {
       ? `${INTERVAL_LABELS[interval]} ${displayPattern(buy)}，${buy.multiTimeframeConfluence ? "相邻周期共振确认" : "策略买点已触发"}`
       : secondaryHint
         ? `${INTERVAL_LABELS[interval]} ${displayPattern(secondaryHint)}，红色B只作防洗踏空提醒`
+      : secondaryPrearm
+        ? `${INTERVAL_LABELS[interval]} ${displayPattern(secondaryPrearm)}，回踩完成后提前盯住二次突破位`
       : pending
         ? `${INTERVAL_LABELS[interval]} ${displayPattern(pending)}，等待真实突破触发`
         : structure
@@ -158,7 +165,9 @@ function monitorFrame(result) {
           : "当前尚无符合龙头起爆策略的高确定性结构",
     signal: buy ? compactSignal(buy, interval, lastIndex) : null,
     alertHint: !buy && secondaryHint ? compactSignal(secondaryHint, interval, lastIndex) : null,
-    pending: pending ? compactSignal(pending, interval, lastIndex) : null,
+    pending: secondaryPrearm
+      ? compactSignal(secondaryPrearm, interval, lastIndex)
+      : pending ? compactSignal(pending, interval, lastIndex) : null,
   };
 }
 
@@ -196,6 +205,7 @@ function analyzeMonitorPayload(input) {
       ...result,
       signals: (result.signals || []).map(decorate),
       secondaryBreakoutHints: (result.secondaryBreakoutHints || []).map(decorate),
+      secondaryBreakoutPrearms: (result.secondaryBreakoutPrearms || []).map(decorate),
       pending: (result.pending || []).map(decorate),
       rejected: (result.rejected || []).map(decorate),
     }));

@@ -113,9 +113,13 @@ class GlobalHotspotMonitorTests(unittest.TestCase):
             {**base, "metrics": {"liquidityUsd": 100, "volumeH1Usd": 10_000, "transactionsH1": 20}},
             snapshot=snapshot, now_ms=NOW,
         )["decision"], "watching")
-        self.assertEqual(server.global_hotspot_enrich_candidate(
+        risk_sample = server.global_hotspot_enrich_candidate(
             {**base, "decision": "filtered"}, snapshot=snapshot, now_ms=NOW
-        )["decision"], "filtered")
+        )
+        self.assertEqual(risk_sample["decision"], "shortlisted")
+        self.assertTrue(risk_sample["worthWatching"])
+        self.assertTrue(risk_sample["resonanceRiskSample"])
+        self.assertEqual(risk_sample["researchPriority"], 100)
         self.assertEqual(server.global_hotspot_enrich_candidate(
             {**base, "contractAddress": ""}, snapshot=snapshot, now_ms=NOW
         )["decision"], "watching")

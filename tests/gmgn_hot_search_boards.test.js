@@ -40,12 +40,15 @@ test("GMGN trench history is scrollable and uses the cached Binance AI narrative
   assert.match(css, /\.gmgn-trench-popover/);
   assert.match(css, /\.gmgn-trench-risk-note/);
   assert.match(css, /\.gmgn-trench-research-badge/);
+  assert.match(css, /\.gmgn-trench-person-badge/);
   assert.match(css, /\.gmgn-trench-hot-row\.is-research-pick/);
   assert.match(js, /function renderGmgnTrenchBoard/);
   assert.match(js, /严格按开盘时间倒序，首屏最新 10 个/);
   assert.match(js, /gmgn-trench-risk-note/);
   assert.match(js, /gmgn-trench-research-badge/);
-  assert.match(js, /V4\.4 好标的/);
+  assert.match(js, /gmgn-trench-person-badge/);
+  assert.match(js, /kind: "person"/);
+  assert.match(js, /V4\.7 好标的/);
   assert.match(js, /is-research-pick/);
   assert.match(js, /币安 AI 叙事/);
   assert.match(js, /sourceId === "gmgn-trenches"/);
@@ -62,9 +65,9 @@ test("GMGN trench history is scrollable and uses the cached Binance AI narrative
   assert.match(server, /"binanceWalletUrl": binance_wallet_contract_url/);
   assert.match(server, /gmgn_trenches_received_history\.json/);
   assert.match(server, /"excludeFromTotal": True/);
-  assert.match(html, /styles\.css\?v=111/);
+  assert.match(html, /styles\.css\?v=112/);
   assert.match(html, /market_total_board\.js\?v=3/);
-  assert.match(html, /app\.js\?v=36/);
+  assert.match(html, /app\.js\?v=37/);
   assert.match(js, /market-hot:payload:v15/);
 });
 

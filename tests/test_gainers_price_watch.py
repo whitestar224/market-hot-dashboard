@@ -7,6 +7,17 @@ from unittest.mock import patch
 import server
 
 
+class FakeResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self.payload
+
+
 class GainersPriceWatchTests(unittest.TestCase):
     def setUp(self):
         handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -38,10 +49,11 @@ class GainersPriceWatchTests(unittest.TestCase):
             ],
         }
 
-    def test_only_binance_and_okx_gainer_leaders_enter_both_monitor_pools(self):
+    def test_binance_spot_futures_and_okx_leaders_enter_both_monitor_pools(self):
         now_ms = 1_800_000_000_000
         sources = [
             self.source("binance-gainers", "AAA", "SHARED"),
+            self.source("binance-futures-gainers", "FUT", "AAA"),
             self.source("okx-gainers", "BBB", "SHARED"),
         ]
         with patch.object(server.time, "time", return_value=now_ms / 1000):
@@ -51,18 +63,42 @@ class GainersPriceWatchTests(unittest.TestCase):
             with (
                 patch.object(server, "price_watch_aicoin_source", return_value={"status": "unavailable", "rows": []}),
                 patch.object(server, "binance_wallet_4h_structure_rows", return_value=[]),
-                patch.object(server, "fetch_new_coin_low_market_activity", return_value={}),
+                patch.object(server, "fetch_new_coin_low_market_activity", return_value={}) as activity_fetch,
                 patch.object(server, "strategy_active_adaptive_contexts", return_value=[]),
             ):
                 structure = {row["symbol"]: row for row in server.price_structure_watch_rows()}
 
-        self.assertEqual(synced, 2)
-        self.assertEqual(set(public), {"AAA", "BBB"})
+        self.assertEqual(synced, 3)
+        self.assertEqual(set(public), {"AAA", "FUT", "BBB"})
         self.assertTrue(all(item["priorHighEnabled"] for item in public.values()))
         self.assertEqual(public["AAA"]["origin"], "binance-gainers")
+        self.assertEqual(public["FUT"]["origin"], "binance-futures-gainers")
         self.assertEqual(public["BBB"]["origin"], "okx-gainers")
         self.assertEqual(structure["AAA"]["structureMembershipSources"], ["Binance涨幅榜"])
+        self.assertEqual(structure["FUT"]["structureMembershipSources"], ["Binance合约涨幅榜"])
         self.assertEqual(structure["BBB"]["structureMembershipSources"], ["OKX涨幅榜"])
+        self.assertTrue(all(item["monitorPoolEnteredAt"] == now_ms for item in structure.values()))
+        self.assertTrue(all(item["structure1mEnabled"] for item in structure.values()))
+        self.assertTrue(all(item["structure1mMode"] == "auto-pool-day" for item in structure.values()))
+        activity_fetch.assert_not_called()
+
+    def test_binance_futures_gainers_use_public_usdt_contract_tickers(self):
+        payload = [
+            {"symbol": "FUTUSDT", "lastPrice": "2.5", "priceChangePercent": "28.4", "quoteVolume": "9000000"},
+            {"symbol": "LOWUSDT", "lastPrice": "1.2", "priceChangePercent": "12.1", "quoteVolume": "8000000"},
+            {"symbol": "BTCUSDT", "lastPrice": "100000", "priceChangePercent": "40", "quoteVolume": "900000000"},
+            {"symbol": "DOWNUSDT", "lastPrice": "1", "priceChangePercent": "-2", "quoteVolume": "100000"},
+            {"symbol": "NOTUSD", "lastPrice": "1", "priceChangePercent": "99", "quoteVolume": "100000"},
+        ]
+        with patch.object(server.requests, "get", return_value=FakeResponse(payload)) as request:
+            source = server.fetch_binance_futures_gainers()
+
+        self.assertEqual(source["id"], "binance-futures-gainers")
+        self.assertEqual(source["title"], "Binance 合约涨幅榜")
+        self.assertEqual([row["symbol"] for row in source["rows"]], ["FUT", "LOW"])
+        self.assertEqual(source["rows"][0]["change"], "+28.40%")
+        self.assertIn("/futures/FUTUSDT", source["rows"][0]["url"])
+        self.assertEqual(request.call_args.args[0], "https://fapi.binance.com/fapi/v1/ticker/24hr")
 
     def test_new_leaders_revoke_old_gainer_membership_but_keep_other_sources(self):
         now_ms = 1_800_000_000_000

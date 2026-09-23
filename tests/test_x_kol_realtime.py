@@ -80,6 +80,61 @@ class XKolRealtimeTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in payload["sources"]], ["x-alpha", "x-beta"])
         self.assertEqual({row["id"] for row in payload["items"]}, {"post-alpha", "post-beta"})
 
+    def test_legacy_manual_sources_are_merged_without_overwriting_newer_records(self):
+        global_payload = {"sources": [
+            {"handle": "legacy", "displayName": "Legacy"},
+            {"handle": "same", "displayName": "Old"},
+        ]}
+        user_file_payload = {"sources": [
+            {"handle": "old_user_kol", "displayName": "Old user KOL"},
+        ]}
+        database_payload = {"sources": [
+            {"handle": "same", "displayName": "Current"},
+        ]}
+
+        rows = server.merge_x_kol_manual_source_payloads(
+            global_payload, user_file_payload, database_payload
+        )
+        by_handle = {row["handle"].lower(): row for row in rows}
+
+        self.assertEqual(set(by_handle), {"legacy", "same", "old_user_kol"})
+        self.assertEqual(by_handle["same"]["displayName"], "Current")
+
+    def test_sources_view_adds_system_people_and_manual_override_wins(self):
+        manual = [{
+            "id": "x:alice",
+            "handle": "alice",
+            "displayName": "My Alice",
+            "category": "kol",
+            "keywords": [],
+            "enabled": True,
+            "createdAt": 1,
+        }]
+        system = [
+            {
+                "id": "trench-person:alice",
+                "handle": "alice",
+                "displayName": "System Alice",
+                "category": "notable",
+                "enabled": True,
+                "systemManaged": True,
+            },
+            {
+                "id": "trench-person:bob",
+                "handle": "bob",
+                "displayName": "Bob",
+                "category": "founder",
+                "enabled": True,
+                "systemManaged": True,
+            },
+        ]
+        with patch.object(server, "x_kol_system_person_sources", return_value=system):
+            rows = server.x_kol_sources_for_view({"id": 1}, manual_sources=manual)
+
+        self.assertEqual([row["handle"] for row in rows], ["alice", "bob"])
+        self.assertFalse(rows[0].get("systemManaged", False))
+        self.assertTrue(rows[1]["systemManaged"])
+
     def test_signature_ignores_refresh_timestamp_but_tracks_content(self):
         base = {
             "items": [{"id": "post-1", "publishedAt": 1234, "text": "first"}],

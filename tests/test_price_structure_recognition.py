@@ -82,6 +82,9 @@ class PriceStructureRecognitionTests(unittest.TestCase):
     def test_background_strategy_scan_is_seconds_not_three_minutes(self):
         self.assertLessEqual(server.PRICE_STRUCTURE_MONITOR_INTERVAL_SECONDS, 3)
 
+    def test_prearm_fixed_distance_starts_at_three_percent(self):
+        self.assertGreaterEqual(server.PRICE_STRUCTURE_PREARM_DISTANCE_PCT, 3.0)
+
     def test_fast_monitor_rotates_one_leader_and_preserves_the_other_cached_rows(self):
         rows = [
             {"symbol": "H", "name": "Humanity Protocol", "icon": ""},
@@ -415,6 +418,144 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         self.assertEqual([candidate["symbol"] for candidate in result], ["HEMI"])
         self.assertEqual(result[0]["grade"], "A+")
 
+    def test_prearm_candidates_also_watch_high_confidence_structure_resistance(self):
+        now_ms = 1_800_000_000_000
+        payload = {
+            "items": [{
+                "symbol": "BCH",
+                "provider": "Binance Futures",
+                "checkedAt": now_ms - 1_000,
+                "frames": [{
+                    "key": "1h",
+                    "label": "1小时",
+                    "pattern": "盘整突破",
+                    "stage": "结构观察",
+                    "confidence": 96,
+                    "resistance": 273.593,
+                    "signal": None,
+                    "alertHint": None,
+                    "pending": None,
+                }],
+                "broadcastEligibility": {"eligible": True, "allowedIntervals": []},
+            }],
+        }
+
+        with (
+            patch.object(server, "price_structure_latest_snapshot_payload", return_value=payload),
+            patch.object(server, "price_structure_excluded_symbols", return_value=set()),
+            patch.object(server, "price_structure_broadcast_allowed", return_value=True),
+            patch.object(server, "price_structure_alert_interval_allowed", return_value=True),
+        ):
+            result = server.price_structure_prearm_candidates(now_ms=now_ms)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["symbol"], "BCH")
+        self.assertEqual(result[0]["triggerPrice"], 273.593)
+        self.assertEqual(result[0]["sourceType"], "structure-resistance")
+        self.assertTrue(result[0]["id"].startswith("structure-watch:1h:"))
+
+    def test_secondary_breakout_prearm_survives_snapshot_candidate_extraction(self):
+        now_ms = 1_800_000_000_000
+        payload = {
+            "items": [{
+                "symbol": "BCH",
+                "provider": "Binance Futures",
+                "checkedAt": now_ms - 1_000,
+                "frames": [{
+                    "key": "1h", "label": "1小时", "stage": "二次突破预判",
+                    "confidence": 94, "signal": None, "alertHint": None,
+                    "pending": {
+                        "id": "bch-secondary-prearm", "interval": "1h",
+                        "pattern": "二次突破预判 · 盘整突破", "certainty": 94,
+                        "grade": "A", "triggerPrice": 100,
+                        "secondaryBreakoutPrearm": True,
+                        "primaryAttemptId": "bch-first-test",
+                    },
+                }],
+                "broadcastEligibility": {"eligible": True, "allowedIntervals": []},
+            }],
+        }
+
+        with (
+            patch.object(server, "price_structure_latest_snapshot_payload", return_value=payload),
+            patch.object(server, "price_structure_excluded_symbols", return_value=set()),
+            patch.object(server, "price_structure_broadcast_allowed", return_value=True),
+            patch.object(server, "price_structure_alert_interval_allowed", return_value=True),
+        ):
+            result = server.price_structure_prearm_candidates(now_ms=now_ms)
+
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result[0]["secondaryBreakoutPrearm"])
+        self.assertEqual(result[0]["primaryAttemptId"], "bch-first-test")
+        self.assertEqual(result[0]["sourceType"], "secondary-breakout-prearm")
+
+    def test_high_confidence_structure_resistance_uses_priority_refresh(self):
+        now_ms = 1_800_000_000_000
+        rows = [{"symbol": "BCH"}, {"symbol": "SLOW"}]
+        snapshots = [
+            {
+                "symbol": "BCH",
+                "checkedAt": now_ms - 11_000,
+                "frames": [{
+                    "key": "1h", "stage": "结构观察", "confidence": 96,
+                    "resistance": 273.593, "signal": None, "alertHint": None,
+                }],
+            },
+            {"symbol": "SLOW", "checkedAt": now_ms - 60_000, "frames": []},
+        ]
+
+        selected = server.price_structure_monitor_next_rows(
+            rows, snapshots, set(), 1, now_ms=now_ms
+        )
+
+        self.assertEqual([row["symbol"] for row in selected], ["BCH"])
+
+    def test_same_day_pool_entry_uses_priority_refresh(self):
+        now_ms = 1_800_000_000_000
+        rows = [
+            {"symbol": "OLDER"},
+            {"symbol": "TAKE", "structure1mMode": "auto-pool-day"},
+        ]
+        snapshots = [
+            {"symbol": "OLDER", "checkedAt": now_ms - 600_000, "frames": []},
+            {"symbol": "TAKE", "checkedAt": now_ms - 60_000, "frames": []},
+        ]
+
+        selected = server.price_structure_monitor_next_rows(
+            rows, snapshots, set(), 1, now_ms=now_ms
+        )
+
+        self.assertEqual([row["symbol"] for row in selected], ["TAKE"])
+
+    def test_same_day_pool_entry_keeps_quota_when_personal_x_backlog_is_unchecked(self):
+        now_ms = 1_800_000_000_000
+        entry_rows = [
+            {
+                "symbol": f"ENTRY{index}",
+                "structure1mMode": "auto-pool-day",
+                "monitorPoolEnteredAt": now_ms - index * 1_000,
+            }
+            for index in range(6)
+        ]
+        personal_x_rows = [
+            {
+                "symbol": f"XBACKLOG{index}",
+                "personalXPriority": True,
+                "structure1mMode": "auto-off",
+            }
+            for index in range(20)
+        ]
+
+        selected = server.price_structure_monitor_next_rows(
+            [*personal_x_rows, *entry_rows], [], set(), 8, now_ms=now_ms
+        )
+
+        entry_symbols = {row["symbol"] for row in entry_rows}
+        self.assertGreaterEqual(
+            len(entry_symbols.intersection({row["symbol"] for row in selected})),
+            4,
+        )
+
     def test_prearm_alert_forecasts_a_structure_inside_ten_minute_window(self):
         candidate = {
             "id": "hemi-5m-pending",
@@ -462,6 +603,43 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         self.assertTrue(result["queued"])
         self.assertIn("已进入临界触发区", launch.call_args.args[0]["body"])
 
+    def test_prearm_alert_fires_at_two_point_nine_percent_without_waiting_for_momentum(self):
+        candidate = {
+            "id": "bch-1h-structure", "symbol": "BCH", "provider": "Binance Futures",
+            "interval": "1h", "label": "1小时", "pattern": "盘整突破",
+            "triggerPrice": 100, "certainty": 96, "grade": "A+",
+            "broadcastEligibility": {"eligible": True, "allowedIntervals": []},
+        }
+        with (
+            patch.object(server, "price_structure_symbol_excluded", return_value=False),
+            patch.object(server, "launch_desktop_alert", return_value={"queued": True}) as launch,
+        ):
+            result = server.launch_price_structure_prearm_alert(candidate, {"price": 97.1})
+
+        self.assertTrue(result["queued"])
+        self.assertIn("距触发价仅 2.90%", launch.call_args.args[0]["body"])
+        self.assertIn("已进入临界触发区", launch.call_args.args[0]["body"])
+
+    def test_secondary_breakout_prearm_uses_its_own_title_and_dedupe_key(self):
+        candidate = {
+            "id": "bch-1h-secondary-prearm", "symbol": "BCH", "provider": "Binance Futures",
+            "interval": "1h", "label": "1小时", "pattern": "二次突破预判 · 盘整突破",
+            "triggerPrice": 100, "certainty": 94, "grade": "A",
+            "secondaryBreakoutPrearm": True, "primaryAttemptId": "bch-first-test",
+            "broadcastEligibility": {"eligible": True, "allowedIntervals": []},
+        }
+        with (
+            patch.object(server, "price_structure_symbol_excluded", return_value=False),
+            patch.object(server, "launch_desktop_alert", return_value={"queued": True}) as launch,
+        ):
+            result = server.launch_price_structure_prearm_alert(candidate, {"price": 97.1})
+
+        self.assertTrue(result["queued"])
+        alert = launch.call_args.args[0]
+        self.assertIn("二次突破预判", alert["title"])
+        self.assertIn("二次突破预判", alert["speech"])
+        self.assertIn("dragon-wave-secondary-prearm", alert["key"])
+
     def test_prearm_alert_skips_far_or_slow_structure(self):
         candidate = {
             "id": "slow-pending", "symbol": "H", "provider": "OKX Swap",
@@ -475,7 +653,7 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         ):
             result = server.launch_price_structure_prearm_alert(
                 candidate,
-                {"price": 97, "speedPctPerMinute": 0.1, "upRatio": 0.7},
+                {"price": 96.9, "speedPctPerMinute": 0.1, "upRatio": 0.7},
             )
 
         self.assertTrue(result["skipped"])
@@ -491,6 +669,27 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         health = server.health_payload()["monitors"]
         self.assertGreaterEqual(health["structurePrearmStatus"]["lastRunAt"], started_at)
         self.assertEqual(health["structurePrearmForecastMinutes"], 10)
+
+    def test_prearm_monitor_exposes_why_a_candidate_was_not_alerted(self):
+        candidate = {
+            "id": "bch-watch", "symbol": "BCH", "provider": "Binance Futures",
+            "interval": "1h", "label": "1小时", "pattern": "盘整突破",
+            "triggerPrice": 100, "certainty": 96, "grade": "A+",
+            "sourceType": "structure-resistance",
+            "broadcastEligibility": {"eligible": True, "allowedIntervals": []},
+        }
+        with (
+            patch.object(server, "price_structure_prearm_candidates", return_value=[candidate]),
+            patch.object(server, "price_structure_realtime_quote", return_value={}),
+            patch.object(server, "price_structure_symbol_excluded", return_value=False),
+            patch.object(server, "price_structure_broadcast_allowed", return_value=True),
+        ):
+            result = server.price_structure_prearm_monitor_once()
+
+        self.assertEqual(result["candidateSources"], {"structure-resistance": 1})
+        self.assertEqual(result["quoteFailures"], 1)
+        self.assertEqual(result["skipReasons"], {"quote unavailable": 1})
+        self.assertGreaterEqual(result["elapsedMs"], 0)
 
     def test_structure_only_frames_never_emit_a_desktop_alert(self):
         item = {
@@ -544,6 +743,77 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         self.assertEqual(alert["excludeSymbol"], "CHIP")
         self.assertEqual(alert["excludeLabel"], "剔除结构")
         self.assertEqual(alert["excludeAction"], "exclude_structure")
+
+    def test_secondary_hint_never_falls_back_to_a_first_observation(self):
+        current = {
+            "symbol": "BCH",
+            "provider": "Binance Futures",
+            "currentPrice": 322.43,
+            "checkedAt": int(time.time() * 1000),
+            "frames": [{
+                "key": "1h",
+                "label": "1小时",
+                "pattern": "二次突破提示",
+                "stage": "二次突破提示",
+                "confidence": 96,
+                "support": 262.4573,
+                "resistance": 273.593,
+                "signal": None,
+                "alertHint": {
+                    "id": "bch-late-secondary",
+                    "interval": "1h",
+                    "decisionTime": int(time.time() * 1000) - 3_600_000,
+                    "secondaryBreakoutHint": True,
+                    "alertOnly": True,
+                },
+            }],
+        }
+        with patch.object(server, "launch_desktop_alert") as launch:
+            count = server.launch_price_structure_first_observation_alerts(current, None)
+
+        self.assertEqual(count, 0)
+        launch.assert_not_called()
+
+    def test_first_observation_is_suppressed_after_price_has_already_taken_off(self):
+        current = {
+            "symbol": "BCH",
+            "provider": "Binance Futures",
+            "currentPrice": 322.43,
+            "checkedAt": int(time.time() * 1000),
+            "frames": [{
+                "key": "1h",
+                "label": "1小时",
+                "pattern": "盘整突破",
+                "stage": "结构观察",
+                "confidence": 96,
+                "support": 262.4573,
+                "resistance": 273.593,
+                "signal": None,
+                "alertHint": None,
+                "pending": None,
+            }],
+        }
+        with patch.object(server, "launch_desktop_alert") as launch, patch.object(
+            server, "claim_price_structure_observation_alert"
+        ) as claim:
+            count = server.launch_price_structure_first_observation_alerts(current, None)
+
+        self.assertEqual(count, 0)
+        claim.assert_not_called()
+        launch.assert_not_called()
+
+    def test_formal_trigger_is_suppressed_after_price_has_left_the_chase_window(self):
+        now_ms = int(time.time() * 1000)
+        signal = {
+            "id": "bch-1h-late",
+            "interval": "1h",
+            "decisionTime": now_ms,
+            "barsAgo": 0,
+            "triggerPrice": 273.593,
+        }
+        item = {"symbol": "BCH", "currentPrice": 322.43, "checkedAt": now_ms}
+
+        self.assertFalse(server.price_structure_signal_actionable_now(signal, item))
 
     def test_wallet_origin_first_structure_opens_wallet_token_page(self):
         current = {
@@ -962,6 +1232,41 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         self.assertEqual(item["provider"], "Binance Wallet K线")
         self.assertEqual(wallet_kline.call_count, len(server.PRICE_STRUCTURE_TIMEFRAMES))
         binance_futures.assert_not_called()
+
+    def test_entry_day_contract_prefers_binance_futures_before_wallet_kline(self):
+        market_rows = candles([0.1 + index * 0.001 for index in range(80)])
+        row = {
+            "symbol": "TAKE",
+            "chain": "56",
+            "contractAddress": "0xe747e54783ba3f77a8e5251a3cba19ebe9c0e197",
+            "monitorPoolEnteredAt": int(time.time() * 1000),
+        }
+        strategy_payload = {
+            "ok": True,
+            "strategyVersion": "shared-engine-live",
+            "frames": [],
+            "signals": [],
+            "alertHints": [],
+        }
+        with (
+            patch.object(
+                server,
+                "price_structure_candles_from_binance",
+                return_value=(market_rows, "Binance Futures"),
+            ) as binance_futures,
+            patch.object(server, "price_structure_candles_from_binance_wallet") as wallet_kline,
+            patch.object(
+                server,
+                "run_dragon_wave_monitor_strategy",
+                return_value=strategy_payload,
+            ),
+        ):
+            item = server.fetch_price_structure_item(row, fast_provider_probe=True)
+
+        self.assertEqual(item["provider"], "Binance Futures")
+        self.assertEqual(item["structure1mMode"], "auto-pool-day")
+        self.assertEqual(binance_futures.call_count, len(server.PRICE_STRUCTURE_TIMEFRAMES))
+        wallet_kline.assert_not_called()
 
     def test_recent_contract_asset_keeps_partial_timeframes_when_daily_history_is_not_ready(self):
         market_rows = candles([0.1, 0.11, 0.12])

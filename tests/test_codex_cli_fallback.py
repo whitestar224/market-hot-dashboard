@@ -27,6 +27,10 @@ class CodexCliFallbackTests(unittest.TestCase):
             self.assertEqual(settings["_analysisLane"], "startup")
             return response
 
+        def requeue_after_ready():
+            self.assertEqual(server.ai_startup_reconnect_snapshot()["status"], "ready")
+            return 4
+
         with (
             patch.object(server, "CODEX_CLI_UNAVAILABLE_UNTIL", 999999.0),
             patch.object(server, "LLM_API_UNAVAILABLE_UNTIL", 999999.0),
@@ -36,7 +40,7 @@ class CodexCliFallbackTests(unittest.TestCase):
             patch.object(server, "NEWS_TRADE_AI_RETRY_AFTER", {"news": 999999.0}),
             patch.object(server, "CHAIN_ECOSYSTEM_AI_RETRY_AFTER", {"chain": 999999.0}),
             patch.object(server, "deepseek_chat", side_effect=connected),
-            patch.object(server.ONCHAIN_FAST_RESEARCH, "retry_unavailable_after_ai_reconnect", return_value=4) as retry,
+            patch.object(server.ONCHAIN_FAST_RESEARCH, "retry_unavailable_after_ai_reconnect", side_effect=requeue_after_ready) as retry,
         ):
             result = server.ai_startup_reconnect_once()
 

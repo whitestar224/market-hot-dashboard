@@ -126,6 +126,45 @@ test("secondary breakout hint is exported as an alert-only red-B notification", 
   assert.equal(frame.alertHint.secondaryBreakoutHint, true);
 });
 
+test("secondary breakout prearm is exported before a generic pending setup", () => {
+  const frame = Bridge.monitorFrame({
+    interval: "1h",
+    candles: [
+      { time: 1, closeTime: 2, open: 97, high: 97.3, low: 96.8, close: 97.1, volume: 1 },
+    ],
+    signals: [],
+    pending: [{
+      id: "generic-pending",
+      index: 0,
+      time: 1,
+      decisionTime: 1,
+      pattern: "盘整突破",
+      certaintyScore: 93,
+      triggerPrice: 101,
+    }],
+    structures: [],
+    secondaryBreakoutHints: [],
+    secondaryBreakoutPrearms: [{
+      id: "second-prearm",
+      index: 0,
+      time: 1,
+      decisionTime: 1,
+      status: "secondary-prearm",
+      secondaryBreakoutPrearm: true,
+      alertOnly: true,
+      pattern: "二次突破预判 · 盘整突破",
+      certaintyScore: 94,
+      triggerPrice: 100,
+      primaryAttemptId: "first-test",
+    }],
+  });
+
+  assert.equal(frame.stage, "二次突破预判");
+  assert.equal(frame.pending.secondaryBreakoutPrearm, true);
+  assert.equal(frame.pending.primaryAttemptId, "first-test");
+  assert.equal(frame.pending.triggerPrice, 100);
+});
+
 test("strategy monitor exports the breakout candle low for unified stop-loss sizing", () => {
   const frame = Bridge.monitorFrame({
     interval: "1h",

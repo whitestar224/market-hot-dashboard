@@ -19,6 +19,19 @@ RUNTIME = ROOT / ".runtime-cache" / "service"
 STOP = RUNTIME / "manual-stop"
 STATE = RUNTIME / "status.json"
 LOCK = RUNTIME / "supervisor.lock"
+BENCHMARK_LEASE = RUNTIME / "rapid-benchmark-lease.json"
+
+
+def benchmark_lease_active(path=BENCHMARK_LEASE, now_ms=None):
+    """Allow a localhost model benchmark to temporarily outlive probes."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        active = int(payload.get("expiresAt") or 0) > int(now_ms or time.time() * 1000)
+        if not active:
+            path.unlink(missing_ok=True)
+        return active
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def acquire_lock(path=LOCK):
@@ -126,7 +139,7 @@ def supervise(host="127.0.0.1", port=8765):
                 good = bool(live and live.get("pid") == child.pid)
                 missed = 0 if good else missed + 1
                 save_state(status="running" if good else "recovering", pid=child.pid, restarts=restarts, port=port, failedProbes=missed)
-                if time.monotonic() - started > 180 and missed >= 6:
+                if time.monotonic() - started > 180 and missed >= 6 and not benchmark_lease_active():
                     logger.error("liveness failed repeatedly, restarting owned pid=%s", child.pid)
                     child.terminate()
                     stop_child(child, grace=5)
@@ -168,20 +181,13 @@ def main():
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     RUNTIME.mkdir(parents=True, exist_ok=True)
-    if args.action == "run":
+    if args.action in {"start", "run"}:
         return supervise(args.host, args.port)
     if args.action == "stop":
         STOP.touch()
         print("已请求手动停止；守护不会自动重新拉起。")
     elif args.action == "status":
         print(STATE.read_text(encoding="utf-8") if STATE.exists() else "尚未启动后台守护。")
-    else:
-        log = (RUNTIME / "launcher.log").open("ab")
-        with log:
-            process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "run", "--host", args.host, "--port", str(args.port)],
-                                      cwd=ROOT, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        print(f"已请求后台启动，守护进程 {process.pid}；状态可用 service_guard.py status 查询。")
     return 0
 
 

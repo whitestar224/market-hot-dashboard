@@ -8,6 +8,8 @@ const html = fs.readFileSync(path.join(root, "price-watch.html"), "utf8");
 const js = fs.readFileSync(path.join(root, "price-watch.js"), "utf8");
 const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
 const server = fs.readFileSync(path.join(root, "server.py"), "utf8");
+const monitorExclusionDb = fs.readFileSync(path.join(root, "monitor_exclusion_db.py"), "utf8");
+const exclusionBackend = `${server}\n${monitorExclusionDb}`;
 const chainMonitor = fs.readFileSync(path.join(root, "chain_ecosystem_monitor.py"), "utf8");
 
 test("strategy replacement preserves the original monitor card layout", () => {
@@ -55,11 +57,11 @@ test("removing from any pool creates one global monitor exclusion", () => {
   assert.match(server, /prior_high_absent_at/);
   assert.match(server, /restoreRule": "manual_readd_only"/);
   assert.match(server, /def exclude_monitor_symbol_globally/);
-  assert.match(server, /opportunity_manual_removed_at = \?/);
-  assert.match(server, /price_watch_oversold_alert_state/);
-  assert.match(server, /price_watch_fib_alert_state/);
-  assert.match(server, /DELETE FROM price_watch_alert_state WHERE symbol = \?/);
-  assert.match(server, /DELETE FROM price_watch_first_confirmations WHERE symbol = \?/);
+  assert.match(exclusionBackend, /opportunity_manual_removed_at = \?/);
+  assert.match(exclusionBackend, /price_watch_oversold_alert_state/);
+  assert.match(exclusionBackend, /price_watch_fib_alert_state/);
+  assert.match(exclusionBackend, /DELETE FROM price_watch_alert_state WHERE symbol = \?/);
+  assert.match(exclusionBackend, /DELETE FROM price_watch_first_confirmations WHERE symbol = \?/);
 });
 
 test("Binance Wallet 4h hot members also enter prior-high monitoring", () => {

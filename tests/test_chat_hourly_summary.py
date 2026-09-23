@@ -232,7 +232,7 @@ class ChatHourlySummaryTests(unittest.TestCase):
         self.assertIn("chatHourlySummaryTemplate", source)
         self.assertIn("闲聊与非币种英文词已过滤", source)
         self.assertIn("chat-hourly-rank-row", styles)
-        self.assertIn("price-watch.js?v=96", html)
+        self.assertIn("price-watch.js?v=106", html)
 
 
 if __name__ == "__main__":

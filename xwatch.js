@@ -296,15 +296,21 @@
     [...local, ...fromServer].forEach((source) => {
       const handle = normalizeHandle(source.handle || source.username || source.url);
       if (!handle) return;
-      map.set(sourceId(handle), {
-        id: sourceId(handle),
+      const key = handle.toLowerCase();
+      map.set(key, {
+        id: String(source.id || sourceId(handle)),
         handle,
         displayName: String(source.displayName || source.name || handle).trim() || handle,
         category: normalizeCategory(source.category || source.categoryId || source.categoryType),
         keywords: splitKeywords(source.keywords),
         enabled: source.enabled !== false,
         avatar: source.avatar || source.avatarUrl || fallbackAvatar(handle),
-        createdAt: Number(source.createdAt) || Date.now()
+        createdAt: Number(source.createdAt) || Date.now(),
+        systemManaged: Boolean(source.systemManaged),
+        readOnly: Boolean(source.readOnly || source.systemManaged),
+        sourceGroup: String(source.sourceGroup || ""),
+        personRole: String(source.personRole || ""),
+        watchTier: String(source.watchTier || "")
       });
     });
     state.sources = [...map.values()];
@@ -334,7 +340,7 @@
     try {
       const payload = await apiJson("/api/x-kol-sources", {
         method: "POST",
-        body: JSON.stringify({ sources: state.sources })
+        body: JSON.stringify({ sources: state.sources.filter((source) => !source.systemManaged) })
       });
       mergeSources(payload.sources);
       if (!silent) status("追踪列表已保存");
@@ -463,8 +469,9 @@
     const avatar = live.avatar || source.avatar || fallbackAvatar(source.handle);
     const initials = (displayName || source.handle || "X").slice(0, 2).toUpperCase();
     const isEditing = source.id === state.editingId;
+    const isSystem = Boolean(source.systemManaged);
     return `
-      <article class="xwatch-source-row${isEditing ? " is-editing" : ""}" data-source-id="${escapeHtml(source.id)}" data-state="${statusClass}">
+      <article class="xwatch-source-row${isEditing ? " is-editing" : ""}${isSystem ? " is-system" : ""}" data-source-id="${escapeHtml(source.id)}" data-state="${statusClass}">
         <button class="xwatch-source-avatar" type="button" data-action="filter" title="只看这个KOL">
           ${avatarMarkup(avatar, initials)}
         </button>
@@ -472,19 +479,20 @@
           <div class="xwatch-source-title">
             <b>${escapeHtml(displayName)}</b>
             <span class="xwatch-category-badge" data-category="${escapeHtml(normalizeCategory(source.category))}">${escapeHtml(categoryBadgeLabel(source.category))}</span>
+            ${isSystem ? '<span class="xwatch-system-badge">人物源</span>' : ""}
           </div>
-          <em>@${escapeHtml(source.handle)} · ${escapeHtml(live.provider || state.provider || "--")} · ${escapeHtml(live.itemsReturned ?? 0)}/${escapeHtml(live.fetchLimit ?? "--")}</em>
-          <input data-action="keywords" value="${escapeHtml((source.keywords || []).join(", "))}" placeholder="关注词，不裁剪动态" />
+          <em>@${escapeHtml(source.handle)} · ${escapeHtml(live.provider || (isSystem ? "共享低频监控" : state.provider) || "--")} · ${escapeHtml(source.personRole || "")}</em>
+          ${isSystem ? "" : `<input data-action="keywords" value="${escapeHtml((source.keywords || []).join(", "))}" placeholder="关注词，不裁剪动态" />`}
           ${live.error ? `<small>${escapeHtml(live.error)}</small>` : ""}
         </div>
-        <label class="xwatch-switch" title="启用/暂停">
+        ${isSystem ? "" : `<label class="xwatch-switch" title="启用/暂停">
           <input data-action="toggle" type="checkbox" ${source.enabled ? "checked" : ""} />
           <span></span>
-        </label>
-        <div class="xwatch-source-actions">
+        </label>`}
+        ${isSystem ? "" : `<div class="xwatch-source-actions">
           <button class="xwatch-edit" type="button" data-action="edit" title="编辑">编辑</button>
           <button class="xwatch-delete" type="button" data-action="delete" title="删除">×</button>
-        </div>
+        </div>`}
       </article>
     `;
   }
@@ -648,7 +656,7 @@
 
   function beginEdit(id) {
     const source = getSource(id);
-    if (!source) return;
+    if (!source || source.systemManaged) return;
     state.editingId = id;
     nodes.handle.value = source.handle || "";
     nodes.name.value = source.displayName || "";
@@ -674,18 +682,22 @@
     }
     const id = sourceId(handle);
     const previous = state.editingId ? getSource(state.editingId) : state.sources.find((source) => source.id === id);
+    const editablePrevious = previous?.systemManaged ? null : previous;
     const next = {
-      ...(previous || {}),
+      ...(editablePrevious || {}),
       id,
       handle,
       displayName: nodes.name.value.trim() || previous?.displayName || handle,
       category: normalizeCategory(nodes.category.value),
       keywords: splitKeywords(nodes.keywords.value),
-      enabled: previous?.enabled !== false,
+      enabled: editablePrevious?.enabled !== false,
       avatar: previous?.handle && normalizeHandle(previous.handle).toLowerCase() === handle.toLowerCase()
         ? (previous.avatar || fallbackAvatar(handle))
         : fallbackAvatar(handle),
-      createdAt: Number(previous?.createdAt) || Date.now()
+      createdAt: Number(editablePrevious?.createdAt) || Date.now(),
+      systemManaged: false,
+      readOnly: false,
+      sourceGroup: ""
     };
     const filtered = state.editingId ? state.sources.filter((source) => source.id !== state.editingId && source.id !== id) : state.sources.filter((source) => source.id !== id);
     state.sources = [...filtered, next];
@@ -709,6 +721,8 @@
     if (!row) return;
     const id = row.dataset.sourceId;
     const action = event.target.closest("[data-action]")?.dataset.action;
+    const source = getSource(id);
+    if (source?.systemManaged && ["delete", "edit"].includes(action)) return;
     if (action === "delete") {
       state.sources = state.sources.filter((source) => source.id !== id);
       if (state.editingId === id) cancelEdit();
@@ -731,6 +745,7 @@
     if (!row) return;
     const id = row.dataset.sourceId;
     const action = event.target.dataset.action;
+    if (getSource(id)?.systemManaged) return;
     if (action === "toggle") {
       updateSource(id, { enabled: event.target.checked });
       await saveSources({ silent: true });

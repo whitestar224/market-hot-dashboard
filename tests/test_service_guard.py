@@ -8,6 +8,13 @@ import service_guard as guard
 
 
 class ServiceGuardTests(unittest.TestCase):
+    def test_start_runs_supervisor_in_the_project_process(self):
+        with patch.object(guard, "supervise", return_value=17) as supervise, patch.object(
+            guard.sys, "argv", ["service_guard.py", "start", "--host", "127.0.0.1", "--port", "8765"]
+        ):
+            self.assertEqual(guard.main(), 17)
+            supervise.assert_called_once_with("127.0.0.1", 8765)
+
     def test_locked_status_file_never_kills_supervision(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(guard,'STATE',Path(directory)/'status.json'), patch.object(Path,'replace',side_effect=PermissionError('sharing violation')) as replace, patch.object(guard.time,'sleep'):
             self.assertFalse(guard.save_state(status='running',pid=123))

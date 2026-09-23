@@ -8,6 +8,11 @@ let mainWindow = null;
 let backendProcess = null;
 let backendPort = null;
 let backendUrl = null;
+let backendSpawnSpec = null;
+let backendRestartTimer = null;
+let backendRestartAttempts = 0;
+let backendStopping = false;
+let appIsQuitting = false;
 
 const PRODUCT_NAME = "星云社";
 const HEALTH_TIMEOUT_MS = 30000;
@@ -238,7 +243,70 @@ function spawnProcess(command, args, options) {
   return child;
 }
 
+function backendRestartDelay(attempt) {
+  return Math.min(60000, 2000 * (2 ** Math.max(0, attempt - 1)));
+}
+
+function launchManagedBackend() {
+  if (!backendSpawnSpec) {
+    throw new Error("后端服务启动参数尚未就绪。");
+  }
+  const { command, args, options } = backendSpawnSpec;
+  const child = spawnProcess(command, args, options);
+  backendProcess = child;
+  child.once("exit", (code, signal) => {
+    if (backendProcess === child) {
+      backendProcess = null;
+    }
+    if (backendStopping || appIsQuitting) {
+      return;
+    }
+    console.error(`[backend] 服务异常退出 code=${code} signal=${signal}; 将由项目自动恢复。`);
+    scheduleBackendRestart();
+  });
+  child.once("error", (error) => {
+    console.error(`[backend] 启动失败: ${error.message || error}`);
+  });
+  return child;
+}
+
+function scheduleBackendRestart() {
+  if (backendStopping || appIsQuitting || backendRestartTimer || backendProcess) {
+    return;
+  }
+  backendRestartAttempts += 1;
+  const delay = backendRestartDelay(backendRestartAttempts);
+  backendRestartTimer = setTimeout(async () => {
+    backendRestartTimer = null;
+    if (backendStopping || appIsQuitting || backendProcess) {
+      return;
+    }
+    try {
+      const child = launchManagedBackend();
+      const healthy = await waitForHealth(backendUrl);
+      if (healthy && backendProcess === child) {
+        backendRestartAttempts = 0;
+        console.log("[backend] 项目服务已自动恢复。");
+        return;
+      }
+      if (backendProcess === child) {
+        stopBackendChild(child);
+        backendProcess = null;
+      }
+      scheduleBackendRestart();
+    } catch (error) {
+      console.error(`[backend] 自动恢复失败: ${error.message || error}`);
+      scheduleBackendRestart();
+    }
+  }, delay);
+}
+
 async function startBackend() {
+  if (backendProcess && backendUrl) {
+    return backendUrl;
+  }
+  backendStopping = false;
+  backendRestartAttempts = 0;
   const root = dashboardRoot();
   const config = ensureDesktopDirectories();
   backendPort = await getFreePort();
@@ -264,22 +332,28 @@ async function startBackend() {
   }
 
   if (backendExe) {
-    backendProcess = spawnProcess(backendExe, commonArgs, { cwd: root, env });
+    backendSpawnSpec = { command: backendExe, args: commonArgs, options: { cwd: root, env } };
   } else {
     const serverPath = path.join(root, "server.py");
     let lastError = null;
     for (const candidate of pythonCandidates()) {
       try {
-        backendProcess = spawnProcess(candidate.command, [...candidate.prefix, serverPath, ...commonArgs], { cwd: root, env });
+        backendSpawnSpec = {
+          command: candidate.command,
+          args: [...candidate.prefix, serverPath, ...commonArgs],
+          options: { cwd: root, env }
+        };
         break;
       } catch (error) {
         lastError = error;
       }
     }
-    if (!backendProcess) {
+    if (!backendSpawnSpec) {
       throw lastError || new Error("Cannot find Python runtime for desktop backend.");
     }
   }
+
+  launchManagedBackend();
 
   const healthy = await waitForHealth(backendUrl);
   if (!healthy) {
@@ -288,25 +362,35 @@ async function startBackend() {
   return backendUrl;
 }
 
-function stopBackend() {
-  if (!backendProcess || backendProcess.killed) {
+function stopBackendChild(child) {
+  if (!child || child.killed) {
     return;
   }
-  const pid = backendProcess.pid;
+  const pid = child.pid;
   try {
     if (process.platform === "win32" && pid) {
       childProcess.spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true });
     } else {
-      backendProcess.kill("SIGTERM");
+      child.kill("SIGTERM");
     }
   } catch (_) {
     try {
-      backendProcess.kill();
+      child.kill();
     } catch (_) {
       // Ignore shutdown races.
     }
   }
+}
+
+function stopBackend() {
+  backendStopping = true;
+  if (backendRestartTimer) {
+    clearTimeout(backendRestartTimer);
+    backendRestartTimer = null;
+  }
+  const child = backendProcess;
   backendProcess = null;
+  stopBackendChild(child);
 }
 
 function desktopPlatformQuery() {
@@ -401,7 +485,10 @@ app.on("window-all-closed", () => {
   }
 });
 
-app.on("before-quit", stopBackend);
+app.on("before-quit", () => {
+  appIsQuitting = true;
+  stopBackend();
+});
 
 app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0) {

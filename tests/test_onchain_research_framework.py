@@ -10,6 +10,55 @@ from onchain_research_framework import (
 )
 
 
+def v48_fields():
+    return {
+        "metaFamily": "源事件 → 当前CA → 同题材候选",
+        "metaRole": "First Real Leader",
+        "metaExpansion": "0-1h 建档，1-6h 买方与分发扩散",
+        "survivalLabel": "strong-hold",
+        "survivalAssessment": "1h 成交、新买家和流动性共同保持",
+        "mechanismStrength": 62,
+        "carrierStrength": 81,
+        "longTermStage": "LT1",
+        "thesisMemory": {
+            "coreThesis": "可传播符号与真实买方开始共振",
+            "terminalVision": "形成跨社区文化资产",
+            "milestones": ["持币广度增长", "跨社区扩散"],
+            "tokenValueCapture": "当前CA承载该符号的交易与社区共识",
+            "invalidation": "买方、叙事与流动性同步衰减",
+            "reactivationConditions": ["新事实与资金同时转强"],
+        },
+        "lifelines": {
+            "project": "来源主张持续可验证",
+            "narrative": "跨渠道注意力扩散",
+            "token": "当前CA买方承接",
+            "liquidity": "退出深度可用",
+        },
+        "reactivationEvidence": [],
+        "personCatalyst": {"status": "none"},
+        "marketMainline": {
+            "status": "active", "asOf": 1_800_000_000_000,
+            "primaryThemes": ["链上文化资产"], "phase": "accelerating",
+            "leaders": ["LOBSTER"],
+            "capitalAttention": "同类资产成交、买方和跨社区注意力同步增加",
+            "evidence": ["同题材多个资产成交扩张", "独立新闻与社区注意力共振"],
+            "candidateRelation": "core-leader",
+            "relationReason": "当前候选在买方、流动性和传播上领先同题材资产",
+            "nextTrigger": "跨链注意力继续扩散", "invalidation": "板块成交和买方同步退潮",
+        },
+        "hotspotOpportunity": {
+            "eventId": "hot-lobster", "eventName": "龙虾热点",
+            "relation": "independent-hotspot", "priority": "P1", "override": True,
+            "officialClaimStatus": "非官方",
+            "mappingFit": {"name": 90, "visual": 80, "semantic": 88, "time": 85, "culture": 82},
+            "identityConclusion": "非官方社区部署，未冒充官方",
+            "opportunityConclusion": "热点、映射和真实买盘同步承接，值得进入龙头竞争",
+            "executionConclusion": "执行许可独立审计，不用热点覆盖风险",
+            "nextTrigger": "跨平台扩散继续加速", "invalidation": "热点衰减且买方退出",
+        },
+    }
+
+
 class OnchainResearchFrameworkTests(unittest.TestCase):
     def candidate(self):
         return {
@@ -77,6 +126,49 @@ class OnchainResearchFrameworkTests(unittest.TestCase):
         self.assertEqual(snapshot["researchRetention"]["policy"], "KEEP")
         self.assertIn("narrativeDiscovery", snapshot["ledgers"])
         self.assertIn("leaderElection", snapshot["ledgers"])
+        self.assertEqual(snapshot["longTermStage"], "LT0")
+        self.assertIn(snapshot["survival"]["label"], {"strong-hold", "divergence", "decay", "dormant", "reactivating", "unknown"})
+        self.assertIn("token", snapshot["lifelines"])
+        self.assertIn("familyRole", snapshot["metaFamily"])
+        self.assertEqual(snapshot["personCatalyst"]["status"], "none")
+        self.assertEqual(snapshot["marketMainline"]["status"], "uncertain")
+        self.assertEqual(snapshot["marketMainline"]["candidateRelation"], "uncertain")
+
+    def test_confirmed_person_signal_is_a_separate_catalyst_ledger(self):
+        row = self.candidate()
+        row["personSignal"] = {
+            "personName": "Market Mover", "personHandle": "marketmover", "personRole": "高影响人物",
+            "sourceCategory": "notable", "sourceTier": "primary", "actionType": "quote",
+            "identityStatus": "person-x-official-handle", "semanticDecisionVersion": "jev-semantic-v1",
+            "semanticRelated": True, "semanticConfidence": 0.94,
+            "semanticReason": "作者明确讨论该币官方账号",
+            "postUrl": "https://x.com/marketmover/status/1", "publishedAt": row["observedAt"] - 30_000,
+            "postText": "This token is interesting", "quoteText": "Official token launch",
+        }
+
+        catalyst = build_candidate_framework_snapshot(row)["personCatalyst"]
+
+        self.assertEqual(catalyst["status"], "confirmed")
+        self.assertEqual(catalyst["sourceTier"], "primary")
+        self.assertEqual(catalyst["action"], "quote")
+        self.assertEqual(catalyst["semanticConfidence"], 0.94)
+        self.assertEqual(catalyst["ageMinutes"], 0.5)
+
+    def test_non_official_hotspot_is_kept_as_high_priority_opportunity_not_identity_failure(self):
+        row = self.candidate()
+        row["researchEvidence"]["identityStatus"] = "community-ca-not-official"
+        row["newsSignal"] = {"eventId": "hot-niulai", "eventName": "牛来公共热点"}
+        row["hotspotRelation"] = "independent_hotspot"
+        row["hotspotOverride"] = True
+        row["hotspotPriority"] = "P0"
+
+        hotspot = build_candidate_framework_snapshot(row)["hotspotOpportunity"]
+
+        self.assertEqual(hotspot["relation"], "independent-hotspot")
+        self.assertEqual(hotspot["priority"], "P0")
+        self.assertTrue(hotspot["override"])
+        self.assertIn("身份标签", hotspot["identityConclusion"])
+        self.assertIn("独立审计", hotspot["executionConclusion"])
 
     def test_source_backed_candidate_can_enter_full_framework_review_without_price_score_rescue(self):
         row = self.candidate()
@@ -87,7 +179,7 @@ class OnchainResearchFrameworkTests(unittest.TestCase):
 
         self.assertEqual(promoted["decision"], "shortlisted")
         self.assertGreaterEqual(promoted["selectedScore"], 60)
-        self.assertTrue(any("V4.4" in reason for reason in promoted["reasons"]))
+        self.assertTrue(any("V4.9" in reason for reason in promoted["reasons"]))
 
     def test_soft_risk_tags_do_not_delete_research_or_become_a_hard_block(self):
         row = self.candidate()
@@ -107,6 +199,7 @@ class OnchainResearchFrameworkTests(unittest.TestCase):
 
     def test_normalizer_keeps_three_ledgers_and_bounds_scores(self):
         result = normalize_framework_assessment({
+            **v48_fields(),
             "potentialTier": "leader",
             "candidatePath": "meme-cultural-leader",
             "currentStage": "S6",
@@ -155,6 +248,32 @@ class OnchainResearchFrameworkTests(unittest.TestCase):
         self.assertEqual(result["transitionTrigger"], "TR_BUYER_RESPONSE")
         self.assertEqual(result["candidateSet"], ["bsc:0xaaa · 当前候选", "bsc:0xbbb · 挑战者"])
         self.assertEqual(result["riskTags"], ["duplicate-image", "流动性待复核"])
+        self.assertEqual(result["marketMainline"]["phase"], "accelerating")
+        self.assertEqual(result["marketMainline"]["candidateRelation"], "core-leader")
+        self.assertTrue(framework_assessment_complete({"frameworkAssessment": result}))
+
+    def test_formal_recommendation_requires_market_mainline_or_explicit_uncertainty(self):
+        fields = v48_fields()
+        fields.pop("marketMainline")
+        result = normalize_framework_assessment({
+            **fields,
+            "potentialTier": "leader", "currentStage": "S6",
+            "attentionState": "A6", "attentionTransition": "A5→A6",
+            "transitionTrigger": "TR_BUYER_RESPONSE",
+            "narrativeDiscovery": "叙事可核验", "mappingFit": "映射可核验",
+            "leaderElection": "买方领先", "nextTrigger": "继续扩散", "invalidation": "买方衰减",
+            "executionPermission": "CAUTION",
+        })
+
+        self.assertFalse(framework_assessment_complete({"frameworkAssessment": result}))
+
+        result["marketMainline"] = {
+            "status": "uncertain", "asOf": 1_800_000_000_000, "primaryThemes": [],
+            "phase": "unclear", "leaders": [], "capitalAttention": "", "evidence": [],
+            "candidateRelation": "independent-catalyst",
+            "relationReason": "批次证据不足，但当前候选存在独立官方事件催化",
+            "nextTrigger": "出现跨资产资金共振", "invalidation": "独立催化无法核验",
+        }
         self.assertTrue(framework_assessment_complete({"frameworkAssessment": result}))
 
     def test_v43_or_incomplete_assessment_is_not_a_v44_formal_recommendation(self):
@@ -177,6 +296,7 @@ class OnchainResearchFrameworkTests(unittest.TestCase):
             "evidenceStatus": "supported",
             "evidenceRefs": ["story"],
             "frameworkAssessment": normalize_framework_assessment({
+                **v48_fields(),
                 "potentialTier": "leader",
                 "candidatePath": "meme-cultural-leader",
                 "currentStage": "S6",

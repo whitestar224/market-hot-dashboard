@@ -89,6 +89,7 @@
   let chainEcosystemRequestId = 0;
   let chainAiPollTimer = 0;
   let chainResearchPaging = false;
+  let chainResearchModeLoading = false;
   const initialResearchParams = new URLSearchParams(window.location.search);
   let selectedChainSlug = initialResearchParams.get("chain") || "";
   let selectedResearchDay = initialResearchParams.get("researchDay") || "";
@@ -1540,15 +1541,29 @@
     const ai = chainAiMeta(row);
     const framework = ai.analysis?.frameworkAssessment && typeof ai.analysis.frameworkAssessment === "object"
       ? ai.analysis.frameworkAssessment : {};
+    const marketMainline = framework.marketMainline && typeof framework.marketMainline === "object" ? framework.marketMainline : {};
+    const marketMainlineReady = [marketMainline.status, marketMainline.phase,
+      marketMainline.candidateRelation, marketMainline.relationReason].every(Boolean)
+      && (marketMainline.status !== "active"
+        || (Array.isArray(marketMainline.primaryThemes) && marketMainline.primaryThemes.length > 0
+          && Array.isArray(marketMainline.evidence) && marketMainline.evidence.length > 0
+          && Boolean(marketMainline.capitalAttention)));
     const frameworkReady = ai.ready
-      && framework.version === "xmind-v4.4-attention-dual-radar-1"
+      && framework.version === "xmind-v4.9-hotspot-derived-ca-three-ledgers-1"
       && [framework.attentionState, framework.attentionTransition, framework.transitionTrigger,
           framework.narrativeDiscovery, framework.mappingFit, framework.leaderElection,
-          framework.nextTrigger, framework.invalidation].every(Boolean);
+          framework.nextTrigger, framework.invalidation, framework.metaFamily,
+          framework.metaExpansion, framework.survivalAssessment, framework.longTermStage,
+          framework.thesisMemory?.coreThesis, framework.thesisMemory?.tokenValueCapture,
+          framework.thesisMemory?.invalidation, framework.lifelines?.project,
+          framework.lifelines?.narrative, framework.lifelines?.token,
+          framework.lifelines?.liquidity, framework.personCatalyst?.status].every(Boolean)
+      && marketMainlineReady;
     const potentialLabels = { leader: "龙头潜力", "golden-dog": "大金狗潜力", watch: "框架观察", none: "暂无潜力结论" };
     const potentialLabel = framework.potentialTier ? potentialLabels[framework.potentialTier] || "框架观察" : "";
     const provisional = row.researchTier === "quantitative-breakout";
     const newsTriggered = row.researchTier === "news-triggered";
+    const rapidRecommended = row.researchTier === "rapid-recommended";
     const metrics = row?.metrics && typeof row.metrics === "object" ? row.metrics : {};
     const href = binanceWalletTokenUrl(row);
     const typeLabel = row.candidateType === "meme" ? "MEME" : "项目";
@@ -1559,8 +1574,10 @@
       ? (row.researchEvidence?.identityStatus === "news-contract-explicit" ? "新闻触发 · CA明确" : "新闻触发 · 身份待核验")
       : provisional
       ? "爆发观察 · 非正式精选"
+      : rapidRecommended
+      ? "快速判断 · 优先研究"
       : row.decision === "shortlisted"
-      ? (frameworkReady ? (ai.analysis.verdict === "strong" ? "优先研究" : "有线索 · 待验证") : "初筛通过 · V4.4待复核")
+      ? (frameworkReady ? (ai.analysis.verdict === "strong" ? "优先研究" : "有线索 · 待验证") : rapidRecommended ? "快速判断 · 优先研究" : "JEV主判完成 · V4.9待深研")
       : row.decision === "warming"
         ? "早期观察"
         : row.decision === "filtered"
@@ -1570,7 +1587,15 @@
     const risks = Array.isArray(row.risks) ? row.risks : [];
     const discoveryTime = Number(row.firstSeenAt) > 0
       ? new Date(Number(row.firstSeenAt)).toLocaleTimeString("zh-CN", { hour12: false }) : "";
-    const timingNote = discoveryTime ? `发现 ${discoveryTime}${Number.isFinite(row.firstScreenMs) ? ` · 初筛 ${Math.ceil(row.firstScreenMs / 1000)}秒` : ""}${Number.isFinite(row.analysisLatencyMs) ? ` · AI ${Math.ceil(row.analysisLatencyMs / 1000)}秒` : ""}` : "";
+    const rapidDecision = row.rapidDecision && typeof row.rapidDecision === "object" ? row.rapidDecision : {};
+    const jevDecision = rapidDecision.jev && typeof rapidDecision.jev === "object" ? rapidDecision.jev : row.jevDecision && typeof row.jevDecision === "object" ? row.jevDecision : {};
+    const jevLabel = { "deep-research": "优先深研", watch: "继续观察", reject: "暂不深研" }[jevDecision.priority] || "";
+    const comparisonStatus = String(rapidDecision.comparisonStatus || "");
+    const comparisonLabel = comparisonStatus === "jev-only" ? "JEV快速主判" : "";
+    const rapidLabel = { "deep-research": rapidRecommended ? "优先研究" : "优先深研", watch: "继续观察", reject: "暂不深研" }[rapidDecision.priority] || jevLabel;
+    const fastDecisionOnly = row.researchMode === "rapid" || rapidRecommended;
+    const rapidScore = Math.round(Number(rapidDecision.goodCandidateProbability || rapidDecision.confidence || 0) * 100);
+    const timingNote = discoveryTime ? `发现 ${discoveryTime}${Number.isFinite(row.firstScreenMs) ? ` · 初筛 ${Math.ceil(row.firstScreenMs / 1000)}秒` : ""}${jevLabel ? ` · JEV主判 ${jevLabel} ${Math.round(Number(jevDecision.confidence || 0) * 100)}%/${Math.ceil(Number(jevDecision.latencyMs || 0) / 1000)}秒` : ""}${comparisonLabel ? ` · ${comparisonLabel}` : ""}${Number.isFinite(row.analysisLatencyMs) ? ` · V4.9深研 ${Math.ceil(Number(row.analysisLatencyMs) / 1000)}秒` : ""}` : "";
     const baseIdentityNote = row.researchEvidence?.identityStatus === "news-contract-explicit"
       ? "新闻原文已给出当前 CA · 事件方身份仍需核验"
       : row.identityAmbiguous && Number(row.sameSymbolContractCount) > 1
@@ -1586,6 +1611,9 @@
     const chatValidation = row.crossValidation && typeof row.crossValidation === "object" ? row.crossValidation : {};
     const chatNote = chatValidation.summary ? `群聊交叉验证：${chatValidation.summary.replace(/^群聊(?:交叉验证|旁证)：?/, "")}` : "";
     const narrative = ai.analysis?.narrative || {};
+    const thesisMemory = framework.thesisMemory && typeof framework.thesisMemory === "object" ? framework.thesisMemory : {};
+    const lifelines = framework.lifelines && typeof framework.lifelines === "object" ? framework.lifelines : {};
+    const personCatalyst = framework.personCatalyst && typeof framework.personCatalyst === "object" ? framework.personCatalyst : {};
     const frameworkFields = [
       ["框架定位", [framework.chainContext, framework.assetIdentity].filter(Boolean).join(" · ")],
       ["状态 / 候选路径", [framework.currentStage, framework.stateTransition, framework.candidatePath].filter(Boolean).join(" · ")],
@@ -1594,6 +1622,19 @@
       ["映射关系", [framework.mappingFit, Array.isArray(framework.candidateSet) ? framework.candidateSet.join("；") : ""].filter(Boolean).join(" · ")],
       ["龙头竞选", [framework.leaderElection, framework.currentLeader, framework.leaderRelation].filter(Boolean).join(" · ")],
       ["休眠 / 复燃", framework.dormantReactivation],
+      ["Meta 家族 / 角色", [framework.metaFamily, framework.metaRole].filter(Boolean).join(" · ")],
+      ["Meta 扩散", framework.metaExpansion],
+      ["生存率", [framework.survivalLabel, framework.survivalAssessment, `机制 ${Number(framework.mechanismStrength) || 0} / 承载币 ${Number(framework.carrierStrength) || 0}`].filter(Boolean).join(" · ")],
+      ["长期阶段", framework.longTermStage],
+      ["Thesis Memory", [thesisMemory.coreThesis, thesisMemory.terminalVision, thesisMemory.tokenValueCapture].filter(Boolean).join(" · ")],
+      ["里程碑", Array.isArray(thesisMemory.milestones) ? thesisMemory.milestones.join("；") : ""],
+      ["四条生命线", [["项目", lifelines.project], ["叙事", lifelines.narrative], ["代币", lifelines.token], ["流动性", lifelines.liquidity]].filter(([, value]) => value).map(([label, value]) => `${label}：${value}`).join("；")],
+      ["复燃证据", Array.isArray(framework.reactivationEvidence) ? framework.reactivationEvidence.join("；") : ""],
+      ["人物 / 官方催化", personCatalyst.status === "none" ? "本轮没有已确认人物或官方原始动作" : [personCatalyst.status, personCatalyst.semanticRelation, personCatalyst.identityMapping, personCatalyst.marketImpact, personCatalyst.evidence].filter(Boolean).join(" · ")],
+      ["人物催化下一步", [personCatalyst.nextTrigger, personCatalyst.invalidation].filter(Boolean).join(" · ")],
+      ["当下市场主线", marketMainline.status === "uncertain" ? `数据不足 · ${marketMainline.relationReason || "暂不确认市场主线"}` : [Array.isArray(marketMainline.primaryThemes) ? marketMainline.primaryThemes.join(" / ") : "", marketMainline.phase, Array.isArray(marketMainline.leaders) ? marketMainline.leaders.join("、") : "", marketMainline.capitalAttention].filter(Boolean).join(" · ")],
+      ["候选与主线关系", [marketMainline.candidateRelation, marketMainline.relationReason].filter(Boolean).join(" · ")],
+      ["主线证据 / 下一步", [Array.isArray(marketMainline.evidence) ? marketMainline.evidence.join("；") : "", marketMainline.nextTrigger, marketMainline.invalidation].filter(Boolean).join(" · ")],
       ["最小注意力单元", [framework.minAttentionUnit, framework.emotionalHook, framework.attentionHook].filter(Boolean).join(" · ")],
       ["当前主要驱动", framework.primaryDriver],
       ["Firstness", framework.firstness],
@@ -1611,7 +1652,7 @@
     ].filter(([, value]) => value);
     const frameworkDetail = frameworkReady ? `
       <section class="onchain-framework-assessment">
-        <header><b>${escapeHtml(potentialLabel || "V4.4 完整框架")}</b><em>注意力跃迁 · 叙事/龙头双雷达 · 六本账</em></header>
+        <header><b>${escapeHtml(potentialLabel || "V4.9 完整框架")}</b><em>热点三账 · 市场主线 · 人物催化 · Meta 扩散 · 生存率</em></header>
         <div class="onchain-framework-scores">
           ${[["叙事发现", framework.narrativeDiscoveryScore ?? framework.discoveryScore], ["注意力", framework.attentionTransitionScore], ["映射", framework.mappingFitScore], ["龙头竞选", framework.leaderElectionScore ?? framework.leaderScore], ["执行", framework.executionScore], ["风险", framework.riskScore], ["置信度", framework.confidenceScore]].map(([label, score]) => `<span><b>${Math.round(Number(score) || 0)}</b><em>${label}</em></span>`).join("")}
         </div>
@@ -1620,7 +1661,7 @@
       </section>` : "";
     const narrativeDetail = frameworkReady && Object.values(narrative).some(Boolean) ? `
       <details class="onchain-narrative-detail" data-research-detail="${escapeHtml(`${row.network}:${row.contractAddress}`)}">
-        <summary>展开完整 V4.4 投研、叙事与风控</summary>
+        <summary>展开完整 V4.9 投研、叙事与风控</summary>
         ${frameworkDetail}
         <dl>${[["thesis", "是什么 / 价值逻辑"], ["attention", "为何现在关注"], ["evidence", "事实依据与局限"], ["invalidation", "待验证 / 失效条件"]].map(([key, label]) => `<div><dt>${label}</dt><dd>${escapeHtml(narrative[key] || "暂无足够资料")}</dd></div>`).join("")}</dl>
         <p>${escapeHtml(timingNote)}${row.analysisRefreshing ? " · 正在补充分析，原结果保留" : ""}</p>
@@ -1632,10 +1673,10 @@
         ${provisional ? `<i class="is-breakout">爆发观察</i>` : ""}
         <span><b>${escapeHtml(row.symbol || row.name || "--")} ${monitorBuyButton(row)}</b><em>${escapeHtml(row.network || "链上")} · ${escapeHtml(row.name || "待补资料")}</em></span>
       </span>
-      <span class="onchain-research-signal" title="${escapeHtml([frameworkReady ? ai.tooltip : "", timingNote].filter(Boolean).join(' / '))}"><b>${escapeHtml(frameworkReady ? ai.summary : newsTriggered ? row.newsTriggerReason || row.newsSignal?.title || "新闻催化已出现，V4.4 正在补充分析" : provisional ? row.provisionalReason || "链上量价达到爆发门槛，V4.4 正在核验叙事" : "尚未形成 V4.4 研究结论")}</b><em>${escapeHtml(identityNote || (frameworkReady ? `催化：${ai.analysis.catalyst || "待确认"}` : newsTriggered ? `来源：${row.newsSignal?.source || "聚合快讯"} · 事件先入档，V4.4 结论待补全` : "量化初筛不代表叙事成立"))}</em></span>
+      <span class="onchain-research-signal" title="${escapeHtml([frameworkReady ? ai.tooltip : "", timingNote].filter(Boolean).join(' / '))}"><b>${escapeHtml(frameworkReady ? ai.summary : newsTriggered ? row.newsTriggerReason || row.newsSignal?.title || "新闻催化已出现，判断正在补充" : provisional ? row.provisionalReason || "链上量价达到爆发门槛，叙事仍待核验" : rapidLabel ? `JEV 主判：${rapidLabel}${comparisonLabel ? ` · ${comparisonLabel}` : ""}${fastDecisionOnly ? "" : "，等待完整深研"}` : "尚未形成投研判断")}</b><em>${escapeHtml(identityNote || (frameworkReady ? `催化：${ai.analysis.catalyst || "待确认"}` : newsTriggered ? `来源：${row.newsSignal?.source || "聚合快讯"} · 事件先入档，结论待补全` : fastDecisionOnly ? "JEV 快速主判；不等同于完整投研或买入建议" : "快速首判只负责分流，不等于最终推荐"))}</em></span>
       <span class="onchain-research-data"><b>${compactUsd(metrics.liquidityUsd)}</b><em>流动性</em></span>
       <span class="onchain-research-data"><b>${compactUsd(metrics.volumeH1Usd)}</b><em>1H成交</em></span>
-      <span class="onchain-research-score ${frameworkReady ? "is-ai" : ""}"><b>${frameworkReady ? ai.narrativeStrength : Number(row.selectedScore) || 0}</b><em>${frameworkReady ? "V4.4叙事" : newsTriggered ? "新闻热度" : `${typeLabel}量化`}</em></span>
+      <span class="onchain-research-score ${frameworkReady || rapidRecommended ? "is-ai" : ""}"><b>${frameworkReady ? ai.narrativeStrength : rapidRecommended ? rapidScore : Number(row.selectedScore) || 0}</b><em>${frameworkReady ? "V4.9叙事" : rapidLabel ? "JEV主判" : newsTriggered ? "新闻热度" : `${typeLabel}量化`}</em></span>
       ${compact ? "" : `<span class="onchain-research-risk"><b>${escapeHtml(decisionLabel)}</b><em>${escapeHtml([frameworkReady ? ai.analysis.risk || risks[0] || "待核验安全数据" : risks[0] || "待核验持仓与权限", walletNote, chatNote].filter(Boolean).join(" · "))}</em></span>`}`;
     return `<article class="onchain-research-entry ${provisional ? "is-provisional" : ""} ${newsTriggered ? "is-news-triggered" : ""}"><div class="onchain-research-candidate ${compact ? "is-compact" : ""}">${content}</div>
       <div class="onchain-research-links">${href ? `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener" title="在币安钱包打开当前链与 CA">查看标的 ↗</a>` : ""}<span>${escapeHtml(row.network || "")} · ${escapeHtml(row.contractAddress || "合约待核验")}</span></div>${narrativeDetail}</article>`;
@@ -1687,6 +1728,26 @@
       </div>`;
   }
 
+  function onchainResearchModeTemplate(research) {
+    const config = research?.researchModeConfig && typeof research.researchModeConfig === "object"
+      ? research.researchModeConfig : {};
+    const requestedMode = config.mode || research?.researchMode || "hourly";
+    const mode = ["rapid", "deep", "hourly"].includes(requestedMode) ? requestedMode : "hourly";
+    const description = config.description || (mode === "rapid"
+      ? "JEV 负责快速主判，不等待聊天深研。"
+      : mode === "deep"
+        ? "标的分批派送到专用 ChatGPT 聊天联网深研，由聊天决定是否弹窗。"
+        : "持续汇总战壕新增币，分批派送到专用 ChatGPT 聊天按 V4.9 深研。");
+    return `<section class="onchain-research-mode-switch" aria-busy="${chainResearchModeLoading}">
+      <div><b>判断模式</b><span>${escapeHtml(description)}</span></div>
+      <div class="onchain-research-mode-options" role="radiogroup" aria-label="新币判断模式">
+        <button type="button" role="radio" aria-checked="${mode === "rapid"}" class="${mode === "rapid" ? "active" : ""}" data-onchain-research-mode="rapid" ${chainResearchModeLoading ? "disabled" : ""}><b>快速实时</b><span>JEV 快速主判</span></button>
+        <button type="button" role="radio" aria-checked="${mode === "deep"}" class="${mode === "deep" ? "active" : ""}" data-onchain-research-mode="deep" ${chainResearchModeLoading ? "disabled" : ""}><b>深研实时</b><span>专用聊天 + V4.9</span></button>
+        <button type="button" role="radio" aria-checked="${mode === "hourly"}" class="${mode === "hourly" ? "active" : ""}" data-onchain-research-mode="hourly" ${chainResearchModeLoading ? "disabled" : ""}><b>深研每小时</b><span>专用聊天 + V4.9 · 默认</span></button>
+      </div>
+    </section>`;
+  }
+
   function onchainResearchTemplate(research, view = "today") {
     const funnel = research?.funnel && typeof research.funnel === "object" ? research.funnel : {};
     const selected = Array.isArray(research?.selected) ? research.selected : [];
@@ -1694,7 +1755,16 @@
     const provisional = Array.isArray(research?.provisional) ? research.provisional : [];
     const provisionalTotal = Number(research?.provisionalTotal ?? provisional.length);
     const queue = research?.reviewQueue || {};
-    const queueNote = `新闻触发 ${Number(queue.newsTriggered) || 0} · 爆发待核验 ${provisionalTotal} · 同名分流 ${Number(queue.sameSymbolSuppressed) || 0} · 待 AI 复核 ${Number(queue.pending) || 0} · 暂不可用 ${Number(queue.unavailable) || 0} · 证据不足 ${Number(queue.needsEvidence) || 0} · AI 淘汰 ${Number(queue.filteredByAi) || 0}（不展示）`;
+    const rapid = research?.rapidDecision && typeof research.rapidDecision === "object" ? research.rapidDecision : {};
+    const training = research?.trainingReadiness && typeof research.trainingReadiness === "object" ? research.trainingReadiness : {};
+    const rapidMode = research?.researchMode === "rapid";
+    const hourlyMode = research?.researchMode === "hourly";
+    const hourly = research?.hourlyResearch && typeof research.hourlyResearch === "object" ? research.hourlyResearch : {};
+    const queueNote = rapidMode
+      ? `JEV 主判 ${Number(rapid.analyzed) || 0}（优先研究 ${Number(rapid.deepResearch) || 0} / 继续观察 ${Number(queue.rapidWatch ?? rapid.watch) || 0} / 淘汰 ${Number(queue.rapidRejected ?? rapid.reject) || 0} · 平均耗时 ${Math.ceil(Number(rapid.jevAvgLatencyMs || 0) / 1000)}秒）· 同名分流 ${Number(queue.sameSymbolSuppressed) || 0} · 待快速判断 ${Number(queue.pending) || 0} · 快速模式不调用聊天深研`
+      : hourlyMode
+        ? `专用 ChatGPT 聊天每小时 V4.9 投研 · 每批 25 个 · 上轮新增 ${Number(hourly.candidateCount) || 0} / 已完成 ${Number(hourly.analyzedCount) || 0} / 聊天精选 ${Number(hourly.selectedCount) || 0} / 失败 ${Number(hourly.failedCount) || 0} · 当前待深研 ${Number(queue.pending) || 0} · 聊天判断值得即直接弹窗`
+        : `专用 ChatGPT 聊天实时 V4.9 投研 · 每批 25 个 · 待深研 ${Number(queue.pending) || 0} · 暂不可用 ${Number(queue.unavailable) || 0} · 聊天判断值得即直接弹窗，不做本地二次打分`;
     const history = Array.isArray(research?.recommendationHistory) ? research.recommendationHistory : [];
     const historyTemplate = Number(research?.historyPagination?.total) ? `<details class="onchain-research-watching" data-research-detail="recommendation-history"><summary>推荐变更与撤回（${Number(research.historyPagination.total)}）</summary>
       ${history.map((row) => `<article class="onchain-research-withdrawn"><b>${escapeHtml(row.symbol || row.name)} · ${escapeHtml(row.network)}</b><p>${escapeHtml(row.withdrawalReason)}</p><small>原结论：${escapeHtml(row.previousAnalysis?.summary || "待核对")} · ${escapeHtml(row.contractAddress)}</small></article>`).join("")}${onchainResearchPaginationTemplate(research.historyPagination, true)}</details>` : "";
@@ -1717,11 +1787,12 @@
       return `
         <section class="onchain-research-board chain-research-view is-scan">
           <header class="onchain-research-head">
-            <span><p class="section-label">FULL MARKET INTAKE / ${escapeHtml(research?.scoreVersion || "")}</p><h3>动态增量扫盘</h3><em>${escapeHtml(research?.day || "今日")} · 后台全量扫描，页面只保留需要你复核的候选</em></span>
+            <span><p class="section-label">FULL MARKET INTAKE / ${escapeHtml(research?.scoreVersion || "")}</p><h3>动态增量扫盘</h3><em>${escapeHtml(research?.day || "今日")} · 后台全量扫描，页面只保留需要你复核的候选 · ${rapidMode ? "JEV 快速主判" : hourlyMode ? "专用聊天每小时 V4.9 投研" : "专用聊天实时 V4.9 投研"}</em></span>
             <div><b>${Number(funnel.discovered) || 0}</b><em>已发现</em></div>
             <div><b>${sourceTotal ? `${sourceOk}/${sourceTotal}` : "等待"}</b><em>链路正常</em></div>
             <div><b>${selectedTotal + provisionalTotal}</b><em>需要查看</em></div>
           </header>
+          ${onchainResearchModeTemplate(research)}
           <nav class="onchain-research-days" aria-label="扫盘日期回溯">
             <strong>日期回溯</strong>
             ${availableDays.map((day) => `<button type="button" class="${day === research?.day ? "active" : ""}" data-chain-research-day="${escapeHtml(day)}">${day === research?.currentDay ? `今天 · ${escapeHtml(day)}` : escapeHtml(day)}</button>`).join("")}
@@ -1763,18 +1834,19 @@
     return `
       <section class="onchain-research-board chain-research-view is-today">
         <header class="onchain-research-head">
-          <span><p class="section-label">TODAY'S RESEARCH DESK</p><h3>今日最值得研究的项目（推荐）</h3><em>${escapeHtml(research?.day || "今日")} · ${escapeHtml(research?.researchSourceLabel || "GMGN 战壕今日新币")} · AI 随后补全起因、叙事和机会</em></span>
+          <span><p class="section-label">TODAY'S RESEARCH DESK</p><h3>今日最值得研究的项目（推荐）</h3><em>${escapeHtml(research?.day || "今日")} · ${escapeHtml(research?.researchSourceLabel || "GMGN 战壕今日新币")} · ${rapidMode ? "JEV 给出快速机会主判" : hourlyMode ? "最新增量经专用聊天 V4.9 精选" : "专用聊天实时补全起因、热点机会、叙事与执行账"}</em></span>
           <div><b>${selectedTotal}</b><em>精选视野</em></div>
           <div><b>${provisionalTotal}</b><em>爆发待核验</em></div>
           <div><b>${relativeTime(research?.updatedAt)}</b><em>最近更新</em></div>
         </header>
+        ${onchainResearchModeTemplate(research)}
         ${provisionalTotal ? `<section class="onchain-research-selected is-provisional">
           <header><b>链上爆发 · 叙事待核验</b><em>双行情源确认强量价后先展示 · 非正式精选，不触发强推荐弹窗</em></header>
           <div>${provisional.map((row) => onchainResearchCandidateTemplate(row)).join("")}</div>
         </section>` : ""}
         <section class="onchain-research-selected">
-          <header><b>优先研究清单</b><em>已按 AI 结论、证据完整度、叙事强度与置信度从优到次排序</em></header>
-          <div>${selected.length ? selected.map((row) => onchainResearchCandidateTemplate(row)).join("") : `<div class="chain-section-empty"><b>暂未筛出 V4.4 精选</b><span>${research?.gmgnTrenchOnly ? "当天 GMGN 战壕新币正在等待新投研体系完成分析；未通过精选的旧币和新币都不会混入这里。" : "系统仍在后台记录全部新池；达到门槛后才会出现在这里。"}</span></div>`}</div>
+          <header><b>优先研究清单</b><em>${rapidMode ? "按 JEV 主判机会概率、置信度与量化强度排序" : "按专用聊天的完整框架判断、证据与提醒结论展示"}</em></header>
+          <div>${selected.length ? selected.map((row) => onchainResearchCandidateTemplate(row)).join("") : `<div class="chain-section-empty"><b>${rapidMode ? "暂未筛出快速模式机会" : "暂未筛出完整投研精选"}</b><span>${research?.gmgnTrenchOnly ? rapidMode ? "当天 GMGN 战壕新币由 JEV 主判；JEV 未给出优先研究的标的不会进入这里。" : "当天 GMGN 战壕新币会分批派送到专用 ChatGPT 聊天；聊天判断值得时会进入这里并直接提醒。" : "系统仍在后台记录全部新池；达到门槛后才会出现在这里。"}</span></div>`}</div>
           ${onchainResearchPaginationTemplate(research?.pagination)}
         </section>
         <p class="onchain-research-queue">${queueNote}</p>${historyTemplate}
@@ -1815,7 +1887,31 @@
       WEB: "⌁",
       SEARCH: "⌕",
       AI: "✦",
+      PERSON: "人",
     }[kind] || "·";
+  }
+
+  function trenchPersonSignalTemplate(row) {
+    const signal = row?.personSignal && typeof row.personSignal === "object" ? row.personSignal : null;
+    if (!signal) return "";
+    const person = String(signal.personName || signal.personHandle || "重要人物").trim();
+    const handle = String(signal.personHandle || "").replace(/^@/, "");
+    const action = String(signal.actionLabel || "点名").trim();
+    const role = String(signal.personRole || "重要人物").trim();
+    const body = String(signal.postText || signal.quoteText || "已捕捉到与该战壕新币直接相关的原始人物动态。").trim();
+    const confidence = Math.max(0, Math.min(100, Number(signal.confidence) || 0));
+    const url = safeExternalUrl(signal.postUrl);
+    return `<span class="onchain-trench-social-tool is-person" tabindex="0">
+      ${url
+        ? `<a class="onchain-trench-social-button" href="${escapeHtml(url)}" target="_blank" rel="noreferrer noopener" aria-label="查看 ${escapeHtml(person)} 原始动态">${trenchSocialGlyph("PERSON")}</a>`
+        : `<button type="button" class="onchain-trench-social-button" aria-label="查看人物信号">${trenchSocialGlyph("PERSON")}</button>`}
+      <span class="onchain-trench-hover-card is-person-card" role="tooltip">
+        <span class="onchain-trench-x-head"><b>${escapeHtml(person)}${handle ? ` @${escapeHtml(handle)}` : ""}</b><em>${escapeHtml(action)}</em></span>
+        <p>${escapeHtml(body)}</p>
+        <small>${escapeHtml(role)} · 身份匹配置信度 ${Math.round(confidence)}% · 已进入 V4.9 快速投研</small>
+        ${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer noopener">打开原始动态 ↗</a>` : ""}
+      </span>
+    </span>`;
   }
 
   function trenchXHoverTemplate(row, url) {
@@ -1869,7 +1965,7 @@
     const searchButton = searchUrl
       ? `<a class="onchain-trench-social-button is-search" href="${escapeHtml(searchUrl)}" target="_blank" rel="noreferrer noopener" aria-label="在 GMGN 搜索" title="在 GMGN 搜索">${trenchSocialGlyph("SEARCH")}</a>`
       : "";
-    return `${trenchNarrativeHoverTemplate(row)}${socialButtons}${searchButton}`;
+    return `${trenchPersonSignalTemplate(row)}${trenchNarrativeHoverTemplate(row)}${socialButtons}${searchButton}`;
   }
 
   function trenchChip(label, value, tone = "") {
@@ -1948,6 +2044,7 @@
               trenchChip("老鼠仓", trenchPercent(facts.insiderPercent), trenchRiskTone(facts.insiderPercent, 1, 5)),
               trenchChip("聪明钱", Number(facts.smartMoneyHolders) || 0, Number(facts.smartMoneyHolders) > 0 ? "positive" : ""),
               trenchChip("KOL", Number(facts.kolHolders) || 0, Number(facts.kolHolders) > 0 ? "positive" : ""),
+              trenchChip("人物信号", row?.personSignal ? `${row.personSignal.personName || row.personSignal.personHandle || "已命中"}·${row.personSignal.actionLabel || "点名"}` : "", row?.personSignal ? "positive" : ""),
               trenchChip("持有人", Number.isFinite(Number(facts.holders ?? metrics.holders)) ? Number(facts.holders ?? metrics.holders).toLocaleString("en-US") : ""),
               trenchChip("新钱包", trenchPercent(facts.freshWalletPercent)),
               trenchChip("蓝筹钱包", trenchPercent(facts.bluechipOwnerPercent), Number(facts.bluechipOwnerPercent) > 0 ? "positive" : ""),
@@ -2767,6 +2864,18 @@
     return payload;
   }
 
+  async function postOnchainResearchMode(mode) {
+    const response = await fetch("/api/onchain-research-mode", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || "投研判断模式切换失败");
+    return payload;
+  }
+
   async function loadStructures({ refresh = false, quiet = false, live = false } = {}) {
     if (structureLoading) return;
     const newLow = currentMode === "newlow";
@@ -3485,22 +3594,24 @@
     const structureExcludeButton = event.target.closest("[data-exclude-structure]");
     if (structureExcludeButton && !loading) {
       const symbol = structureExcludeButton.dataset.excludeStructure;
-      setBusy(true, `正在从整个监控系统剔除 ${symbol}…`);
+      const previousStructureItems = structureItems;
+      const previousNewLowStructureItems = newLowStructureItems;
+      const excludedAt = Date.now();
+      structureExcludeButton.disabled = true;
+      structureItems = structureItems.filter((item) => item.symbol !== symbol);
+      newLowStructureItems = newLowStructureItems.filter((item) => item.symbol !== symbol);
+      lastStructureLoadAt = excludedAt;
+      lastNewLowStructureLoadAt = excludedAt;
+      renderStructures();
+      statusNode.textContent = `正在彻底剔除 ${symbol}…`;
       try {
-        await postStructureAction("exclude", symbol);
-        if (currentMode === "newlow") {
-          newLowStructureItems = newLowStructureItems.filter((item) => item.symbol !== symbol);
-          lastNewLowStructureLoadAt = Date.now();
-        } else {
-          structureItems = structureItems.filter((item) => item.symbol !== symbol);
-          lastStructureLoadAt = Date.now();
-        }
-        renderStructures();
-        statusNode.textContent = `${symbol} 已从整个监控系统剔除；离榜后再次上榜或手动重新加入会恢复`;
+        const payload = await postStructureAction("exclude", symbol);
+        statusNode.textContent = payload.message || `${symbol} 已从整个监控系统彻底剔除；只有手动重新加入才会恢复`;
       } catch (error) {
+        structureItems = previousStructureItems;
+        newLowStructureItems = previousNewLowStructureItems;
+        renderStructures();
         statusNode.textContent = error.message;
-      } finally {
-        setBusy(false);
       }
       return;
     }
@@ -3572,6 +3683,44 @@
         statusNode.textContent = error.message;
       } finally {
         setBusy(false);
+      }
+      return;
+    }
+
+    const researchModeButton = event.target.closest("[data-onchain-research-mode]");
+    if (researchModeButton && currentMode === "chains" && !researchModeButton.disabled && !chainResearchModeLoading) {
+      const requestedMode = researchModeButton.dataset.onchainResearchMode;
+      const mode = ["rapid", "deep", "hourly"].includes(requestedMode) ? requestedMode : "hourly";
+      const savedMode = chainEcosystemPayload.dailyResearch?.researchMode;
+      const currentResearchMode = ["rapid", "deep", "hourly"].includes(savedMode) ? savedMode : "hourly";
+      if (mode === currentResearchMode) return;
+      chainResearchModeLoading = true;
+      renderChainEcosystem();
+      statusNode.textContent = mode === "rapid"
+        ? "正在切换到 JEV 快速实时判断…"
+        : mode === "deep"
+          ? "正在切换到专用 ChatGPT 聊天实时 V4.9 深研…"
+          : "正在切换到专用 ChatGPT 聊天每小时 V4.9 深研…";
+      try {
+        const result = await postOnchainResearchMode(mode);
+        chainEcosystemPayload.dailyResearch = {
+          ...(chainEcosystemPayload.dailyResearch || {}),
+          researchMode: result.mode,
+          researchModeConfig: result,
+        };
+        selectedResearchPage = 1;
+        lastChainEcosystemLoadAt = 0;
+        await loadChainEcosystem({ quiet: false });
+        statusNode.textContent = result.mode === "rapid"
+          ? "已启用快速实时：JEV 快速主判"
+          : result.mode === "deep"
+            ? "已启用专用聊天实时深研：新币分批派送后由聊天决定是否提醒"
+            : "已启用专用聊天每小时深研：整点派送上一小时新增战壕币";
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        chainResearchModeLoading = false;
+        renderChainEcosystem();
       }
       return;
     }
