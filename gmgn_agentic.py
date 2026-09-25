@@ -139,9 +139,10 @@ _GMGN_RUNTIME_DIR = Path(
 _GMGN_PERSIST_DIR = _GMGN_RUNTIME_DIR / "gmgn-readonly"
 _GMGN_RATE_STATE_PATH = _GMGN_RUNTIME_DIR / "gmgn-rate-state.json"
 _GMGN_HTTP_SESSION = requests.Session()
-# Ignore stale HTTP(S)_PROXY values such as an offline local 7890 listener.
-# A dedicated egress must be configured explicitly through GMGN_PROXY_URL.
-_GMGN_HTTP_SESSION.trust_env = False
+# 跟随系统代理 (trust_env=True): 系统级 HTTP(S)_PROXY 由用户统一管理
+# (clash/Proton 混用会切换), GMGN 抓取不应固化直连或某个固定代理。
+# 2026-09-25 实测: 直连超时而系统代理健康, 固化直连导致战壕榜全链停更。
+_GMGN_HTTP_SESSION.trust_env = True
 
 
 class GmgnRateLimitError(RuntimeError):

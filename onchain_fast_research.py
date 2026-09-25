@@ -12,7 +12,9 @@ import re
 import secrets
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 import requests
 
@@ -616,6 +618,57 @@ class FastResearch:
         self.hourly_concurrency = max(1, min(5, int(hourly_concurrency)))
         self._initialized = False
         self._startup_recovery_done = False
+        # GMGN local research channel (bypasses external ChatGPT bridge)
+        self._gmgn_local_enabled = bool(os.getenv("GMGN_LOCAL_RESEARCH_ENABLED", "1") == "1")
+        self._gmgn_local_last_run_ms = 0
+        self._gmgn_local_interval_s = int(os.getenv("GMGN_LOCAL_INTERVAL_SECONDS", "25"))
+        self._gmgn_local_batch_size = int(os.getenv("GMGN_LOCAL_BATCH_SIZE", "3"))
+
+        # Batch ingest buffer to reduce write lock contention
+        self._ingest_buffer: deque[dict[str, Any]] = deque()
+        self._ingest_buffer_lock = threading.Lock()
+        self._ingest_flush_event = threading.Event()
+        self._batch_ingest_enabled = bool(os.getenv("BATCH_INGEST_ENABLED", "1") == "1")
+        self._batch_ingest_max_size = int(os.getenv("BATCH_INGEST_MAX_SIZE", "50"))
+        self._batch_ingest_flush_interval_s = int(os.getenv("BATCH_INGEST_FLUSH_INTERVAL_S", "5"))
+
+        # Batch ingest buffer to reduce write lock contention
+        self._ingest_buffer: deque[dict[str, Any]] = deque()
+        self._ingest_buffer_lock = threading.Lock()
+        self._ingest_flush_event = threading.Event()
+        self._batch_ingest_enabled = bool(os.getenv("BATCH_INGEST_ENABLED", "1") == "1")
+        self._batch_ingest_max_size = int(os.getenv("BATCH_INGEST_MAX_SIZE", "50"))
+        self._batch_ingest_flush_interval_s = int(os.getenv("BATCH_INGEST_FLUSH_INTERVAL_S", "5"))
+
+    def run_gmgn_local_batch(self):
+        """Run GMGN-skill local analysis channel: scan pending trench jobs -> gmgn-cli data -> AI analyze -> write back -> emit alerts.
+
+        This is a separate path from the ChatGPT bridge. Both paths can land
+        candidates in onchain_fast_jobs with status='ready', and emit_alerts
+        will evaluate both. The GMGN channel feeds GMGN data as sources into
+        the same DeepSeek+V4.9 analyzer so results are directly compatible.
+        """
+        if not self._gmgn_local_enabled:
+            return {"status": "disabled"}
+        now_ms = _now_ms()
+        if now_ms - self._gmgn_local_last_run_ms < self._gmgn_local_interval_s * 1000:
+            return {"status": "cooldown"}
+        import gmgn_local_trench_analyzer as _mod  # noqa: PLC0415
+        try:
+            print(f"[GMGN-Local] Starting batch analysis, last_run={self._gmgn_local_last_run_ms}", flush=True)
+            result = _mod.run_gmgn_local_batch(
+                self.store, self.analyzer, self.alert_sink,
+                batch_size=self._gmgn_local_batch_size, now_ms=now_ms,
+            )
+            result["status"] = "ok"
+            self._gmgn_local_last_run_ms = _now_ms()
+            print(f"[GMGN-Local] Batch complete: {result}", flush=True)
+            return result
+        except Exception as exc:
+            print(f"[GMGN-Local] Error: {exc}", flush=True)
+            import traceback  # noqa: PLC0415
+            traceback.print_exc()
+            return {"status": "error", "error": str(exc)[:200]}
 
     def decision_mode(self):
         """Return the active decision lane without making tests depend on app state.
@@ -1211,10 +1264,17 @@ class FastResearch:
                         (json.dumps(row, ensure_ascii=False), _now_ms(), job["key"]))
 
     def ingest(self, rows, *, match_recent_news=True):
-        """Persist all qualified candidates; queue age and page rank never expire a job."""
+        """Persist all qualified candidates; queue age and page rank never expire a job.
+
+        If _auto_buffer is enabled (set by server.py to reduce write lock contention),
+        rows are queued to the buffer instead of being written immediately.
+        """
+        if getattr(self, '_auto_buffer', False) and rows:
+            self.buffer_ingest(rows)
+            return
         now = _now_ms()
         recent_candidates = []
-        with self.store._lock:
+        with self._store_write_lock():
             conn = self.store._connect()
             try:
                 for row in rows:
@@ -1904,8 +1964,38 @@ class FastResearch:
         finally:
             conn.close()
 
+    # A wedged chain-store write lock (a stuck worker inside the region) used
+    # to hang every newsflash/alert writer forever and freeze the whole feed.
+    # Bounded acquisition turns that into a fast, logged, retryable failure.
+    CHAIN_STORE_WRITE_LOCK_TIMEOUT = 60.0
+    # Separate lock for research batch operations to avoid blocking on chain-store writes.
+    _RESEARCH_QUEUE_LOCK = threading.Lock()
+
+    @contextmanager
+    def _store_write_lock(self, timeout: float | None = None):
+        acquired = self.store._lock.acquire(timeout=self.CHAIN_STORE_WRITE_LOCK_TIMEOUT if timeout is None else timeout)
+        if not acquired:
+            raise TimeoutError(
+                f"chain-store write lock busy >{self.CHAIN_STORE_WRITE_LOCK_TIMEOUT if timeout is None else timeout:.0f}s; write deferred"
+            )
+        try:
+            yield
+        finally:
+            self.store._lock.release()
+
+    @contextmanager
+    def _research_queue_lock(self):
+        """Lock for chatgpt batch queueing, separate from chain-store write lock."""
+        acquired = self._RESEARCH_QUEUE_LOCK.acquire(timeout=30.0)
+        if not acquired:
+            raise TimeoutError("research queue lock busy >30s; skip batch creation")
+        try:
+            yield
+        finally:
+            self._RESEARCH_QUEUE_LOCK.release()
+
     def _write(self, sql, params=()):
-        with self.store._lock:
+        with self._store_write_lock():
             conn = self.store._connect()
             try:
                 conn.execute(sql, params)
@@ -1913,7 +2003,93 @@ class FastResearch:
             finally:
                 conn.close()
 
-    @staticmethod
+    # ---------------------------------------------------------------------------
+    # Batch ingest buffer — reduces write lock contention by coalescing multiple
+    # ingest calls into a single locked transaction.
+    # ---------------------------------------------------------------------------
+
+    def buffer_ingest(self, rows: list[dict[str, Any]]) -> None:
+        """Enqueue rows for batched ingest without acquiring the write lock immediately.
+
+        Rows are buffered in-memory and flushed either when the buffer reaches
+        _batch_ingest_max_size or after _batch_ingest_flush_interval_s seconds.
+        This significantly reduces the number of times the chain-store write
+        lock is acquired, especially under high-throughput trench feeds.
+        """
+        if not self._batch_ingest_enabled or not rows:
+            # Fall back to immediate ingest if buffering is disabled
+            if rows:
+                self.ingest(rows, match_recent_news=False)
+            return
+        with self._ingest_buffer_lock:
+            before = len(self._ingest_buffer)
+            self._ingest_buffer.extend(rows)
+            after = len(self._ingest_buffer)
+        if after - before >= self._batch_ingest_max_size:
+            self._ingest_flush_event.set()
+
+    _BATCH_INGEST_FLUSH_LIMIT = 200
+
+    def _flush_ingest_buffer(self) -> int:
+        """Drain up to _BATCH_INGEST_FLUSH_LIMIT rows in a single locked transaction.
+
+        Capping the batch size keeps the chain-store write lock held for a bounded
+        time, so the GMGN local analyzer's own write-back (which acquires the same
+        store._lock) is not starved by one giant flush.
+        """
+        with self._ingest_buffer_lock:
+            if not self._ingest_buffer:
+                return 0
+            batch = []
+            while self._ingest_buffer and len(batch) < self._BATCH_INGEST_FLUSH_LIMIT:
+                batch.append(self._ingest_buffer.popleft())
+        try:
+            self.ingest(batch, match_recent_news=False)
+            return len(batch)
+        except Exception as exc:
+            # On failure, re-enqueue for retry (best-effort)
+            import logging  # noqa: PLC0415
+            logging.getLogger(__name__).error(f"batch ingest flush failed, re-enqueuing: {exc}")
+            with self._ingest_buffer_lock:
+                self._ingest_buffer.extendleft(reversed(batch))
+            return 0
+
+    def _start_batch_ingest_flusher(self) -> None:
+        """Start a background thread that periodically flushes the ingest buffer."""
+        if getattr(self, '_flusher_thread', None) and self._flusher_thread.is_alive():
+            return
+        self._flusher_stop = threading.Event()
+
+        def flush_loop():
+            while not self._flusher_stop.wait(timeout=self._batch_ingest_flush_interval_s):
+                try:
+                    flushed = self._flush_ingest_buffer()
+                    if flushed:
+                        print(f"[BatchIngest] flushed {flushed} rows from buffer", flush=True)
+                except Exception as exc:
+                    print(f"[BatchIngest] flush error: {exc}", flush=True)
+
+        self._flusher_thread = threading.Thread(
+            target=flush_loop,
+            daemon=True,
+            name="batch-ingest-flusher",
+        )
+        self._flusher_thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=3)
+        if self._pools:
+            self._pools.shutdown(wait=False, cancel_futures=True)
+        # Drain any remaining buffered rows before exit
+        if hasattr(self, '_flusher_thread') and self._flusher_thread.is_alive():
+            self._flusher_stop.set()
+            self._flusher_thread.join(timeout=5)
+            try:
+                self._flush_ingest_buffer()
+            except Exception:
+                pass
     def _chatgpt_public_candidate(row):
         """Keep the chat handoff limited to public research facts."""
         def text(value, limit=1000):
@@ -2071,7 +2247,7 @@ class FastResearch:
         batch_limit = max(CHATGPT_RESEARCH_BATCH_MIN, min(CHATGPT_RESEARCH_BATCH_MAX, requested))
         concurrency = self._chatgpt_concurrency(max_concurrent)
         hour_start = hour_end = 0
-        with self.store._lock:
+        with self._research_queue_lock():
             conn = self.store._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -2641,8 +2817,12 @@ class FastResearch:
         if lane not in {"mixed", "live", "history"}:
             raise ValueError("unknown research lane")
         decision_mode = self.decision_mode()
-        if decision_mode in {"rapid", "deep", "hourly"}:
+        # In hourly/deep mode, skip the local analyzer (rely on ChatGPT client)
+        # UNLESS we're in hourly mode and want to fallback to local DeepSeek.
+        if decision_mode in {"rapid", "deep"}:
             return []
+        # For hourly mode: also claim jobs for local DeepSeek analysis
+        # (fallback when no ChatGPT client is available)
         now = _now_ms()
         # One short write transaction owns selection and claim across workers.
         # The model runs only after the transaction/lock have been released.
@@ -3020,7 +3200,8 @@ class FastResearch:
             else:
                 if row.get("researchEvidence", {}).get("identityStatus") == "same-chain-symbol-unverified":
                     continue
-                if not formal_research_worthy(analysis) or not golden_leader_alert_decision(row, analysis)["eligible"]:
+                # B 级及以上进弹窗（B 不播报，A/S 播报），由 golden_leader_alert_decision 分级闸门控制
+                if not formal_research_worthy(analysis) or not golden_leader_alert_decision(row, analysis)["popupEligible"]:
                     continue
             result = self.alert_sink(row, analysis, job)
             if result and result.get("ok"):
@@ -3429,6 +3610,8 @@ class FastResearch:
         self.restore_review_queue()
         self._stop.clear()
         self._pools = ThreadPoolExecutor(max_workers=8, thread_name_prefix="onchain-fast")
+        # Start the batch ingest flusher to reduce write lock contention
+        self._start_batch_ingest_flusher()
         def loop():
             while not self._stop.is_set():
                 for name, action in (("launch", self.poll_launches), ("quotes", self.refresh_quotes), ("clues", self.resolve_clues),
@@ -3436,7 +3619,8 @@ class FastResearch:
                     ("chatgpt-research-queue", self.queue_chatgpt_research_batch),
                     ("ai-live-1", lambda: self._analyze_and_alert("live")),
                     ("ai-live-2", lambda: self._analyze_and_alert("live")),
-                    ("ai-history", lambda: self._analyze_and_alert("history"))):
+                    ("ai-history", lambda: self._analyze_and_alert("history")),
+                    ("gmgn-local", self.run_gmgn_local_batch)):
                     if self._stop.is_set():
                         break
                     future = self._futures.get(name)

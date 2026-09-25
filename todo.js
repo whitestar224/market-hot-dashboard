@@ -78,7 +78,7 @@ function defaultPayload() {
 
   return {
     projects: [
-      { id: coreProject, name: "龙头逻辑list", createdAt: now - 3000 },
+      { id: coreProject, name: "龙头逻辑", createdAt: now - 3000 },
       { id: riskProject, name: "交易系统教学", createdAt: now - 2000 },
       { id: reviewProject, name: "复盘追踪", createdAt: now - 1000 }
     ],
@@ -363,7 +363,7 @@ function currentProjectName() {
 
 function renderTasks() {
   const tasks = visibleTasks();
-  todoCurrentProject.textContent = currentProjectName();
+  if (todoCurrentProject) todoCurrentProject.textContent = currentProjectName();
   todoCurrentProjectTag.textContent = todoState.activeProjectId === "all" ? "收件箱 /" : "我的项目 /";
   if (!tasks.length) {
     todoTaskList.innerHTML = `

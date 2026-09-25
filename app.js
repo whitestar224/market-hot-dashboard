@@ -13,6 +13,7 @@ const MARKET_PRIORITY_VIEW_KEY = "xingyunshe:market-hot:priority-view:v1";
 const MARKET_PRIORITY_PERIOD_KEY = "xingyunshe:market-hot:priority-period:v1";
 const MARKET_PRIORITY_PERIODS = new Set(["1h", "6h", "24h"]);
 const TOTAL_BOARD_PAGE_SIZE = 10;
+const TRENCH_PAGE_SIZE = 50;
 const EXCHANGE_AI_REQUEST_LIMIT = 24;
 const exchangeAiNarrativeCache = new Map();
 const exchangeAiNarrativePending = new Set();
@@ -106,7 +107,8 @@ const state = {
   gmgnHotLoading: false,
   priorityPeriod: normalizePriorityPeriod(readLocalPreference(MARKET_PRIORITY_PERIOD_KEY, "24h")),
   smartPriority: {},
-  totalPage: 1
+  totalPage: 1,
+  trenchPage: 1
 };
 
 const boardsEl = document.querySelector("#leaderboards");
@@ -123,7 +125,12 @@ function renderLive(node, html) {
   if (!node) return false;
   if (window.XingyunLiveDom?.render) return window.XingyunLiveDom.render(node, html);
   if (node.innerHTML === html) return false;
+  // Preserve scroll position during re-render
+  const scrollY = node.closest('.gmgn-trench-hot-scroll')?.scrollTop ?? 0;
   node.innerHTML = html;
+  if (scrollY && node.closest('.gmgn-trench-hot-scroll')) {
+    node.closest('.gmgn-trench-hot-scroll').scrollTop = scrollY;
+  }
   return true;
 }
 
@@ -943,7 +950,13 @@ function renderGmgnTrenchRow(row, source, index) {
 }
 
 function renderGmgnTrenchBoard(source) {
-  const rows = Array.isArray(source?.rows) ? source.rows : [];
+  const allRows = Array.isArray(source?.rows) ? source.rows : [];
+  // Cap at 300 most recent rows, paginated at TRENCH_PAGE_SIZE per page
+  const cappedRows = allRows.slice(0, 300);
+  const totalPages = Math.max(1, Math.ceil(cappedRows.length / TRENCH_PAGE_SIZE));
+  const page = state.trenchPage || 1;
+  const startIdx = (page - 1) * TRENCH_PAGE_SIZE;
+  const rows = cappedRows.slice(startIdx, startIdx + TRENCH_PAGE_SIZE);
   const online = Number(source?.sourceOnline || 0);
   const total = Number(source?.sourceTotal || 6);
   const liveState = source?.rateLimited
@@ -952,14 +965,26 @@ function renderGmgnTrenchBoard(source) {
       ? `GMGN 来源在线 ${online}/${total}`
       : "实时源暂时断开 · 正在展示已接收历史";
   if (!rows.length) return `<div class="rows">${renderEmpty(source)}</div>`;
+  const totalPagesToShow = totalPages <= 1 ? "" : `· <b>${totalPages}</b> 页`;
+  const paginationButtons = totalPages > 1 ? `
+    <div class="total-pagination">
+      <button type="button" class="total-page-button total-page-nav" data-role="trench-page" data-page="${page - 1}" ${page <= 1 ? "disabled" : ""}>上一页</button>
+      <span class="total-page-numbers">${
+        page <= 1 ? "<span>1</span>" :
+        page >= totalPages ? `<span>${totalPages}</span>` :
+        `<span>…</span><span class="total-page-button active">${page}</span><span>…</span>`
+      }</span>
+      <button type="button" class="total-page-button total-page-nav" data-role="trench-page" data-page="${page + 1}" ${page >= totalPages ? "disabled" : ""}>下一页</button>
+    </div>` : "";
   return `
     <div class="gmgn-trench-history-strip">
-      <span><b>${escapeHtml(source.historyCount || rows.length)}</b> 个已接收新币</span>
-      <small>${escapeHtml(liveState)} · 严格按开盘时间倒序，首屏最新 10 个</small>
+      <span><b>${escapeHtml(source.historyCount || cappedRows.length)}</b> 个已接收新币</span>
+      <small>${escapeHtml(liveState)}${totalPagesToShow} · 严格按开盘时间倒序</small>
     </div>
     <div class="gmgn-trench-hot-scroll" role="list" aria-label="GMGN 战壕新币接收历史">
-      ${rows.map((row, index) => renderGmgnTrenchRow(row, source, index + 1)).join("")}
-    </div>`;
+      ${rows.map((row, index) => renderGmgnTrenchRow(row, source, startIdx + index + 1)).join("")}
+    </div>
+    ${paginationButtons}`;
 }
 
 function refreshGmgnTrenchXTools(statusId) {
@@ -1039,6 +1064,10 @@ function renderBoards() {
   const sources = visibleSources();
   renderSummary(sources);
 
+  // Quick visual feedback: dim cards during re-render to make it feel faster
+  const boardCards = boardsEl.querySelectorAll('.board-card');
+  boardCards.forEach(card => card.classList.add('is-rendering'));
+
   renderLive(boardsEl, sources
     .map(
       (source, index) => `
@@ -1057,6 +1086,12 @@ function renderBoards() {
       `
     )
     .join(""));
+
+  // Remove dimming after paint for snappy feel
+  requestAnimationFrame(() => {
+    boardCards.forEach(card => card.classList.remove('is-rendering'));
+  });
+
   if (state.filter !== "total") {
     requestAiInsights(sources.filter((source) => String(source?.id || "") !== "gmgn-trenches"));
   }
@@ -1411,6 +1446,7 @@ async function loadBinanceWalletPeriod(period, options = {}) {
   const normalizedPeriod = normalizeBinanceWalletPeriod(period);
   state.binanceWalletPeriod = normalizedPeriod;
   saveBinanceWalletPeriod(normalizedPeriod);
+  // Optimistic: if we have cached data for this period, show it immediately
   if (!options.refresh && currentBinanceWalletSource(normalizedPeriod)) {
     renderBoards();
     return;
@@ -1542,7 +1578,48 @@ function renderRow(row, source, rank) {
 
 async function loadMarketData(options = {}) {
   const now = Date.now();
-  if (!options.refresh && state.sources.length && now - state.lastRequestedAt < 55_000) return;
+  // If we have cached data, render it IMMEDIATELY (cache-first) then fetch in background
+  if (state.sources.length && !options.refresh) {
+    // Already rendered from cache - just refresh silently in background
+    if (now - state.lastRequestedAt < 55_000) return;
+    if (state.isLoading) return;
+    state.isLoading = true;
+    state.lastRequestedAt = now;
+    try {
+      const response = await fetch(`/api/market-hot${options.refresh ? "?refresh=1" : ""}`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json();
+      const nextSources = Array.isArray(payload.sources) ? payload.sources : [];
+      if (!nextSources.length) throw new Error("Empty market data payload");
+      const preferredWalletSource = state.binanceWalletPeriod === "24h"
+        ? null
+        : currentBinanceWalletSource(state.binanceWalletPeriod);
+      const walletIndex = nextSources.findIndex((source) => String(source?.id || "") === "binance-wallet-hot");
+      if (preferredWalletSource && walletIndex >= 0) nextSources[walletIndex] = preferredWalletSource;
+      state.sources = nextSources;
+      state.smartPriority = payload.smartPriority && typeof payload.smartPriority === "object"
+        ? payload.smartPriority
+        : state.smartPriority;
+      writeCachedPayload(MARKET_CACHE_KEY, payload);
+      setStatus("实时数据", "ok");
+      renderTicker();
+      renderBoards();
+      const receivedWallet = state.sources.find((source) => String(source?.id || "") === "binance-wallet-hot");
+      if (preferredWalletSource) {
+        void loadBinanceWalletPeriod(state.binanceWalletPeriod, { refresh: true });
+      } else if (!receivedWallet || normalizeBinanceWalletPeriod(receivedWallet.period) !== state.binanceWalletPeriod) {
+        void loadBinanceWalletPeriod(state.binanceWalletPeriod);
+      }
+    } catch (error) {
+      console.warn("Market data refresh failed; keeping cached data.", error);
+    } finally {
+      state.isLoading = false;
+      void loadGmgnHotSource();
+    }
+    return;
+  }
+
+  // First load or explicit refresh: show cached/empty immediately, then fetch
   if (state.isLoading) return;
   state.isLoading = true;
   state.lastRequestedAt = now;
@@ -1568,7 +1645,7 @@ async function loadMarketData(options = {}) {
       ? payload.smartPriority
       : state.smartPriority;
     writeCachedPayload(MARKET_CACHE_KEY, payload);
-    setStatus("真实数据", "ok");
+    setStatus("实时数据", "ok");
     renderTicker();
     renderBoards();
     const receivedWallet = state.sources.find((source) => String(source?.id || "") === "binance-wallet-hot");
@@ -1610,33 +1687,50 @@ function updateClock() {
 searchInput.addEventListener("input", (event) => {
   state.query = event.target.value.trim();
   state.totalPage = 1;
-  renderBoards();
+  state.trenchPage = 1;
+  // Debounce render on search input to avoid jank during typing
+  if (searchInput._debounceTimer) clearTimeout(searchInput._debounceTimer);
+  // Show loading state during debounce
+  searchInput.disabled = true;
+  searchInput.classList.add('is-searching');
+  searchInput._debounceTimer = setTimeout(() => {
+    renderBoards();
+    searchInput._debounceTimer = null;
+    searchInput.disabled = false;
+    searchInput.classList.remove('is-searching');
+  }, 80);
 });
 
 sortSelect.addEventListener("change", (event) => {
   state.sort = event.target.value;
   state.totalPage = 1;
+  state.trenchPage = 1;
   saveLocalPreference(MARKET_PRIORITY_VIEW_KEY, state.sort === "priority" ? "smart" : "platform");
-  renderBoards();
+  // Immediate visual feedback via select itself, re-render queued
+  queueMicrotask(renderBoards);
 });
 
 filterButtons.addEventListener("click", (event) => {
   const button = event.target.closest("button");
   if (!button) return;
+  // Optimistic UI: immediately highlight the clicked button
   state.filter = button.dataset.filter;
   state.totalPage = 1;
+  state.trenchPage = 1;
   filterButtons.querySelectorAll("button").forEach((item) => {
     item.classList.toggle("active", item === button);
     item.setAttribute("aria-pressed", item === button ? "true" : "false");
   });
-  renderBoards();
+  // Re-render after paint to keep it snappy
+  queueMicrotask(renderBoards);
 });
 
 priorityPeriodSelect?.addEventListener("change", (event) => {
   state.priorityPeriod = normalizePriorityPeriod(event.target.value);
   state.totalPage = 1;
+  state.trenchPage = 1;
   saveLocalPreference(MARKET_PRIORITY_PERIOD_KEY, state.priorityPeriod);
-  renderBoards();
+  queueMicrotask(renderBoards);
 });
 
 window.addEventListener("xingyun:rank-ai-toggle", () => {
@@ -1661,20 +1755,39 @@ boardsEl.addEventListener("click", (event) => {
     void copyGmgnTrenchContract(contractButton);
     return;
   }
-  const button = event.target.closest('button[data-role="total-page"]');
+  const button = event.target.closest('button[data-role="total-page"], button[data-role="trench-page"]');
   if (!button || button.disabled) return;
+  const isTrench = button.dataset.role === "trench-page";
   const page = Number.parseInt(button.dataset.page || "1", 10);
-  if (!Number.isFinite(page) || page < 1 || page === state.totalPage) return;
+  if (!Number.isFinite(page) || page < 1) return;
+  if (isTrench) {
+    if (page === (state.trenchPage || 1)) return;
+    state.trenchPage = page;
+    renderBoards();
+    requestAnimationFrame(() => {
+      const trenchCard = boardsEl.querySelector(".gmgn-trench-hot-scroll");
+      trenchCard?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    return;
+  }
+  // Optimistic: update state and scroll immediately, re-render in background
   state.totalPage = page;
+  state.trenchPage = 1;
   renderBoards();
   requestAnimationFrame(() => {
-    boardsEl.querySelector(".board-card.is-total-board")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    const totalBoard = boardsEl.querySelector(".board-card.is-total-board");
+    if (totalBoard) {
+      totalBoard.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
   });
 });
 
 boardsEl.addEventListener("change", (event) => {
   const walletSelect = event.target.closest('select[data-role="binance-wallet-period"]');
   if (walletSelect) {
+    // Optimistic: update dropdown immediately before fetch
+    state.binanceWalletPeriod = normalizeBinanceWalletPeriod(walletSelect.value);
+    saveBinanceWalletPeriod(state.binanceWalletPeriod);
     void loadBinanceWalletPeriod(walletSelect.value);
     return;
   }
@@ -1682,28 +1795,28 @@ boardsEl.addEventListener("change", (event) => {
   if (avePeriodSelect) {
     state.avePeriod = normalizeAvePeriod(avePeriodSelect.value);
     saveLocalPreference(AVE_PERIOD_KEY, state.avePeriod);
-    renderBoards();
+    queueMicrotask(renderBoards);
     return;
   }
   const aveChainSelect = event.target.closest('select[data-role="ave-chain"]');
   if (aveChainSelect) {
     state.aveChain = normalizeAveChain(aveChainSelect.value);
     saveLocalPreference(AVE_CHAIN_KEY, state.aveChain);
-    renderBoards();
+    queueMicrotask(renderBoards);
     return;
   }
   const gmgnPeriodSelect = event.target.closest('select[data-role="gmgn-period"]');
   if (gmgnPeriodSelect) {
     state.gmgnPeriod = normalizeGmgnPeriod(gmgnPeriodSelect.value);
     saveLocalPreference(GMGN_PERIOD_KEY, state.gmgnPeriod);
-    renderBoards();
+    queueMicrotask(renderBoards);
     return;
   }
   const gmgnChainSelect = event.target.closest('select[data-role="gmgn-chain"]');
   if (gmgnChainSelect) {
     state.gmgnChain = normalizeGmgnChain(gmgnChainSelect.value);
     saveLocalPreference(GMGN_CHAIN_KEY, state.gmgnChain);
-    renderBoards();
+    queueMicrotask(renderBoards);
   }
 });
 

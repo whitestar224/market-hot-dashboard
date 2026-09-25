@@ -16,7 +16,9 @@ from typing import Any, Mapping
 
 
 FRAMEWORK_VERSION = "xmind-v4.9-hotspot-derived-ca-three-ledgers-1"
-FRAMEWORK_SOURCE_SHA256 = "6CDCCB939C0A6E691D378F4E48C6A5BD275003012A9D15416ED0ADC003A2A456"
+# 来源文件已更新为《链上投研体系_V4.9_热点衍生CA增强版_修复版.xmind》（2026-09-24）
+# 核心增量：热点衍生CA（非官方≠低价值，热点承接优先）+ 三账本分离 + CA↔热点双向扫描 + 同热点竞争池
+FRAMEWORK_SOURCE_SHA256 = "CE652027481B849552AB900FD7C92B2E126BF2B7F479B4F484AB9D6A20879060"
 VALID_STAGES = {"S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "SX"}
 VALID_ATTENTION_STATES = {f"A{index}" for index in range(9)}
 VALID_TRANSITION_TRIGGERS = {
@@ -884,49 +886,17 @@ def normalize_framework_assessment(value: Any) -> dict[str, Any]:
 
 
 def framework_assessment_complete(analysis: Mapping[str, Any] | None) -> bool:
-    """Only a materially complete V4.9 review may become a formal recommendation."""
+    """只要 S/A/B/C 分级核心字段齐备（version + 级别 + 执行许可）即算完成。
+
+    DeepSeek 输出精简后不再返回 130 字段，只需给出分级所需的核心字段即可，
+    分级（potentialTier）由 golden_leader_alert_decision 决定，none 即 C 级不弹窗。
+    """
     raw = _mapping(_mapping(analysis).get("frameworkAssessment"))
     if _text(raw.get("version"), 80) != FRAMEWORK_VERSION:
         return False
     normalized = normalize_framework_assessment(raw)
-    required = (
-        normalized["attentionState"], normalized["attentionTransition"],
-        normalized["transitionTrigger"], normalized["narrativeDiscovery"],
-        normalized["mappingFit"], normalized["leaderElection"],
-        normalized["nextTrigger"], normalized["invalidation"],
-        normalized["metaFamily"], normalized["metaExpansion"],
-        normalized["survivalAssessment"], normalized["longTermStage"],
-        normalized["thesisMemory"]["coreThesis"], normalized["thesisMemory"]["tokenValueCapture"],
-        normalized["thesisMemory"]["invalidation"],
-        normalized["lifelines"]["project"], normalized["lifelines"]["narrative"],
-        normalized["lifelines"]["token"], normalized["lifelines"]["liquidity"],
-        normalized["personCatalyst"]["status"],
-        normalized["marketMainline"]["status"], normalized["marketMainline"]["phase"],
-        normalized["marketMainline"]["candidateRelation"], normalized["marketMainline"]["relationReason"],
-        normalized["hotspotOpportunity"]["relation"], normalized["hotspotOpportunity"]["priority"],
-        normalized["hotspotOpportunity"]["identityConclusion"],
-        normalized["hotspotOpportunity"]["opportunityConclusion"],
-        normalized["hotspotOpportunity"]["executionConclusion"],
-    )
-    person = normalized["personCatalyst"]
-    person_complete = person["status"] == "none" or bool(
-        person["status"] in VALID_PERSON_CATALYST_STATUSES - {"none"}
-        and person["semanticRelation"] and person["identityMapping"]
-        and person["marketImpact"] and person["evidence"]
-    )
-    mainline = normalized["marketMainline"]
-    mainline_complete = bool(
-        mainline["status"] in VALID_MARKET_MAINLINE_STATUSES
-        and mainline["phase"] in VALID_MARKET_MAINLINE_PHASES
-        and mainline["candidateRelation"] in VALID_MARKET_MAINLINE_RELATIONS
-        and mainline["relationReason"]
-        and (
-            mainline["status"] != "active"
-            or (mainline["primaryThemes"] and mainline["evidence"] and mainline["capitalAttention"])
-        )
-    )
     return bool(
-        all(required) and person_complete and mainline_complete
+        normalized["potentialTier"] in VALID_POTENTIAL_TIERS
         and normalized["executionPermission"] in VALID_PERMISSIONS
     )
 
@@ -979,10 +949,51 @@ def golden_leader_alert_decision(row: Mapping[str, Any], analysis: Mapping[str, 
         reasons.append("长期阶段或生存率已不满足主动提醒门槛")
     if not reactivation_ok:
         reasons.append("复燃缺少至少两条独立生命线证据")
+
+    # ===== S/A/B/C 分级（对应投研体系 V5.0 资产分流 + 无偏回测结论）=====
+    # 分级用于弹窗分级展示 + 播报闸门：B 级进弹窗不播报，A/S 级进弹窗且播报。
+    # 映射依据：potentialTier + opportunityScore + leaderScore + 执行许可 + 结论/证据强度。
+    #   S 级：龙头实锤、机会/龙头双高、执行许可 ALLOW —— 重点跟踪。
+    #   A 级：达当前 leader/golden-dog 弹窗门槛（原 eligible）—— 关注。
+    #   B 级：结论/证据较强、机会分 ≥ 60、框架完整，但未达 A 级龙头门槛 —— 观察（进弹窗不播报）。
+    #   C 级：其余 —— 不弹窗。
+    if (
+        tier == "leader"
+        and opportunity >= 85
+        and leader >= 85
+        and permission == "ALLOW"
+        and verdict == "strong"
+        and evidence == "supported"
+        and confidence >= 80
+        and framework_complete
+    ):
+        grade = "S"
+    elif eligible and permission != "BLOCK":
+        grade = "A"
+    elif (
+        verdict in {"strong", "watch"}
+        and evidence in {"supported", "partial"}
+        and opportunity >= 60
+        and framework_complete
+        and permission != "BLOCK"
+    ):
+        grade = "B"
+    else:
+        grade = "C"
+
+    grade_label = {"S": "S级·重点", "A": "A级·关注", "B": "B级·观察", "C": "C级·一般"}[grade]
+    # 弹窗/播报闸门：B 级进弹窗但不播报；A/S 级进弹窗且播报；C 级不弹窗。
+    popup_eligible = grade in {"S", "A", "B"}
+    speech_eligible = grade in {"S", "A"}
+
     return {
         "eligible": eligible,
         "label": label,
         "potentialTier": tier,
+        "grade": grade,
+        "gradeLabel": grade_label,
+        "popupEligible": popup_eligible,
+        "speechEligible": speech_eligible,
         "opportunityScore": opportunity,
         "leaderScore": leader,
         "executionScore": framework["executionScore"],
@@ -1028,132 +1039,13 @@ FULL_FRAMEWORK_PROMPT = """
 FRAMEWORK_OUTPUT_SCHEMA = {
     "version": FRAMEWORK_VERSION,
     "potentialTier": "leader|golden-dog|watch|none",
-    "candidatePath": "候选路径",
-    "currentStage": "S0-S8/SX",
-    "stateTransition": "链上阶段迁移",
-    "eventId": "链外事件ID或来源标识",
-    "narrativeId": "叙事簇标识",
-    "attentionState": "A0-A8",
-    "previousAttentionState": "A0-A8或空",
-    "attentionTransition": "前态→新态、证据、置信度、观察者",
-    "transitionTrigger": "TR_ATTN_JUMP|TR_PRIMARY_EVENT|TR_MAPPING_SWARM|TR_BUYER_RESPONSE|TR_LEADER_CONCENTRATION|TR_LEADER_ROTATION|TR_DORMANT_REACTIVATION|TR_RISK_FLIP",
-    "narrativeDiscovery": "叙事发现账：故事、最小单元、来源覆盖和证据缺口",
-    "mappingFit": "映射适配账：事件如何映射当前CA、竞争CA和官方性边界",
-    "leaderElection": "龙头竞选账：双窗口比较、领先依据、挑战者与轮动条件",
-    "candidateSet": ["链:CA · 候选角色/依据"],
-    "currentLeader": "当前龙头；未形成就明确写未形成",
-    "leaderRelation": "当前候选与龙头/挑战者关系及可能轮动",
-    "dormantReactivation": "资产年龄与注意力年龄；是否属于休眠复燃",
-    "metaFamily": "Meta 家族来源、成员、Canonical Source 与当前龙头",
-    "metaRole": "Mechanism Origin|Canonical Source|First Official|First Tradable|First Ecosystem Child|First Real Leader|Fork/Clone",
-    "metaExpansion": "0-1h/1-6h/6-24h/24h+ 扩散、分叉和轮动结论",
-    "survivalLabel": "strong-hold|divergence|decay|dormant|reactivating|unknown",
-    "survivalAssessment": "1h/3h/6h/24h 的市值保持、增量成交、新买家、持续排名、注意力速度、流动性与退出深度",
-    "mechanismStrength": 0,
-    "carrierStrength": 0,
-    "longTermStage": "LT0|LT1|LT2|LT3|LT4|LT5|LT6",
-    "thesisMemory": {
-        "coreThesis": "为什么值得持续跟踪",
-        "terminalVision": "终局想象",
-        "milestones": ["未来 3-5 个可验证里程碑"],
-        "tokenValueCapture": "代币如何承接项目/叙事价值；纯 Meme 也要写明承接机制",
-        "invalidation": "什么变化会破坏原逻辑",
-        "reactivationConditions": ["什么事实会重新唤醒研究"],
-    },
-    "lifelines": {
-        "project": "项目生命线及证据",
-        "narrative": "叙事生命线及证据",
-        "token": "代币生命线及证据",
-        "liquidity": "流动性生命线及证据",
-    },
-    "reactivationEvidence": ["复燃的独立事实/资金证据；非复燃可为空"],
-    "personCatalyst": {
-        "status": "none|watch|confirmed|ambiguous|rejected",
-        "sourceImpact": 0,
-        "actionStrength": 0,
-        "semanticRelation": "原始动作是否真的指向这个具体加密资产；区分作者正文与引用内容",
-        "identityMapping": "人物动作如何映射到链、CA、官方X；同名多CA必须写歧义",
-        "marketImpact": "对叙事/分发/注意力的潜在影响；不得直接写成官方背书或买入结论",
-        "evidence": "原帖、动作、发布时间和语义确证依据",
-        "nextTrigger": "人物催化升级还需出现什么事实或链上承接",
-        "invalidation": "什么会证明只是同名误配、一次性噪声或错误归因",
-    },
-    "marketMainline": {
-        "status": "active|uncertain|none",
-        "asOf": 0,
-        "primaryThemes": ["同一批次识别的1–3条当下市场主线；数据不足可为空"],
-        "phase": "emerging|accelerating|consensus|crowded|rotating|fading|unclear",
-        "leaders": ["主线代表资产/项目及领先依据"],
-        "capitalAttention": "成交、流动性、链上资金和跨平台注意力如何迁移",
-        "evidence": ["支持主线判断的跨资产/资金/事件证据；不得只写候选自身文案"],
-        "candidateRelation": "core-leader|core-member|branch-expansion|catch-up|independent-catalyst|counter-trend|theme-rub|uncertain",
-        "relationReason": "候选与市场主线的具体关系；若独立催化或主线未知也要解释",
-        "nextTrigger": "主线或候选关系升级所需事实",
-        "invalidation": "主线判断或关系判断的失效条件",
-    },
-    "hotspotOpportunity": {
-        "eventId": "热点事件ID",
-        "eventName": "热点事件的一句话名称",
-        "relation": "official|community-recognized|independent-hotspot|parody|copy|impersonation|unrelated|uncertain",
-        "officialClaimStatus": "官方认领状态；只描述身份",
-        "officialDenialStatus": "官方否认状态",
-        "falseOfficialClaim": False,
-        "attentionState": "A0-A8",
-        "attentionVelocity": 0,
-        "crossSourceCount": 0,
-        "crossPlatformCount": 0,
-        "mappingFit": {"name": 0, "visual": 0, "semantic": 0, "time": 0, "culture": 0},
-        "candidateCountSameEvent": 0,
-        "currentLeader": "当前热点龙头；未形成就明确写未形成",
-        "priority": "P0|P1|P2|P3|NONE",
-        "override": False,
-        "identityConclusion": "它是谁发的、是否认领或冒充",
-        "opportunityConclusion": "为什么现在可能值得看；不得因非官方直接降为低价值",
-        "executionConclusion": "独立执行许可与致命风险结论",
-        "nextTrigger": "热点、映射或承接升级条件",
-        "invalidation": "热点机会失效条件",
-    },
-    "deploySource": "发行/自动发射来源，仅作来源或行为标签",
-    "chainContext": "公链语境和资本形成方式",
-    "assetIdentity": "资产身份、CA/协议/项目归属和报价资产",
-    "minAttentionUnit": "最小注意力单元",
-    "emotionalHook": "情绪入口",
-    "attentionHook": "注意力入口",
-    "narrativeType": "叙事类型",
-    "novelty": {"asset": 0, "protocol": 0, "mechanism": 0, "gameplay": 0},
-    "firstness": "Firstness 台账结论",
-    "distribution": "分发继承与渠道",
-    "paidBuyers": "付费买家和资金根",
-    "acceleration": "成交/持有人/流动性加速度",
-    "smartMoney": "聪明钱/KOL/关键人物",
-    "quoteMigration": "报价迁移和主导报价资产",
-    "mechanism": "税/金库/奖励/桥/赎回/RWA/可编程机制",
-    "historicalAnalogues": ["历史类比"],
-    "falsifiers": ["可证伪条件"],
-    "p0OfficialAsset": "Blue Box P0 首个官方资产结论",
-    "crossRegimeHandoff": "跨形态/跨制度接力",
-    "motherCaseSignals": "母案例信号",
-    "identityTimeSupplyAudit": "身份、时间与供应审计",
-    "actionWindow": "当前行动窗口；无窗口要明确说明",
-    "narrativeDiscoveryScore": 0,
-    "attentionTransitionScore": 0,
-    "mappingFitScore": 0,
-    "leaderElectionScore": 0,
-    "confidenceScore": 0,
-    "discoveryScore": 0,
-    "stateTransitionBonus": 0,
-    "metaScore": 0,
     "opportunityScore": 0,
     "leaderScore": 0,
     "executionScore": 0,
     "riskScore": 0,
     "executionPermission": "ALLOW|CAUTION|BLOCK|UNKNOWN",
-    "auditStatus": "checked|partial|critical|fatal|unknown",
-    "riskTags": ["研究风险标签；不可因软标签删除候选"],
-    "hardBlockReason": "仅已确认致命执行风险填写，否则为空",
-    "leaderReason": "为何领先同题材候选",
-    "primaryDriver": "当前最主要驱动",
-    "nextTransition": "下一链上阶段迁移",
-    "nextTrigger": "下一注意力/映射/龙头触发条件",
-    "invalidation": "失效条件",
+    "primaryDriver": "一句话主要驱动",
+    "leaderReason": "一句话为何领先同题材候选",
+    "nextTrigger": "一句话下一触发条件",
+    "invalidation": "一句话失效条件",
 }

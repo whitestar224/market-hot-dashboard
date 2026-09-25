@@ -199,9 +199,92 @@ def configured_feed_sources() -> list[dict[str, Any]]:
     return sources
 
 
+# Local VPN/proxy clients (Clash, v2rayN, ...) expose HTTP proxies on these
+# well-known loopback ports. The dashboard host rotates proxy software over
+# time, so every fetch races direct + all plausible local proxy routes and the
+# first healthy response wins. Dead ports fail fast on loopback connect, so
+# probing them inside the race is effectively free.
+PROXY_CANDIDATE_PORTS = (7890, 7897, 7899, 10809, 2080, 53000)
+
+
+def _env_proxy_url() -> str:
+    for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        value = str(os.getenv(name) or "").strip()
+        if value:
+            return value.rstrip("/")
+    return ""
+
+
+def _candidate_routes() -> list[str]:
+    """Routes to race: direct first, then env proxy, then known local ports."""
+    routes = [""]
+    for proxy in [_env_proxy_url()] + [f"http://127.0.0.1:{port}" for port in PROXY_CANDIDATE_PORTS]:
+        if proxy and proxy not in routes:
+            routes.append(proxy)
+    return routes
+
+
+def _get_via_route(url: str, headers: dict[str, str], timeout: float, proxy: str) -> requests.Response:
+    # One retry per route: transient TLS resets (VPN tunnel handoff, CDN edge)
+    # must not disqualify an otherwise healthy route.
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            if proxy:
+                return requests.get(
+                    url,
+                    headers=headers,
+                    timeout=timeout,
+                    proxies={"http": proxy, "https": proxy},
+                    allow_redirects=True,
+                )
+            # Direct route: ignore HTTP(S)_PROXY env so a stale desktop proxy
+            # cannot wedge the fetch; the OS default route (e.g. a system VPN
+            # tunnel) applies.
+            session = requests.Session()
+            session.trust_env = False
+            try:
+                return session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+            finally:
+                session.close()
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt == 0:
+                time.sleep(0.4)
+    assert last_error is not None
+    raise last_error
+
+
+def http_get_race(url: str, *, headers: dict[str, str] | None = None, timeout: float = 10.0) -> requests.Response:
+    """GET via direct + local proxy routes in parallel; first healthy response wins.
+
+    A half-dead local proxy can hold a news source until timeout while the same
+    URL is fine direct (or via another proxy port). Racing the routes keeps the
+    newsflash aggregation working whichever route is broken today.
+    """
+    request_headers = dict(headers or {"User-Agent": "XingyunSocietyNewsflash/1.0"})
+    routes = _candidate_routes()
+    if len(routes) == 1:
+        return _get_via_route(url, request_headers, timeout, "")
+    pool = ThreadPoolExecutor(max_workers=len(routes), thread_name_prefix="newsflash-route")
+    futures = [pool.submit(_get_via_route, url, request_headers, timeout, proxy) for proxy in routes]
+    first_error: Exception | None = None
+    try:
+        for future in as_completed(futures):
+            try:
+                response = future.result()
+                response.raise_for_status()
+            except Exception as exc:  # route failure: try the next completed route
+                first_error = first_error or exc
+                continue
+            return response
+        raise first_error or RuntimeError(f"all routes failed for {url}")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
 def _fetch_feed(source: dict[str, Any], headers: dict[str, str], timeout: float) -> list[dict[str, Any]]:
-    response = requests.get(str(source["url"]), headers=headers, timeout=timeout)
-    response.raise_for_status()
+    response = http_get_race(str(source["url"]), headers=headers, timeout=timeout)
     if len(response.content) > 2_000_000:
         raise ValueError("feed response is too large")
     return parse_feed_xml(response.text, source)

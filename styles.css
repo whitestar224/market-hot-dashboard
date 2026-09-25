@@ -154,6 +154,9 @@ button {
   white-space: nowrap;
   text-decoration: none;
   background: rgba(0, 0, 0, 0.18);
+  /* Fast responsive transitions */
+  transition: color 120ms ease, background 120ms ease, border-color 120ms ease, transform 100ms ease;
+  will-change: transform;
 }
 
 .ranking-shell .nav-link,
@@ -349,6 +352,12 @@ body:not(.admin-console-body) .status-cluster {
   display: flex;
   width: max-content;
   animation: ticker 34s linear infinite;
+  /* Pause on hover for easier reading */
+  transition: animation-play-state 0.2s ease;
+}
+
+.ticker-rail:hover .ticker-track {
+  animation-play-state: paused;
 }
 
 .ticker-item {
@@ -411,6 +420,20 @@ body:not(.admin-console-body) .status-cluster {
   border: 1px solid var(--line);
   border-radius: 6px;
   background: rgba(0, 0, 0, 0.18);
+  /* Smooth focus transitions */
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.search-box:focus-within,
+.sort-box:focus-within {
+  border-color: rgba(246, 187, 72, 0.6);
+  box-shadow: 0 0 0 2px rgba(246, 187, 72, 0.15);
+}
+
+/* Search loading state */
+.search-box.is-searching input {
+  opacity: 0.5;
+  cursor: wait;
 }
 
 .action-button {
@@ -536,7 +559,9 @@ select option {
   border-radius: 6px;
   color: var(--muted);
   background: rgba(241, 234, 215, 0.055);
-  transition: 0.18s ease;
+  /* Snappy filter button transitions */
+  transition: color 120ms ease, background 120ms ease, border-color 120ms ease, transform 100ms ease;
+  will-change: transform;
 }
 
 .segmented button:hover,
@@ -994,6 +1019,8 @@ select option {
   font-weight: 900;
   cursor: pointer;
   background: rgba(246, 187, 72, 0.06);
+  /* Snappy pagination button */
+  transition: background 100ms ease, border-color 100ms ease, color 100ms ease;
 }
 
 .total-page-button:hover:not(:disabled),
@@ -1190,6 +1217,8 @@ select option {
   font-weight: 900;
   cursor: pointer;
   background-color: rgba(246, 187, 72, 0.1);
+  /* Snappy dropdown feedback */
+  transition: background 100ms ease;
 }
 
 .board-period-control select option {
@@ -1292,6 +1321,8 @@ select option {
   min-height: 54px;
   padding: 8px 14px;
   border-bottom: 1px solid rgba(241, 234, 215, 0.08);
+  /* Fast hover feedback */
+  transition: background 100ms ease;
 }
 
 .rank-row:last-child {
@@ -5407,12 +5438,19 @@ body.todo-app-body .loading-panel b {
 @keyframes cardIn {
   from {
     opacity: 0;
-    transform: translateY(12px);
+    transform: translateY(8px);
   }
   to {
     opacity: 1;
     transform: translateY(0);
   }
+}
+
+/* Optimistic render: skip animation for re-renders */
+.board-card.is-rendering {
+  animation: none;
+  opacity: 1;
+  transform: translateY(0);
 }
 
 @media (max-width: 1180px) {

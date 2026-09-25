@@ -32,6 +32,11 @@
   let loading = false;
   let adding = false;
   let items = [];
+  // Symbols dismissed seconds ago can still come back inside a stale server
+  // snapshot (the cache rebuilds in the background). Until the tombstone
+  // expires, keep hiding the symbol so a card never visibly resurrects; the
+  // expiry also lets a legitimately re-added symbol show up again later.
+  const pendingExcluded = new Map();
   let structureItems = [];
   let newLowStructureItems = [];
   let structureLoading = false;
@@ -2546,7 +2551,12 @@
   }
 
   function render(payload) {
-    items = Array.isArray(payload.items) ? payload.items : [];
+    const freshItems = Array.isArray(payload.items) ? payload.items : [];
+    const nowMs = Date.now();
+    pendingExcluded.forEach((expiresAt, symbol) => {
+      if (expiresAt <= nowMs) pendingExcluded.delete(symbol);
+    });
+    items = freshItems.filter((item) => !pendingExcluded.has(item.symbol));
     if (payload.summary) currentSummary = payload.summary;
     const summary = currentSummary;
     Object.entries(metricNodes).forEach(([key, node]) => {
@@ -2591,7 +2601,7 @@
     grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-chains");
     const visibleItems = currentMode === "oversold"
       ? items.filter((item) => item.oversoldCandidate || item.fibCandidate)
-      : items.filter((item) => item.priorHighEnabled !== false);
+      : items.filter((item) => item.priorHighEnabled !== false && item.status !== "unavailable");
     if (!visibleItems.length) {
       renderGrid(`
         <div class="price-watch-empty">
@@ -3169,7 +3179,8 @@
       method: "POST",
       cache: "no-store",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action, symbol, ...extra })
+      body: JSON.stringify({ action, symbol, ...extra }),
+      signal: AbortSignal.timeout(15000)
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok || payload.ok === false) throw new Error(payload.error || "操作失败");
@@ -3970,33 +3981,39 @@
     }
 
     const priorHighExcludeButton = event.target.closest("[data-exclude-prior-high]");
-    if (priorHighExcludeButton && !loading) {
+    if (priorHighExcludeButton) {
       const symbol = priorHighExcludeButton.dataset.excludePriorHigh;
-      setBusy(true, `正在从整个监控系统剔除 ${symbol}…`);
+      // Optimistic removal that also works while an auto-poll is in flight:
+      // gating on `loading` made clicks during a slow poll feel dead.
+      pendingExcluded.set(symbol, Date.now() + 120_000);
+      priorHighExcludeButton.closest("article")?.remove();
+      items = items.filter((item) => item.symbol !== symbol);
+      render({ items });
+      statusNode.textContent = `正在从整个监控系统剔除 ${symbol}…`;
       try {
         await postAction("exclude_prior_high", symbol);
-        render(await getPayload(false));
         statusNode.textContent = `${symbol} 已从整个监控系统剔除；离榜后再次上榜或手动重新加入会恢复`;
       } catch (error) {
-        statusNode.textContent = error.message;
-      } finally {
-        setBusy(false);
+        pendingExcluded.delete(symbol);
+        statusNode.textContent = `${symbol} 剔除请求失败：${error.message}`;
       }
       return;
     }
 
     const oversoldExcludeButton = event.target.closest("[data-exclude-oversold]");
-    if (oversoldExcludeButton && !loading) {
+    if (oversoldExcludeButton) {
       const symbol = oversoldExcludeButton.dataset.excludeOversold;
-      setBusy(true, `正在从整个监控系统剔除 ${symbol}…`);
+      pendingExcluded.set(symbol, Date.now() + 120_000);
+      oversoldExcludeButton.closest("article")?.remove();
+      items = items.filter((item) => item.symbol !== symbol);
+      render({ items });
+      statusNode.textContent = `正在从整个监控系统剔除 ${symbol}…`;
       try {
         await postAction("exclude_prior_high", symbol);
-        render(await getPayload(false));
         statusNode.textContent = `${symbol} 已从整个监控系统剔除；离榜后再次上榜或手动重新加入会恢复`;
       } catch (error) {
-        statusNode.textContent = error.message;
-      } finally {
-        setBusy(false);
+        pendingExcluded.delete(symbol);
+        statusNode.textContent = `${symbol} 剔除请求失败：${error.message}`;
       }
       return;
     }

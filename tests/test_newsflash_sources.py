@@ -1,9 +1,11 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from newsflash_sources import (
+    _get_via_route,
     aggregate_newsflash,
     deduplicate_news_items,
+    http_get_race,
     parse_feed_xml,
     stories_match,
 )
@@ -134,6 +136,70 @@ def test_aggregation_isolates_a_failed_source_and_reports_deduplication():
 
 
 
+def test_http_get_race_returns_first_healthy_route_and_skips_dead_proxies():
+    direct_response = MagicMock()
+    direct_response.raise_for_status.return_value = None
+
+    def fake_route(url, headers, timeout, proxy):
+        if proxy:
+            raise RuntimeError(f"proxy {proxy} is half-dead")
+        return direct_response
+
+    with patch("newsflash_sources._get_via_route", side_effect=fake_route), patch(
+        "newsflash_sources._env_proxy_url", return_value="http://127.0.0.1:7890"
+    ):
+        assert http_get_race("https://example.com/feed", timeout=8) is direct_response
+
+
+def test_http_get_race_uses_proxy_route_when_direct_fails():
+    proxy_response = MagicMock()
+    proxy_response.raise_for_status.return_value = None
+
+    def fake_route(url, headers, timeout, proxy):
+        if not proxy:
+            raise RuntimeError("direct is blocked")
+        return proxy_response
+
+    with patch("newsflash_sources._get_via_route", side_effect=fake_route), patch(
+        "newsflash_sources._env_proxy_url", return_value="http://127.0.0.1:7890"
+    ):
+        assert http_get_race("https://example.com/feed", timeout=8) is proxy_response
+
+
+def test_http_get_race_raises_last_error_when_every_route_fails():
+    def fake_route(url, headers, timeout, proxy):
+        raise RuntimeError(f"route {proxy or 'direct'} failed")
+
+    with patch("newsflash_sources._get_via_route", side_effect=fake_route), patch(
+        "newsflash_sources._env_proxy_url", return_value=""
+    ):
+        try:
+            http_get_race("https://example.com/feed", timeout=8)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("expected RuntimeError when all routes fail")
+
+
+def test_direct_route_ignores_proxy_environment():
+    captured = {}
+
+    class FakeSession:
+        trust_env = True
+
+        def get(self, url, **kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        def close(self):
+            return None
+
+    with patch("newsflash_sources.requests.Session", return_value=FakeSession()):
+        _get_via_route("https://example.com/feed", {"User-Agent": "t"}, 8, "")
+
+    assert captured.get("timeout") == 8
+
+
 class NewsflashSourcesTests(unittest.TestCase):
     def test_cross_source_duplicates(self):
         test_cross_source_duplicates_keep_blockbeats_and_merge_source_metadata()
@@ -156,5 +222,17 @@ class NewsflashSourcesTests(unittest.TestCase):
 
     def test_source_failure_isolation(self):
         test_aggregation_isolates_a_failed_source_and_reports_deduplication()
+
+    def test_race_returns_first_healthy_route(self):
+        test_http_get_race_returns_first_healthy_route_and_skips_dead_proxies()
+
+    def test_race_falls_back_to_proxy_route(self):
+        test_http_get_race_uses_proxy_route_when_direct_fails()
+
+    def test_race_raises_when_all_routes_fail(self):
+        test_http_get_race_raises_last_error_when_every_route_fails()
+
+    def test_direct_route_bypasses_env_proxy(self):
+        test_direct_route_ignores_proxy_environment()
 
 

@@ -33,3 +33,6 @@ tmp_*.js
 
 # Runtime temp data
 tmp/
+
+# WorkBuddy workspace memory (local only, not project code)
+.workbuddy/
