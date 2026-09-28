@@ -37,5 +37,8 @@ tmp/
 # Large local binary artifacts (GitHub has a 100MB per-file hard limit)
 backtest-backup/*.db
 
+# tools/extract_module.py 的自动备份（本地排查用，不入库）
+*.extractbak
+
 # WorkBuddy workspace memory (local only, not project code)
 .workbuddy/

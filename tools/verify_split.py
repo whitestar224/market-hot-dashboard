@@ -35,31 +35,50 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # 已抽取到 app.* 的名字 -> 期望来源模块。每完成一个批次就往这里追加。
+# 已抽取的模块。每项分两类：
+#   reexported —— server.py 仍会引用的名字，必须能在 server 命名空间解析，
+#                 且不得再在 server.py 里重复定义
+#   internal   —— 只在新模块内部使用的辅助函数，不应出现在 server 命名空间
 EXTRACTED = {
-    "app.core.paths": ["ROOT", "CODEX_HOME"],
-    "app.core.config": [
-        "TRUTHY_ENV_VALUES", "PRODUCTION_ENV_VALUES", "raw_env_value", "raw_env_flag",
-        "is_raw_production_mode", "is_production_mode", "env_flag", "env_value",
-        "expose_dev_code", "cookie_secure_enabled",
-    ],
+    "app.core.paths": {
+        "reexported": ["ROOT", "CODEX_HOME"],
+        "internal": [],
+    },
+    "app.core.config": {
+        "reexported": [
+            "TRUTHY_ENV_VALUES", "PRODUCTION_ENV_VALUES", "raw_env_value", "raw_env_flag",
+            "is_raw_production_mode", "is_production_mode", "env_flag", "env_value",
+            "expose_dev_code", "cookie_secure_enabled",
+        ],
+        "internal": [],
+    },
+    "app.api.seo": {
+        "reexported": ["SEO_NOINDEX_PATHS", "SEO_PUBLIC_PAGES", "inject_seo_into_html",
+                       "normalized_page_path", "robots_txt", "sitemap_xml"],
+        "internal": ["request_base_url", "canonical_url", "strip_runtime_seo_tags",
+                     "seo_schema_for_page", "request_base_url_for_schema", "inject_site_footer",
+                     "site_footer_html", "refresh_stylesheet_version", "seo_head_block"],
+    },
 }
 
 _CHILD = r'''
-import json, os, sys, warnings
+import importlib, json, os, sys, warnings
 warnings.filterwarnings("ignore")
-result = {"ok": False}
+result = {"ok": False, "module_names": {}, "server_names": {}}
+spec = json.loads(os.environ["EXTRACTED_JSON"])
 try:
     import server
     result["ok"] = True
     result["root"] = str(server.ROOT)
     result["root_is_project"] = (server.ROOT / "index.html").exists() and (server.ROOT / "server.py").exists()
     result["persist_dir"] = str(server.PERSIST_CACHE_DIR)
-    found = {}
-    for mod, names in json.loads(os.environ["EXTRACTED_JSON"]).items():
-        for n in names:
+    for mod, groups in spec.items():
+        m = importlib.import_module(mod)
+        for n in groups["reexported"] + groups["internal"]:
+            result["module_names"][f"{mod}:{n}"] = type(getattr(m, n, None)).__name__
+        for n in groups["reexported"]:
             obj = getattr(server, n, "<MISSING>")
-            found[n] = None if obj == "<MISSING>" else type(obj).__name__
-    result["names"] = found
+            result["server_names"][n] = None if obj == "<MISSING>" else type(obj).__name__
 except Exception as exc:
     import traceback
     result["error"] = f"{type(exc).__name__}: {exc}"
@@ -122,17 +141,17 @@ def main() -> int:
             print(f"[verify] ✓ 运行时隔离生效: {rd}")
         else:
             print(f"[verify] ⚠ 运行时未隔离: {rd}")
-        print("[verify] 已抽取名字可用性:")
-        for mod, names in EXTRACTED.items():
-            line = []
-            for n in names:
-                t = payload["names"].get(n)
-                if t is None:
-                    failures.append(f"{n} 不在 server 命名空间")
-                    line.append(f"{n}=缺失")
-                else:
-                    line.append(f"{n}={t}")
-            print(f"    {mod}: " + ", ".join(line))
+        print("[verify] 已抽取模块检查:")
+        for mod, groups in EXTRACTED.items():
+            miss_mod = [n for n in groups["reexported"] + groups["internal"]
+                        if payload["module_names"].get(f"{mod}:{n}") in (None, "NoneType")]
+            miss_srv = [n for n in groups["reexported"] if payload["server_names"].get(n) is None]
+            if miss_mod:
+                failures.append(f"{mod} 内缺失: {miss_mod}")
+            if miss_srv:
+                failures.append(f"{mod} 的再导出名不在 server 命名空间: {miss_srv}")
+            mark = "✓" if not miss_mod and not miss_srv else "✗"
+            print(f"    {mark} {mod}: 再导出 {len(groups['reexported'])} 个 / 内部 {len(groups['internal'])} 个")
 
     # 残留定义检查：抽取过的名字不应再在 server.py 里定义
     import ast
@@ -146,7 +165,7 @@ def main() -> int:
             for t in node.targets:
                 if isinstance(t, ast.Name):
                     defined.add(t.id)
-    moved = {n for names in EXTRACTED.values() for n in names}
+    moved = {n for g in EXTRACTED.values() for n in g["reexported"] + g["internal"]}
     leftovers = sorted(moved & defined)
     if leftovers:
         print(f"[verify] ✗ server.py 仍有重复定义: {leftovers}")
