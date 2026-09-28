@@ -70,8 +70,12 @@ def _server():
     """懒加载 server 模块对象，用于读取仍留在 server.py 命名空间里的运行时状态。
 
     必须在【函数体内】调用（见模块 docstring）。模块导入期调用会因循环导入失败。
+
+    关键坑：`python server.py` 直接运行时，模块注册名是 `__main__` 而非 `server`
+    （只有 `import server` 才会注册 `sys.modules["server"]`）。因此这里先查 `server`，
+    再回退 `__main__`，两条路径都能拿到同一个、状态实时更新的模块对象。
     """
-    return sys.modules["server"]
+    return sys.modules.get("server") or sys.modules["__main__"]
 
 
 def runtime_thread_groups() -> dict[str, int]:

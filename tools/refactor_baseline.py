@@ -124,6 +124,10 @@ VOLATILE_HINT_KEYS = frozenset({"updatedAt", "generatedAt", "timestamp", "ts", "
 VOLATILE_KEY_DICTS = frozenset({
     "threadGroups",
     "threadStackSummary",
+    # 链名键字典：GMGN 五链/链上源状态，键是链名（solana/bsc/base/eth/...），
+    # 冷启动时哪些链返回了状态取决于上游 API 时机，键集合跨进程不稳定。
+    "sourceStatus",
+    "researchSourceStatus",
 })
 
 MAX_DEPTH = 8

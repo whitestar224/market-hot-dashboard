@@ -514,9 +514,46 @@ state.py 且是同一对象，直接 `from app.core.state import`。
 ### 后续批次顺序（据此更新）
 
 1. ~~批次 1 核心层~~ 2. ~~批次 2 seo~~ 3. ~~批次 3 共享状态区~~ 4. ~~批次 4 ops_health~~
-5. **`auth_config`**（3 函数、0 重绑定、最干净）→ `smart_money`（13 函数、0 重绑定）
+5. **`auth_config`**（3 函数、0 重绑定、最干净）→ ~~`smart_money`~~（本批已完成）
    → `binance` → `alert` → `onchain` → `dragon_wave` / `strategy` / `market`
    → `news` / `wechat` / `price_watch` / `price_structure` / `social_x` → `misc`（最后）
+
+### 批次 5：smart_money / 全网热点域（app/api/smart_money.py）✅ 已完成并验证
+
+**内容**：把 `global_hotspot_*` 15 个函数（原 server.py 第 49521-49975 行，连续 455 行）
+搬到 `src/app/api/smart_money.py`。`server.py` 54172 → 53717 行（-455）。
+
+**保留在 server.py**：`start_global_hotspot_monitor`（仅 6 行）因含
+`global GLOBAL_HOTSPOT_MONITOR_ACTIVE` 重绑定，按坑 1 铁律留在原文件（重绑定名
+`GLOBAL_HOTSPOT_MONITOR_ACTIVE` 定义在第 864 行，仍属 server.py 顶层）。
+
+**外部依赖处理**：这 15 个函数引用 16 个仍未拆分的 server 本地函数/单例
+（`clean_feed_text`/`safe_float`/`unique_values`/`read_json_cache`/`write_json_cache`/
+`event_monitor_source_rows`/`js_stable_key`/`alert_event_ms`/`codex_cli_chat`/
+`deepseek_extract_json`/`trigger_api_refresh`/`build_event_monitor_core_payload`/
+`event_monitor_hot_entities`/`news_trade_dex_search_rows`/`safe_error_text`/
+`ONCHAIN_FAST_RESEARCH`），全部走 `_server()` 懒加载读取；`NEWS_TRIGGER_VERSION`/
+`promote_resonance_priority` 从 `onchain_fast_research` 直接 import；锁/常量
+（`GLOBAL_HOTSPOT_LOCK`/`GLOBAL_HOTSPOT_STATE_PATH` 等）从 `app.core.state` 直接 import。
+
+**🔴 踩中并修复的坑 8：「懒 import server」必须回退 `__main__`** —— 批次 4 的 `health.py`
+写的 `_server() = sys.modules["server"]` 有**潜伏 bug**：`python server.py` 直接运行时
+（生产 + `ab_verify.py` 都是这么启动），模块注册名是 `__main__` 而非 `server`（只有
+`import server` 才注册 `sys.modules["server"]`）。所以 `_server()` 会 `KeyError` → 端点
+抛异常 → 连接被断（表现为 `RemoteDisconnected`）。批次 4 时 `health` 端点在 A/B 里一直
+返回 `RemoteDisconnected`，被误判成「冷启动网络抖动」，实际是**真 bug 被抖动掩盖了**。
+正解：`_server()` 改成 `sys.modules.get("server") or sys.modules["__main__"]`，两条路径
+都拿同一对象。已同步修 `health.py` 与 `smart_money.py`。**后续所有 `_server()` 一律用此写法。**
+
+**验收结果**：
+- `verify_split`：15 名再导出、对象同一性、零重绑定泄漏、零残留重复定义
+- 静态页面 19/19 逐字节一致
+- API A/B：40 端点全通过（`global-hotspots` 修复 `_server()` 后 116ms→554ms 结构一致；
+  `health` 从「静默 RemoteDisconnected」变为正常返回；`chain-ecosystem` 的
+  `dailyResearch.sourceStatus.solana` 差异是链名键字典的冷启动时序抖动，已在
+  `VOLATILE_KEY_DICTS` 加入 `sourceStatus`/`researchSourceStatus` 折叠消除；`strategy-board`
+  首采 17 字段差异是策略引擎首个计算周期未完成，重探后一致）
+- 单测：`test_global_hotspot_monitor.py` 6/6 通过；无其他测试引用本域名字
 
 
 

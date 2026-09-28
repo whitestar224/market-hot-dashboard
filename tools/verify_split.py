@@ -59,6 +59,19 @@ EXTRACTED = {
                      "seo_schema_for_page", "request_base_url_for_schema", "inject_site_footer",
                      "site_footer_html", "refresh_stylesheet_version", "seo_head_block"],
     },
+    "app.api.smart_money": {
+        "reexported": [
+            "global_hotspot_candidate_matches", "global_hotspot_claim_batch",
+            "global_hotspot_day_key", "global_hotspot_enrich_candidate",
+            "global_hotspot_identity_text", "global_hotspot_match_event",
+            "global_hotspot_monitor_loop", "global_hotspot_prompt",
+            "global_hotspot_public_url", "global_hotspot_research_rows",
+            "global_hotspot_snapshot", "global_hotspot_source_row",
+            "global_hotspot_text_list", "normalize_global_hotspot_event",
+            "run_global_hotspot_batch",
+        ],
+        "internal": [],
+    },
     "app.core.state": {
         # check_all_identity：把模块导出的全部公开名字逐个与 server 命名空间做
         # `is` 同一性比对。这对锁/缓存是生死线 —— 若出现「两把不同的锁」，
