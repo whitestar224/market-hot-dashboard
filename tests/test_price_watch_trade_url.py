@@ -37,7 +37,7 @@ class PriceWatchTradeUrlTests(unittest.TestCase):
                 chain_id="4663",
                 contract_address="0x56910d4409f3a0c78c64dd8d0545ff0705389870",
             ),
-            "https://web3.binance.com/en/token/robinhood/0x56910d4409f3a0c78c64dd8d0545ff0705389870?ref=MQ6JD2X4",
+            "https://web3.binance.com/zh-CN/token/robinhood/0x56910d4409f3a0c78c64dd8d0545ff0705389870?ref=MQ6JD2X4",
         )
 
     def test_wallet_origin_overrides_secondary_contract_provider(self):
@@ -49,7 +49,7 @@ class PriceWatchTradeUrlTests(unittest.TestCase):
                 contract_address="6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx",
                 prefer_wallet=True,
             ),
-            "https://web3.binance.com/en/token/sol/6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx?ref=MQ6JD2X4",
+            "https://web3.binance.com/zh-CN/token/sol/6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx?ref=MQ6JD2X4",
         )
 
     def test_price_alert_view_uses_signal_provider_trade_page(self):

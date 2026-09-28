@@ -162,6 +162,7 @@ class GmgnTrenchHotBoardTests(unittest.TestCase):
                 patch.object(server, "fetch_live_onchain_trenches", return_value=payload) as fetch_live,
                 patch.object(server.time, "time", return_value=observed_at / 1000),
                 patch.object(server, "ONCHAIN_FAST_RESEARCH", fast_research),
+                patch.object(server, "queue_onchain_research_ingest", return_value=1) as queue_ingest,
             ):
                 source = server.refresh_gmgn_trenches_hot_board()
 
@@ -178,7 +179,7 @@ class GmgnTrenchHotBoardTests(unittest.TestCase):
             self.assertEqual(source["rows"][0]["icon"], "https://img.example/NEW.png")
             self.assertEqual(
                 source["rows"][0]["binanceWalletUrl"],
-                "https://web3.binance.com/en/token/sol/SoLaNaContract123?ref=MQ6JD2X4",
+                "https://web3.binance.com/zh-CN/token/sol/SoLaNaContract123?ref=MQ6JD2X4",
             )
             self.assertEqual(source["rows"][0]["xOriginal"]["text"], "NEW original post")
             self.assertEqual(source["refreshIntervalSeconds"], server.GMGN_TRENCH_BOARD_REFRESH_SECONDS)
@@ -186,11 +187,104 @@ class GmgnTrenchHotBoardTests(unittest.TestCase):
             self.assertEqual(source["aiPolicy"], "visible-latest-10-cached")
             self.assertEqual(source["currentFetchedCount"], 1)
             self.assertEqual(source["incrementalResearchIngested"], 1)
-            ingested = fast_research.ingest.call_args.args[0]
+            ingested = queue_ingest.call_args.args[0]
             self.assertEqual(len(ingested), 1)
             self.assertEqual(ingested[0]["symbol"], "NEW")
             self.assertTrue(ingested[0]["gmgnTrenchBoardMember"])
             self.assertTrue(ingested[0]["boardResearchRequired"])
+            self.assertTrue(queue_ingest.call_args.kwargs["match_recent_news"])
+
+    def test_recent_hotspot_derived_ca_is_worth_watching_without_official_claim(self):
+        observed_at = 1_800_000_000_000
+        contract = "0xd305785d98f72868d047ce8d4cbaec6dcb6acccc"
+        raw = trench_row("ZC", contract, observed_at, volume=968_482, network="eth")
+        raw["name"] = "zipcoin"
+        raw["decision"] = "watch"
+        raw["selectedScore"] = 81.8
+        raw["metrics"].update({
+            "liquidityUsd": 28_506,
+            "volumeH1Usd": None,
+            "transactionsH1": 0,
+            "transactionsH24": 1_946,
+            "smartMoneyHolders": 30,
+            "kolHolders": 7,
+        })
+        raw["launchFacts"].update({"smartMoneyHolders": 30, "kolHolders": 7})
+        topic_payload = {
+            "topics": [{
+                "id": "narrative:zipcoin",
+                "title": "zipcoin 近期热点出现链上承接",
+                "thesis": "热点衍生 Meme 正在形成成交与流动性共振",
+                "isHotTopic": True,
+                "topicScore": 86,
+                "firstSeenAt": observed_at - 2 * 60 * 60_000,
+                "lastSeenAt": observed_at,
+                "memeCandidates": [{
+                    "symbol": "ZC",
+                    "chain": "ethereum",
+                    "contractAddress": contract,
+                    "sourceUrl": "https://dexscreener.com/ethereum/example",
+                    "role": "backup",
+                    "rank": 3,
+                    "candidateScore": 64.7,
+                    "heatScore": 49.7,
+                    "narrativeRelevance": 98,
+                    "associationStatus": "highly-related-unconfirmed",
+                    "association": {"confidence": 78, "officialEvidenceUrl": ""},
+                }],
+            }],
+        }
+
+        hotspot_index = server.build_news_trade_hotspot_contract_index(
+            topic_payload,
+            now_ms=observed_at,
+        )
+        candidate = server.gmgn_trench_research_candidate(
+            raw,
+            current_ms=observed_at,
+            hotspot_index=hotspot_index,
+        )
+
+        self.assertEqual(candidate["decision"], "shortlisted")
+        self.assertTrue(candidate["worthWatching"])
+        self.assertTrue(candidate["hotspotOverride"])
+        self.assertEqual(candidate["hotspotOpportunity"]["relation"], "independent-hotspot")
+        self.assertEqual(candidate["hotspotOpportunity"]["officialClaimStatus"], "unconfirmed")
+        self.assertIn("不作为研究否决项", candidate["hotspotOpportunity"]["identityConclusion"])
+        self.assertEqual(candidate["researchEvidence"]["identityStatus"], "hotspot-derived-ca-unverified")
+        self.assertEqual(candidate["newsSignal"]["tier"], "news-triggered")
+        self.assertTrue(candidate["narrativeFallbackEligible"])
+        self.assertEqual(
+            server.news_trigger_signal(candidate, now_ms=observed_at)["tier"],
+            "news-triggered",
+        )
+
+    def test_stale_hotspot_does_not_promote_a_trench_candidate(self):
+        observed_at = 1_800_000_000_000
+        contract = "0x" + "a" * 40
+        hotspot_index = server.build_news_trade_hotspot_contract_index({
+            "topics": [{
+                "title": "旧热点",
+                "isHotTopic": True,
+                "topicScore": 90,
+                "lastSeenAt": observed_at - 25 * 60 * 60_000,
+                "memeCandidates": [{
+                    "chain": "ethereum",
+                    "contractAddress": contract,
+                    "heatScore": 100,
+                }],
+            }],
+        }, now_ms=observed_at)
+
+        candidate = server.gmgn_trench_research_candidate(
+            trench_row("OLD", contract, observed_at, volume=1_000_000, network="eth"),
+            current_ms=observed_at,
+            hotspot_index=hotspot_index,
+        )
+
+        self.assertEqual(hotspot_index, {})
+        self.assertNotIn("newsSignal", candidate)
+        self.assertNotEqual(candidate.get("decision"), "shortlisted")
 
     def test_refresh_submits_only_live_board_not_historical_tape(self):
         observed_at = 1_800_000_000_000
@@ -206,16 +300,17 @@ class GmgnTrenchHotBoardTests(unittest.TestCase):
                 patch.object(server, "fetch_live_onchain_trenches", return_value=payload),
                 patch.object(server.time, "time", return_value=observed_at / 1000),
                 patch.object(server, "ONCHAIN_FAST_RESEARCH", fast_research),
+                patch.object(server, "queue_onchain_research_ingest", return_value=1) as queue_ingest,
             ):
                 first = server.refresh_gmgn_trenches_hot_board()
                 second = server.refresh_gmgn_trenches_hot_board()
 
         self.assertEqual(first["incrementalResearchIngested"], 1)
         self.assertEqual(second["incrementalResearchIngested"], 1)
-        self.assertEqual(fast_research.ingest.call_count, 2)
+        self.assertEqual(queue_ingest.call_count, 2)
         self.assertTrue(all(
             call.args[0][0]["symbol"] == "ONCE"
-            for call in fast_research.ingest.call_args_list
+            for call in queue_ingest.call_args_list
         ))
 
     def test_unprofiled_history_is_not_displayed(self):
@@ -240,12 +335,13 @@ class GmgnTrenchHotBoardTests(unittest.TestCase):
         cached_market = {"sources": [{"id": "binance-wallet-hot", "rows": []}, stale]}
         with (
             patch.object(server, "cached_api_payload", return_value=cached_market),
-            patch.object(server, "fetch_gmgn_trenches_hot_board", return_value=latest),
+            patch.object(server, "fetch_gmgn_trenches_hot_board", return_value=latest) as fetch_gmgn,
         ):
             payload = server.market_hot_response_payload()
 
         gmgn = next(source for source in payload["sources"] if source["id"] == "gmgn-trenches")
         self.assertEqual(gmgn["rows"][0]["symbol"], "NEW")
+        fetch_gmgn.assert_called_once_with(force_refresh=False, attach_overlays=True)
 
     def test_v44_good_research_candidate_is_marked_without_mutating_cached_board(self):
         observed_at = 1_800_000_000_000

@@ -1,10 +1,12 @@
 """Read-only asset preflight at monitor intake. Never reads wallets or creates orders."""
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextlib import closing
 import copy
 import json
 import math
+import os
 from pathlib import Path
 import queue
 import sqlite3
@@ -54,11 +56,25 @@ class MonitorIdentityRegistry:
     REFRESH = 12 * 60 * 60
     RETRY = 60
 
-    def __init__(self, path, resolver, capacity=256):
+    def __init__(self, path, resolver, capacity=256, cache_size=None):
         self.path = Path(path)
         self.resolver = resolver
         self.lock = threading.RLock()
-        self.records = {}
+        configured_cache_size = cache_size if cache_size is not None else os.getenv("MONITOR_IDENTITY_CACHE_SIZE", "4096")
+        try:
+            self.cache_size = max(256, min(20_000, int(configured_cache_size)))
+        except (TypeError, ValueError):
+            self.cache_size = 4096
+        # SQLite remains authoritative. Keeping every historical identity as
+        # expanded Python dictionaries made a long-running service retain
+        # hundreds of thousands of objects even though only current rows are
+        # used. This small LRU preserves exact behavior while loading old rows
+        # on demand.
+        self.records = OrderedDict()
+        # The intake sweeper only needs membership to avoid re-verifying old
+        # history. A compact key set prevents a SQLite lookup for every row on
+        # every sweep without expanding each JSON record into Python objects.
+        self.known_keys = set()
         # Keep foreground identities independent from the large persisted
         # monitor backlog. Values are queue priorities: 0 = visible now,
         # 10 = background intake.
@@ -78,16 +94,7 @@ class MonitorIdentityRegistry:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("CREATE TABLE IF NOT EXISTS identities (key TEXT PRIMARY KEY, data TEXT NOT NULL)")
                 conn.commit()
-                for key, data in conn.execute("SELECT key, data FROM identities"):
-                    try:
-                        record = json.loads(data)
-                        if not isinstance(record, dict) or not all(isinstance(record.get(field, 0), (int, float)) and math.isfinite(record.get(field, 0)) for field in ("verifiedAt", "expiresAt", "retryAt")):
-                            continue
-                        if record.get("status") == "verified" and (self.key(target_identity(record["target"])) != key or type(record["target"].get("decimals")) is not int or not 0 <= record["target"]["decimals"] <= 36):
-                            continue
-                        self.records[key] = record
-                    except (ValueError, TypeError, KeyError):
-                        continue  # A damaged record stays unverified; it cannot break monitoring.
+                self.known_keys = {str(row[0]) for row in conn.execute("SELECT key FROM identities")}
             self.running = True
             for index in range(4):
                 worker = threading.Thread(target=self._work, name=f"monitor-ca-{index}", daemon=True)
@@ -102,6 +109,45 @@ class MonitorIdentityRegistry:
     def key(target):
         return f"{target['chainId']}:{target['address']}"
 
+    def _decode_record(self, key, data):
+        try:
+            record = json.loads(data)
+            if not isinstance(record, dict) or not all(
+                    isinstance(record.get(field, 0), (int, float)) and math.isfinite(record.get(field, 0))
+                    for field in ("verifiedAt", "expiresAt", "retryAt")):
+                return None
+            if record.get("status") == "verified" and (
+                    self.key(target_identity(record["target"])) != key
+                    or type(record["target"].get("decimals")) is not int
+                    or not 0 <= record["target"]["decimals"] <= 36):
+                return None
+            return record
+        except (json.JSONDecodeError, ValueError, TypeError, KeyError):
+            return None  # A damaged row stays unverified; it cannot break monitoring.
+
+    def _remember_locked(self, key, record):
+        self.records[key] = record
+        self.known_keys.add(key)
+        self.records.move_to_end(key)
+        while len(self.records) > self.cache_size:
+            self.records.popitem(last=False)
+        return record
+
+    def _record_locked(self, key):
+        record = self.records.get(key)
+        if record is not None:
+            self.records.move_to_end(key)
+            return record
+        try:
+            with closing(sqlite3.connect(self.path, timeout=3)) as conn:
+                row = conn.execute("SELECT data FROM identities WHERE key = ?", (key,)).fetchone()
+        except sqlite3.Error:
+            return None
+        if not row:
+            return None
+        record = self._decode_record(key, row[0])
+        return self._remember_locked(key, record) if record is not None else None
+
     def snapshot(self, row, enqueue=True, *, priority=10, retry_existing=True):
         try:
             target = target_identity(row)
@@ -110,9 +156,12 @@ class MonitorIdentityRegistry:
         key = self.key(target)
         now = time.time()
         with self.lock:
-            record = copy.deepcopy(self.records.get(key) or {})
+            known_background_record = not retry_existing and key in self.known_keys and key not in self.records
+            record = {} if known_background_record else copy.deepcopy(self._record_locked(key) or {})
             queued_priority = self.pending.get(key)
-            needs_check = not record or (retry_existing and now - record.get("verifiedAt", 0) >= self.REFRESH)
+            needs_check = not known_background_record and (
+                not record or (retry_existing and now - record.get("verifiedAt", 0) >= self.REFRESH)
+            )
             if (enqueue and self.running and needs_check and now >= record.get("retryAt", 0)
                     and (queued_priority is None or priority < queued_priority)):
                 target_queue = self.urgent_jobs if priority == 0 else self.jobs
@@ -151,7 +200,7 @@ class MonitorIdentityRegistry:
             if target_identity(resolved) != target or type(resolved.get("decimals")) is not int or not 0 <= resolved["decimals"] <= 36 or not resolved.get("symbol"):
                 raise ValueError("元数据与监控链或 CA 不一致")
             with self.lock:
-                previous = self.records.get(key) or {}
+                previous = self._record_locked(key) or {}
             if previous.get("target") and any(previous["target"].get(field) != resolved.get(field) for field in ("chainId", "address", "decimals")):
                 record = {"status": "conflict", "reason": "目标元数据发生变化，已停止开放买入", "retryAt": now + self.REFRESH}
             else:
@@ -159,7 +208,7 @@ class MonitorIdentityRegistry:
                           "expiresAt": now + self.TTL, "retryAt": 0}
         except Exception:
             with self.lock:
-                previous = copy.deepcopy(self.records.get(key) or {})
+                previous = copy.deepcopy(self._record_locked(key) or {})
             record = previous if previous.get("expiresAt", 0) > now else {
                 "status": "retrying", "reason": "CA 元数据核验暂未通过，后台稍后重试；暂不开放买入"}
             record["retryAt"] = now + self.RETRY
@@ -168,7 +217,7 @@ class MonitorIdentityRegistry:
             conn.execute("INSERT OR REPLACE INTO identities VALUES (?, ?)", (key, json.dumps(record, ensure_ascii=False)))
             conn.commit()
         with self.lock:
-            self.records[key] = record
+            self._remember_locked(key, record)
 
     def _work(self):
         while not self.stopped.is_set():

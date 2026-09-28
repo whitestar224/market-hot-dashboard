@@ -34,5 +34,8 @@ tmp_*.js
 # Runtime temp data
 tmp/
 
+# Large local binary artifacts (GitHub has a 100MB per-file hard limit)
+backtest-backup/*.db
+
 # WorkBuddy workspace memory (local only, not project code)
 .workbuddy/

@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import server
-from trench_person_signals import important_person_sources, match_person_post
+from trench_person_signals import important_official_sources, important_person_sources, match_person_post
 
 
 NOW = 1_800_000_000_000
@@ -53,23 +53,37 @@ def confirmed_semantics(pairs):
 
 
 class TrenchPersonSignalTests(unittest.TestCase):
-    def test_default_roster_keeps_only_market_moving_people_plus_official_accounts(self):
+    def test_default_person_roster_keeps_only_market_leaders(self):
         rows = important_person_sources()
         by_handle = {row["handle"].casefold(): row for row in rows}
 
-        self.assertEqual(len(rows), 129)
+        self.assertEqual(len(rows), 40)
         for handle in (
             "vitalikbuterin", "realdonaldtrump", "jtlonsdale", "novogratz",
-            "sunyuchentron", "binance", "solana", "layerzero_core",
+            "sunyuchentron", "satyanadella", "demishassabis", "rajgokal",
+            "ilblackdragon", "elibensasson", "alexgluchowski", "vladtenev",
         ):
             self.assertIn(handle, by_handle)
-        for handle in ("brian_armstrong", "satyanadella", "karpathy", "secgov"):
+        for handle in (
+            "brian_armstrong", "karpathy", "secgov", "nearprotocol", "okx",
+            "binance", "cobie", "ericbalchunas", "jmilei", "nayibbukele",
+            "davidsacks",
+        ):
             self.assertNotIn(handle, by_handle)
-        self.assertEqual(by_handle["binance"]["category"], "project_official")
         self.assertEqual(by_handle["elonmusk"]["watchTier"], "primary")
-        self.assertEqual(sum(row["category"] == "project_official" for row in rows), 80)
-        self.assertEqual(sum(row["category"] != "project_official" for row in rows), 49)
+        self.assertEqual(sum(row["category"] == "project_official" for row in rows), 0)
         self.assertEqual(len(rows), len(by_handle))
+
+    def test_passive_official_roster_excludes_exchanges(self):
+        rows = important_official_sources()
+        by_handle = {row["handle"].casefold(): row for row in rows}
+
+        self.assertEqual(len(rows), 66)
+        for handle in ("nearprotocol", "solana", "ethereum", "layerzero_core"):
+            self.assertIn(handle, by_handle)
+        for handle in ("binance", "coinbase", "okx", "krakenfx", "robinhoodapp"):
+            self.assertNotIn(handle, by_handle)
+        self.assertTrue(all(row["category"] == "project_official" for row in rows))
 
     def test_quote_of_token_official_x_is_strong_identity(self):
         signal = match_person_post(
@@ -234,6 +248,129 @@ class TrenchPersonSignalTests(unittest.TestCase):
 
         self.assertEqual(result["source"], "fresh")
 
+    def test_already_checked_primary_cannot_starve_unvisited_official_source(self):
+        sources = [
+            {
+                "id": "trench-person:primary",
+                "handle": "primary",
+                "displayName": "Primary",
+                "personRole": "重要人物",
+                "category": "notable",
+                "watchTier": "primary",
+                "aliases": [],
+            },
+            {
+                "id": "trench-person:official",
+                "handle": "official",
+                "displayName": "Official",
+                "personRole": "项目官方",
+                "category": "project_official",
+                "watchTier": "official",
+                "aliases": [],
+            },
+        ]
+        with (
+            patch.dict(server.TRENCH_PERSON_WATCH_NEXT_DUE, {"trench-person:primary": 1_000.0}, clear=True),
+            patch.dict(server.TRENCH_PERSON_WATCH_FAILURES, {}, clear=True),
+            patch.object(server.time, "monotonic", return_value=1_000.0),
+            patch.object(server, "trench_person_recent_rows", return_value=[]),
+            patch.object(server, "trench_person_watch_sources", return_value=sources),
+            patch.object(server, "trench_person_fetch_public_source", return_value={
+                "source": {"status": "ok", "lastCheckAt": NOW},
+                "items": [],
+            }),
+            patch.object(server, "trench_person_record_source_health"),
+            patch.object(server, "ingest_trench_person_payload", return_value=[]),
+        ):
+            result = server.trench_person_poll_once()
+
+        self.assertEqual(result["source"], "official")
+
+    def test_startup_preserves_curated_primary_order_over_temporary_relevance(self):
+        sources = [
+            {
+                "id": "trench-person:vitalik",
+                "handle": "vitalik",
+                "displayName": "Vitalik",
+                "personRole": "重要人物",
+                "category": "notable",
+                "watchTier": "primary",
+                "aliases": [],
+            },
+            {
+                "id": "trench-person:hot",
+                "handle": "hot",
+                "displayName": "Hot",
+                "personRole": "重要人物",
+                "category": "notable",
+                "watchTier": "primary",
+                "aliases": ["hot-token"],
+            },
+        ]
+        with (
+            patch.dict(server.TRENCH_PERSON_WATCH_NEXT_DUE, {}, clear=True),
+            patch.dict(server.TRENCH_PERSON_WATCH_FAILURES, {}, clear=True),
+            patch.object(server, "trench_person_recent_rows", return_value=[trench_row()]),
+            patch.object(server, "trench_person_watch_sources", return_value=sources),
+            patch.object(server, "person_relevance_score", side_effect=lambda source, _rows: 99 if source["handle"] == "hot" else 0),
+            patch.object(server, "trench_person_fetch_public_source", return_value={
+                "source": {"status": "ok", "lastCheckAt": NOW},
+                "items": [],
+            }),
+            patch.object(server, "trench_person_record_source_health"),
+            patch.object(server, "ingest_trench_person_payload", return_value=[]),
+        ):
+            result = server.trench_person_poll_once()
+
+        self.assertEqual(result["source"], "vitalik")
+
+    def test_person_watch_fetches_due_sources_as_a_small_parallel_batch(self):
+        sources = [
+            {
+                "id": f"trench-person:person-{index}",
+                "handle": f"person{index}",
+                "displayName": f"Person {index}",
+                "personRole": "重要人物",
+                "category": "notable",
+                "watchTier": "primary",
+                "aliases": [],
+            }
+            for index in range(4)
+        ]
+        with (
+            patch.dict(server.TRENCH_PERSON_WATCH_NEXT_DUE, {}, clear=True),
+            patch.dict(server.TRENCH_PERSON_WATCH_FAILURES, {}, clear=True),
+            patch.object(server, "trench_person_recent_rows", return_value=[]),
+            patch.object(server, "trench_person_watch_sources", return_value=sources),
+            patch.object(server, "trench_person_fetch_public_source", return_value={
+                "source": {"status": "ok", "lastCheckAt": NOW},
+                "items": [{"id": "fresh", "publishedAt": NOW, "text": "fresh"}],
+            }) as fetch,
+            patch.object(server, "trench_person_record_source_health"),
+            patch.object(server, "ingest_trench_person_payload", return_value=[]),
+            patch.object(server, "wake_all_x_kol_realtime_workers") as wake,
+        ):
+            result = server.trench_person_poll_once(batch_size=3)
+
+        self.assertEqual(result["batchSize"], 3)
+        self.assertEqual(fetch.call_count, 3)
+        self.assertEqual(len(result["sources"]), 3)
+        wake.assert_called_once_with()
+
+    def test_person_payload_queues_semantics_without_blocking_polling(self):
+        incoming = [{"id": "post-1", "handle": "alice", "publishedAt": NOW}]
+        with (
+            patch.object(server, "trench_person_store_activity", return_value=incoming) as store,
+            patch.object(server, "queue_trench_person_activity", return_value=1) as queue,
+            patch.object(server, "process_trench_person_activity") as process,
+        ):
+            result = server.ingest_trench_person_payload({"items": incoming})
+
+        self.assertEqual(result, [])
+        store.assert_called_once()
+        queue.assert_called_once_with(incoming)
+        process.assert_not_called()
+
     def test_free_providers_alternate_without_double_requesting(self):
         source = {"id": "trench-person:test", "handle": "test"}
         with (
@@ -366,8 +503,8 @@ class TrenchPersonSignalTests(unittest.TestCase):
             "tweetId": "monitor-tool",
             "text": "SCOUT is our City Hall monitor for public meetings.",
             "publishedAt": NOW,
-            "url": "https://x.com/garryslist/status/monitor-tool",
-            "_personSource": {**person_source(), "handle": "garryslist", "displayName": "Garry's List"},
+            "url": "https://x.com/finkd/status/monitor-tool",
+            "_personSource": person_source(),
         }
         row = trench_row(symbol="MONITOR", name="Monitor", contract="MonitorContract111")
         with tempfile.TemporaryDirectory() as temp_dir:

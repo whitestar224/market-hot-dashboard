@@ -840,7 +840,7 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         self.assertEqual(count, 1)
         alert_url = launch.call_args.args[0]["url"]
         self.assertIn(
-            "web3.binance.com/en/token/robinhood/0x3df3644bcf4ce0d993e18c86c3080e53bfea06f1",
+            "web3.binance.com/zh-CN/token/robinhood/0x3df3644bcf4ce0d993e18c86c3080e53bfea06f1",
             alert_url,
         )
         self.assertNotIn("/futures/", alert_url)
@@ -1052,13 +1052,23 @@ class PriceStructureRecognitionTests(unittest.TestCase):
                 ]
             },
         }
-        with patch.object(server.requests, "get", return_value=response) as request:
-            rows, provider = server.price_structure_candles_from_binance_wallet(
-                "AVBN6kXdaw27ySuvMevKYzNTL8d39b7sGQFDCmsvpump",
-                "CT_501",
-                "1h",
-                limit=140,
-            )
+        with server.PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE_LOCK:
+            server.PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE.clear()
+            server.PRICE_STRUCTURE_ONCHAIN_KLINE_ERROR_CACHE.clear()
+            server.PRICE_STRUCTURE_ONCHAIN_KLINE_INFLIGHT.clear()
+        try:
+            with patch.object(server.ONCHAIN_KLINE_HTTP_SESSION, "get", return_value=response) as request:
+                rows, provider = server.price_structure_candles_from_binance_wallet(
+                    "AVBN6kXdaw27ySuvMevKYzNTL8d39b7sGQFDCmsvpump",
+                    "CT_501",
+                    "1h",
+                    limit=140,
+                )
+        finally:
+            with server.PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE_LOCK:
+                server.PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE.clear()
+                server.PRICE_STRUCTURE_ONCHAIN_KLINE_ERROR_CACHE.clear()
+                server.PRICE_STRUCTURE_ONCHAIN_KLINE_INFLIGHT.clear()
 
         self.assertEqual(provider, "Binance Wallet K线")
         self.assertEqual(len(rows), 2)
@@ -1087,7 +1097,7 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         try:
             with (
                 patch.object(server.CHAIN_ECOSYSTEM_MONITOR.store, "list_chains", return_value=[]),
-                patch.object(server.requests, "get", return_value=response) as request,
+                patch.object(server.ONCHAIN_KLINE_HTTP_SESSION, "get", return_value=response) as request,
             ):
                 pool = server.price_structure_onchain_pool(
                     "FABLE", contract_address=contract, chain="4663"
@@ -1120,7 +1130,7 @@ class PriceStructureRecognitionTests(unittest.TestCase):
             with (
                 patch.object(server.CHAIN_ECOSYSTEM_MONITOR.store, "list_chains", return_value=[]),
                 patch.object(
-                    server.requests,
+                    server.ONCHAIN_KLINE_HTTP_SESSION,
                     "get",
                     side_effect=[server.requests.Timeout("primary timeout"), fallback],
                 ) as request,
@@ -1151,12 +1161,22 @@ class PriceStructureRecognitionTests(unittest.TestCase):
             "OKX_DEX_SECRET_KEY": "secret",
             "OKX_DEX_PASSPHRASE": "passphrase",
         }
-        with patch.dict(server.os.environ, env, clear=False), patch.object(
-            server.requests, "get", return_value=response
-        ) as request:
-            rows, provider = server.price_structure_candles_from_okx_dex(
-                "0xABCDEF", "4663", "1h", limit=2, min_rows=2
-            )
+        with server.PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE_LOCK:
+            server.PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE.clear()
+            server.PRICE_STRUCTURE_ONCHAIN_KLINE_ERROR_CACHE.clear()
+            server.PRICE_STRUCTURE_ONCHAIN_KLINE_INFLIGHT.clear()
+        try:
+            with patch.dict(server.os.environ, env, clear=False), patch.object(
+                server.ONCHAIN_KLINE_HTTP_SESSION, "get", return_value=response
+            ) as request:
+                rows, provider = server.price_structure_candles_from_okx_dex(
+                    "0xABCDEF", "4663", "1h", limit=2, min_rows=2
+                )
+        finally:
+            with server.PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE_LOCK:
+                server.PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE.clear()
+                server.PRICE_STRUCTURE_ONCHAIN_KLINE_ERROR_CACHE.clear()
+                server.PRICE_STRUCTURE_ONCHAIN_KLINE_INFLIGHT.clear()
 
         url = request.call_args.args[0]
         headers = request.call_args.kwargs["headers"]
@@ -1188,7 +1208,7 @@ class PriceStructureRecognitionTests(unittest.TestCase):
             return response
 
         try:
-            with patch.object(server.requests, "get", side_effect=delayed_response) as request:
+            with patch.object(server.ONCHAIN_KLINE_HTTP_SESSION, "get", side_effect=delayed_response) as request:
                 with ThreadPoolExecutor(max_workers=4) as executor:
                     results = list(executor.map(
                         lambda _index: server.price_structure_geckoterminal_base_candles(pool, "minute"),

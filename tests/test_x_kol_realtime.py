@@ -3,7 +3,7 @@ import threading
 import time
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import server
 
@@ -80,6 +80,23 @@ class XKolRealtimeTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in payload["sources"]], ["x-alpha", "x-beta"])
         self.assertEqual({row["id"] for row in payload["items"]}, {"post-alpha", "post-beta"})
 
+    def test_x_public_http_route_falls_back_and_remembers_working_route(self):
+        failed = server.requests.ConnectionError("direct route blocked")
+        response = Mock(status_code=200)
+        session = Mock()
+        session.get.side_effect = [failed, response]
+        with (
+            patch.object(server, "x_kol_http_session", return_value=session),
+            patch.object(server, "x_kol_http_proxy_candidates", return_value=["", "http://127.0.0.1:7890"]),
+        ):
+            with server.X_KOL_HTTP_ROUTE_LOCK:
+                server.X_KOL_HTTP_ROUTE.update({"resolved": False, "proxyUrl": "", "expiresAt": 0.0})
+            result = server.x_kol_http_get("https://api.fxtwitter.com/test", timeout=3)
+
+        self.assertIs(result, response)
+        self.assertEqual(session.get.call_count, 2)
+        self.assertEqual(server.X_KOL_HTTP_ROUTE["proxyUrl"], "http://127.0.0.1:7890")
+
     def test_legacy_manual_sources_are_merged_without_overwriting_newer_records(self):
         global_payload = {"sources": [
             {"handle": "legacy", "displayName": "Legacy"},
@@ -128,7 +145,10 @@ class XKolRealtimeTests(unittest.TestCase):
                 "systemManaged": True,
             },
         ]
-        with patch.object(server, "x_kol_system_person_sources", return_value=system):
+        with (
+            patch.object(server, "x_kol_system_person_sources", return_value=system),
+            patch.object(server, "x_kol_system_official_sources", return_value=[]),
+        ):
             rows = server.x_kol_sources_for_view({"id": 1}, manual_sources=manual)
 
         self.assertEqual([row["handle"] for row in rows], ["alice", "bob"])
@@ -978,7 +998,7 @@ class XKolRealtimeTests(unittest.TestCase):
 
     def test_existing_x_sources_receive_identity_based_categories(self):
         cases = {
-            "RobinhoodApp": "project_official",
+            "longdotxyz": "project_official",
             "Natan_benish": "founder",
             "elonmusk": "notable",
             "alpha_pls": "kol",
@@ -987,6 +1007,15 @@ class XKolRealtimeTests(unittest.TestCase):
             with self.subTest(handle=handle):
                 source = server.normalize_x_source({"handle": handle, "displayName": handle})
                 self.assertEqual(source["category"], expected)
+
+    def test_exchange_accounts_are_rejected_even_from_legacy_manual_sources(self):
+        for handle in ("OKX", "binance", "Coinbase", "RobinhoodApp"):
+            with self.subTest(handle=handle):
+                self.assertIsNone(server.normalize_x_source({
+                    "handle": handle,
+                    "displayName": handle,
+                    "category": "项目官方X",
+                }))
 
 
 if __name__ == "__main__":

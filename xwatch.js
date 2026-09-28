@@ -2,6 +2,7 @@
   const CACHE_KEY = "xingyunshe:xwatch:feed:v5";
   const SOURCES_KEY = "xingyunshe:xwatch:sources:v1";
   const FRESH_WINDOW_MS = 24 * 60 * 60 * 1000;
+  const SNAPSHOT_FALLBACK_MS = 15_000;
   const CATEGORY_OPTIONS = [
     { id: "kol", label: "普通KOL" },
     { id: "celebrity", label: "明星" },
@@ -35,7 +36,8 @@
     translationLoading: new Set(),
     feedLoading: false,
     stream: null,
-    streamReady: false
+    streamReady: false,
+    lastFeedAt: 0
   };
 
   const $ = (id) => document.getElementById(id);
@@ -379,6 +381,7 @@
     mergeLiveSourceState(state.sourceStates);
     state.provider = payload.provider || "--";
     state.hasToken = Boolean(payload.hasToken);
+    if (!cached) state.lastFeedAt = Date.now();
     if (!cached) saveCachedFeed(payload);
     const limited = state.sourceStates.some((source) => source.limited);
     const upstreamMode = payload.upstreamMode || "";
@@ -394,7 +397,9 @@
             ? "RSS受限"
             : "追踪中";
     const recovering = state.sourceStates.some((source) => source.status === "recovering");
-    status(cached ? "缓存内容 · 正在同步" : realtimeLabel, cached || upstreamMode.includes("rss") || limited || recovering ? "warn" : "ok");
+    const recoveringCount = state.sourceStates.filter((source) => source.status === "recovering").length;
+    const liveLabel = recoveringCount ? `${realtimeLabel} · ${recoveringCount} 个源补拉中` : realtimeLabel;
+    status(cached ? "缓存内容 · 正在同步" : liveLabel, cached || upstreamMode.includes("rss") || limited || recovering ? "warn" : "ok");
     render();
   }
 
@@ -406,6 +411,7 @@
     stream.addEventListener("open", () => {
       state.streamReady = true;
       status("实时连接", "ok");
+      if (!state.lastFeedAt || Date.now() - state.lastFeedAt > SNAPSHOT_FALLBACK_MS) void loadFeed();
     });
     stream.addEventListener("feed", (event) => {
       try {
@@ -481,7 +487,7 @@
             <span class="xwatch-category-badge" data-category="${escapeHtml(normalizeCategory(source.category))}">${escapeHtml(categoryBadgeLabel(source.category))}</span>
             ${isSystem ? '<span class="xwatch-system-badge">人物源</span>' : ""}
           </div>
-          <em>@${escapeHtml(source.handle)} · ${escapeHtml(live.provider || (isSystem ? "共享低频监控" : state.provider) || "--")} · ${escapeHtml(source.personRole || "")}</em>
+          <em>@${escapeHtml(source.handle)} · ${escapeHtml(live.provider || (isSystem ? "人物快速监控" : state.provider) || "--")} · ${escapeHtml(source.personRole || "")}</em>
           ${isSystem ? "" : `<input data-action="keywords" value="${escapeHtml((source.keywords || []).join(", "))}" placeholder="关注词，不裁剪动态" />`}
           ${live.error ? `<small>${escapeHtml(live.error)}</small>` : ""}
         </div>
@@ -810,12 +816,12 @@
 
   setInterval(() => {
     if (!state.user || document.hidden) return;
-    if (!state.streamReady) loadFeed();
+    if (!state.streamReady || !state.lastFeedAt || Date.now() - state.lastFeedAt > SNAPSHOT_FALLBACK_MS) loadFeed();
   }, 5_000);
 
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && state.user && (!state.stream || state.stream.readyState === EventSource.CLOSED)) {
-      connectRealtimeFeed();
-    }
+    if (document.hidden || !state.user) return;
+    if (!state.stream || state.stream.readyState === EventSource.CLOSED) connectRealtimeFeed();
+    if (!state.lastFeedAt || Date.now() - state.lastFeedAt > SNAPSHOT_FALLBACK_MS) void loadFeed();
   });
 })();

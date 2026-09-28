@@ -478,8 +478,10 @@
   }
 
   async function loadModelSettings() {
+    // Keep modelOptionsCache across opens: refetching /api/auth/model-options
+    // on every open (remote /models, up to 12s timeout) made the modal feel
+    // laggy. The 刷新 button still forces a fresh fetch.
     modelSettingsData = await getJson("/api/auth/model-settings");
-    modelOptionsCache = new Map();
     return modelSettingsData;
   }
 

@@ -81,20 +81,50 @@ class MarketAlertSpeechTests(unittest.TestCase):
     def test_x_tracking_never_emits_raw_popup(self):
         now_ms = 1_800_000_000_000
         events = [
-            {"key": "official", "title": "官方更新", "time": now_ms, "xCategory": "project_official"},
-            {"key": "kol", "title": "普通 KOL 有价值观点", "time": now_ms, "xCategory": "kol"},
+            {"key": "official", "title": "官方更新", "time": now_ms, "xCategory": "project_official", "authorHandle": "NEARProtocol", "originalText": "官方发布更新"},
+            {"key": "leader", "title": "领军人物观点", "time": now_ms, "xCategory": "notable", "authorHandle": "VitalikButerin", "originalText": "一条有价值观点"},
         ]
-        state = {"ready": ["x-kol"], "seen": {}}
+        state = {
+            "ready": ["x-kol"],
+            "seen": {},
+            "xTweetAnalysisWatermarks": {
+                "nearprotocol": now_ms - 1,
+                "vitalikbuterin": now_ms - 1,
+            },
+        }
         feed = {"name": "x-kol", "maxAgeMs": 10 * 60 * 1000, "fetch": lambda: {}, "parse": lambda payload: events}
         with (
             patch.object(server, "load_site_alert_state", return_value=state),
             patch.object(server, "save_site_alert_state"),
             patch.object(server, "x_kol_ai_filter_events", side_effect=lambda rows: rows) as filter_events,
+            patch.object(server.X_TWEET_ANALYSIS_QUEUE, "enqueue", return_value={"ok": True, "accepted": 1}) as enqueue,
             patch.object(server, "launch_desktop_alert") as launch_alert,
             patch.object(server.time, "time", return_value=now_ms / 1000),
         ):
             server.sync_site_alert_feed(feed)
         filter_events.assert_not_called()
+        enqueue.assert_called_once()
+        self.assertEqual(enqueue.call_args.args[0], [events[1]])
+        launch_alert.assert_not_called()
+
+    def test_x_analysis_first_snapshot_is_baseline_only(self):
+        now_ms = 1_800_000_000_000
+        events = [{
+            "key": "notable", "title": "名人更新", "time": now_ms,
+            "xCategory": "notable", "originalText": "一条启动前已有的推文",
+        }]
+        events[0]["authorHandle"] = "VitalikButerin"
+        state = {"ready": ["x-kol"], "seen": {}, "xTweetAnalysisWatermarks": {}}
+        feed = {"name": "x-kol", "maxAgeMs": 10 * 60 * 1000, "fetch": lambda: {}, "parse": lambda payload: events}
+        with (
+            patch.object(server, "load_site_alert_state", return_value=state),
+            patch.object(server, "save_site_alert_state"),
+            patch.object(server.X_TWEET_ANALYSIS_QUEUE, "enqueue") as enqueue,
+            patch.object(server, "launch_desktop_alert") as launch_alert,
+            patch.object(server.time, "time", return_value=now_ms / 1000),
+        ):
+            server.sync_site_alert_feed(feed)
+        enqueue.assert_not_called()
         launch_alert.assert_not_called()
 
     def test_aster_contract_rows_keep_perpetual_and_pending_contracts(self):
@@ -386,7 +416,7 @@ class MarketAlertSpeechTests(unittest.TestCase):
         self.assertEqual(event["speech"], "币安钱包热门榜新进，我的女友景甜 新进入24小时热门榜前十。")
         self.assertEqual(
             event["url"],
-            "https://web3.binance.com/en/token/bsc/0xFf673079235560e4de3fe4554c9981d759Af7777?ref=MQ6JD2X4",
+            "https://web3.binance.com/zh-CN/token/bsc/0xFf673079235560e4de3fe4554c9981d759Af7777?ref=MQ6JD2X4",
         )
         self.assertEqual(event["contractAddress"], row["contractAddress"])
         self.assertEqual(event["chain"], row["chain"])
@@ -414,7 +444,7 @@ class MarketAlertSpeechTests(unittest.TestCase):
             "contractAddress": "0x14778a17d61ccc17a22265b6d7d434c7a5559700",
             "narrativeLabel": "链上生态 / 交易平台",
             "narrativeLabels": ["链上生态 / 交易平台"],
-            "url": "https://web3.binance.com/en/token/robinhood/0x14778a17d61ccc17a22265b6d7d434c7a5559700",
+            "url": "https://web3.binance.com/zh-CN/token/robinhood/0x14778a17d61ccc17a22265b6d7d434c7a5559700",
         }
 
         snapshot = server.rank_monitor_snapshot(source, row, 8, "hot")

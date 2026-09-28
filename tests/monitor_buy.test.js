@@ -150,7 +150,7 @@ test('progress timers track the real stage without resetting on a repeated updat
 
 test('identity binds chain + contract, preserves Solana case and does not guess symbols', () => {
   const ca = '0x56910d4409f3a0c78c64dd8d0545ff0705389870';
-  assert.deepEqual(core.identity({symbol:'INDEX', tradeUrl:`https://web3.binance.com/en/token/robinhood/${ca}`}),
+  assert.deepEqual(core.identity({symbol:'INDEX', tradeUrl:`https://web3.binance.com/zh-CN/token/robinhood/${ca}`}),
     {symbol:'INDEX', chainId:4663, address:ca, kind:'token'});
   assert.ok(!core.validTarget(core.identity({symbol:'RAYUSDT'})));
   const sol = '5ExRQUbJiZysXWG7KapGwsQmjYvx4hCeBgwAGvht5qab';

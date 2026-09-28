@@ -77,7 +77,7 @@ class GlobalHotspotMonitorTests(unittest.TestCase):
                 server, "codex_cli_chat", return_value=response
             ) as chat, patch.object(server, "news_trade_dex_search_rows", return_value=dex), patch.object(
                 server, "trigger_api_refresh"
-            ), patch.object(server.ONCHAIN_FAST_RESEARCH, "ingest", research):
+            ), patch.object(server.ONCHAIN_FAST_RESEARCH, "buffer_ingest", research):
                 payload = server.run_global_hotspot_batch(now_ms=NOW, existing_titles=["已有快讯"])
 
             self.assertTrue(payload["ok"])

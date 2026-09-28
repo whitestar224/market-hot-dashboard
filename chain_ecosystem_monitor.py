@@ -114,6 +114,11 @@ PROVIDER_HEADERS = {
     "User-Agent": "XingyunShe-Chain-Ecosystem/1.0",
     "Accept": "application/json",
 }
+CHAIN_HTTP_SESSION = requests.Session()
+CHAIN_HTTP_SESSION.mount(
+    "https://",
+    requests.adapters.HTTPAdapter(pool_connections=24, pool_maxsize=12, max_retries=0, pool_block=True),
+)
 
 # GeckoTerminal's free public API is capped at 30 calls/minute. New-pool scans
 # run per chain, so coordinate their request starts instead of letting all
@@ -324,7 +329,7 @@ def _get_json(
     timeout: tuple[float, float] = (5, 15),
     attempts: int = 2,
 ) -> Any:
-    client = session or requests
+    client = session or CHAIN_HTTP_SESSION
     request_headers = dict(PROVIDER_HEADERS)
     request_headers.update(dict(headers or {}))
     last_error: Exception | None = None
@@ -1194,7 +1199,7 @@ def fetch_live_onchain_trenches(
     job_count = len(selected_networks) + len(rank_jobs) + sum(
         1 for network in selected_networks if network in MEME_RUSH_CHAIN_IDS
     )
-    executor = ThreadPoolExecutor(max_workers=max(1, min(9, job_count)))
+    executor = ThreadPoolExecutor(max_workers=max(1, min(6, job_count)))
     try:
         for network in selected_networks:
             if source_key != "binance":
@@ -1305,7 +1310,7 @@ def fetch_live_onchain_trenches(
             for key, platform in sorted(discovered.items()):
                 if native_saturated or key not in defaults:
                     supplement_specs.append((network, (platform,), False))
-        with ThreadPoolExecutor(max_workers=max(1, min(12, len(supplement_specs)))) as executor:
+        with ThreadPoolExecutor(max_workers=max(1, min(6, len(supplement_specs)))) as executor:
             for network, platforms, unique_only in supplement_specs:
                 if platforms:
                     supplement_jobs[executor.submit(
@@ -2560,8 +2565,14 @@ class ChainEcosystemStore:
         self._lock = threading.RLock()
 
     def _connect(self) -> sqlite3.Connection:
+        # A wedged SQLite connection (Windows file-lock deadlock) inside any
+        # `with self._lock:` region used to hold the store lock forever, which
+        # froze every ingest/scoring writer and stalled the trench-board scorer.
+        # A hard busy_timeout bounds every statement so the lock is always
+        # released in a finally block instead of leaking into a zombie lock.
         conn = sqlite3.connect(self.path, timeout=15)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 15000")
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
@@ -4837,7 +4848,24 @@ class ChainEcosystemMonitor:
     ):
         self.store = store
         self.provider_factory = provider_factory or self._default_provider_factory
-        self.submitter = submitter or self._submit_thread
+        try:
+            configured_workers = int(os.environ.get("CHAIN_ECOSYSTEM_WORKERS", "3") or "3")
+        except ValueError:
+            configured_workers = 3
+        self.worker_count = max(1, min(6, configured_workers))
+        self._executor = None
+        if submitter is None:
+            # Chain discovery, per-network research and contract lookups share
+            # one bounded lane. The previous thread-per-job submitter could run
+            # every chain and every network at once, multiplying large response
+            # payloads and nested provider work during each refresh cycle.
+            self._executor = ThreadPoolExecutor(
+                max_workers=self.worker_count,
+                thread_name_prefix="chain-ecosystem-refresh",
+            )
+            self.submitter = self._executor.submit
+        else:
+            self.submitter = submitter
         self.alert_sink = alert_sink
         self.research_candidate_sink = None
         self.stale_after_ms = max(60_000, int(stale_after_ms))

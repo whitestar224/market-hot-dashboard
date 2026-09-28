@@ -42,6 +42,8 @@ NARRATIVE_VERSION = 7
 DISCORD_MONITOR_PURGE_MIGRATION = "remove-discord-monitor-input-v1"
 CHATGPT_INCREMENTAL_ONLY_MIGRATION = "chatgpt-incremental-only-v1"
 CHATGPT_CONTINUOUS_STREAM_MIGRATION = "chatgpt-continuous-stream-v1"
+CHATGPT_LATEST_ONLY_MIGRATION = "chatgpt-latest-only-v2"
+CHATGPT_LIVE_STREAM_MIGRATION = "chatgpt-live-stream-v3"
 BREAKOUT_VERSION = 2
 BREAKOUT_MAX_POOL_AGE_MINUTES = 180
 BREAKOUT_VISIBLE_MS = 2 * 60 * 60_000
@@ -61,6 +63,7 @@ CHATGPT_RESEARCH_BATCH_MIN = 3
 CHATGPT_RESEARCH_BATCH_MAX = 50
 CHATGPT_RESEARCH_BATCH_DEFAULT = 25
 CHATGPT_RESEARCH_LEASE_MS = 20 * 60_000
+CHATGPT_RESEARCH_PENDING_MAX_AGE_MS = 15 * 60_000
 CHATGPT_RESEARCH_CONCURRENCY_DEFAULT = 3
 CHATGPT_RESEARCH_CONCURRENCY_MAX = 8
 NEWS_TRIGGER_SYMBOL_STOPWORDS = {
@@ -362,11 +365,9 @@ def paginate_research(research, page=1, page_size=12):
 
 
 def research_worthy(analysis):
+    # 精简输出后不再要求 narrative 四段 + evidenceRefs（分级由 golden_leader_alert_decision 负责）
     return (analysis.get("verdict") in {"strong", "watch"}
-            and analysis.get("evidenceStatus") in {"partial", "supported"}
-            and bool(analysis.get("evidenceRefs"))
-            and all((analysis.get("narrative") or {}).get(field)
-                    for field in ("thesis", "attention", "evidence", "invalidation")))
+            and analysis.get("evidenceStatus") in {"partial", "supported"})
 
 
 def formal_research_worthy(analysis):
@@ -397,7 +398,19 @@ def news_trigger_signal(row, *, now_ms=None):
     minimum_liquidity = 5_000 if exact_contract else 20_000
     minimum_volume = 5_000 if exact_contract else 10_000
     minimum_transactions = 8 if exact_contract else 50
-    if liquidity < minimum_liquidity or (volume_h1 < minimum_volume and transactions_h1 < minimum_transactions):
+    active = volume_h1 >= minimum_volume or transactions_h1 >= minimum_transactions
+    h1_missing = not any(float(metrics.get(key) or 0) > 0 for key in (
+        "volumeH1Usd", "transactionsH1", "buysH1", "sellsH1",
+    ))
+    if not active and row.get("narrativeFallbackEligible") and h1_missing:
+        # Fresh GMGN migrations often have no 1h candle yet.  A recent hotspot
+        # mapping can still be shown as worth researching when the available
+        # 24h tape already proves real activity; official CA is not required.
+        active = (
+            float(metrics.get("volumeH24Usd") or 0) >= 20_000
+            or int(float(metrics.get("transactionsH24") or 0)) >= (25 if exact_contract else 50)
+        )
+    if liquidity < minimum_liquidity or not active:
         return {}
     return signal
 
@@ -584,7 +597,7 @@ def decode_launch_log(log, *, received_at=None):
         "provider": "flap-event" if flap else "fourmeme-event",
         "providers": ["flap-event" if flap else "fourmeme-event"],
         "dexId": "", "metrics": {},
-        "tradeUrl": f"https://web3.binance.com/en/token/bsc/{address}",
+        "tradeUrl": f"https://web3.binance.com/zh-CN/token/bsc/{address}",
         "reasons": ["外部线索：链上创建事件；发行名称与合约已记录，题材及交易条件待核验"],
     }
 
@@ -886,6 +899,8 @@ class FastResearch:
                 self._purge_legacy_discord_monitor_data(conn)
                 self._enable_chatgpt_incremental_only(conn)
                 self._enable_chatgpt_continuous_stream(conn)
+                self._enable_chatgpt_latest_only(conn)
+                self._enable_chatgpt_live_stream(conn)
                 self._suppress_pre_incremental_chatgpt_backlog(conn)
                 self._drop_non_board_chatgpt_batches(conn)
                 if not self._startup_recovery_done:
@@ -1064,6 +1079,38 @@ class FastResearch:
         ).fetchone()
         return int(row["applied_at"] if isinstance(row, dict) else row[0]) if row else 0
 
+    def _enable_chatgpt_latest_only(self, conn):
+        """Drop every unsent batch present at upgrade and preserve its watermark."""
+        applied = conn.execute(
+            "SELECT 1 FROM onchain_data_migrations WHERE name=?",
+            (CHATGPT_LATEST_ONLY_MIGRATION,),
+        ).fetchone()
+        if applied:
+            return {}
+        now = _now_ms()
+        stale = [row[0] for row in conn.execute("""SELECT batch_id
+            FROM onchain_chatgpt_research_batches
+            WHERE status IN ('pending','claimed') AND sent_at=0""")]
+        skipped_jobs = 0
+        if stale:
+            placeholders = ",".join("?" for _ in stale)
+            conn.execute(f"""UPDATE onchain_chatgpt_research_batches
+                SET status='skipped',claim_token='',claimed_at=0,lease_until=0,
+                    target_thread_id='',target_thread_title='',
+                    error='升级后跳过未发送旧批次，仅保留最新增量投研',updated_at=?
+                WHERE batch_id IN ({placeholders})""", (now, *stale))
+            skipped_jobs = conn.execute(f"""UPDATE onchain_fast_jobs
+                SET status='screened',error='升级后跳过未发送旧批次，仅保留最新增量投研',updated_at=?
+                WHERE status='chatgpt-queued'
+                  AND key IN (SELECT job_key FROM onchain_chatgpt_research_items
+                              WHERE batch_id IN ({placeholders}))""", (now, *stale)).rowcount
+        details = {"skippedBatches": len(stale), "skippedQueuedJobs": skipped_jobs}
+        conn.execute(
+            "INSERT INTO onchain_data_migrations(name,applied_at,details_json) VALUES(?,?,?)",
+            (CHATGPT_LATEST_ONLY_MIGRATION, now, json.dumps(details, ensure_ascii=False, sort_keys=True)),
+        )
+        return details
+
     def _enable_chatgpt_continuous_stream(self, conn):
         """Baseline the durable ChatGPT stream by local insertion order.
 
@@ -1090,16 +1137,74 @@ class FastResearch:
         )
         return details
 
+    def _enable_chatgpt_live_stream(self, conn):
+        """Rebase the handoff at upgrade so historical rows cannot refill it."""
+        row = conn.execute(
+            "SELECT details_json FROM onchain_data_migrations WHERE name=?",
+            (CHATGPT_LIVE_STREAM_MIGRATION,),
+        ).fetchone()
+        if row:
+            return json.loads(row["details_json"] if isinstance(row, dict) else row[0])
+        now = _now_ms()
+        baseline = int(conn.execute(
+            "SELECT coalesce(MAX(rowid),0) FROM onchain_fast_jobs"
+        ).fetchone()[0] or 0)
+        stale = [item[0] for item in conn.execute("""SELECT batch_id
+            FROM onchain_chatgpt_research_batches
+            WHERE status IN ('pending','claimed') AND sent_at=0""")]
+        skipped_jobs = 0
+        if stale:
+            placeholders = ",".join("?" for _ in stale)
+            conn.execute(f"""UPDATE onchain_chatgpt_research_batches
+                SET status='skipped',claim_token='',claimed_at=0,lease_until=0,
+                    target_thread_id='',target_thread_title='',
+                    error='实时增量基线已重置，历史批次不再投递',updated_at=?
+                WHERE batch_id IN ({placeholders})""", (now, *stale))
+            skipped_jobs = conn.execute(f"""UPDATE onchain_fast_jobs
+                SET status='screened',error='实时增量基线已重置，历史批次不再投递',updated_at=?
+                WHERE status='chatgpt-queued'
+                  AND key IN (SELECT job_key FROM onchain_chatgpt_research_items
+                              WHERE batch_id IN ({placeholders}))""", (now, *stale)).rowcount
+        details = {
+            "baselineRowId": baseline,
+            "cutoffMs": now,
+            "skippedBatches": len(stale),
+            "skippedQueuedJobs": skipped_jobs,
+        }
+        conn.execute(
+            "INSERT INTO onchain_data_migrations(name,applied_at,details_json) VALUES(?,?,?)",
+            (CHATGPT_LIVE_STREAM_MIGRATION, now, json.dumps(details, sort_keys=True)),
+        )
+        return details
+
     def _chatgpt_stream_baseline_rowid(self, conn):
         row = conn.execute(
             "SELECT details_json FROM onchain_data_migrations WHERE name=?",
-            (CHATGPT_CONTINUOUS_STREAM_MIGRATION,),
+            (CHATGPT_LIVE_STREAM_MIGRATION,),
         ).fetchone()
+        if not row:
+            row = conn.execute(
+                "SELECT details_json FROM onchain_data_migrations WHERE name=?",
+                (CHATGPT_CONTINUOUS_STREAM_MIGRATION,),
+            ).fetchone()
         if not row:
             return 0
         try:
             details = json.loads(row["details_json"] if isinstance(row, dict) else row[0])
             return int(details.get("baselineRowId") or 0)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return 0
+
+    def _chatgpt_live_stream_cutoff(self, conn):
+        row = conn.execute(
+            "SELECT details_json FROM onchain_data_migrations WHERE name=?",
+            (CHATGPT_LIVE_STREAM_MIGRATION,),
+        ).fetchone()
+        if not row:
+            return self._chatgpt_incremental_cutoff(conn)
+        try:
+            details = json.loads(row["details_json"] if isinstance(row, dict) else row[0])
+            return int(details.get("cutoffMs") or 0)
         except (TypeError, ValueError, json.JSONDecodeError):
             return 0
 
@@ -1116,7 +1221,7 @@ class FastResearch:
             FROM onchain_chatgpt_research_items i
             JOIN onchain_chatgpt_research_batches b ON b.batch_id=i.batch_id
             JOIN onchain_fast_jobs j ON j.key=i.job_key
-            WHERE b.status IN ('pending','claimed','sent','complete')""").fetchone()
+            WHERE b.status IN ('pending','claimed','sent','complete','skipped')""").fetchone()
         return int((row[0] if row else 0) or 0)
 
     def _suppress_pre_incremental_chatgpt_backlog(self, conn):
@@ -1263,13 +1368,15 @@ class FastResearch:
             self._write("UPDATE onchain_fast_jobs SET candidate_json=?,updated_at=? WHERE key=?",
                         (json.dumps(row, ensure_ascii=False), _now_ms(), job["key"]))
 
-    def ingest(self, rows, *, match_recent_news=True):
+    def ingest(self, rows, *, match_recent_news=True, _bypass_buffer=False):
         """Persist all qualified candidates; queue age and page rank never expire a job.
 
         If _auto_buffer is enabled (set by server.py to reduce write lock contention),
         rows are queued to the buffer instead of being written immediately.
+        _bypass_buffer is internal: the buffer flusher must write directly, otherwise
+        ingest->buffer_ingest->flush->ingest recurses forever and rows never land.
         """
-        if getattr(self, '_auto_buffer', False) and rows:
+        if getattr(self, '_auto_buffer', False) and rows and not _bypass_buffer:
             self.buffer_ingest(rows)
             return
         now = _now_ms()
@@ -2019,7 +2126,7 @@ class FastResearch:
         if not self._batch_ingest_enabled or not rows:
             # Fall back to immediate ingest if buffering is disabled
             if rows:
-                self.ingest(rows, match_recent_news=False)
+                self.ingest(rows, match_recent_news=False, _bypass_buffer=True)
             return
         with self._ingest_buffer_lock:
             before = len(self._ingest_buffer)
@@ -2044,7 +2151,7 @@ class FastResearch:
             while self._ingest_buffer and len(batch) < self._BATCH_INGEST_FLUSH_LIMIT:
                 batch.append(self._ingest_buffer.popleft())
         try:
-            self.ingest(batch, match_recent_news=False)
+            self.ingest(batch, match_recent_news=False, _bypass_buffer=True)
             return len(batch)
         except Exception as exc:
             # On failure, re-enqueue for retry (best-effort)
@@ -2237,6 +2344,66 @@ class FastResearch:
             WHERE status='pending' ORDER BY created_at LIMIT 1""").fetchone()
         return dict(row) if row else None
 
+    @staticmethod
+    def _skip_stale_chatgpt_pending_batches(conn, *, now):
+        """Release unsent queue slots without reviving historical backlog."""
+        cutoff = int(now) - CHATGPT_RESEARCH_PENDING_MAX_AGE_MS
+        stale = [row[0] for row in conn.execute("""SELECT batch_id
+            FROM onchain_chatgpt_research_batches
+            WHERE status='pending' AND sent_at=0 AND target_thread_id=''
+              AND created_at<?""", (cutoff,))]
+        if not stale:
+            return 0
+        placeholders = ",".join("?" for _ in stale)
+        conn.execute(f"""UPDATE onchain_chatgpt_research_batches
+            SET status='skipped',claim_token='',claimed_at=0,lease_until=0,
+                error='未发送批次已过期，仅保留最新增量投研',updated_at=?
+            WHERE batch_id IN ({placeholders})""", (now, *stale))
+        conn.execute(f"""UPDATE onchain_fast_jobs
+            SET status='screened',error='未发送批次已过期，仅保留最新增量投研',updated_at=?
+            WHERE status='chatgpt-queued'
+              AND key IN (SELECT job_key FROM onchain_chatgpt_research_items
+                          WHERE batch_id IN ({placeholders}))""", (now, *stale))
+        return len(stale)
+
+    def _merge_pending_hourly_chatgpt_batches(self, conn, *, now):
+        pending = list(conn.execute("""SELECT batch_id FROM onchain_chatgpt_research_batches
+            WHERE lane='hourly' AND status='pending' AND sent_at=0
+            ORDER BY created_at,batch_id"""))
+        if len(pending) < 2:
+            return pending[0][0] if pending else ""
+        primary = pending[0][0]
+        position = int(conn.execute(
+            "SELECT COUNT(*) FROM onchain_chatgpt_research_items WHERE batch_id=?",
+            (primary,),
+        ).fetchone()[0] or 0)
+        for row in pending[1:]:
+            secondary = row[0]
+            for item in conn.execute("""SELECT job_key FROM onchain_chatgpt_research_items
+                WHERE batch_id=? ORDER BY position""", (secondary,)).fetchall():
+                exists = conn.execute("""SELECT 1 FROM onchain_chatgpt_research_items
+                    WHERE batch_id=? AND job_key=?""", (primary, item[0])).fetchone()
+                if not exists:
+                    conn.execute("INSERT INTO onchain_chatgpt_research_items VALUES(?,?,?)",
+                                 (primary, item[0], position))
+                    position += 1
+            conn.execute("""UPDATE onchain_chatgpt_research_batches
+                SET status='skipped',error='已合并到同一次历史积压投研批次',updated_at=?
+                WHERE batch_id=? AND status='pending'""", (now, secondary))
+        candidate_rows = conn.execute("""SELECT j.candidate_json
+            FROM onchain_chatgpt_research_items i
+            JOIN onchain_fast_jobs j ON j.key=i.job_key
+            WHERE i.batch_id=? ORDER BY i.position""", (primary,)).fetchall()
+        candidates = [json.loads(row[0]) for row in candidate_rows]
+        prompt = self._chatgpt_prompt(
+            candidates, batch_id=primary, lane="hourly", hour_start=0,
+            include_framework=False,
+        )
+        conn.execute("""UPDATE onchain_chatgpt_research_batches
+            SET item_count=?,prompt=?,updated_at=? WHERE batch_id=? AND status='pending'""",
+            (len(candidates), prompt, now, primary))
+        return primary
+
     def queue_chatgpt_research_batch(self, *, limit=None, now_ms=None, max_concurrent=None):
         """Queue a durable small handoff for an available dedicated chat."""
         mode = self.decision_mode()
@@ -2252,15 +2419,21 @@ class FastResearch:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 self._active_chatgpt_batch(conn)
+                self._skip_stale_chatgpt_pending_batches(conn, now=now)
+                self._merge_pending_hourly_chatgpt_batches(conn, now=now)
+                # Only batches already bound to a chat consume concurrency.
+                # A pending batch is backlog waiting to be claimed; counting it
+                # as an active chat slot can deadlock dispatch when the other
+                # slots are occupied by sent batches.
                 active_rows = [dict(row) for row in conn.execute("""SELECT *
                     FROM onchain_chatgpt_research_batches
-                    WHERE status IN ('pending','claimed','sent') ORDER BY created_at""")]
+                    WHERE status IN ('claimed','sent') ORDER BY created_at""")]
+                pending_rows = [dict(row) for row in conn.execute("""SELECT *
+                    FROM onchain_chatgpt_research_batches
+                    WHERE status='pending' ORDER BY created_at""")]
                 incremental_cutoff = self._chatgpt_incremental_cutoff(conn)
                 stream_baseline_rowid = self._chatgpt_stream_baseline_rowid(conn)
-                dispatched_first_seen = max(
-                    incremental_cutoff,
-                    self._chatgpt_dispatched_first_seen_watermark(conn),
-                )
+                live_stream_cutoff = self._chatgpt_live_stream_cutoff(conn)
                 if len(active_rows) >= concurrency:
                     active = active_rows[0]
                     conn.commit()
@@ -2292,10 +2465,10 @@ class FastResearch:
                             OR json_extract(analysis_json,'$.frameworkAssessment.version')=?
                           ))
                           AND next_due_at<=?
-                        ORDER BY first_seen_at,rowid LIMIT ?""", (
-                            stream_baseline_rowid, dispatched_first_seen,
+                        ORDER BY first_seen_at,rowid""", (
+                            stream_baseline_rowid, live_stream_cutoff,
                             CHATGPT_RESEARCH_ROUTE, FRAMEWORK_VERSION,
-                            now, batch_limit,
+                            now,
                         ))]
                 else:
                     jobs = [dict(row) for row in conn.execute("""SELECT * FROM onchain_fast_jobs
@@ -2326,21 +2499,39 @@ class FastResearch:
                             "activeCount": len(active_rows), "maxConcurrent": concurrency,
                         }
                     return {"status": "empty", "lane": mode, "itemCount": 0}
-                candidates = [json.loads(job["candidate_json"]) for job in jobs]
-                batch_id = f"research-{now}-{secrets.token_hex(4)}"
+                pending_backlog = pending_rows[0] if mode == "hourly" and pending_rows else None
+                existing_candidates = []
+                existing_count = 0
+                if pending_backlog:
+                    batch_id = pending_backlog["batch_id"]
+                    existing_rows = conn.execute("""SELECT j.candidate_json
+                        FROM onchain_chatgpt_research_items i
+                        JOIN onchain_fast_jobs j ON j.key=i.job_key
+                        WHERE i.batch_id=? ORDER BY i.position""", (batch_id,)).fetchall()
+                    existing_candidates = [json.loads(row[0]) for row in existing_rows]
+                    existing_count = len(existing_candidates)
+                else:
+                    batch_id = f"research-{now}-{secrets.token_hex(4)}"
+                candidates = existing_candidates + [json.loads(job["candidate_json"]) for job in jobs]
                 # A batch is not bound to a chat yet.  Store the compact form;
                 # claim() upgrades only a chat's first batch with the framework.
                 prompt = self._chatgpt_prompt(
                     candidates, batch_id=batch_id, lane=mode, hour_start=hour_start,
                     include_framework=False,
                 )
-                conn.execute("""INSERT INTO onchain_chatgpt_research_batches
-                    (batch_id,lane,hour_start,status,item_count,prompt,created_at,updated_at)
-                    VALUES(?,?,?,'pending',?,?,?,?)""",
-                    (batch_id, mode, hour_start, len(jobs), prompt, now, now))
+                if pending_backlog:
+                    conn.execute("""UPDATE onchain_chatgpt_research_batches
+                        SET item_count=?,prompt=?,updated_at=?
+                        WHERE batch_id=? AND status='pending'""",
+                        (len(candidates), prompt, now, batch_id))
+                else:
+                    conn.execute("""INSERT INTO onchain_chatgpt_research_batches
+                        (batch_id,lane,hour_start,status,item_count,prompt,created_at,updated_at)
+                        VALUES(?,?,?,'pending',?,?,?,?)""",
+                        (batch_id, mode, hour_start, len(jobs), prompt, now, now))
                 for position, job in enumerate(jobs):
                     conn.execute("INSERT INTO onchain_chatgpt_research_items VALUES(?,?,?)",
-                                 (batch_id, job["key"], position))
+                                 (batch_id, job["key"], existing_count + position))
                     next_hourly_attempt = (
                         int(job.get("hourly_attempts") or 0) + 1
                         if mode == "hourly" and int(job.get("hourly_hour_start") or 0) == hour_start
@@ -2356,8 +2547,9 @@ class FastResearch:
                         ))
                 conn.commit()
                 return {
-                    "status": "pending", "batchId": batch_id, "itemCount": len(jobs), "lane": mode,
-                    "activeCount": len(active_rows) + 1, "maxConcurrent": concurrency,
+                    "status": "pending", "batchId": batch_id, "itemCount": len(candidates), "lane": mode,
+                    "activeCount": len(active_rows),
+                    "maxConcurrent": concurrency,
                 }
             finally:
                 conn.close()
@@ -2386,12 +2578,11 @@ class FastResearch:
                     "includesFramework": bool(batch.get("includes_framework")),
                     "recover": True,
                 }
+        # queue() also expires unsent historical batches before filling the
+        # newly available slot with the latest incremental board members.
+        self.queue_chatgpt_research_batch(limit=limit, max_concurrent=max_concurrent)
         active_rows = self._query("""SELECT * FROM onchain_chatgpt_research_batches
             WHERE status='pending' ORDER BY created_at LIMIT 1""")
-        if not active_rows:
-            self.queue_chatgpt_research_batch(limit=limit, max_concurrent=max_concurrent)
-            active_rows = self._query("""SELECT * FROM onchain_chatgpt_research_batches
-                WHERE status='pending' ORDER BY created_at LIMIT 1""")
         active_preview = active_rows[0] if active_rows else None
         framework_ready = bool(target_thread_id and self._query(
             """SELECT 1 FROM onchain_chatgpt_research_chats
@@ -2801,7 +2992,7 @@ class FastResearch:
             FROM onchain_chatgpt_research_batches ORDER BY created_at DESC LIMIT 1""")
         active = self._query(f"""SELECT {fields}
             FROM onchain_chatgpt_research_batches
-            WHERE status IN ('pending','claimed','sent') ORDER BY created_at""")
+            WHERE status IN ('claimed','sent') ORDER BY created_at""")
         queued = self._query("""SELECT COUNT(*) AS total FROM onchain_fast_jobs
             WHERE status='chatgpt-queued'""")[0]["total"]
         return {
@@ -3177,12 +3368,11 @@ class FastResearch:
         current_hour = now // RESEARCH_HOUR_MS * RESEARCH_HOUR_MS
         for job in self._query("""SELECT * FROM onchain_fast_jobs WHERE status='ready' AND alerted_at=0
                                   AND ((analyzed_at>=? AND
-                                        json_extract(analysis_json,'$.researchRoute')=?)
+                                        json_extract(analysis_json,'$.researchRoute') IN ('chatgpt-chat-v49','gmgn-local'))
                                     OR first_seen_at>=? OR (
                                       hourly_requested_at>=? AND hourly_hour_start>=?
                                     )) ORDER BY analyzed_at LIMIT 20""", (
                                       now - max_age_ms,
-                                      CHATGPT_RESEARCH_ROUTE,
                                       now - max_age_ms,
                                       now - hourly_max_age_ms,
                                       current_hour - RESEARCH_HOUR_MS,
@@ -3609,7 +3799,11 @@ class FastResearch:
         self.initialize()
         self.restore_review_queue()
         self._stop.clear()
-        self._pools = ThreadPoolExecutor(max_workers=8, thread_name_prefix="onchain-fast")
+        # Most lanes are network/SQLite single-flight jobs. Six workers keep
+        # live/history/JEV lanes concurrent without retaining eight large
+        # thread stacks for the lifetime of the desktop service.
+        worker_count = max(4, min(8, int(os.getenv("ONCHAIN_FAST_WORKERS", "4") or "4")))
+        self._pools = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="onchain-fast")
         # Start the batch ingest flusher to reduce write lock contention
         self._start_batch_ingest_flusher()
         def loop():

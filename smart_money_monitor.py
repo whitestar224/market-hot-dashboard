@@ -1049,7 +1049,7 @@ class SmartMoneyMonitor:
             skipped = max(skipped, max(0, fallback_start - previous - 1))
             block_numbers = list(range(fallback_start, latest + 1))
             blocks: dict[int, dict[str, Any]] = {}
-            with ThreadPoolExecutor(max_workers=min(8, len(block_numbers))) as executor:
+            with ThreadPoolExecutor(max_workers=min(4, len(block_numbers))) as executor:
                 futures = {
                     executor.submit(self.rpc, chain, "eth_getBlockByNumber", [hex(block_number), True]): block_number
                     for block_number in block_numbers

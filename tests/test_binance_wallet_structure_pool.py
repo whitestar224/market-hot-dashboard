@@ -28,7 +28,7 @@ class BinanceWalletStructurePoolTests(unittest.TestCase):
             "amount": 12_500_000,
             "heat": 100,
             "liquidity": 800_000,
-            "url": "https://web3.binance.com/en/markets",
+            "url": "https://web3.binance.com/zh-CN/markets",
         }
 
     def test_live_4h_appearances_are_persisted_for_thirty_days(self):

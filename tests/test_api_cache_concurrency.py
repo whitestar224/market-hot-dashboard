@@ -79,6 +79,57 @@ class ApiCacheConcurrencyTests(unittest.TestCase):
         self.assertEqual(result["sources"][0]["id"], "recent")
         self.assertEqual(fetcher_called, [])
 
+    def test_overaged_cache_stays_nonblocking_while_refresh_is_inflight(self):
+        key = "already-refreshing"
+        stale_payload = {
+            "_cache": {"key": key, "updatedAt": int(time.time() * 1000) - 100_000},
+            "sources": [{"id": "stale", "rows": []}],
+        }
+        with server.API_REFRESH_LOCK:
+            server.API_REFRESHING[key] = time.time()
+        try:
+            with (
+                patch.object(server, "read_json_cache", return_value=stale_payload),
+                patch.object(server, "refresh_api_cache_now") as refresh,
+            ):
+                result = server.cached_api_payload(key, lambda: {}, 60, max_age_seconds=30)
+        finally:
+            with server.API_REFRESH_LOCK:
+                server.API_REFRESHING.pop(key, None)
+                server.API_REFRESH_STALL_LOGGED.discard(key)
+
+        refresh.assert_not_called()
+        self.assertTrue(result["_cache"]["stale"])
+        self.assertTrue(result["_cache"]["refreshing"])
+
+    def test_failed_composite_aicoin_card_is_repaired_from_independent_cache(self):
+        failed = {
+            "updatedAt": 1,
+            "sources": [{
+                "id": "aicoin",
+                "status": "unavailable",
+                "sourceName": "fetch raised",
+                "rows": [],
+            }],
+        }
+        cached = {
+            "id": "aicoin",
+            "status": "ok",
+            "sourceName": "AICoin encrypted getHotCoinHour · 本地缓存",
+            "rows": [{"symbol": "BTC"}],
+        }
+
+        with (
+            patch.object(server, "source_fallback_allowed", return_value=True),
+            patch.object(server, "cached_source_fallback", return_value=cached),
+        ):
+            result = server.recover_market_sources_from_independent_caches(failed)
+
+        source = result["sources"][0]
+        self.assertEqual(source["status"], "ok")
+        self.assertEqual(source["rows"][0]["symbol"], "BTC")
+        self.assertIn("使用独立缓存", source["sourceName"])
+
 
 if __name__ == "__main__":
     unittest.main()

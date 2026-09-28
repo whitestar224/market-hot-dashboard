@@ -1,5 +1,6 @@
 from contextlib import closing
 import copy
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -43,10 +44,10 @@ class MonitorIdentityTests(unittest.TestCase):
         self.resolver.assert_called_once()
 
     def test_only_explicit_exact_chain_and_ca_are_used(self):
-        self.assertEqual(target_identity({"tradeUrl": f"https://web3.binance.com/en/token/bsc/{CA}"}),
+        self.assertEqual(target_identity({"tradeUrl": f"https://web3.binance.com/zh-CN/token/bsc/{CA}"}),
                          {"chainId": 56, "address": CA, "kind": "token"})
         for row in [{"symbol": "TEST"}, {**ROW, "chainId": 1}, {**ROW, "tokenAddress": "0x" + "cd" * 20},
-                    {**ROW, "tradeUrl": f"https://web3.binance.com/en/token/ethereum/{CA}"}, {**ROW, "kind": "nft"},
+                    {**ROW, "tradeUrl": f"https://web3.binance.com/zh-CN/token/ethereum/{CA}"}, {**ROW, "kind": "nft"},
                     {**ROW, "contractAddress": "not-a-ca"}]:
             self.assertEqual(self.registry.snapshot(row)["status"], "unresolved")
         self.resolver.assert_not_called()
@@ -84,6 +85,9 @@ class MonitorIdentityTests(unittest.TestCase):
     def test_resolver_cannot_change_chain_ca_or_precision(self):
         for changed in ({"chainId": 1}, {"address": "0x" + "ef" * 20}, {"decimals": 99}):
             self.registry.records.clear()
+            with closing(sqlite3.connect(self.registry.path)) as conn:
+                conn.execute("DELETE FROM identities")
+                conn.commit()
             self.resolver.return_value = {**TARGET, **changed}
             self.assertNotEqual(self.ready()["status"], "verified")
 
@@ -152,6 +156,40 @@ class MonitorIdentityTests(unittest.TestCase):
         self.registry = MonitorIdentityRegistry(self.registry.path, self.resolver)
         self.registry.start()
         self.assertEqual(self.ready()["status"], "verified")
+
+    def test_large_persisted_history_is_loaded_on_demand_into_bounded_cache(self):
+        self.registry.stop()
+        saved = {"status": "verified", "target": TARGET, "verifiedAt": time.time(),
+                 "expiresAt": time.time() + 60, "retryAt": 0}
+        with closing(sqlite3.connect(self.registry.path)) as conn:
+            conn.execute("INSERT OR REPLACE INTO identities VALUES (?, ?)",
+                         (self.registry.key(TARGET), json.dumps(saved)))
+            conn.executemany(
+                "INSERT OR REPLACE INTO identities VALUES (?, ?)",
+                ((f"56:0x{index:040x}", json.dumps(saved)) for index in range(600)),
+            )
+            conn.commit()
+        self.registry = MonitorIdentityRegistry(self.registry.path, self.resolver, cache_size=256)
+        self.registry.start()
+        self.assertEqual(len(self.registry.records), 0)
+        self.assertEqual(len(self.registry.known_keys), 601)
+        self.assertEqual(self.registry.snapshot(ROW, enqueue=False)["status"], "verified")
+        self.assertEqual(len(self.registry.records), 1)
+
+    def test_background_history_sweep_uses_key_index_without_loading_records(self):
+        self.registry.stop()
+        saved = {"status": "retrying", "reason": "稍后重试", "retryAt": 0}
+        with closing(sqlite3.connect(self.registry.path)) as conn:
+            conn.execute("INSERT OR REPLACE INTO identities VALUES (?, ?)",
+                         (self.registry.key(target_identity(ROW)), json.dumps(saved)))
+            conn.commit()
+        self.registry = MonitorIdentityRegistry(self.registry.path, self.resolver)
+        self.registry.start()
+        for _ in range(20):
+            self.registry.observe({"items": [ROW]})
+        self.assertEqual(len(self.registry.records), 0)
+        self.assertEqual(self.registry.jobs.qsize(), 0)
+        self.resolver.assert_not_called()
 
     def test_quote_requires_persisted_identity_before_any_balance_or_price_request(self):
         service = MonitorBuyService(Path(self.temp.name) / "buy.sqlite")

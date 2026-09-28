@@ -841,11 +841,80 @@ def _rebuild_candidate_row(job: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _trench_dup_rank_key(base_row: dict[str, Any]) -> tuple:
+    """同名同链多 CA 时给每个 CA 打分，选龙一（分数越高越优先）。
+
+    依据：流动性 -> 24h 成交 -> 市值 -> 成立时间(越早越优先) -> 先发现(越早越优先)。
+    流动性/成交是「真实资金活跃」的最强信号（回测命中率最高），市值反而易靠锁仓虚高，
+    所以流动性和成交排在市值之前，避免把活跃真币误降级为仿盘。
+    """
+    metrics = base_row.get("metrics") if isinstance(base_row.get("metrics"), dict) else {}
+    def num(v):
+        try:
+            return float(v) if v is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+    pool_created = int(num(base_row.get("poolCreatedAt")) or num(base_row.get("firstSeenAt")) or 0)
+    first_seen = int(num(base_row.get("firstSeenAt")) or 0)
+    return (
+        num(metrics.get("liquidityUsd")),
+        num(metrics.get("volumeH24Usd") or metrics.get("volumeH1Usd")),
+        num(metrics.get("marketCapUsd") or metrics.get("fdvUsd")),
+        -pool_created,
+        -first_seen,
+    )
+
+
+def _dedup_same_symbol_trench(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """同名同链多 CA 去重：每组只保留龙一，其余标记 challenger（蹭名仿盘）。
+
+    返回 (保留的 rows, 被抑制的 rows)。challenger 会被本地回写 avoid，不送 DeepSeek，
+    避免同名仿盘重复分析、省 token、也减少弹窗/页面的「重复感」。
+    """
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for job in rows:
+        base_row = _rebuild_candidate_row(job)
+        chain = str(base_row.get("network") or "").strip().lower()
+        symbol = str(base_row.get("symbol") or "").strip().upper()
+        if not chain or not symbol:
+            continue
+        groups.setdefault((chain, symbol), []).append(job)
+
+    keep: list[dict] = []
+    suppressed: list[dict] = []
+    for (chain, symbol), group in groups.items():
+        if len(group) < 2:
+            keep.extend(group)
+            continue
+        # 选龙一：按 _trench_dup_rank_key 排序取最大
+        leader = max(group, key=lambda j: _trench_dup_rank_key(_rebuild_candidate_row(j)))
+        for job in group:
+            base_row = _rebuild_candidate_row(job)
+            if job is leader:
+                base_row["sameSymbolRole"] = "leader-candidate"
+                base_row["sameSymbolLeaderReason"] = "同名同链多 CA，按市值/流动性/成交/成立时间选出龙一"
+                keep.append(job)
+            else:
+                base_row["sameSymbolRole"] = "challenger"
+                base_row["sameSymbolLeaderReason"] = "同名同链蹭名仿盘，隐藏以避免重复分析"
+                suppressed.append(job)
+    return keep, suppressed
+
+
 def _write_back_scored(store, items, analysis_map, now):
     """回写 (job, base_row, local) 列表；analysis_map 有有效结论用 AI 结果，否则本地结论。"""
     written = 0
     lock = getattr(store, "_lock", None)
-    _lock_ctx = lock if lock is not None else contextlib.nullcontext()
+    if lock is None:
+        _lock_ctx = contextlib.nullcontext()
+    else:
+        # Bounded acquisition: a wedged holder (zombie lock) must not freeze the
+        # scorer forever and stall the whole trench-board pipeline. On timeout we
+        # fail fast and let the caller retry next round instead of hanging.
+        if not lock.acquire(timeout=30):
+            raise TimeoutError("chain-store write lock busy >30s; scorer write-back deferred")
+        _lock_ctx = contextlib.ExitStack()
+        _lock_ctx.callback(lock.release)
     with _lock_ctx:
         conn = store._connect()
         try:
@@ -882,13 +951,15 @@ def _write_back_scored(store, items, analysis_map, now):
     return written
 
 
-def _flush_promising_buffer(store, analyzer_fn, alert_sink_fn, now):
-    """缓冲攒够 PROMISING_BATCH_SIZE 个 promising 时，一次性送 DeepSeek 并回写。"""
+def _flush_promising_buffer(store, analyzer_fn, alert_sink_fn, now, force=False):
+    """缓冲攒够 PROMISING_BATCH_SIZE 个（或 force 时）一次性送 DeepSeek 并回写。"""
     with _PROMISING_BUFFER_LOCK:
-        if len(_PROMISING_BUFFER) < PROMISING_BATCH_SIZE:
+        if not _PROMISING_BUFFER:
             return 0
-        batch = list(_PROMISING_BUFFER[:PROMISING_BATCH_SIZE])
-        del _PROMISING_BUFFER[:PROMISING_BATCH_SIZE]
+        if not force and len(_PROMISING_BUFFER) < PROMISING_BATCH_SIZE:
+            return 0
+        batch = list(_PROMISING_BUFFER)
+        _PROMISING_BUFFER.clear()
         for job, _r, _l in batch:
             _PROMISING_BUFFERED_KEYS.discard(job["key"])
     promising_rows = []
@@ -956,7 +1027,11 @@ def run_gmgn_local_batch(
               )
               AND NOT (status='ready' AND analyzed_at>0
                        AND json_extract(analysis_json,'$.frameworkAssessment.version')!='')
-            ORDER BY first_seen_at ASC
+            -- 最新刷新优先：按「榜单刷新时间 lastSeenAt」倒序，最新被榜单刷出来的币最优先分析；
+            -- 同批内按进榜时间 receivedAt 倒序；lastSeenAt 缺失时回退 receivedAt/first_seen_at。
+            -- 这样每次都是先啃刚刷出来的当下榜新币，历史 pending 积压只有余力时才轮到。
+            ORDER BY coalesce(json_extract(candidate_json,'$.lastSeenAt'), 0) DESC,
+                     coalesce(json_extract(candidate_json,'$.receivedAt'), first_seen_at, 0) DESC
             LIMIT ?
         """, (scan_limit,))]
     finally:
@@ -968,9 +1043,28 @@ def run_gmgn_local_batch(
     if buffered_keys:
         rows = [r for r in rows if r["key"] not in buffered_keys]
 
+    # 同名同链多 CA 去重：每组只保留龙一，其余蹭名仿盘直接本地回写 avoid（零 AI，不送 DeepSeek）
+    if rows:
+        rows, same_symbol_suppressed = _dedup_same_symbol_trench(rows)
+        if same_symbol_suppressed:
+            avoid_items = []
+            for job in same_symbol_suppressed:
+                base_row = _rebuild_candidate_row(job)
+                avoid_local = {
+                    "score": 0, "redFlags": ["同名同链蹭名仿盘，已选龙一"],
+                    "signals": [], "verdict": "avoid", "promising": False,
+                }
+                avoid_items.append((job, base_row, avoid_local))
+            try:
+                _written_suppressed = _write_back_scored(store, avoid_items, {}, now)
+                print(f"[GMGN-Local] 同名去重：隐藏 {_written_suppressed} 个蹭名仿盘（每组保留龙一）", flush=True)
+            except Exception as exc:
+                print(f"[GMGN-Local] 同名去重回写失败（回退全部保留）: {exc}", flush=True)
+                rows = rows + same_symbol_suppressed  # 回写失败则恢复，避免丢币
+
     if not rows:
-        # 没有新 pending，但缓冲可能已攒够，尝试 flush
-        flushed = _flush_promising_buffer(store, analyzer_fn, alert_sink_fn, now)
+        # 没有新 pending，把缓冲里剩下的 promising 强制 flush（即使不足 50 也送，避免卡住积压）
+        flushed = _flush_promising_buffer(store, analyzer_fn, alert_sink_fn, now, force=True)
         return {"selected": 0, "localScored": 0, "aiAssisted": 0, "written": flushed, "errors": 0}
 
     selected = len(rows)

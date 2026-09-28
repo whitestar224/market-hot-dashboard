@@ -66,7 +66,7 @@ class BinanceWalletPriorHighTests(unittest.TestCase):
         self.assertEqual(public["PONS"]["contractAddress"], "0x1234")
         self.assertEqual(
             public["PONS"]["tradeUrl"],
-            "https://web3.binance.com/en/token/bsc/0x1234?ref=MQ6JD2X4",
+            "https://web3.binance.com/zh-CN/token/bsc/0x1234?ref=MQ6JD2X4",
         )
         self.assertTrue(public["我的女友景甜"]["priorHighEnabled"])
         with server.auth_db() as conn:

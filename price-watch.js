@@ -1539,7 +1539,7 @@
     };
     const network = aliases[rawNetwork] || rawNetwork.replace(/[^a-z0-9-]/g, "");
     if (!contract || !network) return "";
-    return safeExternalUrl(`https://web3.binance.com/en/token/${encodeURIComponent(network)}/${encodeURIComponent(contract)}`);
+    return safeExternalUrl(`https://web3.binance.com/zh-CN/token/${encodeURIComponent(network)}/${encodeURIComponent(contract)}`);
   }
 
   function onchainResearchCandidateTemplate(row, compact = false) {

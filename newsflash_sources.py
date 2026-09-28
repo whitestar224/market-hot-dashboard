@@ -9,6 +9,7 @@ import time
 import unicodedata
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
@@ -205,6 +206,14 @@ def configured_feed_sources() -> list[dict[str, Any]]:
 # first healthy response wins. Dead ports fail fast on loopback connect, so
 # probing them inside the race is effectively free.
 PROXY_CANDIDATE_PORTS = (7890, 7897, 7899, 10809, 2080, 53000)
+NEWSFLASH_ROUTE_WORKERS = max(
+    2,
+    min(8, int(os.getenv("NEWSFLASH_ROUTE_WORKERS", "4") or "4")),
+)
+NEWSFLASH_ROUTE_POOL = ThreadPoolExecutor(
+    max_workers=NEWSFLASH_ROUTE_WORKERS,
+    thread_name_prefix="newsflash-route",
+)
 
 
 def _env_proxy_url() -> str:
@@ -266,8 +275,13 @@ def http_get_race(url: str, *, headers: dict[str, str] | None = None, timeout: f
     routes = _candidate_routes()
     if len(routes) == 1:
         return _get_via_route(url, request_headers, timeout, "")
-    pool = ThreadPoolExecutor(max_workers=len(routes), thread_name_prefix="newsflash-route")
-    futures = [pool.submit(_get_via_route, url, request_headers, timeout, proxy) for proxy in routes]
+    # All feed sources share one bounded route pool.  Previously every source
+    # created up to seven threads of its own, so a six-source refresh could
+    # briefly retain 40+ stacks whenever proxy routes timed out.
+    futures = [
+        NEWSFLASH_ROUTE_POOL.submit(_get_via_route, url, request_headers, timeout, proxy)
+        for proxy in routes
+    ]
     first_error: Exception | None = None
     try:
         for future in as_completed(futures):
@@ -280,7 +294,8 @@ def http_get_race(url: str, *, headers: dict[str, str] | None = None, timeout: f
             return response
         raise first_error or RuntimeError(f"all routes failed for {url}")
     finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        for future in futures:
+            future.cancel()
 
 
 def _fetch_feed(source: dict[str, Any], headers: dict[str, str], timeout: float) -> list[dict[str, Any]]:
@@ -376,39 +391,65 @@ def _actions_conflict(left: set[str], right: set[str]) -> bool:
     )
 
 
-def stories_match(left: dict[str, Any], right: dict[str, Any], window_seconds: int = 18 * 3600) -> bool:
-    left_family = source_family(left.get("sourceId") or left.get("source"))
-    right_family = source_family(right.get("sourceId") or right.get("source"))
-    left_id, right_id = str(left.get("id") or "").strip(), str(right.get("id") or "").strip()
-    if left_id and right_id and left_family == right_family and left_id == right_id:
+@dataclass(frozen=True, slots=True)
+class _StoryFingerprint:
+    family: str
+    story_id: str
+    url: str
+    text: str
+    timestamp: int
+    actions: frozenset[str]
+    numbers: frozenset[str]
+    bigrams: frozenset[str]
+    entities: frozenset[str]
+
+
+def _story_fingerprint(item: dict[str, Any]) -> _StoryFingerprint:
+    text = _normalized_story_text(item)
+    return _StoryFingerprint(
+        family=source_family(item.get("sourceId") or item.get("source")),
+        story_id=str(item.get("id") or "").strip(),
+        url=_canonical_url(item.get("url")),
+        text=text,
+        timestamp=_timestamp_seconds(item.get("add_time")),
+        actions=frozenset(_event_actions(item)),
+        numbers=frozenset(_number_anchors(text)),
+        bigrams=frozenset(_bigrams(text[:500])),
+        entities=frozenset(_semantic_entities(item)),
+    )
+
+
+def _fingerprints_match(
+    left: _StoryFingerprint,
+    right: _StoryFingerprint,
+    window_seconds: int = 18 * 3600,
+) -> bool:
+    if left.story_id and right.story_id and left.family == right.family and left.story_id == right.story_id:
         return True
-    left_url, right_url = _canonical_url(left.get("url")), _canonical_url(right.get("url"))
-    if left_url and left_url == right_url:
+    if left.url and left.url == right.url:
         return True
-    left_text, right_text = _normalized_story_text(left), _normalized_story_text(right)
+    left_text, right_text = left.text, right.text
     if not left_text or not right_text:
         return False
     if left_text == right_text:
         return True
-    left_time = _timestamp_seconds(left.get("add_time"))
-    right_time = _timestamp_seconds(right.get("add_time"))
-    if abs(left_time - right_time) > window_seconds:
+    if abs(left.timestamp - right.timestamp) > window_seconds:
         return False
-    left_actions, right_actions = _event_actions(left), _event_actions(right)
+    left_actions, right_actions = left.actions, right.actions
     if _actions_conflict(left_actions, right_actions):
         return False
-    left_numbers, right_numbers = _number_anchors(left_text), _number_anchors(right_text)
+    left_numbers, right_numbers = left.numbers, right.numbers
     if left_numbers and right_numbers and not (left_numbers & right_numbers):
         return False
     shorter, longer = sorted((left_text, right_text), key=len)
     if len(shorter) >= 18 and shorter in longer and len(shorter) / len(longer) >= 0.45:
         return True
     ratio = SequenceMatcher(None, left_text[:700], right_text[:700]).ratio()
-    left_pairs, right_pairs = _bigrams(left_text[:500]), _bigrams(right_text[:500])
+    left_pairs, right_pairs = left.bigrams, right.bigrams
     union = left_pairs | right_pairs
     jaccard = len(left_pairs & right_pairs) / len(union) if union else 0.0
     shared_actions = left_actions & right_actions
-    shared_entities = _semantic_entities(left) & _semantic_entities(right)
+    shared_entities = left.entities & right.entities
     core_facts_match = bool(
         shared_actions
         and shared_entities
@@ -416,6 +457,10 @@ def stories_match(left: dict[str, Any], right: dict[str, Any], window_seconds: i
         and (len(shared_entities) >= 2 or jaccard >= 0.2 or ratio >= 0.48)
     )
     return core_facts_match or ratio >= 0.78 or (ratio >= 0.62 and jaccard >= 0.5)
+
+
+def stories_match(left: dict[str, Any], right: dict[str, Any], window_seconds: int = 18 * 3600) -> bool:
+    return _fingerprints_match(_story_fingerprint(left), _story_fingerprint(right), window_seconds)
 
 
 def _source_record(item: dict[str, Any]) -> dict[str, str]:
@@ -446,11 +491,18 @@ def deduplicate_news_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     prepared.sort(key=lambda row: (row["sourcePriority"], row["add_time"], len(row["content"])), reverse=True)
     unique: list[dict[str, Any]] = []
+    unique_fingerprints: list[_StoryFingerprint] = []
     for item in prepared:
-        duplicate = next((kept for kept in unique if stories_match(kept, item)), None)
-        if duplicate is None:
+        item_fingerprint = _story_fingerprint(item)
+        duplicate_index = next(
+            (index for index, fingerprint in enumerate(unique_fingerprints) if _fingerprints_match(fingerprint, item_fingerprint)),
+            None,
+        )
+        if duplicate_index is None:
             unique.append(item)
+            unique_fingerprints.append(item_fingerprint)
             continue
+        duplicate = unique[duplicate_index]
         known_ids = {source["id"] for source in duplicate["sources"]}
         for source in item["sources"]:
             if source["id"] not in known_ids:
@@ -458,6 +510,7 @@ def deduplicate_news_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         duplicate["duplicateCount"] += 1 + int(item.get("duplicateCount") or 0)
         if len(item["content"]) > len(duplicate["content"]):
             duplicate["content"] = item["content"]
+            unique_fingerprints[duplicate_index] = _story_fingerprint(duplicate)
     unique.sort(key=lambda row: row["add_time"], reverse=True)
     return unique
 
@@ -481,7 +534,7 @@ def aggregate_newsflash(blockbeats_payload: dict[str, Any], headers: dict[str, s
     source_status.append(blockbeats_status)
 
     jobs: dict[Any, dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=6, thread_name_prefix="newsflash-source") as pool:
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="newsflash-source") as pool:
         for source in configured_feed_sources():
             jobs[pool.submit(_fetch_feed, source, request_headers, timeout)] = source
         for future in as_completed(jobs):

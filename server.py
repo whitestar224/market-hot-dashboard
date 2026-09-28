@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import atexit
 import base64
+import functools
+import gc
 import gzip
 import hashlib
 import hmac
@@ -46,6 +48,7 @@ from bs4 import BeautifulSoup
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import quiet_http_server as dragon_wave_local
 from network_proxy import (
+    local_proxy_candidates,
     network_proxy_generation,
     network_proxy_status,
     network_proxy_url,
@@ -79,10 +82,13 @@ from news_trade_explanations import ExplanationService, context_for as explanati
 from newsflash_sources import aggregate_newsflash, http_get_race, source_family
 from event_flow_window import attention_evidence, attention_window, STAGES as ATTENTION_STAGES
 from listing_alerts import attach_inventory as attach_listing_inventory, observe_listings, asset_key as listing_asset_key
+from opennews_client import opennews_feed_payload
+from opentwitter_client import twitter_watch_feed_payload
+from pump_claim_monitor import pump_claim_feed_payload
 from onchain_fast_research import (
     CHATGPT_RESEARCH_ROUTE, FastResearch, NARRATIVE_VERSION, NEWS_TRIGGER_VERSION,
     ResearchCapacityBusy, story_text, paginate_research, formal_research_worthy,
-    promote_resonance_priority, chatgpt_positive_alert_decision,
+    promote_resonance_priority, chatgpt_positive_alert_decision, news_trigger_signal,
     candidate_key as onchain_candidate_key,
 )
 from onchain_research_framework import (
@@ -97,11 +103,17 @@ from rapid_decision_compare import RAPID_DECISION_VERSION, analyze_rapid_candida
 from jev_decision import JEV_SEMANTIC_VERSION, analyze_jev_person_semantics
 from smart_money_monitor import CHAIN_META as SMART_MONEY_CHAIN_META, SmartMoneyMonitor
 from trench_person_signals import (
+    EXCHANGE_OFFICIAL_HANDLES,
     EXCLUDED_IMPORTANT_HANDLES,
+    important_official_sources,
     important_person_sources,
     match_person_post,
     person_relevance_score,
     token_identity as trench_person_token_identity,
+)
+from x_tweet_analysis import (
+    CHAT_TITLE as X_TWEET_ANALYSIS_CHAT_TITLE,
+    XTweetAnalysisQueue,
 )
 from contextlib import closing, contextmanager, nullcontext
 from personal_x_future_event import (
@@ -119,6 +131,68 @@ from wechat_group_monitor import (
     normalize_chat_platform,
     normalize_group_name,
     send_text_to_wechat,
+)
+
+
+class _SharedRequestsFacade:
+    """Keep requests' public API while routing one-shot calls through keep-alive pools."""
+
+    _METHODS = frozenset({"delete", "get", "head", "options", "patch", "post", "put", "request"})
+
+    def __init__(self, module: Any, session: requests.Session, max_inflight: int):
+        self._module = module
+        self._session = session
+        self._max_inflight = max(1, int(max_inflight))
+        self._semaphore = threading.BoundedSemaphore(self._max_inflight)
+        self._state_lock = threading.Lock()
+        self._active = 0
+        self._peak = 0
+
+    def _call(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        with self._semaphore:
+            with self._state_lock:
+                self._active += 1
+                self._peak = max(self._peak, self._active)
+            try:
+                return getattr(self._session, name)(*args, **kwargs)
+            finally:
+                with self._state_lock:
+                    self._active = max(0, self._active - 1)
+
+    def stats(self) -> dict[str, int]:
+        with self._state_lock:
+            return {
+                "active": self._active,
+                "peak": self._peak,
+                "limit": self._max_inflight,
+            }
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self._METHODS:
+            return functools.partial(self._call, name)
+        return getattr(self._module, name)
+
+
+# Most monitor calls used requests.get/post directly, which creates and closes a
+# Session for every call. On Windows that repeatedly loads the certificate store
+# and performs a fresh proxy/TLS handshake across dozens of workers. Reuse a
+# process-wide pool; Session's adapters/urllib3 pools and cookie jar are guarded,
+# while callers still provide their own headers, proxies and timeouts.
+_REQUESTS_MODULE = requests
+SHARED_HTTP_SESSION = requests.Session()
+SHARED_HTTP_SESSION.mount(
+    "http://",
+    requests.adapters.HTTPAdapter(pool_connections=64, pool_maxsize=24, max_retries=0, pool_block=True),
+)
+SHARED_HTTP_SESSION.mount(
+    "https://",
+    requests.adapters.HTTPAdapter(pool_connections=64, pool_maxsize=24, max_retries=0, pool_block=True),
+)
+atexit.register(SHARED_HTTP_SESSION.close)
+requests = _SharedRequestsFacade(
+    _REQUESTS_MODULE,
+    SHARED_HTTP_SESSION,
+    max_inflight=max(2, min(16, int(os.getenv("OUTBOUND_HTTP_MAX_INFLIGHT", "6") or "6"))),
 )
 
 
@@ -142,6 +216,17 @@ CACHE_TTL = 15
 CACHE_MAX_ENTRIES = 96
 SERVER_SHUTDOWN_EVENT = threading.Event()
 SERVER_RUNTIME_ACTIVE = False
+# The dashboard is intentionally I/O-heavy and keeps many mostly-idle workers.
+# A 1 MiB stack is ample for these non-recursive tasks and avoids reserving the
+# platform default stack for every pool/request thread.
+THREAD_STACK_SIZE_BYTES = max(
+    512 * 1024,
+    min(4 * 1024 * 1024, int(float(os.getenv("XINGYUN_THREAD_STACK_KB", "1024") or "1024")) * 1024),
+)
+try:
+    threading.stack_size(THREAD_STACK_SIZE_BYTES)
+except (RuntimeError, ValueError):
+    THREAD_STACK_SIZE_BYTES = 0
 EVENT_MONITOR_DEX_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 EVENT_MONITOR_DEX_CACHE_LOCK = threading.Lock()
 EVENT_MONITOR_DEX_CACHE_TTL_SECONDS = 120
@@ -154,7 +239,10 @@ NEWS_TRADE_DISCOVERY_CACHE_TTL_SECONDS = max(
 NEWS_TRADE_SECURITY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 NEWS_TRADE_SECURITY_CACHE_LOCK = threading.Lock()
 NEWS_TRADE_SECURITY_INFLIGHT: set[str] = set()
-NEWS_TRADE_SECURITY_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="news-trade-security")
+NEWS_TRADE_SECURITY_POOL = ThreadPoolExecutor(
+    max_workers=max(2, min(6, int(os.getenv("NEWS_TRADE_SECURITY_WORKERS", "3") or "3"))),
+    thread_name_prefix="news-trade-security",
+)
 NEWS_TRADE_SECURITY_CACHE_TTL_SECONDS = max(
     120,
     int(float(os.getenv("NEWS_TRADE_SECURITY_CACHE_SECONDS", "900") or "900")),
@@ -190,18 +278,33 @@ CHAIN_ECOSYSTEM_AI_LOCK = threading.Lock()
 CHAIN_ECOSYSTEM_AI_INFLIGHT: set[str] = set()
 CHAIN_ECOSYSTEM_AI_RETRY_AFTER: dict[str, float] = {}
 CHAIN_ECOSYSTEM_AI_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chain-ecosystem-ai")
+BINANCE_AI_NARRATIVE_POOL = ThreadPoolExecutor(
+    max_workers=max(2, min(6, int(os.getenv("BINANCE_AI_NARRATIVE_WORKERS", "3") or "3"))),
+    thread_name_prefix="binance-ai-narrative",
+)
+EXCHANGE_AI_TRENCH_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="exchange-ai-trench")
+AVE_CHAIN_POOL = ThreadPoolExecutor(
+    max_workers=max(2, min(5, int(os.getenv("AVE_CHAIN_WORKERS", "3") or "3"))),
+    thread_name_prefix="ave-chain-hot",
+)
 NEWS_TRADE_ALERT_STATE_LOCK = threading.Lock()
 NEWS_TRADE_DESKTOP_INTAKE_LOCK = threading.Lock()
 ASTER_ANNOUNCEMENT_LOCK = threading.Lock()
 ASTER_X_LISTING_LOCK = threading.Lock()
 API_REFRESH_LOCK = threading.Lock()
-# key -> monotonic-free wall start of the in-flight refresh worker.  A worker
-# stuck on a downstream lock must not freeze its key forever, so entries older
-# than API_REFRESH_STUCK_SECONDS are treated as abandoned and replaced.
+# key -> wall-clock start of the one in-flight refresh worker.  Python cannot
+# safely kill a blocked thread.  Starting a "replacement" only leaks the old
+# thread and its stack, so every cache key stays strict single-flight until its
+# owner actually exits.
 API_REFRESHING: dict[str, float] = {}
+API_REFRESH_STALL_LOGGED: set[str] = set()
 API_REFRESH_STUCK_SECONDS = max(
     60.0,
     float(os.getenv("API_REFRESH_STUCK_SECONDS", "300") or 300),
+)
+API_REFRESH_POOL = ThreadPoolExecutor(
+    max_workers=max(2, min(8, int(float(os.getenv("API_REFRESH_WORKERS", "4") or "4")))),
+    thread_name_prefix="api-refresh",
 )
 API_CACHE_WRITE_LOCK = threading.Lock()
 DESKTOP_ALERT_LOCK = threading.Lock()
@@ -417,8 +520,8 @@ X_KOL_RSS_TIMEOUT_SECONDS = max(2.0, float(os.getenv("X_KOL_RSS_TIMEOUT_SECONDS"
 # 个人 X 监控 · 未来事件自动入 todolist 的去重与并发保护
 FUTURE_EVENT_LOCK = threading.Lock()
 FUTURE_EVENT_SEEN: set[str] = set()
-X_KOL_RSS_MIRROR_WORKERS = max(1, min(8, int(os.getenv("X_KOL_RSS_MIRROR_WORKERS", "4") or "4")))
-X_KOL_RSS_SOURCE_WORKERS = max(1, min(6, int(os.getenv("X_KOL_RSS_SOURCE_WORKERS", "4") or "4")))
+X_KOL_RSS_MIRROR_WORKERS = max(1, min(8, int(os.getenv("X_KOL_RSS_MIRROR_WORKERS", "3") or "3")))
+X_KOL_RSS_SOURCE_WORKERS = max(1, min(6, int(os.getenv("X_KOL_RSS_SOURCE_WORKERS", "3") or "3")))
 X_KOL_RSS_MIRROR_ATTEMPTS = max(1, min(4, int(os.getenv("X_KOL_RSS_MIRROR_ATTEMPTS", "2") or "2")))
 X_KOL_RSS_USER_AGENT = str(os.getenv(
     "X_KOL_RSS_USER_AGENT",
@@ -435,6 +538,17 @@ X_KOL_FXTWITTER_TIMEOUT_SECONDS = max(
     3.0,
     float(os.getenv("X_KOL_FXTWITTER_TIMEOUT_SECONDS", "12") or "12"),
 )
+X_KOL_HTTP_ROUTE_LOCK = threading.Lock()
+X_KOL_HTTP_ROUTE: dict[str, Any] = {
+    "resolved": False,
+    "proxyUrl": "",
+    "expiresAt": 0.0,
+}
+X_KOL_HTTP_ROUTE_TTL_SECONDS = max(
+    30.0,
+    float(os.getenv("X_KOL_HTTP_ROUTE_TTL_SECONDS", "600") or "600"),
+)
+X_KOL_HTTP_THREAD_LOCAL = threading.local()
 GMGN_TRENCH_X_POST_CACHE_TTL_SECONDS = max(
     60.0,
     float(os.getenv("GMGN_TRENCH_X_POST_CACHE_TTL_SECONDS", str(24 * 60 * 60)) or str(24 * 60 * 60)),
@@ -513,28 +627,40 @@ TRENCH_PERSON_ALERT_PERSON_COOLDOWN_MS = max(
     int(float(os.getenv("TRENCH_PERSON_ALERT_PERSON_COOLDOWN_SECONDS", "600") or "600") * 1000),
 )
 TRENCH_PERSON_REQUEST_MIN_INTERVAL_SECONDS = max(
-    30.0,
-    float(os.getenv("TRENCH_PERSON_REQUEST_MIN_INTERVAL_SECONDS", "45") or "45"),
+    2.0,
+    float(os.getenv("TRENCH_PERSON_REQUEST_MIN_INTERVAL_SECONDS", "3") or "3"),
+)
+TRENCH_PERSON_BATCH_SIZE = max(
+    1,
+    min(8, int(os.getenv("TRENCH_PERSON_BATCH_SIZE", "6") or "6")),
+)
+TRENCH_PERSON_FETCH_WORKERS = max(
+    1,
+    min(8, int(os.getenv("TRENCH_PERSON_FETCH_WORKERS", str(TRENCH_PERSON_BATCH_SIZE)) or TRENCH_PERSON_BATCH_SIZE)),
+)
+TRENCH_PERSON_BATCH_TIMEOUT_SECONDS = max(
+    8.0,
+    float(os.getenv("TRENCH_PERSON_BATCH_TIMEOUT_SECONDS", "25") or "25"),
 )
 TRENCH_PERSON_SOURCE_LIMIT = max(
     80,
     min(500, int(os.getenv("TRENCH_PERSON_SOURCE_LIMIT", "300") or "300")),
 )
 TRENCH_PERSON_DEFAULT_REFRESH_SECONDS = max(
-    5 * 60.0,
-    float(os.getenv("TRENCH_PERSON_DEFAULT_REFRESH_SECONDS", "600") or "600"),
+    30.0,
+    float(os.getenv("TRENCH_PERSON_DEFAULT_REFRESH_SECONDS", "75") or "75"),
 )
 TRENCH_PERSON_SECONDARY_REFRESH_SECONDS = max(
-    15 * 60.0,
-    float(os.getenv("TRENCH_PERSON_SECONDARY_REFRESH_SECONDS", "3600") or "3600"),
+    5 * 60.0,
+    float(os.getenv("TRENCH_PERSON_SECONDARY_REFRESH_SECONDS", "600") or "600"),
 )
 TRENCH_PERSON_OFFICIAL_REFRESH_SECONDS = max(
-    10 * 60.0,
-    float(os.getenv("TRENCH_PERSON_OFFICIAL_REFRESH_SECONDS", "1800") or "1800"),
+    2 * 60.0,
+    float(os.getenv("TRENCH_PERSON_OFFICIAL_REFRESH_SECONDS", "300") or "300"),
 )
 TRENCH_PERSON_RELEVANT_REFRESH_SECONDS = max(
-    90.0,
-    float(os.getenv("TRENCH_PERSON_RELEVANT_REFRESH_SECONDS", "120") or "120"),
+    20.0,
+    float(os.getenv("TRENCH_PERSON_RELEVANT_REFRESH_SECONDS", "30") or "30"),
 )
 TRENCH_PERSON_POST_MAX_AGE_MS = max(
     60 * 60_000,
@@ -668,6 +794,20 @@ FIRST_LISTING_ALERT_LOCK = threading.Lock()
 AVE_HOT_ALERT_LOCK = threading.Lock()
 GLOBAL_HOTSPOT_LOCK = threading.Lock()
 GMGN_TRENCH_HISTORY_LOCK = threading.Lock()
+ONCHAIN_RESEARCH_INGEST_LOCK = threading.Lock()
+ONCHAIN_RESEARCH_INGEST_PENDING: dict[str, tuple[dict[str, Any], bool]] = {}
+ONCHAIN_RESEARCH_INGEST_THREAD: threading.Thread | None = None
+ONCHAIN_RESEARCH_INGEST_PENDING_LIMIT = max(
+    300,
+    min(3000, int(float(os.getenv("ONCHAIN_RESEARCH_INGEST_PENDING_LIMIT", "1200") or "1200"))),
+)
+TRENCH_PERSON_REPLAY_LOCK = threading.Lock()
+TRENCH_PERSON_REPLAY_PENDING: list[dict[str, Any]] | None = None
+TRENCH_PERSON_REPLAY_THREAD: threading.Thread | None = None
+TRENCH_PERSON_ACTIVITY_LOCK = threading.Lock()
+TRENCH_PERSON_ACTIVITY_PENDING: dict[str, dict[str, Any]] = {}
+TRENCH_PERSON_ACTIVITY_THREAD: threading.Thread | None = None
+TRENCH_PERSON_ACTIVITY_PENDING_LIMIT = 320
 GMGN_TRENCH_BOARD_REFRESH_SECONDS = max(
     120,
     int(float(os.getenv("GMGN_TRENCH_BOARD_REFRESH_SECONDS", "180") or "180")),
@@ -852,7 +992,7 @@ PRICE_STRUCTURE_MONITOR_INTERVAL_SECONDS = max(
 )
 PRICE_STRUCTURE_MONITOR_WORKERS = max(
     2,
-    min(16, int(os.getenv("PRICE_STRUCTURE_MONITOR_WORKERS", "8") or "8")),
+    min(16, int(os.getenv("PRICE_STRUCTURE_MONITOR_WORKERS", "6") or "6")),
 )
 PRICE_STRUCTURE_PRIORITY_REFRESH_SECONDS = max(
     3.0,
@@ -1041,6 +1181,28 @@ PRICE_STRUCTURE_CHAIN_FROM_GT_NETWORK = {
 }
 PRICE_STRUCTURE_ONCHAIN_POOL_CACHE_MAX_ENTRIES = 256
 PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE_MAX_ENTRIES = 720
+# Contract-bound kline providers (Binance Wallet / OKX DEX) share one keep-alive
+# session: bare requests.get pays a fresh TCP+TLS(+proxy CONNECT) handshake on
+# every call, which measured 11s+ cold vs 0.7-2s warm against bapi — enough to
+# blow the 4s fast-probe timeout and destabilize every on-chain refresh.
+# trust_env stays enabled on purpose: outbound traffic must follow the system
+# proxy stack, never a hardcoded direct or fixed proxy route.
+ONCHAIN_KLINE_HTTP_SESSION = requests.Session()
+ONCHAIN_KLINE_HTTP_SESSION.mount(
+    "https://",
+    requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=32),
+)
+# Same TTL/inflight/stale-error discipline the GeckoTerminal fetcher already
+# uses, applied to Binance Wallet and OKX DEX so parallel monitor workers,
+# prior-high refreshes and onchain fallback fills coalesce into one request.
+PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE: dict[str, tuple[float, list]] = {}
+PRICE_STRUCTURE_ONCHAIN_KLINE_ERROR_CACHE: dict[str, tuple[float, str]] = {}
+PRICE_STRUCTURE_ONCHAIN_KLINE_INFLIGHT: dict[str, threading.Event] = {}
+PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE_LOCK = threading.Lock()
+PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE_TTL_SECONDS = 15
+PRICE_STRUCTURE_ONCHAIN_KLINE_STALE_TTL_SECONDS = 10 * 60
+PRICE_STRUCTURE_ONCHAIN_KLINE_ERROR_TTL_SECONDS = 8
+PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE_MAX_ENTRIES = 1024
 PRICE_STRUCTURE_MOMENTUM_CACHE_MAX_ENTRIES = 512
 PRICE_STRUCTURE_MOMENTUM_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 PRICE_STRUCTURE_MOMENTUM_CACHE_LOCK = threading.Lock()
@@ -1081,20 +1243,24 @@ X_KOL_RSS_SOURCE_POOL = ThreadPoolExecutor(
     thread_name_prefix="x-kol-source",
 )
 X_KOL_RSS_MIRROR_POOL = ThreadPoolExecutor(
-    max_workers=max(2, min(8, X_KOL_RSS_SOURCE_WORKERS * X_KOL_RSS_MIRROR_ATTEMPTS)),
+    max_workers=X_KOL_RSS_MIRROR_WORKERS,
     thread_name_prefix="x-kol-mirror",
+)
+TRENCH_PERSON_FETCH_POOL = ThreadPoolExecutor(
+    max_workers=TRENCH_PERSON_FETCH_WORKERS,
+    thread_name_prefix="trench-person-fast",
 )
 PRICE_STRUCTURE_TIMEFRAME_POOL = ThreadPoolExecutor(
     max_workers=max(
-        6,
-        min(24, int(os.getenv("PRICE_STRUCTURE_TIMEFRAME_WORKERS", "12") or "12")),
+        4,
+        min(24, int(os.getenv("PRICE_STRUCTURE_TIMEFRAME_WORKERS", "6") or "6")),
     ),
     thread_name_prefix="market-timeframe",
 )
 PRICE_STRUCTURE_ENTRY_DAY_TIMEFRAME_POOL = ThreadPoolExecutor(
     max_workers=max(
-        6,
-        min(16, int(os.getenv("PRICE_STRUCTURE_ENTRY_DAY_TIMEFRAME_WORKERS", "12") or "12")),
+        3,
+        min(16, int(os.getenv("PRICE_STRUCTURE_ENTRY_DAY_TIMEFRAME_WORKERS", "4") or "4")),
     ),
     thread_name_prefix="entry-day-timeframe",
 )
@@ -1123,18 +1289,23 @@ PRICE_WATCH_REALTIME_PROXY_STATE: dict[str, Any] = {"resolved": False, "url": ""
 MARKET_SOURCE_POOL = ThreadPoolExecutor(
     max_workers=max(
         4,
-        min(12, int(os.getenv("MARKET_SOURCE_WORKERS", "8") or "8")),
+        min(12, int(os.getenv("MARKET_SOURCE_WORKERS", "6") or "6")),
     ),
     thread_name_prefix="market-source",
 )
 SHARED_EXECUTORS = (
+    API_REFRESH_POOL,
     NEWS_TRADE_SECURITY_POOL,
     NEWS_TRADE_AI_POOL,
     ROTATION_AI_POOL,
     CHAIN_ECOSYSTEM_AI_POOL,
+    BINANCE_AI_NARRATIVE_POOL,
+    EXCHANGE_AI_TRENCH_POOL,
+    AVE_CHAIN_POOL,
     WECHAT_GROUP_ANALYSIS_POOL,
     X_KOL_RSS_SOURCE_POOL,
     X_KOL_RSS_MIRROR_POOL,
+    TRENCH_PERSON_FETCH_POOL,
     PRICE_STRUCTURE_TIMEFRAME_POOL,
     PRICE_STRUCTURE_ENTRY_DAY_TIMEFRAME_POOL,
     PRICE_STRUCTURE_QUOTE_POOL,
@@ -1144,6 +1315,15 @@ SHARED_EXECUTORS = (
 configured_runtime_dir = os.getenv("XINGYUN_RUNTIME_DIR", "").strip()
 PERSIST_CACHE_DIR = Path(configured_runtime_dir).expanduser().resolve() if configured_runtime_dir else ROOT / ".runtime-cache"
 PERSIST_CACHE_DIR.mkdir(exist_ok=True)
+X_TWEET_ANALYSIS_QUEUE = XTweetAnalysisQueue(PERSIST_CACHE_DIR / "x_tweet_analysis.sqlite")
+X_TWEET_ANALYSIS_INCREMENTAL_STATE = X_TWEET_ANALYSIS_QUEUE.enable_incremental_only()
+X_TWEET_ANALYSIS_PERSON_HANDLES = frozenset(
+    str(source.get("handle") or "").strip().casefold().lstrip("@")[:80]
+    for source in important_person_sources()
+    if str(source.get("handle") or "").strip()
+)
+X_TWEET_ANALYSIS_QUEUE.suppress_disallowed_handles(X_TWEET_ANALYSIS_PERSON_HANDLES)
+X_TWEET_ANALYSIS_QUEUE.refresh_pending_prompts()
 SMART_MONEY_MONITOR = SmartMoneyMonitor(
     PERSIST_CACHE_DIR / "smart_money_monitor.sqlite",
     seed_defaults=True,
@@ -1634,6 +1814,7 @@ def maintain_runtime_memory(now: float | None = None) -> dict[str, int]:
         for key in chain_retry_keys:
             CHAIN_ECOSYSTEM_AI_RETRY_AFTER.pop(key, None)
         removed["chainAiRetries"] = len(chain_retry_keys)
+    removed["garbage"] = gc.collect()
     return removed
 
 
@@ -1707,7 +1888,16 @@ def write_json_cache(path: Path, payload: dict[str, Any]) -> None:
         write_price_structure_snapshot(path, payload)
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f"{path.name}.tmp")
+    # Unique tmp name per call.  The old fixed "{name}.tmp" collides when two
+    # threads write the same cache file concurrently (e.g. the market pool
+    # refresh and the direct /api/binance-wallet-hot endpoint): A's replace
+    # removes the shared tmp, B's replace then raises FileNotFoundError
+    # (WinError 2) and a perfectly good live fetch was discarded.  Per-call
+    # names keep the atomic same-directory replace while making concurrent
+    # writers independent; stale leftovers age out via the *.tmp sweep.
+    tmp_path = path.with_name(
+        f"{path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp"
+    )
     # Compact serialization: indent=2 was purely cosmetic but bloated every cache
     # file ~40-70% and slowed each write.  Readers use json.loads and are unaffected.
     tmp_path.write_text(
@@ -1820,7 +2010,11 @@ def cleanup_runtime_ephemeral_files(
                 removed["qr"] += 1
         except OSError:
             continue
-    for path in root.glob("*.tmp"):
+    tmp_paths = list(root.glob("*.tmp"))
+    source_tmp_dir = root / "source-cache"
+    if source_tmp_dir.is_dir():
+        tmp_paths.extend(source_tmp_dir.glob("*.tmp"))
+    for path in tmp_paths:
         try:
             if path.is_file() and current - path.stat().st_mtime > RUNTIME_TEMP_MAX_AGE_SECONDS:
                 path.unlink(missing_ok=True)
@@ -4303,8 +4497,6 @@ def admin_clear_cache_payload() -> dict[str, Any]:
                 deleted += 1
         except OSError:
             continue
-    with API_REFRESH_LOCK:
-        API_REFRESHING.clear()
     return {"ok": True, "deleted": deleted, "cache": runtime_cache_stats()}
 
 
@@ -4403,7 +4595,14 @@ def cached_or_fallback_source(
                 if len(rows) < 10 and len(fallback_rows) > len(rows):
                     fallback["sourceName"] = f"{fallback.get('sourceName') or key} · 实时不足 {len(rows)} 条，保留完整缓存"
                     return fallback
-            write_json_cache(cache_path, source)
+            try:
+                write_json_cache(cache_path, source)
+            except Exception as exc:
+                # The live fetch succeeded; a persistence hiccup (disk/AV/
+                # replace race) must not flip the board to "unavailable" and
+                # throw the fresh rows away.  Log and serve; the next refresh
+                # retries the write.
+                print(f"[source-cache] {cache_path.name} write failed, serving live rows anyway: {safe_error_text(str(exc))}", flush=True)
             return source
         fallback = cached_source_fallback(key, cache_path, api_key=api_key) if source_fallback_allowed(key, cache_path) else {}
         if fallback:
@@ -4479,13 +4678,19 @@ def trigger_api_refresh(key: str, fetcher) -> None:
     with API_REFRESH_LOCK:
         previous_started = API_REFRESHING.get(key)
         if previous_started is not None:
-            if now - previous_started < API_REFRESH_STUCK_SECONDS:
-                return
-            print(
-                f"API cache refresh '{key}' in-flight for {now - previous_started:.0f}s; starting a replacement worker.",
-                file=sys.stderr,
-            )
+            if (
+                now - previous_started >= API_REFRESH_STUCK_SECONDS
+                and key not in API_REFRESH_STALL_LOGGED
+            ):
+                API_REFRESH_STALL_LOGGED.add(key)
+                print(
+                    f"API cache refresh '{key}' still in-flight after "
+                    f"{now - previous_started:.0f}s; duplicate refresh suppressed.",
+                    file=sys.stderr,
+                )
+            return
         API_REFRESHING[key] = now
+        API_REFRESH_STALL_LOGGED.discard(key)
 
     def worker() -> None:
         try:
@@ -4495,12 +4700,22 @@ def trigger_api_refresh(key: str, fetcher) -> None:
             print(f"API cache refresh '{key}' failed: {safe_monitor_error(exc)}", file=sys.stderr)
         finally:
             with API_REFRESH_LOCK:
-                # Only clear our own entry: a replacement worker may already
-                # own the key after the stuck-entry takeover above.
                 if API_REFRESHING.get(key) == now:
                     API_REFRESHING.pop(key, None)
+                    API_REFRESH_STALL_LOGGED.discard(key)
 
-    threading.Thread(target=worker, daemon=True, name=f"api-refresh-{key}").start()
+    try:
+        API_REFRESH_POOL.submit(worker)
+    except RuntimeError:
+        with API_REFRESH_LOCK:
+            if API_REFRESHING.get(key) == now:
+                API_REFRESHING.pop(key, None)
+                API_REFRESH_STALL_LOGGED.discard(key)
+
+
+def api_refresh_inflight(key: str) -> bool:
+    with API_REFRESH_LOCK:
+        return key in API_REFRESHING
 
 
 def cached_api_payload(
@@ -4511,6 +4726,7 @@ def cached_api_payload(
     force_refresh: bool = False,
     max_age_seconds: float | None = None,
     allow_sync_rebuild: bool = True,
+    _cached_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return cached payload, refreshing in background when stale.
 
@@ -4528,18 +4744,26 @@ def cached_api_payload(
     """
     if max_age_seconds is None:
         max_age_seconds = float(os.getenv("API_CACHE_MAX_AGE_SECONDS", "600"))
-    cached_payload = read_json_cache(api_cache_path(key))
+    cached_payload = _cached_payload if _cached_payload is not None else read_json_cache(api_cache_path(key))
     now = time.time()
     if cached_payload:
         age = now - payload_cache_time(cached_payload)
         stale = age > ttl_seconds
         if age > max_age_seconds:
             if allow_sync_rebuild:
+                if api_refresh_inflight(key):
+                    result = with_cache_meta(key, cached_payload, stale=True)
+                    result["_cache"]["refreshing"] = True
+                    return result
                 return with_cache_meta(key, refresh_api_cache_now(key, fetcher), stale=False)
             # 超龄但禁止同步重建: 交给后台单飞刷新, 请求线程只拿 stale 数据。
             trigger_api_refresh(key, fetcher)
             return with_cache_meta(key, cached_payload, stale=True)
         if force_refresh:
+            if api_refresh_inflight(key):
+                result = with_cache_meta(key, cached_payload, stale=True)
+                result["_cache"]["refreshing"] = True
+                return result
             return with_cache_meta(key, refresh_api_cache_now(key, fetcher), stale=False)
         if stale:
             trigger_api_refresh(key, fetcher)
@@ -5998,7 +6222,7 @@ def normalize_x_source(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     handle = normalize_x_handle(value.get("handle") or value.get("username") or value.get("url"))
-    if not handle:
+    if not handle or handle.casefold() in EXCHANGE_OFFICIAL_HANDLES:
         return None
     display_name = clean_feed_text(value.get("displayName") or value.get("name") or handle, 80)
     keywords = normalize_x_keywords(value.get("keywords"))
@@ -6553,7 +6777,7 @@ def save_dragon_wave_feedback_for_user(user: dict[str, Any], incoming: Any) -> d
 
 
 def x_kol_system_person_sources() -> list[dict[str, Any]]:
-    """Expose the shared low-frequency person roster without duplicating polling."""
+    """Expose only high-impact personal accounts in the 人物源 group."""
     return [
         {
             **source,
@@ -6564,6 +6788,22 @@ def x_kol_system_person_sources() -> list[dict[str, Any]]:
             "createdAt": 0,
         }
         for source in important_person_sources()
+        if source.get("enabled") is not False
+    ]
+
+
+def x_kol_system_official_sources() -> list[dict[str, Any]]:
+    """Expose passive non-exchange official accounts outside the person roster."""
+    return [
+        {
+            **source,
+            "avatar": x_kol_avatar_url(source.get("handle")),
+            "systemManaged": True,
+            "readOnly": True,
+            "sourceGroup": "官方源",
+            "createdAt": 0,
+        }
+        for source in important_official_sources()
         if source.get("enabled") is not False
     ]
 
@@ -6581,7 +6821,7 @@ def x_kol_sources_for_view(
     }
     system = [
         source
-        for source in x_kol_system_person_sources()
+        for source in [*x_kol_system_person_sources(), *x_kol_system_official_sources()]
         if normalize_x_handle(source.get("handle")).casefold() not in manual_handles
     ]
     return [*manual, *system]
@@ -7465,6 +7705,89 @@ def _store_gmgn_trench_x_post(status_id: str, payload: dict[str, Any], ttl_secon
         GMGN_TRENCH_X_POST_CACHE[status_id] = (time.time() + max(60.0, ttl_seconds), dict(payload))
 
 
+def x_kol_http_session() -> requests.Session:
+    """Return one keep-alive client per worker without inheriting a stale global route."""
+    session = getattr(X_KOL_HTTP_THREAD_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.trust_env = False
+        adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=8)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        X_KOL_HTTP_THREAD_LOCAL.session = session
+    return session
+
+
+def x_kol_http_proxy_candidates() -> list[str]:
+    """Prefer the local browser route for X, whose direct route is often blocked."""
+    configured = str(os.getenv("X_KOL_HTTP_PROXY", "auto") or "auto").strip()
+    folded = configured.casefold()
+    if folded in {"direct", "off", "none", "false", "0"}:
+        return [""]
+
+    candidates: list[str] = []
+    now = time.monotonic()
+    with X_KOL_HTTP_ROUTE_LOCK:
+        cached = dict(X_KOL_HTTP_ROUTE)
+    if cached.get("resolved") and safe_float(cached.get("expiresAt"), 0) > now:
+        candidates.append(str(cached.get("proxyUrl") or ""))
+
+    if folded not in {"", "auto"}:
+        if "://" not in configured:
+            configured = f"http://{configured}"
+        candidates.append(configured)
+    else:
+        # The desktop browser can reach X through the local proxy even when the
+        # generic health check selects direct routing for other public APIs.
+        candidates.extend(local_proxy_candidates())
+        candidates.append(network_proxy_url())
+        candidates.append("")
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = str(candidate or "").strip().rstrip("/")
+        key = normalized.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(normalized)
+    return ordered or [""]
+
+
+def x_kol_http_get(url: str, **kwargs: Any) -> requests.Response:
+    """GET an X public source through the first working free network route."""
+    last_error: Exception | None = None
+    session = x_kol_http_session()
+    for proxy_url in x_kol_http_proxy_candidates():
+        request_kwargs = dict(kwargs)
+        request_kwargs["proxies"] = (
+            {"http": proxy_url, "https": proxy_url}
+            if proxy_url
+            else {"http": "", "https": ""}
+        )
+        try:
+            response = session.get(url, **request_kwargs)
+            if response.status_code in {407, 502, 503, 504}:
+                response.close()
+                raise requests.HTTPError(f"X route returned HTTP {response.status_code}")
+            with X_KOL_HTTP_ROUTE_LOCK:
+                X_KOL_HTTP_ROUTE.update({
+                    "resolved": True,
+                    "proxyUrl": proxy_url,
+                    "expiresAt": time.monotonic() + X_KOL_HTTP_ROUTE_TTL_SECONDS,
+                })
+            return response
+        except requests.RequestException as exc:
+            last_error = exc
+            with X_KOL_HTTP_ROUTE_LOCK:
+                if X_KOL_HTTP_ROUTE.get("proxyUrl") == proxy_url:
+                    X_KOL_HTTP_ROUTE.update({"resolved": False, "proxyUrl": "", "expiresAt": 0.0})
+    if last_error is not None:
+        raise last_error
+    raise requests.ConnectionError("No X public network route is available")
+
+
 def gmgn_trench_x_post_payload(status_id: Any, *, session: Any = None) -> dict[str, Any]:
     """Fetch one original post lazily; never prefetch the GMGN trench history."""
     global GMGN_TRENCH_X_POST_NEXT_REQUEST_AT
@@ -7488,15 +7811,14 @@ def gmgn_trench_x_post_payload(status_id: Any, *, session: Any = None) -> dict[s
         result: dict[str, Any]
         ttl = GMGN_TRENCH_X_POST_NEGATIVE_TTL_SECONDS
         try:
-            client = session or requests
-            response = client.get(
-                url,
-                headers={
+            request_kwargs = {
+                "headers": {
                     "User-Agent": "XingyunMarketDashboard/1.0 (+https://github.com/whitestar224/market-hot-dashboard)",
                     "Accept": "application/json",
                 },
-                timeout=(min(3.0, X_KOL_FXTWITTER_TIMEOUT_SECONDS), X_KOL_FXTWITTER_TIMEOUT_SECONDS),
-            )
+                "timeout": (min(3.0, X_KOL_FXTWITTER_TIMEOUT_SECONDS), X_KOL_FXTWITTER_TIMEOUT_SECONDS),
+            }
+            response = session.get(url, **request_kwargs) if session else x_kol_http_get(url, **request_kwargs)
             if int(getattr(response, "status_code", 0) or 0) == 429:
                 result = {
                     "ok": False,
@@ -7647,7 +7969,7 @@ def x_kol_fetch_fxtwitter_timeline(source: dict[str, Any]) -> dict[str, Any]:
     handle = normalize_x_handle(source.get("handle"))
     url = f"{X_KOL_FXTWITTER_BASE_URL}/2/profile/{quote(handle, safe='')}/statuses"
     try:
-        response = requests.get(
+        response = x_kol_http_get(
             url,
             headers={
                 "User-Agent": "XingyunMarketDashboard/1.0 (+https://github.com/whitestar224/market-hot-dashboard)",
@@ -7807,7 +8129,7 @@ def x_kol_fetch_public_timeline(source: dict[str, Any]) -> dict[str, Any]:
     handle = normalize_x_handle(source.get("handle"))
     url = f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{quote(handle, safe='')}?dnt=true"
     try:
-        response = requests.get(
+        response = x_kol_http_get(
             url,
             headers={**HEADERS, "Accept": "text/html,application/xhtml+xml"},
             timeout=(min(3.0, X_KOL_PUBLIC_TIMELINE_TIMEOUT_SECONDS), X_KOL_PUBLIC_TIMELINE_TIMEOUT_SECONDS),
@@ -7845,7 +8167,7 @@ def x_kol_fetch_rss_template(
     )
     started_at = time.monotonic()
     try:
-        response = requests.get(
+        response = x_kol_http_get(
             url,
             headers={
                 **HEADERS,
@@ -8094,6 +8416,7 @@ def x_kol_shared_person_activity(
     }
     health_rows = document.get("sourceHealth") if isinstance(document.get("sourceHealth"), dict) else {}
     states: list[dict[str, Any]] = []
+    now_ms = int(time.time() * 1000)
     for health in health_rows.values():
         if not isinstance(health, dict):
             continue
@@ -8101,7 +8424,18 @@ def x_kol_shared_person_activity(
         source = by_handle.get(handle)
         if not source:
             continue
-        states.append({
+        tier = str(source.get("watchTier") or "secondary").strip().lower()
+        expected_refresh = (
+            TRENCH_PERSON_DEFAULT_REFRESH_SECONDS
+            if tier == "primary"
+            else TRENCH_PERSON_OFFICIAL_REFRESH_SECONDS
+            if tier == "official"
+            else TRENCH_PERSON_SECONDARY_REFRESH_SECONDS
+        )
+        last_check_at = int(safe_float(health.get("lastCheckAt"), 0))
+        stale_after_ms = int(max(3 * 60.0, expected_refresh * 3.0) * 1000)
+        stale = not last_check_at or now_ms - last_check_at > stale_after_ms
+        state = {
             **source,
             **health,
             "id": source["id"],
@@ -8109,8 +8443,14 @@ def x_kol_shared_person_activity(
             "displayName": source.get("displayName") or health.get("displayName") or source["handle"],
             "provider": health.get("provider") or "shared-person-watch",
             "sharedWatcher": True,
-        })
-
+            "stale": stale,
+        }
+        if stale:
+            state.update({
+                "status": "recovering",
+                "error": "人物源正在快车道补拉最新动态",
+            })
+        states.append(state)
     items: list[dict[str, Any]] = []
     for raw in document.get("recentPosts") if isinstance(document.get("recentPosts"), list) else []:
         if not isinstance(raw, dict):
@@ -9955,14 +10295,14 @@ def binance_wallet_contract_url(chain_id: Any, contract_address: Any) -> str:
             route_chain = "sol"
     if not contract or not route_chain:
         return ""
-    base_url = f"https://web3.binance.com/en/token/{route_chain}/{quote(contract, safe='')}"
+    base_url = f"https://web3.binance.com/zh-CN/token/{route_chain}/{quote(contract, safe='')}"
     referral = quote(BINANCE_WALLET_REFERRAL_CODE, safe="")
     return f"{base_url}?ref={referral}" if referral else base_url
 
 
 def binance_wallet_token_url(chain_id: Any, contract_address: Any) -> str:
     """Return a Binance Web3 token page, preserving the legacy market fallback."""
-    return binance_wallet_contract_url(chain_id, contract_address) or "https://web3.binance.com/en/markets"
+    return binance_wallet_contract_url(chain_id, contract_address) or "https://web3.binance.com/zh-CN/markets"
 
 
 def binance_wallet_ai_narrative_available(raw: dict[str, Any]) -> bool:
@@ -10076,25 +10416,21 @@ def enrich_binance_wallet_ai_narratives(source: dict[str, Any]) -> dict[str, Any
     ]
     if not candidates:
         return source
-    with ThreadPoolExecutor(
-        max_workers=min(6, len(candidates)),
-        thread_name_prefix="binance-ai-narrative",
-    ) as pool:
-        futures = {
-            pool.submit(
-                fetch_binance_wallet_ai_narrative,
-                row.get("chain"),
-                row.get("contractAddress"),
-            ): row
-            for row in candidates
-        }
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-            except Exception:
-                continue
-            if result:
-                futures[future].update(result)
+    futures = {
+        BINANCE_AI_NARRATIVE_POOL.submit(
+            fetch_binance_wallet_ai_narrative,
+            row.get("chain"),
+            row.get("contractAddress"),
+        ): row
+        for row in candidates
+    }
+    for future in as_completed(futures):
+        try:
+            result = future.result()
+        except Exception:
+            continue
+        if result:
+            futures[future].update(result)
     return source
 
 
@@ -10449,23 +10785,20 @@ def exchange_ai_narratives_payload(payload: dict[str, Any]) -> dict[str, Any]:
     # Binance AI fan-out deliberately narrow; positive and negative results are
     # cached by fetch_binance_wallet_ai_narrative.
     worker_limit = 2 if contains_trenches else 6
-    with ThreadPoolExecutor(
-        max_workers=min(worker_limit, len(items)),
-        thread_name_prefix="exchange-ai-narrative",
-    ) as pool:
-        futures = {
-            pool.submit(exchange_ai_narrative_for_item, item): index
-            for index, item in enumerate(items)
-        }
-        for future in as_completed(futures):
-            index = futures[future]
-            try:
-                results[index] = future.result()
-            except Exception:
-                results[index] = {
-                    "key": clean_feed_text(items[index].get("key"), 260),
-                    "exchangeAiNarrativeStatus": "UNAVAILABLE",
-                }
+    pool = EXCHANGE_AI_TRENCH_POOL if worker_limit == 2 else BINANCE_AI_NARRATIVE_POOL
+    futures = {
+        pool.submit(exchange_ai_narrative_for_item, item): index
+        for index, item in enumerate(items)
+    }
+    for future in as_completed(futures):
+        index = futures[future]
+        try:
+            results[index] = future.result()
+        except Exception:
+            results[index] = {
+                "key": clean_feed_text(items[index].get("key"), 260),
+                "exchangeAiNarrativeStatus": "UNAVAILABLE",
+            }
     return {"ok": True, "items": [item for item in results if isinstance(item, dict)]}
 
 
@@ -12013,19 +12346,18 @@ def fetch_ave_hot(max_rows: int = 10) -> dict[str, Any]:
     }
     chain_results: dict[str, list[dict[str, Any]]] = {}
     chain_errors: dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=len(AVE_HOT_CHAINS), thread_name_prefix="ave-chain-hot") as executor:
-        futures = {
-            executor.submit(ave_treasure_items, token, udid, chain): (chain, label)
-            for chain, label in AVE_HOT_CHAINS
-        }
-        for future in as_completed(futures):
-            chain, _label = futures[future]
-            try:
-                chain_results[chain] = ave_hot_rows_from_items(future.result(), max_rows=max_rows)
-            except Exception as exc:
-                fallback_rows = prior_boards.get(chain, {}).get("rows")
-                chain_results[chain] = fallback_rows[:max_rows] if isinstance(fallback_rows, list) else []
-                chain_errors[chain] = alert_text(exc, 100)
+    futures = {
+        AVE_CHAIN_POOL.submit(ave_treasure_items, token, udid, chain): (chain, label)
+        for chain, label in AVE_HOT_CHAINS
+    }
+    for future in as_completed(futures):
+        chain, _label = futures[future]
+        try:
+            chain_results[chain] = ave_hot_rows_from_items(future.result(), max_rows=max_rows)
+        except Exception as exc:
+            fallback_rows = prior_boards.get(chain, {}).get("rows")
+            chain_results[chain] = fallback_rows[:max_rows] if isinstance(fallback_rows, list) else []
+            chain_errors[chain] = alert_text(exc, 100)
 
     source = source_template(
         id="ave",
@@ -13035,7 +13367,23 @@ def process_trench_person_activity(
         if not isinstance(item, dict):
             continue
         source = item.get("_personSource") if isinstance(item.get("_personSource"), dict) else {}
-        if normalize_x_handle(source.get("handle") or item.get("handle")).casefold() in EXCLUDED_IMPORTANT_HANDLES:
+        handle = normalize_x_handle(source.get("handle") or item.get("handle")).casefold()
+        category = normalize_x_kol_category(
+            source.get("category") or item.get("category"),
+            handle=handle,
+            display_name=source.get("displayName") or item.get("sourceName"),
+            keywords=source.get("keywords"),
+        )
+        # Official projects remain available to the passive official/news
+        # pipeline, but they are never people and must not create 人物信号.
+        # The handle check also prevents old cached minor-person posts from
+        # resurfacing after the leader roster is tightened.
+        if (
+            not handle
+            or handle in EXCLUDED_IMPORTANT_HANDLES
+            or category == "project_official"
+            or handle not in X_TWEET_ANALYSIS_PERSON_HANDLES
+        ):
             continue
         matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for row in candidates:
@@ -13123,7 +13471,77 @@ def process_trench_person_activity(
 
 def ingest_trench_person_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
     incoming = trench_person_store_activity(payload)
-    return process_trench_person_activity(incoming) if incoming else []
+    if incoming:
+        queue_trench_person_activity(incoming)
+    # Signal creation is intentionally asynchronous. Fresh posts must reach the
+    # timeline immediately even when semantic AI is slow or unavailable.
+    return []
+
+
+def trench_person_activity_key(row: dict[str, Any]) -> str:
+    source = row.get("_personSource") if isinstance(row.get("_personSource"), dict) else {}
+    handle = normalize_x_handle(row.get("handle") or source.get("handle")).casefold()
+    post_id = clean_feed_text(row.get("tweetId") or row.get("id") or row.get("url"), 300)
+    return f"{handle}:{post_id}" if handle and post_id else stable_feed_id("person-activity", row)
+
+
+def trench_person_activity_worker() -> None:
+    """Run slow semantic/research work without holding up public X polling."""
+    global TRENCH_PERSON_ACTIVITY_THREAD
+    current_thread = threading.current_thread()
+    try:
+        while not SERVER_SHUTDOWN_EVENT.is_set():
+            with TRENCH_PERSON_ACTIVITY_LOCK:
+                rows = list(TRENCH_PERSON_ACTIVITY_PENDING.values())
+                TRENCH_PERSON_ACTIVITY_PENDING.clear()
+            if not rows:
+                return
+            try:
+                process_trench_person_activity(rows)
+            except Exception as exc:
+                print(f"Trench person semantic processing deferred: {safe_monitor_error(exc)}", file=sys.stderr)
+    finally:
+        with TRENCH_PERSON_ACTIVITY_LOCK:
+            if TRENCH_PERSON_ACTIVITY_THREAD is current_thread:
+                TRENCH_PERSON_ACTIVITY_THREAD = None
+            has_pending = bool(TRENCH_PERSON_ACTIVITY_PENDING)
+        if has_pending and not SERVER_SHUTDOWN_EVENT.is_set():
+            queue_trench_person_activity([])
+
+
+def queue_trench_person_activity(rows: list[dict[str, Any]]) -> int:
+    """Coalesce person posts into one bounded background semantic worker."""
+    global TRENCH_PERSON_ACTIVITY_THREAD
+    accepted = 0
+    with TRENCH_PERSON_ACTIVITY_LOCK:
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            row = dict(raw)
+            key = trench_person_activity_key(row)
+            if not key:
+                continue
+            TRENCH_PERSON_ACTIVITY_PENDING[key] = row
+            accepted += 1
+        while len(TRENCH_PERSON_ACTIVITY_PENDING) > TRENCH_PERSON_ACTIVITY_PENDING_LIMIT:
+            TRENCH_PERSON_ACTIVITY_PENDING.pop(next(iter(TRENCH_PERSON_ACTIVITY_PENDING)))
+        if (
+            not SERVER_SHUTDOWN_EVENT.is_set()
+            and TRENCH_PERSON_ACTIVITY_PENDING
+            and (TRENCH_PERSON_ACTIVITY_THREAD is None or not TRENCH_PERSON_ACTIVITY_THREAD.is_alive())
+        ):
+            TRENCH_PERSON_ACTIVITY_THREAD = threading.Thread(
+                target=trench_person_activity_worker,
+                daemon=True,
+                name="trench-person-semantic",
+            )
+            TRENCH_PERSON_ACTIVITY_THREAD.start()
+    return accepted
+
+
+def queue_trench_person_payload(payload: dict[str, Any]) -> int:
+    incoming = trench_person_store_activity(payload)
+    return queue_trench_person_activity(incoming) if incoming else 0
 
 
 def reevaluate_trench_person_recent_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -13133,9 +13551,17 @@ def reevaluate_trench_person_recent_activity(rows: list[dict[str, Any]]) -> list
 
 def trench_person_watch_sources() -> list[dict[str, Any]]:
     saved = [source for source in load_x_kol_sources(None) if source.get("enabled") is not False]
-    # Expanding the roster does not expand concurrency: the watch loop still
-    # performs one public read per global interval and rotates due sources.
-    return important_person_sources(saved)[:TRENCH_PERSON_SOURCE_LIMIT]
+    # The fast lane uses a small bounded batch; roster growth cannot create an
+    # unbounded request/thread fan-out.
+    people = [
+        {**source, "sourceGroup": "人物源"}
+        for source in important_person_sources(saved)
+    ]
+    officials = [
+        {**source, "sourceGroup": "官方源"}
+        for source in important_official_sources(saved)
+    ]
+    return [*people, *officials][:TRENCH_PERSON_SOURCE_LIMIT]
 
 
 def trench_person_fetch_public_source(source: dict[str, Any]) -> dict[str, Any]:
@@ -13146,83 +13572,282 @@ def trench_person_fetch_public_source(source: dict[str, Any]) -> dict[str, Any]:
     return x_kol_fetch_fxtwitter_timeline(source)
 
 
-def trench_person_poll_once() -> dict[str, Any]:
+def trench_person_poll_once(*, batch_size: int = 1) -> dict[str, Any]:
     now = time.monotonic()
     rows = trench_person_recent_rows()
     sources = trench_person_watch_sources()
     due = [source for source in sources if now >= TRENCH_PERSON_WATCH_NEXT_DUE.get(source["id"], 0.0)]
     if not due:
         return {"ok": True, "idle": True, "sourceCount": len(sources)}
-    ranked_due: list[tuple[float, str, dict[str, Any], int]] = []
+    source_order = {source["id"]: index for index, source in enumerate(sources)}
+    ranked_due: list[tuple[float, int, str, dict[str, Any], int]] = []
     for candidate in due:
         relevance = person_relevance_score(candidate, rows)
         tier = str(candidate.get("watchTier") or "secondary").strip().lower()
-        tier_boost = {"primary": 600.0, "official": 300.0, "secondary": 0.0}.get(tier, 0.0)
         scheduled = TRENCH_PERSON_WATCH_NEXT_DUE.get(candidate["id"])
         never_checked = scheduled is None
-        relevance_boost = 1800.0 if relevance and never_checked else 60.0 if relevance else 0.0
-        first_check_boost = 120.0 if never_checked else 0.0
-        # Lower effective due time wins. New relevant sources are checked first,
-        # then the unvisited core/project roster; already-hot sources cannot
-        # permanently starve the rest of the expanded watch list.
-        effective_due = (
-            (now if never_checked else float(scheduled))
-            - tier_boost
-            - relevance_boost
-            - first_check_boost
+        if never_checked:
+            # Startup ordering only: core people first, then official projects.
+            # The former implementation subtracted this tier boost forever,
+            # which let already-checked primary accounts starve other people for
+            # hours or days even though their persisted nextDueAt was overdue.
+            tier_startup_boost = {
+                "primary": 600.0,
+                "official": 300.0,
+                "secondary": 120.0,
+            }.get(tier, 0.0)
+            # Relevance already shortens the steady-state refresh below. At
+            # startup, preserve curated person order so Vitalik/CZ/etc. are not
+            # pushed behind dozens of token-alias matches.
+            relevance_startup_boost = 0.0
+            effective_due = now - tier_startup_boost - relevance_startup_boost
+        else:
+            # Once visited, the real due time is authoritative. Relevance gets
+            # only a small tie-breaker and cannot create a permanent fast loop.
+            effective_due = float(scheduled) - (15.0 if relevance else 0.0)
+        ranked_due.append((
+            effective_due,
+            source_order.get(candidate["id"], len(source_order)),
+            candidate["id"],
+            candidate,
+            relevance,
+        ))
+    ranked_due.sort(key=lambda item: (item[0], item[1], item[2]))
+    selected = ranked_due[: max(1, min(TRENCH_PERSON_BATCH_SIZE, int(batch_size or 1)))]
+
+    fetched_by_id: dict[str, dict[str, Any]] = {}
+    if len(selected) == 1:
+        source = selected[0][3]
+        fetched_by_id[source["id"]] = trench_person_fetch_public_source(source)
+    else:
+        futures = {
+            TRENCH_PERSON_FETCH_POOL.submit(trench_person_fetch_public_source, source): source
+            for _effective_due, _source_order, _source_id, source, _relevance in selected
+        }
+        try:
+            for future in as_completed(futures, timeout=TRENCH_PERSON_BATCH_TIMEOUT_SECONDS):
+                source = futures[future]
+                try:
+                    fetched_by_id[source["id"]] = future.result()
+                except Exception as exc:
+                    fetched_by_id[source["id"]] = {
+                        "source": {
+                            **source,
+                            "status": "error",
+                            "provider": "free-public-route",
+                            "error": "人物源免费线路暂时不可用",
+                            "upstreamError": clean_feed_text(exc, 240),
+                            "lastCheckAt": int(time.time() * 1000),
+                        },
+                        "items": [],
+                    }
+        except FuturesTimeoutError:
+            pass
+        for future, source in futures.items():
+            if source["id"] in fetched_by_id:
+                continue
+            future.cancel()
+            fetched_by_id[source["id"]] = {
+                "source": {
+                    **source,
+                    "status": "error",
+                    "provider": "free-public-route",
+                    "error": "人物源本轮读取超时，已继续下一批",
+                    "lastCheckAt": int(time.time() * 1000),
+                },
+                "items": [],
+            }
+
+    summaries: list[dict[str, Any]] = []
+    should_wake_feed = False
+    for _effective_due, _source_order, _source_id, source, relevance_score in selected:
+        result = fetched_by_id.get(source["id"]) or {"source": {**source, "status": "error"}, "items": []}
+        source_state = result.get("source") if isinstance(result.get("source"), dict) else {}
+        ok = source_state.get("status") == "ok"
+        failures = 0 if ok else TRENCH_PERSON_WATCH_FAILURES.get(source["id"], 0) + 1
+        TRENCH_PERSON_WATCH_FAILURES[source["id"]] = failures
+        relevant = relevance_score > 0
+        tier = str(source.get("watchTier") or "secondary").strip().lower()
+        tier_refresh = (
+            TRENCH_PERSON_DEFAULT_REFRESH_SECONDS
+            if tier == "primary"
+            else TRENCH_PERSON_OFFICIAL_REFRESH_SECONDS
+            if tier == "official"
+            else TRENCH_PERSON_SECONDARY_REFRESH_SECONDS
         )
-        ranked_due.append((effective_due, candidate["id"], candidate, relevance))
-    ranked_due.sort(key=lambda item: (item[0], item[1]))
-    _effective_due, _source_id, source, relevance_score = ranked_due[0]
-    result = trench_person_fetch_public_source(source)
-    source_state = result.get("source") if isinstance(result.get("source"), dict) else {}
-    ok = source_state.get("status") == "ok"
-    failures = 0 if ok else TRENCH_PERSON_WATCH_FAILURES.get(source["id"], 0) + 1
-    TRENCH_PERSON_WATCH_FAILURES[source["id"]] = failures
-    relevant = relevance_score > 0
-    tier = str(source.get("watchTier") or "secondary").strip().lower()
-    tier_refresh = (
-        TRENCH_PERSON_DEFAULT_REFRESH_SECONDS
-        if tier == "primary"
-        else TRENCH_PERSON_OFFICIAL_REFRESH_SECONDS
-        if tier == "official"
-        else TRENCH_PERSON_SECONDARY_REFRESH_SECONDS
-    )
-    refresh = TRENCH_PERSON_RELEVANT_REFRESH_SECONDS if relevant else tier_refresh
-    if failures:
-        refresh = min(60 * 60.0, max(refresh, 60.0 * (2 ** min(failures, 5))))
-    TRENCH_PERSON_WATCH_NEXT_DUE[source["id"]] = now + refresh
-    trench_person_record_source_health(
-        source,
-        source_state,
-        failures=failures,
-        refresh_seconds=refresh,
-    )
-    payload = {
-        "ok": ok,
-        "sources": [{**source, **source_state, "personRole": source.get("personRole")}],
-        "items": result.get("items") if isinstance(result.get("items"), list) else [],
-        "updatedAt": int(time.time() * 1000),
-    }
-    emitted = ingest_trench_person_payload(payload)
+        refresh = TRENCH_PERSON_RELEVANT_REFRESH_SECONDS if relevant else tier_refresh
+        if failures:
+            refresh = min(60 * 60.0, max(refresh, 60.0 * (2 ** min(failures, 5))))
+        TRENCH_PERSON_WATCH_NEXT_DUE[source["id"]] = time.monotonic() + refresh
+        trench_person_record_source_health(
+            source,
+            source_state,
+            failures=failures,
+            refresh_seconds=refresh,
+        )
+        payload_items = result.get("items") if isinstance(result.get("items"), list) else []
+        payload = {
+            "ok": ok,
+            "sources": [{**source, **source_state, "personRole": source.get("personRole")}],
+            "items": payload_items,
+            "updatedAt": int(time.time() * 1000),
+        }
+        emitted = ingest_trench_person_payload(payload)
+        should_wake_feed = should_wake_feed or bool(payload_items)
+        summaries.append({
+            "ok": ok,
+            "source": source["handle"],
+            "relevant": relevant,
+            "items": len(payload_items),
+            "signals": len(emitted),
+            "nextDueSeconds": int(refresh),
+        })
+
+    if should_wake_feed:
+        wake_all_x_kol_realtime_workers()
+    first = summaries[0]
     return {
-        "ok": ok,
-        "source": source["handle"],
-        "relevant": relevant,
-        "items": len(payload["items"]),
-        "signals": len(emitted),
-        "nextDueSeconds": int(refresh),
+        **first,
+        "batchSize": len(summaries),
+        "sources": [row["source"] for row in summaries],
+        "okCount": sum(1 for row in summaries if row["ok"]),
     }
 
 
 def trench_person_watch_loop() -> None:
     while not SERVER_SHUTDOWN_EVENT.is_set():
         try:
-            trench_person_poll_once()
+            trench_person_poll_once(batch_size=TRENCH_PERSON_BATCH_SIZE)
         except Exception as exc:
             print(f"Trench person watch recovering: {safe_monitor_error(exc)}", file=sys.stderr)
         if SERVER_SHUTDOWN_EVENT.wait(TRENCH_PERSON_REQUEST_MIN_INTERVAL_SECONDS):
             return
+
+
+def onchain_research_ingest_identity(row: dict[str, Any]) -> str:
+    network = clean_feed_text(row.get("network") or row.get("chain"), 40).casefold()
+    address = clean_feed_text(
+        row.get("contractAddress") or row.get("contract_address"), 180
+    ).casefold()
+    symbol = clean_feed_text(row.get("symbol") or row.get("name"), 100).casefold()
+    return f"{network}:{address or symbol}"
+
+
+def onchain_research_ingest_worker() -> None:
+    """Drain the latest trench candidates through one bounded writer.
+
+    The old request path created a new daemon thread on every board poll.  If
+    SQLite's writer lock was busy, all of those threads remained alive while
+    holding duplicate 300-row payloads.  Coalescing by CA preserves every
+    distinct candidate while keeping exactly one potentially-blocked writer.
+    """
+
+    global ONCHAIN_RESEARCH_INGEST_THREAD
+    current_thread = threading.current_thread()
+    try:
+        while not SERVER_SHUTDOWN_EVENT.is_set():
+            with ONCHAIN_RESEARCH_INGEST_LOCK:
+                entries = list(ONCHAIN_RESEARCH_INGEST_PENDING.items())[:300]
+                for key, _value in entries:
+                    ONCHAIN_RESEARCH_INGEST_PENDING.pop(key, None)
+            if not entries:
+                return
+            research = globals().get("ONCHAIN_FAST_RESEARCH")
+            if research is None:
+                continue
+            for match_recent_news in (False, True):
+                batch = [
+                    row
+                    for _key, (row, should_match) in entries
+                    if should_match is match_recent_news
+                ]
+                if not batch:
+                    continue
+                try:
+                    research.ingest(batch, match_recent_news=match_recent_news)
+                except Exception as exc:
+                    print(
+                        f"On-chain research queued ingest deferred: {safe_monitor_error(exc)}",
+                        file=sys.stderr,
+                    )
+    finally:
+        with ONCHAIN_RESEARCH_INGEST_LOCK:
+            if ONCHAIN_RESEARCH_INGEST_THREAD is current_thread:
+                ONCHAIN_RESEARCH_INGEST_THREAD = None
+
+
+def queue_onchain_research_ingest(
+    rows: list[dict[str, Any]], *, match_recent_news: bool = True
+) -> int:
+    """Coalesce duplicate research ingestion without spawning per-request threads."""
+
+    global ONCHAIN_RESEARCH_INGEST_THREAD
+    accepted = 0
+    with ONCHAIN_RESEARCH_INGEST_LOCK:
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            row = dict(raw)
+            key = onchain_research_ingest_identity(row)
+            if not key or key == ":":
+                continue
+            ONCHAIN_RESEARCH_INGEST_PENDING[key] = (row, bool(match_recent_news))
+            accepted += 1
+        while len(ONCHAIN_RESEARCH_INGEST_PENDING) > ONCHAIN_RESEARCH_INGEST_PENDING_LIMIT:
+            ONCHAIN_RESEARCH_INGEST_PENDING.pop(next(iter(ONCHAIN_RESEARCH_INGEST_PENDING)))
+        if (
+            accepted
+            and not SERVER_SHUTDOWN_EVENT.is_set()
+            and (ONCHAIN_RESEARCH_INGEST_THREAD is None or not ONCHAIN_RESEARCH_INGEST_THREAD.is_alive())
+        ):
+            ONCHAIN_RESEARCH_INGEST_THREAD = threading.Thread(
+                target=onchain_research_ingest_worker,
+                daemon=True,
+                name="onchain-research-ingest",
+            )
+            ONCHAIN_RESEARCH_INGEST_THREAD.start()
+    return accepted
+
+
+def trench_person_activity_replay_worker() -> None:
+    """Process only the newest pending person-activity window in one worker."""
+
+    global TRENCH_PERSON_REPLAY_PENDING, TRENCH_PERSON_REPLAY_THREAD
+    current_thread = threading.current_thread()
+    try:
+        while not SERVER_SHUTDOWN_EVENT.is_set():
+            with TRENCH_PERSON_REPLAY_LOCK:
+                rows = TRENCH_PERSON_REPLAY_PENDING
+                TRENCH_PERSON_REPLAY_PENDING = None
+            if rows is None:
+                return
+            try:
+                reevaluate_trench_person_recent_activity(rows)
+            except Exception as exc:
+                print(
+                    f"Trench person activity replay deferred: {safe_monitor_error(exc)}",
+                    file=sys.stderr,
+                )
+    finally:
+        with TRENCH_PERSON_REPLAY_LOCK:
+            if TRENCH_PERSON_REPLAY_THREAD is current_thread:
+                TRENCH_PERSON_REPLAY_THREAD = None
+
+
+def queue_trench_person_activity_replay(rows: list[dict[str, Any]]) -> None:
+    global TRENCH_PERSON_REPLAY_PENDING, TRENCH_PERSON_REPLAY_THREAD
+    with TRENCH_PERSON_REPLAY_LOCK:
+        TRENCH_PERSON_REPLAY_PENDING = [dict(row) for row in rows if isinstance(row, dict)]
+        if (
+            not SERVER_SHUTDOWN_EVENT.is_set()
+            and (TRENCH_PERSON_REPLAY_THREAD is None or not TRENCH_PERSON_REPLAY_THREAD.is_alive())
+        ):
+            TRENCH_PERSON_REPLAY_THREAD = threading.Thread(
+                target=trench_person_activity_replay_worker,
+                daemon=True,
+                name="gmgn-trench-person-replay",
+            )
+            TRENCH_PERSON_REPLAY_THREAD.start()
 
 
 def start_trench_person_watch_monitor() -> None:
@@ -13243,6 +13868,7 @@ def gmgn_trench_research_candidate(
     *,
     current_ms: int,
     research_label: str = "GMGN 战壕新币",
+    hotspot_index: dict[tuple[str, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Convert one visible GMGN trench row into a durable research candidate."""
     if not isinstance(raw, dict):
@@ -13286,6 +13912,230 @@ def gmgn_trench_research_candidate(
         ]))[:6],
         "risks": list(raw.get("risks") or [])[:6],
     })
+    return enrich_trench_candidate_from_news_trade_hotspot(
+        row,
+        hotspot_index=hotspot_index or {},
+        now_ms=current_ms,
+    )
+
+
+def normalize_hotspot_candidate_network(value: Any) -> str:
+    """Normalize News Trade chain labels to the scanner's five-chain keys."""
+    network = clean_feed_text(value, 40).lower()
+    return {
+        "ethereum": "eth",
+        "eth": "eth",
+        "sol": "solana",
+        "solana": "solana",
+        "bnb": "bsc",
+        "bnb chain": "bsc",
+        "binance-smart-chain": "bsc",
+        "bsc": "bsc",
+        "robinhood chain": "robinhood",
+        "robinhood": "robinhood",
+        "arc chain": "arc",
+        "arc": "arc",
+    }.get(network, network)
+
+
+def build_news_trade_hotspot_contract_index(
+    payload: dict[str, Any] | None,
+    *,
+    now_ms: int,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Index recent hotspot-derived CAs without treating unofficial as unrelated.
+
+    News Trade already ranks the competing CAs under one meme/event.  The trench
+    scanner used to ignore that result and therefore repeated an older
+    official-identity gate.  Keep official status as a label, while feeding the
+    exact ranked CA and its market evidence back into the research queue.
+    """
+    topics = (payload or {}).get("topics")
+    if not isinstance(topics, list):
+        return {}
+    current_ms = int(now_ms)
+    max_age_ms = 24 * 60 * 60_000
+    indexed: dict[tuple[str, str], dict[str, Any]] = {}
+    for topic in topics:
+        if not isinstance(topic, dict):
+            continue
+        topic_at = int(safe_float(
+            topic.get("lastSeenAt") or topic.get("updatedAt")
+            or topic.get("firstSeenAt") or topic.get("timestamp"),
+            0,
+        ))
+        if topic_at and not 0 <= current_ms - topic_at <= max_age_ms:
+            continue
+        topic_score = max(
+            safe_float(topic.get("topicScore"), 0),
+            safe_float(topic.get("eventHeatScore"), 0),
+            safe_float(topic.get("score"), 0),
+        )
+        if not topic.get("isHotTopic") and topic_score < 60:
+            continue
+        candidates = topic.get("memeCandidates") if isinstance(topic.get("memeCandidates"), list) else []
+        for position, candidate in enumerate(candidates[:8], 1):
+            if not isinstance(candidate, dict):
+                continue
+            contract = clean_feed_text(candidate.get("contractAddress"), 160)
+            network = normalize_hotspot_candidate_network(candidate.get("chain") or candidate.get("chainLabel"))
+            if not contract or network not in ONCHAIN_RESEARCH_DEFAULT_NETWORKS:
+                continue
+            key = (network, contract.casefold())
+            role = clean_feed_text(candidate.get("role"), 20).lower() or ("primary" if position == 1 else "backup")
+            association = candidate.get("association") if isinstance(candidate.get("association"), dict) else {}
+            match = {
+                "topicId": clean_feed_text(topic.get("id") or topic.get("topicKey"), 300),
+                "title": clean_feed_text(topic.get("title"), 240),
+                "thesis": clean_feed_text(topic.get("thesis") or topic.get("body"), 700),
+                "url": clean_feed_text(candidate.get("sourceUrl") or topic.get("url"), 800),
+                "publishedAt": int(safe_float(topic.get("timestamp") or topic.get("firstSeenAt"), topic_at or current_ms)),
+                "observedAt": current_ms,
+                "topicScore": round(topic_score, 1),
+                "eventStage": clean_feed_text(topic.get("eventStage"), 30),
+                "fullyFermented": bool(topic.get("fullyFermented")),
+                "role": role,
+                "rank": int(safe_float(candidate.get("rank"), position)),
+                "candidateCount": len(candidates),
+                "candidateScore": safe_float(candidate.get("candidateScore"), 0),
+                "heatScore": safe_float(candidate.get("heatScore"), 0),
+                "narrativeRelevance": safe_float(candidate.get("narrativeRelevance"), 0),
+                "associationStatus": clean_feed_text(
+                    candidate.get("associationStatus") or association.get("code"), 80,
+                ),
+                "associationConfidence": safe_float(association.get("confidence"), 0),
+                "officialEvidenceUrl": clean_feed_text(association.get("officialEvidenceUrl"), 800),
+                "primaryContract": clean_feed_text(
+                    (candidates[0] or {}).get("contractAddress") if candidates and isinstance(candidates[0], dict) else "",
+                    160,
+                ),
+            }
+            previous = indexed.get(key)
+            rank_key = (
+                1 if role == "primary" else 0,
+                match["topicScore"],
+                match["candidateScore"],
+                match["publishedAt"],
+            )
+            previous_key = (
+                1 if previous and previous.get("role") == "primary" else 0,
+                safe_float((previous or {}).get("topicScore"), 0),
+                safe_float((previous or {}).get("candidateScore"), 0),
+                int(safe_float((previous or {}).get("publishedAt"), 0)),
+            )
+            if not previous or rank_key > previous_key:
+                indexed[key] = match
+    return indexed
+
+
+def enrich_trench_candidate_from_news_trade_hotspot(
+    candidate: dict[str, Any],
+    *,
+    hotspot_index: dict[tuple[str, str], dict[str, Any]],
+    now_ms: int,
+) -> dict[str, Any]:
+    """Promote a recent, market-backed meme mapping without claiming it official."""
+    row = dict(candidate)
+    network = normalize_hotspot_candidate_network(row.get("network") or row.get("chain"))
+    contract = clean_feed_text(row.get("contractAddress"), 160)
+    match = hotspot_index.get((network, contract.casefold())) if contract else None
+    if not isinstance(match, dict):
+        return row
+    metrics = row.get("metrics") if isinstance(row.get("metrics"), dict) else {}
+    launch = row.get("launchFacts") if isinstance(row.get("launchFacts"), dict) else {}
+    filters = row.get("filterSignals") if isinstance(row.get("filterSignals"), dict) else {}
+    liquidity = safe_float(metrics.get("liquidityUsd"), 0)
+    volume_h1 = safe_float(metrics.get("volumeH1Usd"), 0)
+    tx_h1 = int(safe_float(metrics.get("transactionsH1"), 0))
+    volume_h24 = safe_float(metrics.get("volumeH24Usd"), 0)
+    tx_h24 = int(safe_float(metrics.get("transactionsH24"), 0))
+    smart_money = int(safe_float(
+        metrics.get("smartMoneyHolders") or launch.get("smartMoneyHolders"), 0,
+    ))
+    kol_holders = int(safe_float(metrics.get("kolHolders") or launch.get("kolHolders"), 0))
+    market_backed = bool(
+        liquidity >= 20_000
+        and (
+            volume_h1 >= 10_000 or tx_h1 >= 50
+            or volume_h24 >= 100_000 or tx_h24 >= 250
+        )
+        and (
+            safe_float(match.get("heatScore"), 0) >= 45
+            or smart_money >= 3 or kol_holders >= 1
+        )
+    )
+    hard_blocked = bool(
+        row.get("decision") == "filtered"
+        or filters.get("honeypot") is True
+        or launch.get("honeypot") is True
+    )
+    identity_status = "hotspot-derived-ca-unverified"
+    role = clean_feed_text(match.get("role"), 20).lower() or "backup"
+    priority = "P0" if role == "primary" and not match.get("fullyFermented") else "P1"
+    evidence_text = " ".join(filter(None, [
+        clean_feed_text(match.get("title"), 240),
+        clean_feed_text(match.get("thesis"), 700),
+    ]))
+    if not isinstance(row.get("researchEvidence"), dict) or not row["researchEvidence"].get("identityStatus"):
+        row["researchEvidence"] = {
+            "source": "News Trade 热点池",
+            "url": match.get("url") or "",
+            "publishedAt": int(safe_float(match.get("publishedAt"), now_ms)),
+            "text": evidence_text,
+            "identityStatus": identity_status,
+            "identityNote": "该 CA 是近期热点下的链上候选；非官方不等于无机会，但不得表述为官方发行",
+        }
+    row["narrativeFallbackEligible"] = True
+    row["hotspotRelation"] = "independent-hotspot"
+    row["hotspotPriority"] = priority
+    row["hotspotOpportunity"] = {
+        **(row.get("hotspotOpportunity") if isinstance(row.get("hotspotOpportunity"), dict) else {}),
+        "eventId": match.get("topicId") or "",
+        "eventName": match.get("title") or "近期热点 Meme",
+        "relation": "independent-hotspot",
+        "priority": priority,
+        "override": market_backed and not hard_blocked,
+        "officialClaimStatus": "unconfirmed",
+        "candidateCountSameEvent": int(safe_float(match.get("candidateCount"), 0)),
+        "currentLeader": match.get("primaryContract") or "",
+        "identityConclusion": "热点衍生候选，未确认官方关系；官方性只作身份标签，不作为研究否决项",
+        "opportunityConclusion": "近期热点映射与链上成交、流动性和交易活跃度形成承接，值得及时复核",
+        "executionConclusion": "可进入研究视野；交易前仍须独立核验可卖性、权限、流动性和持仓结构",
+        "nextTrigger": "讨论热度、跨平台扩散和真实买盘继续增强",
+        "invalidation": "热点退潮、同题材龙头明显切换或成交与流动性同步衰减",
+    }
+    row["hotspotDerivedCandidate"] = {
+        key: match.get(key) for key in (
+            "topicId", "topicScore", "eventStage", "role", "rank", "candidateCount",
+            "candidateScore", "heatScore", "narrativeRelevance", "associationStatus",
+            "associationConfidence", "primaryContract",
+        )
+    }
+    row["reasons"] = list(dict.fromkeys([
+        f"近期热点衍生 CA（{role}）：不以官方身份作为研究硬门槛",
+        *(row.get("reasons") or []),
+    ]))[:6]
+    if market_backed and not hard_blocked:
+        row.update({
+            "decision": "shortlisted",
+            "selectedScore": max(safe_float(row.get("selectedScore"), 0), 90 if priority == "P0" else 84),
+            "researchPriority": max(safe_float(row.get("researchPriority"), 0), 96 if priority == "P0" else 86),
+            "worthWatching": True,
+            "hotspotOverride": True,
+            "researchTier": "hotspot-derived",
+            "newsObservedAt": int(now_ms),
+            "newsSignal": {
+                "version": NEWS_TRIGGER_VERSION,
+                "tier": "news-triggered",
+                "source": "News Trade 热点池",
+                "title": match.get("title") or "近期热点 Meme",
+                "url": match.get("url") or "",
+                "publishedAt": int(safe_float(match.get("publishedAt"), now_ms)),
+                "observedAt": int(now_ms),
+                "identityStatus": identity_status,
+                "reason": "近期热点 Meme 与该 CA 的链上承接同时成立；官方性仅作标签，AI 继续核验龙头地位与风险",
+            },
+        })
     return row
 
 
@@ -13343,20 +14193,9 @@ def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
         })
 
     # Re-evaluate the bounded public-person activity window after the tape is
-    # persisted.  This may call semantic AI and must not block the fresh-board
-    # cache from being written.
-    def replay_trench_person_activity(rows: list[dict[str, Any]]) -> None:
-        try:
-            reevaluate_trench_person_recent_activity(rows)
-        except Exception as exc:
-            print(f"Trench person activity replay deferred: {safe_monitor_error(exc)}", file=sys.stderr)
-
-    threading.Thread(
-        target=replay_trench_person_activity,
-        args=(list(history_rows),),
-        daemon=True,
-        name="gmgn-trench-person-replay",
-    ).start()
+    # persisted.  Semantic AI can be slow, so repeated refreshes replace the
+    # pending snapshot instead of spawning overlapping replay threads.
+    queue_trench_person_activity_replay(history_rows)
 
     rows = gmgn_trench_board_rows(history_rows, current_rows=live_rows)
     current_display_rows = gmgn_trench_board_rows(live_rows, current_rows=live_rows)
@@ -13373,32 +14212,29 @@ def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
     research_ingested = 0
     research_ingest_error = ""
     if board_research_rows:
+        hotspot_index = build_news_trade_hotspot_contract_index(
+            read_json_cache(PERSIST_CACHE_DIR / "news_trade_topic_pool.json"),
+            now_ms=observed_at,
+        )
         research_candidates = [
             candidate
             for raw in board_research_rows
-            for candidate in [gmgn_trench_research_candidate(raw, current_ms=observed_at)]
+            for candidate in [gmgn_trench_research_candidate(
+                raw,
+                current_ms=observed_at,
+                hotspot_index=hotspot_index,
+            )]
             if candidate is not None
         ]
         fast_research = globals().get("ONCHAIN_FAST_RESEARCH")
         if research_candidates and fast_research is not None:
             # The board tape must persist even while the research store is
-            # busy.  Ingest is durable and idempotent (the bridge and scan
-            # workers feed the same store), so run it in the background
-            # instead of blocking the cache write behind the chain-store
-            # write lock — a stalled ingest used to freeze the whole board.
-            def ingest_trench_candidates(candidates: list[dict[str, Any]], research: Any) -> None:
-                try:
-                    research.ingest(candidates, match_recent_news=True)
-                except Exception as exc:
-                    print(f"GMGN trench incremental ingest deferred: {safe_monitor_error(exc)}", file=sys.stderr)
-
-            research_ingested = len(research_candidates)
-            threading.Thread(
-                target=ingest_trench_candidates,
-                args=(list(research_candidates), fast_research),
-                daemon=True,
-                name="gmgn-trench-research-ingest",
-            ).start()
+            # busy.  The bounded single writer coalesces repeated board polls
+            # by CA instead of retaining one blocked 300-row thread per poll.
+            research_ingested = queue_onchain_research_ingest(
+                research_candidates,
+                match_recent_news=True,
+            )
     source_status = live_payload.get("sourceStatus") if isinstance(live_payload.get("sourceStatus"), dict) else {}
     online_count = sum(1 for value in source_status.values() if value == "ok")
     capped_rows = rows[:GMGN_TRENCH_RESPONSE_MAX_ROWS]
@@ -13482,30 +14318,49 @@ def load_v44_research_marks(rows: list[dict[str, Any]]) -> dict[str, dict[str, A
             analysis = json.loads(record["analysis_json"] or "{}")
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
-        # "好标的" is intentionally stricter than an observation candidate:
-        # it needs the full V4.9 ledgers, supported evidence and a strong verdict.
-        if candidate.get("decision") != "shortlisted" or analysis.get("verdict") != "strong":
-            continue
-        if not formal_research_worthy(analysis):
-            continue
+        # A completed V4.9 strong verdict remains the highest-confidence badge.
+        # A recent hotspot-derived CA may also surface immediately as "worth a
+        # look" while the full AI review is pending.  This is a research badge,
+        # not an official-identity or execution claim.
         framework = analysis.get("frameworkAssessment") if isinstance(analysis.get("frameworkAssessment"), dict) else {}
-        tier = clean_feed_text(framework.get("potentialTier"), 30)
-        marks[record["key"]] = {
-            "label": "V4.9 好标的",
-            "potentialTier": tier,
-            "potentialLabel": {
-                "leader": "龙头潜力",
-                "golden-dog": "大金狗潜力",
-                "watch": "正式精选",
-            }.get(tier, "正式精选"),
-            "summary": clean_feed_text(analysis.get("summary") or analysis.get("identitySummary"), 180),
-            "attentionState": clean_feed_text(framework.get("attentionState"), 12),
-            "currentStage": clean_feed_text(framework.get("currentStage"), 12),
-            "nextTrigger": clean_feed_text(framework.get("nextTrigger"), 240),
-            "invalidation": clean_feed_text(framework.get("invalidation"), 240),
-            "executionPermission": clean_feed_text(framework.get("executionPermission"), 20),
-            "opportunityScore": max(0, min(100, int(safe_float(framework.get("opportunityScore"), 0)))),
-        }
+        if (candidate.get("decision") == "shortlisted"
+                and analysis.get("verdict") == "strong"
+                and formal_research_worthy(analysis)):
+            tier = clean_feed_text(framework.get("potentialTier"), 30)
+            marks[record["key"]] = {
+                "label": "V4.9 好标的",
+                "potentialTier": tier,
+                "potentialLabel": {
+                    "leader": "龙头潜力",
+                    "golden-dog": "大金狗潜力",
+                    "watch": "正式精选",
+                }.get(tier, "正式精选"),
+                "summary": clean_feed_text(analysis.get("summary") or analysis.get("identitySummary"), 180),
+                "attentionState": clean_feed_text(framework.get("attentionState"), 12),
+                "currentStage": clean_feed_text(framework.get("currentStage"), 12),
+                "nextTrigger": clean_feed_text(framework.get("nextTrigger"), 240),
+                "invalidation": clean_feed_text(framework.get("invalidation"), 240),
+                "executionPermission": clean_feed_text(framework.get("executionPermission"), 20),
+                "opportunityScore": max(0, min(100, int(safe_float(framework.get("opportunityScore"), 0)))),
+            }
+            continue
+        trigger = news_trigger_signal(candidate)
+        hotspot = candidate.get("hotspotOpportunity") if isinstance(candidate.get("hotspotOpportunity"), dict) else {}
+        if trigger and hotspot.get("relation") == "independent-hotspot":
+            marks[record["key"]] = {
+                "label": "热点值得看",
+                "potentialTier": "hotspot-watch",
+                "potentialLabel": "非官方热点衍生",
+                "summary": clean_feed_text(
+                    trigger.get("reason") or hotspot.get("opportunityConclusion"), 180,
+                ),
+                "attentionState": clean_feed_text(hotspot.get("attentionState"), 12),
+                "currentStage": clean_feed_text((candidate.get("hotspotDerivedCandidate") or {}).get("eventStage"), 20),
+                "nextTrigger": clean_feed_text(hotspot.get("nextTrigger"), 240),
+                "invalidation": clean_feed_text(hotspot.get("invalidation"), 240),
+                "executionPermission": "CAUTION",
+                "opportunityScore": max(0, min(100, int(safe_float(candidate.get("researchPriority"), 0)))),
+            }
     return marks
 
 
@@ -14980,7 +15835,7 @@ def fetch_hyperliquid_new_markets(*, dex: str = "") -> dict[str, Any]:
             return symbol, 0
 
     first_candles: dict[str, int] = {}
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         for symbol, listed_at in executor.map(listing_time, candidates[:14]):
             first_candles[symbol] = listed_at
     rows: list[dict[str, Any]] = []
@@ -16195,7 +17050,7 @@ def eastmoney_stock_quotes(codes: list[str]) -> dict[str, dict[str, float]]:
             return digits, None
         return digits, None
 
-    with ThreadPoolExecutor(max_workers=min(8, max(1, len(unique_codes)))) as executor:
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(unique_codes)))) as executor:
         futures = [executor.submit(fetch_quote, code) for code in missing_codes if code]
         for future in as_completed(futures):
             code, quote = future.result()
@@ -16398,7 +17253,7 @@ def clean_html(value: str) -> str:
     return BeautifulSoup(value, "lxml").get_text(" ", strip=True)
 
 
-NEWS_INGEST_BACKGROUND_STATE = {"active": False, "started_at": 0.0}
+NEWS_INGEST_BACKGROUND_STATE = {"active": False, "started_at": 0.0, "stall_logged": False}
 NEWS_INGEST_BACKGROUND_LOCK = threading.Lock()
 NEWS_INGEST_BACKGROUND_STUCK_SECONDS = 300
 
@@ -16409,21 +17264,28 @@ def spawn_background_news_ingest(items: Any) -> None:
     ingest_news persists into the chain-store behind its global write lock;
     when that lock is wedged the refresh worker used to hang forever and the
     newsflash cache froze at its last good build. Ingest is durable and
-    idempotent (scan workers re-feed the same store), so run it in a bounded
-    daemon thread — one at a time, with a stuck attempt replaced after
-    NEWS_INGEST_BACKGROUND_STUCK_SECONDS — and let the cache write proceed.
+    idempotent (scan workers re-feed the same store), so run it in one daemon
+    thread at a time and let the cache write proceed.  A blocked Python thread
+    cannot be reclaimed safely; suppress duplicates instead of leaking a new
+    replacement every NEWS_INGEST_BACKGROUND_STUCK_SECONDS.
     """
     rows = [dict(item) for item in (items if isinstance(items, list) else []) if isinstance(item, dict)][:80]
     if not rows:
         return
     started_at = time.time()
     with NEWS_INGEST_BACKGROUND_LOCK:
-        if NEWS_INGEST_BACKGROUND_STATE["active"] and (
-            started_at - float(NEWS_INGEST_BACKGROUND_STATE["started_at"] or 0) < NEWS_INGEST_BACKGROUND_STUCK_SECONDS
-        ):
+        if NEWS_INGEST_BACKGROUND_STATE["active"]:
+            age = started_at - float(NEWS_INGEST_BACKGROUND_STATE["started_at"] or 0)
+            if age >= NEWS_INGEST_BACKGROUND_STUCK_SECONDS and not NEWS_INGEST_BACKGROUND_STATE["stall_logged"]:
+                NEWS_INGEST_BACKGROUND_STATE["stall_logged"] = True
+                print(
+                    f"Newsflash research ingest still in-flight after {age:.0f}s; duplicate ingest suppressed.",
+                    file=sys.stderr,
+                )
             return
         NEWS_INGEST_BACKGROUND_STATE["active"] = True
         NEWS_INGEST_BACKGROUND_STATE["started_at"] = started_at
+        NEWS_INGEST_BACKGROUND_STATE["stall_logged"] = False
 
     def ingest_worker(batch: list[dict[str, Any]]) -> None:
         try:
@@ -16435,6 +17297,7 @@ def spawn_background_news_ingest(items: Any) -> None:
             with NEWS_INGEST_BACKGROUND_LOCK:
                 if float(NEWS_INGEST_BACKGROUND_STATE.get("started_at") or 0) == started_at:
                     NEWS_INGEST_BACKGROUND_STATE["active"] = False
+                    NEWS_INGEST_BACKGROUND_STATE["stall_logged"] = False
 
     threading.Thread(target=ingest_worker, args=(rows,), daemon=True, name="newsflash-research-ingest").start()
 
@@ -18039,6 +18902,45 @@ def automation_briefs_payload() -> dict[str, Any]:
     }
 
 
+def recover_market_sources_from_independent_caches(payload: dict[str, Any]) -> dict[str, Any]:
+    """Replace failed composite cards with their latest successful source cache.
+
+    A process shutdown can interrupt every market-source future at once.  The
+    composite refresh must not turn that transient executor failure into a
+    page full of ERR cards when an independently persisted source (notably
+    AICoin) already has usable rows.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    sources = payload.get("sources") if isinstance(payload.get("sources"), list) else []
+    repaired: list[dict[str, Any]] = []
+    changed = False
+    for raw in sources:
+        if not isinstance(raw, dict) or source_has_rows(raw):
+            repaired.append(raw)
+            continue
+        source_id = clean_feed_text(raw.get("id"), 80).lower()
+        # GMGN has its own live overlay immediately below; avoid reading its
+        # large tape twice on every request.
+        if not source_id or source_id == "gmgn-trenches":
+            repaired.append(raw)
+            continue
+        cache_path = source_cache_path(source_id, "market-hot")
+        fallback = (
+            cached_source_fallback(source_id, cache_path, api_key="market-hot")
+            if source_fallback_allowed(source_id, cache_path)
+            else {}
+        )
+        if not fallback:
+            repaired.append(raw)
+            continue
+        source_name = clean_feed_text(fallback.get("sourceName"), 180) or source_id
+        fallback["sourceName"] = f"{source_name} · 综合榜异常，使用独立缓存"
+        repaired.append(fallback)
+        changed = True
+    return {**payload, "sources": repaired} if changed else payload
+
+
 def market_payload() -> dict[str, Any]:
     sources = []
     fetchers = [
@@ -18090,13 +18992,24 @@ def market_payload() -> dict[str, Any]:
     for key, future in futures:
         try:
             sources.append(future.result())
-        except Exception:
-            # A source that raised unexpectedly must not abort the whole board;
-            # emit an unavailable placeholder just like the serial path would.
+        except Exception as exc:
+            # A source that raised unexpectedly must not abort the whole board
+            # or overwrite a successful independent cache with an ERR card.
             fallback_group = "hk" if "futu-hk" in key else "us" if "futu-us" in key else "cn" if key == "ths" else "crypto"
+            cache_path = source_cache_path(key, "market-hot")
+            fallback = (
+                cached_source_fallback(key, cache_path, api_key="market-hot")
+                if source_fallback_allowed(key, cache_path)
+                else {}
+            )
+            if fallback:
+                source_name = clean_feed_text(fallback.get("sourceName"), 180) or key
+                fallback["sourceName"] = f"{source_name} · 综合刷新异常，保留独立缓存"
+                sources.append(fallback)
+                continue
             sources.append(source_template(
                 id=key, group=fallback_group, title=key, subtitle="数据源请求失败",
-                accent="#777777", source_label="ERR", source_name="fetch raised",
+                accent="#777777", source_label="ERR", source_name=f"fetch raised: {alert_text(exc, 80)}",
                 rows=[], status="unavailable",
             ))
     updated_at = int(time.time() * 1000)
@@ -18138,10 +19051,15 @@ def market_hot_response_payload(*, force_refresh: bool = False) -> dict[str, Any
             force_refresh=False, max_age_seconds=180,
             allow_sync_rebuild=False,
         )
+    payload = recover_market_sources_from_independent_caches(payload)
     try:
         if force_refresh:
             trigger_api_refresh("gmgn-trenches-hot-board-v8", refresh_gmgn_trenches_hot_board)
-        latest_gmgn = fetch_gmgn_trenches_hot_board(force_refresh=False, attach_overlays=False)
+        # The independently refreshed tape is newer than the composite market
+        # cache, but it still needs the read-only research/person overlays.
+        # Returning the raw tape here used to erase a freshly written
+        # ``热点值得看`` mark from every /api/market-hot response.
+        latest_gmgn = fetch_gmgn_trenches_hot_board(force_refresh=False, attach_overlays=True)
     except Exception:
         return payload
     if not source_has_rows(latest_gmgn):
@@ -21523,6 +22441,47 @@ def deepseek_compact_rows(payload: dict[str, Any], settings: dict[str, Any] | No
     return rows[: deepseek_max_total_rows(settings)]
 
 
+def _extract_last_balanced_json(text: str) -> str:
+    """从推理模型的 reasoning_content 里提取最后一个括号平衡的完整 JSON 对象。
+
+    从右往左找 '}'，向左反向匹配到配对的 '{'，返回第一个能被 json.loads 解析的完整对象；
+    找不到则返回空串。天然命中「最后一个闭合的 JSON 对象」。
+    """
+    if not text:
+        return ""
+    for end in range(len(text) - 1, -1, -1):
+        if text[end] != "}":
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(end, -1, -1):
+            ch = text[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == "}":
+                depth += 1
+            elif ch == "{":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[i:end + 1]
+                    try:
+                        json.loads(candidate)
+                        return candidate
+                    except Exception:
+                        break
+    return ""
+
+
 def deepseek_extract_json(text: str) -> dict[str, Any]:
     text = text.strip()
     if not text:
@@ -21614,10 +22573,17 @@ def deepseek_chat(messages: list[dict[str, str]], settings: dict[str, Any] | Non
             message = (data.get("choices") or [{}])[0].get("message") or {}
             if not message.get("content") and message.get("reasoning_content"):
                 rc = str(message.get("reasoning_content") or "")
-                # 取最后一个 { 到最后一个 } 的 JSON 对象（最终答案通常在末尾）
-                start = rc.rfind("{")
-                if start >= 0:
-                    message["content"] = rc[start:]
+                # 推理模型可能把最终 JSON 答案放在 reasoning_content 里。
+                # 优先取最后一个「括号平衡」的完整 JSON 对象（而非简单 rfind 到末尾，
+                # 因为 reasoning 末尾可能还有尾随文字，且中间可能夹着多个片段）。
+                content_candidate = _extract_last_balanced_json(rc)
+                if not content_candidate:
+                    # 退化兜底：取最后一个 { 到末尾（兼容旧行为）
+                    start = rc.rfind("{")
+                    if start >= 0:
+                        content_candidate = rc[start:]
+                if content_candidate:
+                    message["content"] = content_candidate
             with LLM_API_STATE_LOCK:
                 LLM_API_UNAVAILABLE_UNTIL = 0.0
             return data
@@ -22783,10 +23749,16 @@ def desktop_alert_price_watch_suppression_reason(
 def desktop_alert_runtime_suppression_reason(
     item: dict[str, Any], *, pending: bool, now: float | None = None
 ) -> str:
-    if clean_feed_text(item.get("sourceType"), 40) == "trench-person-signal":
+    source_type = clean_feed_text(item.get("sourceType"), 40)
+    if source_type in {"trench-person-signal", "x-tweet-analysis"}:
         handle = normalize_x_handle(item.get("authorHandle")).casefold()
-        if handle in EXCLUDED_IMPORTANT_HANDLES:
-            return "该账号已从人物源移除"
+        if (
+            handle in EXCLUDED_IMPORTANT_HANDLES
+            or not handle
+            or handle not in X_TWEET_ANALYSIS_PERSON_HANDLES
+        ):
+            return "非领军人物账号已从人物弹窗移除"
+    if source_type == "trench-person-signal":
         if pending:
             event_ms = alert_event_ms(item.get("time"))
             queued_ms = alert_event_ms(item.get("queuedAt"))
@@ -23423,6 +24395,10 @@ def launch_desktop_alert(payload: dict[str, Any]) -> dict[str, Any]:
                 loaded_seen = expand_legacy_desktop_alert_seen_keys({
                     str(key): safe_float(value) for key, value in cached_seen.items()
                 })
+                if len(loaded_seen) > DESKTOP_ALERT_SEEN_LIMIT:
+                    loaded_seen = dict(sorted(
+                        loaded_seen.items(), key=lambda item: safe_float(item[1])
+                    )[-DESKTOP_ALERT_SEEN_LIMIT:])
                 DESKTOP_ALERT_SEEN.update(loaded_seen)
             DESKTOP_ALERT_SEEN_LOADED = True
         stale = [item_key for item_key, seen_at in DESKTOP_ALERT_SEEN.items() if now - seen_at > DESKTOP_ALERT_TTL]
@@ -26641,12 +27617,12 @@ PRICE_WATCH_SNAPSHOT_CACHE_AT = 0.0
 PRICE_WATCH_SNAPSHOT_BUILD_LOCK = threading.Lock()
 PRICE_WATCH_SNAPSHOT_BUILD_THREAD: threading.Thread | None = None
 PRICE_WATCH_SNAPSHOT_BUILD_STARTED_AT = 0.0
+PRICE_WATCH_SNAPSHOT_STALL_LOGGED = False
 PRICE_WATCH_SNAPSHOT_FRESH_SECONDS = 5.0
 PRICE_WATCH_SNAPSHOT_JOIN_SECONDS = 2.0
-# A wedged builder (blocked forever on an in-process lock held by another hung
-# thread) must not monopolize rebuilds: after this cap the thread is treated as
-# abandoned and the next poll spawns a replacement. The abandoned daemon thread,
-# if it ever unblocks, simply publishes one extra snapshot.
+# A slow builder is reported after this cap.  It remains the sole owner of the
+# rebuild: Python cannot safely terminate it, and spawning replacements caused
+# one leaked thread every polling cycle while the original lock stayed blocked.
 PRICE_WATCH_SNAPSHOT_BUILD_CAP_SECONDS = 90.0
 
 
@@ -26685,6 +27661,7 @@ def price_watch_snapshot_payload() -> dict[str, Any]:
     """
     global PRICE_WATCH_SNAPSHOT_CACHE, PRICE_WATCH_SNAPSHOT_CACHE_AT
     global PRICE_WATCH_SNAPSHOT_BUILD_THREAD, PRICE_WATCH_SNAPSHOT_BUILD_STARTED_AT
+    global PRICE_WATCH_SNAPSHOT_STALL_LOGGED
     cached = PRICE_WATCH_SNAPSHOT_CACHE
     if cached is not None and time.monotonic() - PRICE_WATCH_SNAPSHOT_CACHE_AT < PRICE_WATCH_SNAPSHOT_FRESH_SECONDS:
         return cached
@@ -26697,13 +27674,16 @@ def price_watch_snapshot_payload() -> dict[str, Any]:
                 and PRICE_WATCH_SNAPSHOT_BUILD_STARTED_AT > 0
                 and time.monotonic() - PRICE_WATCH_SNAPSHOT_BUILD_STARTED_AT > PRICE_WATCH_SNAPSHOT_BUILD_CAP_SECONDS
             )
-            if wedged:
+            if wedged and not PRICE_WATCH_SNAPSHOT_STALL_LOGGED:
+                PRICE_WATCH_SNAPSHOT_STALL_LOGGED = True
                 print(
-                    f"price-watch snapshot builder abandoned after {int(time.monotonic() - PRICE_WATCH_SNAPSHOT_BUILD_STARTED_AT)}s (hung worker reclaimed)",
+                    f"price-watch snapshot builder still running after "
+                    f"{int(time.monotonic() - PRICE_WATCH_SNAPSHOT_BUILD_STARTED_AT)}s; "
+                    "duplicate rebuild suppressed",
                     flush=True,
                 )
-                thread = None
             if thread is None or not thread.is_alive():
+                PRICE_WATCH_SNAPSHOT_STALL_LOGGED = False
                 def _build_price_watch_snapshot() -> None:
                     global PRICE_WATCH_SNAPSHOT_CACHE, PRICE_WATCH_SNAPSHOT_CACHE_AT
                     try:
@@ -27651,14 +28631,62 @@ BINANCE_WALLET_KLINE_CHAINS = {
     "solana": ("CT_501", "solana"),
     "sol": ("CT_501", "solana"),
 }
-BINANCE_WALLET_DQUERY_INTERVALS = {
-    "1m": "1min",
-    "5m": "5min",
-    "15m": "15min",
-    "1h": "1h",
-    "4h": "4h",
-    "1d": "1d",
-}
+# Intervals accepted by the Binance Wallet bapi kline endpoint, passed through
+# verbatim (the removed dquery chart-backend fallback had its own naming).
+BINANCE_WALLET_KLINE_INTERVALS = {"1m", "5m", "15m", "1h", "4h", "1d"}
+
+
+def _binance_wallet_kline_raw(
+    chain_id: str,
+    contract: str,
+    interval_key: str,
+    *,
+    timeout: float = 8,
+) -> list[tuple[int, float, float, float, float, float]]:
+    """Fetch the full Binance Wallet OHLCV series for one contract/interval."""
+    headers = {
+        **HEADERS,
+        "Accept": "application/json",
+        "Accept-Encoding": "identity",
+        "User-Agent": "binance-web3/1.1 (Xingyun Market Dashboard)",
+    }
+    response = ONCHAIN_KLINE_HTTP_SESSION.get(
+        "https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/dex/market/token/kline/ai",
+        params={
+            "chainId": chain_id,
+            "contractAddress": contract,
+            "interval": interval_key,
+            "limit": 300,
+        },
+        headers=headers,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    data = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else {}
+    rows = data.get("klineInfos") if isinstance(data.get("klineInfos"), list) else []
+    candles = [
+        (
+            int(safe_float(row[0], 0)),
+            safe_float(row[1]),
+            safe_float(row[2]),
+            safe_float(row[3]),
+            safe_float(row[4]),
+            safe_float(row[5]),
+        )
+        for row in rows
+        if isinstance(row, list)
+        and len(row) >= 6
+        and int(safe_float(row[0], 0)) > 0
+        and safe_float(row[1], 0) > 0
+        and safe_float(row[2], 0) > 0
+        and safe_float(row[3], 0) > 0
+        and safe_float(row[4], 0) > 0
+    ]
+    candles.sort(key=lambda item: item[0])
+    if len(candles) < 2:
+        raise RuntimeError("Binance Wallet kline rows insufficient")
+    return candles
 
 
 def price_structure_candles_from_binance_wallet(
@@ -27670,104 +28698,31 @@ def price_structure_candles_from_binance_wallet(
     min_rows: int = 2,
     timeout: float = 8,
 ) -> tuple[list[tuple[int, float, float, float, float, float]], str]:
-    """Fetch contract-first OHLCV from Binance Wallet, with its chart backend as fallback."""
+    """Fetch contract-first OHLCV from Binance Wallet behind a shared TTL cache."""
     contract = clean_feed_text(contract_address, 180)
     chain_meta = BINANCE_WALLET_KLINE_CHAINS.get(str(chain or "").strip().lower())
     interval_key = clean_feed_text(interval, 12).lower()
-    if not contract or not chain_meta or interval_key not in BINANCE_WALLET_DQUERY_INTERVALS:
+    if not contract or not chain_meta or interval_key not in BINANCE_WALLET_KLINE_INTERVALS:
         raise RuntimeError("unsupported Binance Wallet onchain kline identity")
-    chain_id, platform = chain_meta
+    chain_id, _platform = chain_meta
     request_limit = max(2, min(300, int(limit or 300)))
-    headers = {
-        **HEADERS,
-        "Accept": "application/json",
-        "Accept-Encoding": "identity",
-        "User-Agent": "binance-web3/1.1 (Xingyun Market Dashboard)",
-    }
-    errors: list[str] = []
-
-    try:
-        response = requests.get(
-            "https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/dex/market/token/kline/ai",
-            params={
-                "chainId": chain_id,
-                "contractAddress": contract,
-                "interval": interval_key,
-                "limit": request_limit,
-            },
-            headers=headers,
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        data = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else {}
-        rows = data.get("klineInfos") if isinstance(data.get("klineInfos"), list) else []
-        candles = [
-            (
-                int(safe_float(row[0], 0)),
-                safe_float(row[1]),
-                safe_float(row[2]),
-                safe_float(row[3]),
-                safe_float(row[4]),
-                safe_float(row[5]),
-            )
-            for row in rows
-            if isinstance(row, list)
-            and len(row) >= 6
-            and int(safe_float(row[0], 0)) > 0
-            and safe_float(row[1], 0) > 0
-            and safe_float(row[2], 0) > 0
-            and safe_float(row[3], 0) > 0
-            and safe_float(row[4], 0) > 0
-        ]
-        candles.sort(key=lambda item: item[0])
-        if len(candles) >= max(2, min_rows):
-            return candles[-request_limit:], "Binance Wallet K线"
-        errors.append("Binance Wallet kline rows insufficient")
-    except Exception as exc:
-        errors.append(safe_error_text(str(exc)))
-
-    try:
-        response = requests.get(
-            "https://dquery.sintral.io/u-kline/v1/k-line/candles",
-            params={
-                "address": contract,
-                "platform": platform,
-                "interval": BINANCE_WALLET_DQUERY_INTERVALS[interval_key],
-                "limit": request_limit,
-                "pm": "p",
-            },
-            headers=headers,
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        rows = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), list) else []
-        candles = [
-            (
-                int(safe_float(row[5], 0)),
-                safe_float(row[0]),
-                safe_float(row[1]),
-                safe_float(row[2]),
-                safe_float(row[3]),
-                safe_float(row[4]),
-            )
-            for row in rows
-            if isinstance(row, list)
-            and len(row) >= 6
-            and int(safe_float(row[5], 0)) > 0
-            and safe_float(row[0], 0) > 0
-            and safe_float(row[1], 0) > 0
-            and safe_float(row[2], 0) > 0
-            and safe_float(row[3], 0) > 0
-        ]
-        candles.sort(key=lambda item: item[0])
-        if len(candles) >= max(2, min_rows):
-            return candles[-request_limit:], "Binance Wallet K线"
-        errors.append("Binance Wallet chart rows insufficient")
-    except Exception as exc:
-        errors.append(safe_error_text(str(exc)))
-    raise RuntimeError("; ".join(errors[-2:]) or "no Binance Wallet onchain candles")
+    # EVM addresses are case-insensitive and normalize to lowercase; Solana
+    # base58 is case-sensitive and must keep its exact casing in cache keys.
+    cache_identity = contract.lower() if contract.lower().startswith("0x") else contract
+    cache_key = f"bw:{chain_id}:{cache_identity}:{interval_key}"
+    # The former dquery.sintral.io chart-backend fallback is gone on purpose
+    # (measured 2026-09-27): its `platform` param rejects BSC identities and,
+    # when it does answer, returns unrelated candles for the same address —
+    # 13s+ of dead latency per failed refresh with a wrong-market data risk.
+    # OKX DEX and GeckoTerminal remain the onchain fallbacks for this feed.
+    candles = price_structure_onchain_kline_cached(
+        cache_key,
+        lambda: _binance_wallet_kline_raw(chain_id, contract, interval_key, timeout=timeout),
+        timeout=timeout,
+    )
+    if len(candles) < max(2, min_rows):
+        raise RuntimeError("insufficient Binance Wallet structure candles")
+    return candles[-request_limit:], "Binance Wallet K线"
 
 
 OKX_DEX_KLINE_CHAINS = {
@@ -27806,33 +28761,23 @@ OKX_DEX_KLINE_BARS = {
 }
 
 
-def price_structure_candles_from_okx_dex(
-    contract_address: Any,
-    chain: Any,
-    interval: str,
+def _okx_dex_kline_raw(
+    chain_index: str,
+    contract: str,
+    bar: str,
+    api_key: str,
+    api_secret: str,
+    passphrase: str,
     *,
-    limit: int = 299,
-    min_rows: int = 2,
     timeout: float = 8,
-) -> tuple[list[tuple[int, float, float, float, float, float]], str]:
-    """Fetch signed contract-first OHLCV from OKX OnchainOS Market API."""
-    contract = clean_feed_text(contract_address, 180)
-    chain_index = OKX_DEX_KLINE_CHAINS.get(str(chain or "").strip().lower(), "")
-    bar = OKX_DEX_KLINE_BARS.get(clean_feed_text(interval, 12).lower(), "")
-    api_key = str(os.getenv("OKX_DEX_API_KEY") or "").strip()
-    api_secret = str(os.getenv("OKX_DEX_SECRET_KEY") or "").strip()
-    passphrase = str(os.getenv("OKX_DEX_PASSPHRASE") or "").strip()
-    if not contract or not chain_index or not bar:
-        raise RuntimeError("unsupported OKX DEX onchain kline identity")
-    if not api_key or not api_secret or not passphrase:
-        raise RuntimeError("OKX DEX market credentials unavailable")
-
+) -> list[tuple[int, float, float, float, float, float]]:
+    """Fetch the full OKX DEX OHLCV series for one contract/bar (max 299 rows)."""
     path = "/api/v6/dex/market/candles"
     params = {
         "chainIndex": chain_index,
         "tokenContractAddress": contract.lower() if contract.lower().startswith("0x") else contract,
         "bar": bar,
-        "limit": str(max(1, min(299, int(limit or 299)))),
+        "limit": "299",
     }
     query = urlencode(params)
     request_path = f"{path}?{query}"
@@ -27844,7 +28789,7 @@ def price_structure_candles_from_okx_dex(
             hashlib.sha256,
         ).digest()
     ).decode("ascii")
-    response = requests.get(
+    response = ONCHAIN_KLINE_HTTP_SESSION.get(
         f"https://web3.okx.com{request_path}",
         headers={
             **HEADERS,
@@ -27877,6 +28822,40 @@ def price_structure_candles_from_okx_dex(
         and all(safe_float(row[index], 0) > 0 for index in (1, 2, 3, 4))
     ]
     candles.sort(key=lambda item: item[0])
+    if len(candles) < 2:
+        raise RuntimeError("insufficient OKX DEX structure candles")
+    return candles
+
+
+def price_structure_candles_from_okx_dex(
+    contract_address: Any,
+    chain: Any,
+    interval: str,
+    *,
+    limit: int = 299,
+    min_rows: int = 2,
+    timeout: float = 8,
+) -> tuple[list[tuple[int, float, float, float, float, float]], str]:
+    """Fetch signed contract-first OHLCV from OKX OnchainOS Market API."""
+    contract = clean_feed_text(contract_address, 180)
+    chain_index = OKX_DEX_KLINE_CHAINS.get(str(chain or "").strip().lower(), "")
+    bar = OKX_DEX_KLINE_BARS.get(clean_feed_text(interval, 12).lower(), "")
+    api_key = str(os.getenv("OKX_DEX_API_KEY") or "").strip()
+    api_secret = str(os.getenv("OKX_DEX_SECRET_KEY") or "").strip()
+    passphrase = str(os.getenv("OKX_DEX_PASSPHRASE") or "").strip()
+    if not contract or not chain_index or not bar:
+        raise RuntimeError("unsupported OKX DEX onchain kline identity")
+    if not api_key or not api_secret or not passphrase:
+        raise RuntimeError("OKX DEX market credentials unavailable")
+    cache_identity = contract.lower() if contract.lower().startswith("0x") else contract
+    cache_key = f"okx-dex:{chain_index}:{cache_identity}:{bar}"
+    candles = price_structure_onchain_kline_cached(
+        cache_key,
+        lambda: _okx_dex_kline_raw(
+            chain_index, contract, bar, api_key, api_secret, passphrase, timeout=timeout
+        ),
+        timeout=timeout,
+    )
     if len(candles) < max(1, min_rows):
         raise RuntimeError("insufficient OKX DEX structure candles")
     return candles[-max(1, min(299, int(limit or 299))):], "OKX DEX K线"
@@ -28204,7 +29183,7 @@ def price_structure_onchain_pool(
         pairs: list[dict[str, Any]] = []
         if contract_filter and requested_network:
             try:
-                response = requests.get(
+                response = ONCHAIN_KLINE_HTTP_SESSION.get(
                     (
                         "https://api.dexscreener.com/token-pairs/v1/"
                         f"{quote(requested_network, safe='')}/{quote(contract_filter, safe='')}"
@@ -28219,7 +29198,7 @@ def price_structure_onchain_pool(
                 pairs = []
         if not pairs:
             try:
-                response = requests.get(
+                response = ONCHAIN_KLINE_HTTP_SESSION.get(
                     (
                         f"https://api.dexscreener.com/latest/dex/tokens/{quote(contract_filter, safe='')}"
                         if contract_filter
@@ -28464,6 +29443,76 @@ def price_structure_resample_candles(
     return result
 
 
+def _onchain_kline_cache_prune_locked() -> None:
+    """Evict the oldest cached series once the kline cache outgrows its cap."""
+    overflow = len(PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE) - PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE_MAX_ENTRIES
+    if overflow <= 0:
+        return
+    oldest_keys = sorted(
+        PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE,
+        key=lambda key: PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE[key][0],
+    )[:overflow]
+    for key in oldest_keys:
+        PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE.pop(key, None)
+
+
+def price_structure_onchain_kline_cached(
+    cache_key: str,
+    loader,
+    *,
+    timeout: float,
+) -> list:
+    """Coalesce concurrent contract-bound kline fetches behind one TTL cache.
+
+    Mirrors the GeckoTerminal candle discipline: fresh-cache short-circuit,
+    single inflight request per key, error backoff and stale-while-error so a
+    flaky upstream degrades to slightly older candles instead of blank cards.
+    """
+    now = time.time()
+    with PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE_LOCK:
+        cached = PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE.get(cache_key)
+        if cached and now - cached[0] < PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE_TTL_SECONDS:
+            return list(cached[1])
+        cached_error = PRICE_STRUCTURE_ONCHAIN_KLINE_ERROR_CACHE.get(cache_key)
+        if cached_error and now - cached_error[0] < PRICE_STRUCTURE_ONCHAIN_KLINE_ERROR_TTL_SECONDS:
+            raise RuntimeError(cached_error[1])
+        inflight = PRICE_STRUCTURE_ONCHAIN_KLINE_INFLIGHT.get(cache_key)
+        owner = inflight is None
+        if owner:
+            inflight = threading.Event()
+            PRICE_STRUCTURE_ONCHAIN_KLINE_INFLIGHT[cache_key] = inflight
+
+    if not owner:
+        if not inflight.wait(max(1.0, timeout + 2)):
+            raise RuntimeError("onchain kline request still in progress")
+        with PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE_LOCK:
+            cached = PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE.get(cache_key)
+            cached_error = PRICE_STRUCTURE_ONCHAIN_KLINE_ERROR_CACHE.get(cache_key)
+        if cached and time.time() - cached[0] < PRICE_STRUCTURE_ONCHAIN_KLINE_STALE_TTL_SECONDS:
+            return list(cached[1])
+        raise RuntimeError(cached_error[1] if cached_error else "onchain kline request failed")
+
+    try:
+        candles = loader()
+        with PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE_LOCK:
+            PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE[cache_key] = (time.time(), candles)
+            PRICE_STRUCTURE_ONCHAIN_KLINE_ERROR_CACHE.pop(cache_key, None)
+            _onchain_kline_cache_prune_locked()
+        return list(candles)
+    except Exception as exc:
+        error = safe_error_text(str(exc)) or "onchain kline request failed"
+        with PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE_LOCK:
+            PRICE_STRUCTURE_ONCHAIN_KLINE_ERROR_CACHE[cache_key] = (time.time(), error)
+        if cached and time.time() - cached[0] < PRICE_STRUCTURE_ONCHAIN_KLINE_STALE_TTL_SECONDS:
+            return list(cached[1])
+        raise
+    finally:
+        with PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE_LOCK:
+            event = PRICE_STRUCTURE_ONCHAIN_KLINE_INFLIGHT.pop(cache_key, None)
+            if event:
+                event.set()
+
+
 def price_structure_geckoterminal_base_candles(
     pool: dict[str, Any], timeframe: str, *, timeout: float = 10
 ) -> list[tuple[int, float, float, float, float, float]]:
@@ -28499,7 +29548,7 @@ def price_structure_geckoterminal_base_candles(
     # This preserves parallelism between different assets without hitting the
     # public API four times for the same minute/hour base series.
     try:
-        response = requests.get(
+        response = ONCHAIN_KLINE_HTTP_SESSION.get(
             f"https://api.geckoterminal.com/api/v2/networks/{network}/pools/{pool_address}/ohlcv/{timeframe}",
             params={
                 "aggregate": 1,
@@ -40546,6 +41595,14 @@ def wake_x_kol_realtime_worker(user: dict[str, Any] | None = None) -> None:
     wake_x_kol_official_stream()
 
 
+def wake_all_x_kol_realtime_workers() -> None:
+    """Publish shared-person changes immediately to every connected X view."""
+    with X_KOL_REALTIME_CONDITION:
+        events = list(X_KOL_REALTIME_WAKE_EVENTS.values())
+    for event in events:
+        event.set()
+
+
 def x_kol_realtime_snapshot(
     user: dict[str, Any] | None = None,
     *,
@@ -41522,7 +42579,13 @@ def load_site_alert_state() -> dict[str, Any]:
         seen = payload.get("seen") if isinstance(payload.get("seen"), dict) else {}
         ready = payload.get("ready") if isinstance(payload.get("ready"), list) else []
         ready_scopes = payload.get("newboardReadyScopes") if isinstance(payload.get("newboardReadyScopes"), list) else []
-        SITE_ALERT_STATE = {"seen": seen, "ready": ready, "newboardReadyScopes": ready_scopes}
+        x_watermarks = payload.get("xTweetAnalysisWatermarks") if isinstance(payload.get("xTweetAnalysisWatermarks"), dict) else {}
+        SITE_ALERT_STATE = {
+            "seen": seen,
+            "ready": ready,
+            "newboardReadyScopes": ready_scopes,
+            "xTweetAnalysisWatermarks": x_watermarks,
+        }
         SITE_ALERT_STATE_LOADED = True
         return SITE_ALERT_STATE
 
@@ -41538,6 +42601,8 @@ def save_site_alert_state() -> None:
                 "seen": recent_seen,
                 "ready": list(dict.fromkeys(SITE_ALERT_STATE.get("ready") or [])),
                 "newboardReadyScopes": list(dict.fromkeys(SITE_ALERT_STATE.get("newboardReadyScopes") or [])),
+                "xTweetAnalysisWatermarks": SITE_ALERT_STATE.get("xTweetAnalysisWatermarks")
+                if isinstance(SITE_ALERT_STATE.get("xTweetAnalysisWatermarks"), dict) else {},
             },
         )
 
@@ -42647,11 +43712,132 @@ def parse_site_x_kol_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "sourceAuthority": source_authority,
                 "authorHandle": normalize_x_handle(handle),
                 "sourceId": clean_feed_text(item.get("sourceId") or source_row.get("id"), 120),
+                "sourceGroup": clean_feed_text(source_row.get("sourceGroup"), 40),
+                "systemManaged": bool(source_row.get("systemManaged")),
                 "originalText": original_text,
                 "quoteText": quote_text,
             }
         )
     return events
+
+
+def x_tweet_analysis_person_source_allowed(value: dict[str, Any]) -> bool:
+    """Only curated high-impact personal accounts may enter person AI popups."""
+    if not isinstance(value, dict):
+        return False
+    handle = normalize_x_handle(
+        value.get("authorHandle") or value.get("handle")
+    ).casefold()
+    category = clean_feed_text(
+        value.get("xCategory") or value.get("category"), 40,
+    ).casefold()
+    return bool(
+        handle
+        and handle in X_TWEET_ANALYSIS_PERSON_HANDLES
+        and category != "project_official"
+    )
+
+
+def x_tweet_analysis_source_key(value: dict[str, Any]) -> str:
+    """Stable per-account key used to baseline each X source before analysis."""
+    if not isinstance(value, dict):
+        return ""
+    handle = normalize_x_handle(
+        value.get("authorHandle") or value.get("handle")
+    ).casefold()
+    if handle:
+        return handle
+    return clean_feed_text(value.get("sourceId") or value.get("source"), 120).casefold()
+
+
+def x_tweet_analysis_popup(job: dict[str, Any]) -> dict[str, Any]:
+    """Deliver exactly one popup after the pinned analysis chat has replied."""
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    analysis = job.get("analysis") if isinstance(job.get("analysis"), dict) else {}
+    job_id = clean_feed_text(job.get("job_id") or analysis.get("jobId"), 160)
+    if not job_id or not analysis:
+        return {"ok": False, "error": "推文分析结果不完整"}
+    if not x_tweet_analysis_person_source_allowed(payload):
+        X_TWEET_ANALYSIS_QUEUE.mark_alerted(job_id)
+        return {"ok": True, "suppressed": True, "reason": "非领军人物来源不弹窗"}
+    author = clean_feed_text(
+        payload.get("author") or payload.get("handle") or "重要人物", 80
+    )
+    one_line = clean_feed_text(analysis.get("oneLine"), 180)
+    meaning = clean_feed_text(analysis.get("meaning"), 700)
+    potential = clean_feed_text(analysis.get("memePotential"), 20).casefold()
+    worth_watching = bool(analysis.get("worthWatching"))
+    novelty = clean_feed_text(analysis.get("novelty"), 20).casefold()
+    generic_theme = analysis.get("genericTheme") is True
+    if not worth_watching or generic_theme or novelty == "low":
+        X_TWEET_ANALYSIS_QUEUE.mark_alerted(job_id)
+        return {
+            "ok": True,
+            "suppressed": True,
+            "reason": clean_feed_text(analysis.get("noveltyReason"), 180)
+            or "AI 判定为低新颖度或无新增市场信息",
+        }
+    urgency = clean_feed_text(analysis.get("urgency"), 20).casefold()
+    is_red = bool(worth_watching and (potential == "strong" or urgency == "high"))
+    keywords = [
+        clean_feed_text(item, 40)
+        for item in analysis.get("keywords") or []
+        if clean_feed_text(item, 40)
+    ][:3]
+    tokens = [item for item in analysis.get("tokens") or [] if isinstance(item, dict)][:5]
+    token_labels = []
+    primary_contract = ""
+    primary_chain = ""
+    for item in tokens:
+        symbol = clean_feed_text(item.get("symbol"), 30)
+        chain = clean_feed_text(item.get("chain"), 24)
+        contract = clean_feed_text(item.get("ca"), 180)
+        if not primary_contract and contract:
+            primary_contract = contract
+            primary_chain = chain
+        label = symbol or (contract[:8] + "…" if contract else "")
+        if label:
+            token_labels.append(f"{label}{f'({chain})' if chain else ''}")
+    headline_keyword = keywords[0] if keywords else (token_labels[0] if token_labels else "重要动态")
+    body = alert_body_join(
+        f"{'红色机会｜' if is_red else ''}{one_line}" if one_line else ("红色机会" if is_red else ""),
+        meaning,
+        f"炒作词：{' / '.join(keywords)}" if keywords else "",
+        f"对应币：{' / '.join(token_labels)}" if token_labels else "暂未发现可信对应币",
+        clean_feed_text(analysis.get("risk"), 300),
+    )
+    result = launch_desktop_alert({
+        "key": f"x-tweet-analysis:{job_id}",
+        "eventFlowKey": f"x-tweet-analysis:{job_id}",
+        "kind": "X推文分析",
+        "sourceType": "x-tweet-analysis",
+        "source": author,
+        "sourceLabel": "X析",
+        "sourceId": clean_feed_text(payload.get("handle"), 80),
+        "authorHandle": clean_feed_text(payload.get("handle"), 80),
+        "xCategory": clean_feed_text(payload.get("category"), 40),
+        "title": f"{author}：{headline_keyword}",
+        "body": body,
+        "url": clean_feed_text(payload.get("url"), 800) or "./xwatch.html",
+        "contractAddress": primary_contract,
+        "chain": primary_chain,
+        # The result completion time is the popup event time; the source post
+        # timestamp remains in originalText/persistent job metadata.
+        "time": int(time.time() * 1000),
+        "expiresAt": int(time.time() * 1000) + 10 * 60_000,
+        "priority": "红色高潜力" if is_red else "推文分析完成",
+        "queuePriority": 940 if is_red else 84,
+        "alertTone": "red" if is_red else "normal",
+        "speech": (
+            f"重要人物推文红色机会，{author}，{one_line}"
+            if is_red else ""
+        ),
+        "originalText": clean_feed_text(payload.get("originalText"), 1800),
+        "quoteText": clean_feed_text(payload.get("quoteText"), 1200),
+    })
+    if result.get("ok"):
+        X_TWEET_ANALYSIS_QUEUE.mark_alerted(job_id)
+    return result
 
 
 def x_kol_ai_filter_signature(event: dict[str, Any], settings: dict[str, Any]) -> str:
@@ -43187,6 +44373,16 @@ def news_trade_candidate_trade_urls(row: dict[str, Any], chain: str, contract: s
 def event_monitor_onchain_candidate(row: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(row, dict):
         return None
+    if row.get("_eventMonitorPrepared"):
+        # Discovery evaluates the same market universe against many news rows.
+        # Normalize it once per core build, then clone only the small mutable
+        # parts before event-specific scoring.
+        candidate = dict(row)
+        candidate.pop("_eventMonitorPrepared", None)
+        candidate["riskFlags"] = list(row.get("riskFlags") or [])
+        candidate["venues"] = list(row.get("venues") or [])
+        candidate["tradeUrls"] = dict(row.get("tradeUrls") or {})
+        return candidate
     symbol = clean_feed_text(row.get("symbol") or row.get("name"), 40)
     if not symbol:
         return None
@@ -43614,19 +44810,24 @@ def news_trade_attach_security(topics: list[dict[str, Any]]) -> list[dict[str, A
     return topics
 
 
+@functools.lru_cache(maxsize=8192)
+def _event_monitor_term_pattern(value: str):
+    # Term-driven patterns are unbounded (new symbols/names keep arriving);
+    # re's built-in 512-entry cache thrashes and re-parses them on every call,
+    # which once burned ~9% of server CPU. Compile once per term instead.
+    return re.compile(
+        rf"(?<![A-Za-z0-9]){re.escape(value)}(?=(?:USDT|USDC|USD)?(?![A-Za-z0-9]))",
+        flags=re.I,
+    )
+
+
 def event_monitor_term_matches(term: str, text: str) -> bool:
     value = clean_feed_text(term, 80).strip()
     if len(value) < 2:
         return False
     if re.search(r"[\u3400-\u9fff]", value):
         return value.casefold() in text.casefold()
-    return bool(
-        re.search(
-            rf"(?<![A-Za-z0-9]){re.escape(value)}(?=(?:USDT|USDC|USD)?(?![A-Za-z0-9]))",
-            text,
-            flags=re.I,
-        )
-    )
+    return bool(_event_monitor_term_pattern(value).search(text))
 
 
 def event_monitor_candidate_relevance(
@@ -43634,24 +44835,33 @@ def event_monitor_candidate_relevance(
     combined: str,
     entities: list[str],
     listing_assets: list[str],
+    *,
+    combined_folded: str | None = None,
+    normalized_listing: set[str] | None = None,
+    entity_pairs: list[tuple[str, str]] | None = None,
 ) -> float:
     contract = str(candidate.get("contractAddress") or "")
     symbol = clean_feed_text(candidate.get("symbol"), 40)
     name = clean_feed_text(candidate.get("name"), 80)
-    if contract and contract.casefold() in combined.casefold():
+    folded_text = combined_folded if combined_folded is not None else combined.casefold()
+    if contract and contract.casefold() in folded_text:
         return 100.0
-    normalized_listing = {clean_price_watch_symbol(asset) for asset in listing_assets}
-    if clean_price_watch_symbol(symbol) in normalized_listing:
+    listing = normalized_listing if normalized_listing is not None else {
+        clean_price_watch_symbol(asset) for asset in listing_assets
+    }
+    if clean_price_watch_symbol(symbol) in listing:
         return 100.0
-    for entity in entities:
-        if entity.casefold() in {symbol.casefold(), name.casefold()} or event_monitor_term_matches(entity, f"{symbol} {name}"):
+    candidate_terms = {symbol.casefold(), name.casefold()}
+    candidate_text = f"{symbol} {name}"
+    pairs = entity_pairs if entity_pairs is not None else [(entity, entity.casefold()) for entity in entities]
+    for entity, folded_entity in pairs:
+        if folded_entity in candidate_terms or event_monitor_term_matches(entity, candidate_text):
             return 98.0
     if event_monitor_term_matches(symbol, combined):
         return 94.0
     if name and event_monitor_term_matches(name.split()[0], combined):
         return 90.0
-    shared = [entity for entity in entities if event_monitor_term_matches(entity, f"{symbol} {name}")]
-    return min(88.0, 60.0 + len(shared) * 10.0) if shared else 0.0
+    return 0.0
 
 
 def event_monitor_merge_candidate(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
@@ -43711,12 +44921,23 @@ def event_monitor_rank_meme_candidates(
         direct_contract = direct_match.group(0).lower() if direct_match else ""
     entities = event_monitor_hot_entities(title, body)
     listing_assets = event_monitor_assets(row.get("symbol"), title, body)
+    combined_folded = combined.casefold()
+    normalized_listing = {clean_price_watch_symbol(asset) for asset in listing_assets}
+    entity_pairs = [(entity, entity.casefold()) for entity in entities]
     candidates: list[dict[str, Any]] = []
     for market_row in source_rows if isinstance(source_rows, list) else event_monitor_onchain_source_rows():
         candidate = event_monitor_onchain_candidate(market_row)
         if not candidate:
             continue
-        relevance = event_monitor_candidate_relevance(candidate, combined, entities, listing_assets)
+        relevance = event_monitor_candidate_relevance(
+            candidate,
+            combined,
+            entities,
+            listing_assets,
+            combined_folded=combined_folded,
+            normalized_listing=normalized_listing,
+            entity_pairs=entity_pairs,
+        )
         if relevance < 55:
             continue
         liquidity_score = event_monitor_metric_score(safe_float(candidate.get("liquidityUsd"), 0), floor=50_000, ceiling=10_000_000)
@@ -44381,7 +45602,7 @@ def news_trade_trending_onchain_rows() -> list[dict[str, Any]]:
     gathered: list[dict[str, Any]] = []
     if not networks:
         return gathered
-    with ThreadPoolExecutor(max_workers=min(4, len(networks))) as pool:
+    with ThreadPoolExecutor(max_workers=min(2, len(networks))) as pool:
         futures = [pool.submit(fetch, network) for network in networks]
         for future in as_completed(futures):
             try:
@@ -45048,6 +46269,107 @@ def event_monitor_source_rows() -> list[dict[str, Any]]:
         if url_key:
             existing_urls.add(url_key)
         existing_titles.add(title_key)
+
+    # 静默研究输入：OpenNews 高分英文新闻 / Hyperliquid 巨鲸 / 海外所上新，
+    # 以及 Pump 认领与 X 删推等风控信号，只进投研共振与风险核查，不产生弹窗。
+    rows.extend(opennews_research_rows())
+    rows.extend(risk_signal_research_rows())
+    return rows
+
+
+def opennews_research_rows() -> list[dict[str, Any]]:
+    """OpenNews high-signal news as silent research input (no popups)."""
+    try:
+        payload = opennews_feed_payload()
+    except Exception:
+        return []
+    if not isinstance(payload, dict) or payload.get("disabled"):
+        return []
+    rows: list[dict[str, Any]] = []
+    fetched_at = int(safe_float(payload.get("fetchedAt")) or 0)
+
+    def push(items: list[dict[str, Any]], *, source_type: str, source_label: str, kind: str) -> None:
+        for item in items:
+            if not isinstance(item, dict) or not item.get("text"):
+                continue
+            rating = item.get("aiRating") if isinstance(item.get("aiRating"), dict) else {}
+            coins = [str(c.get("symbol") or "").strip().upper()
+                     for c in (item.get("coins") or []) if isinstance(c, dict) and c.get("symbol")]
+            rows.append({
+                "id": item.get("id"),
+                "sourceType": source_type,
+                "source": item.get("newsType") or kind,
+                "sourceLabel": source_label,
+                "title": clean_feed_text(item.get("text"), 240),
+                "body": alert_body_join(
+                    " ".join(coins[:4]) if coins else "",
+                    f"AI影响力 {rating.get('score')}" if rating.get("score") else "",
+                    str(rating.get("signal") or ""),
+                    clean_feed_text(rating.get("summary"), 200),
+                ),
+                "url": clean_feed_text(item.get("link"), 800),
+                "timestamp": alert_event_ms(item.get("ts")) or fetched_at,
+                "capturedAt": fetched_at,
+                "claimStatus": "source-reported",
+                "opennewsKind": kind,
+                "opennewsScore": int(safe_float(rating.get("score"), 0)),
+            })
+
+    push(payload.get("listing") or [], source_type="opennews-listing", source_label="ON", kind="海外所上新")
+    push(payload.get("onchain") or [], source_type="opennews-onchain", source_label="HL", kind="HL巨鲸")
+    push(payload.get("market") or [], source_type="opennews-market", source_label="MK", kind="衍生品")
+    push(payload.get("news") or [], source_type="opennews-news", source_label="NW", kind="海外快讯")
+    return rows
+
+
+def risk_signal_research_rows() -> list[dict[str, Any]]:
+    """Pump claim + X deleted-tweet signals as silent risk input (no popups)."""
+    rows: list[dict[str, Any]] = []
+    try:
+        claim_payload = pump_claim_feed_payload()
+    except Exception:
+        claim_payload = {"disabled": True}
+    if isinstance(claim_payload, dict) and not claim_payload.get("disabled"):
+        for row in claim_payload.get("rows") or []:
+            data = row.get("data") if isinstance(row, dict) and isinstance(row.get("data"), dict) else {}
+            symbol = clean_feed_text(data.get("symbol") or row.get("token_address"), 32)
+            if not symbol:
+                continue
+            rows.append({
+                "id": f"pump-claim:{row.get('token_address')}",
+                "sourceType": "pump-claim",
+                "source": data.get("launchpad") or "Pump.fun",
+                "sourceLabel": "PC",
+                "title": f"Pump 认领：{symbol}",
+                "body": alert_body_join(data.get("creator_token_status"), f"触发市值 {row.get('trigger_mc')}"),
+                "url": "",
+                "timestamp": int(safe_float(row.get("trigger_at"), 0) or int(time.time() * 1000)),
+                "capturedAt": int(time.time() * 1000),
+                "claimStatus": "source-reported",
+            })
+    try:
+        x_payload = twitter_watch_feed_payload()
+    except Exception:
+        x_payload = {"disabled": True}
+    if isinstance(x_payload, dict) and not x_payload.get("disabled"):
+        fetched_at = int(safe_float(x_payload.get("fetchedAt")) or 0)
+        for account in x_payload.get("accounts") or []:
+            handle = clean_feed_text(account.get("username"), 40)
+            deleted = account.get("deleted") if isinstance(account, dict) and isinstance(account.get("deleted"), list) else []
+            if not handle or not deleted:
+                continue
+            rows.append({
+                "id": f"x-deleted:{handle}",
+                "sourceType": "x-deleted",
+                "source": f"X @{handle}",
+                "sourceLabel": "XD",
+                "title": f"@{handle} 删除了 {len(deleted)} 条推文",
+                "body": clean_feed_text((deleted[0] or {}).get("text"), 200),
+                "url": f"https://x.com/{handle}",
+                "timestamp": fetched_at,
+                "capturedAt": fetched_at,
+                "claimStatus": "source-reported",
+            })
     return rows
 
 
@@ -48132,6 +49454,31 @@ def onchain_market_mainline_context(rows: list[dict[str, Any]]) -> dict[str, Any
 
 
 LIGHT_SCREEN_MIN_ROWS = 3  # 候选数 >= 此值才启用轻量预筛（少于 3 个直接完整分析，避免两次调用更贵）
+LIGHT_SCREEN_CACHE_TTL_S = 600  # 轻量预筛结果缓存 10 分钟：同一 CA 在 TTL 内复用结论，不重复调 DeepSeek
+_LIGHT_SCREEN_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_LIGHT_SCREEN_CACHE_LOCK = threading.Lock()
+
+
+def _light_screen_cached_lookup(keys: list[str], *, now: float) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """返回 (命中缓存的结果, 未命中的 key)。带锁，过期自动剔除。"""
+    hit: dict[str, dict[str, Any]] = {}
+    miss: list[str] = []
+    with _LIGHT_SCREEN_CACHE_LOCK:
+        for key in keys:
+            entry = _LIGHT_SCREEN_CACHE.get(key)
+            if entry and now - entry[0] < LIGHT_SCREEN_CACHE_TTL_S:
+                hit[key] = entry[1]
+            else:
+                _LIGHT_SCREEN_CACHE.pop(key, None)
+                miss.append(key)
+    return hit, miss
+
+
+def _light_screen_cached_store(results: dict[str, dict[str, Any]], *, now: float) -> None:
+    with _LIGHT_SCREEN_CACHE_LOCK:
+        for key, value in results.items():
+            if value:
+                _LIGHT_SCREEN_CACHE[key] = (now, value)
 
 
 def _light_screen_onchain_candidates(rows: list[dict[str, Any]], *, settings: dict[str, Any], lane: str) -> dict[str, dict[str, Any]]:
@@ -48140,6 +49487,7 @@ def _light_screen_onchain_candidates(rows: list[dict[str, Any]], *, settings: di
     大部分战壕币是蹭名/仿盘/无真实叙事/蜜罐/高税，不需要完整 V4.9 frameworkAssessment。
     先用极简 prompt（不挂 26 条框架规则 + 130 字段 schema）判断 verdict + worthDeepResearch，
     只有 worthDeepResearch=True 的才进完整深度分析。返回 {key: {verdict, summary, worthDeepResearch}}。
+    带 10 分钟内存缓存：同一 CA 在 TTL 内复用结论，只对「新出现的 key」调 DeepSeek。
     """
     light_rows: list[dict[str, Any]] = []
     for row in rows:
@@ -48166,19 +49514,29 @@ def _light_screen_onchain_candidates(rows: list[dict[str, Any]], *, settings: di
             "description": str(nc.get("description") or "")[:160],
             "gmgnNarrative": str(row.get("gmgnNarrative") or "")[:160],
         })
+    # 缓存命中：TTL 内复用结论，只对未命中的 key 构造 prompt 调 DeepSeek。
+    _now = time.monotonic()
+    _all_keys = [r["key"] for r in light_rows]
+    _cached, _miss_keys = _light_screen_cached_lookup(_all_keys, now=_now)
+    _miss_set = set(_miss_keys)
+    _fresh_rows = [r for r in light_rows if r["key"] in _miss_set]
+    out: dict[str, dict[str, Any]] = dict(_cached)
+    if not _fresh_rows:
+        return out
     messages = [
         {"role": "system", "content": (
             "你是链上新币快速筛选手，输入含多个候选，逐个判断是否值得深度研究。"
             "蹭名/仿盘/无真实叙事/蜜罐/高税/rug 直接 avoid；有真实题材但证据不足 watch；题材清晰证据强 strong。"
+            "近期热点 Meme 不要求官方 CA：官方性只标注身份，不作为研究硬门槛。热点映射贴合且成交、流动性、"
+            "交易活跃或聪明钱承接明显时，应 worthDeepResearch=true；仅在映射失配或明显仿盘时淘汰。"
             "worthDeepResearch=true 表示值得进完整 V4.9 深度研究（有真实叙事或题材，且非明显蹭名/仿盘/蜜罐/高税）。"
             "只返回 JSON：{\"items\":[{\"key\":\"照抄输入key\",\"verdict\":\"avoid|watch|strong\",\"summary\":\"一句话结论\",\"worthDeepResearch\":true|false}]}，不要输出其他内容。"
         )},
-        {"role": "user", "content": json.dumps({"rows": light_rows}, ensure_ascii=False, separators=(",", ":"))},
+        {"role": "user", "content": json.dumps({"rows": _fresh_rows}, ensure_ascii=False, separators=(",", ":"))},
     ]
     response = deepseek_chat(messages, {**settings, "maxTokens": 4000,
         "_analysisNoTimeout": True, "_analysisLane": lane, "_preferCodexCli": False})
     parsed = deepseek_extract_json(response.get("choices", [{}])[0].get("message", {}).get("content", ""))
-    out: dict[str, dict[str, Any]] = {}
     for item in (parsed.get("items", []) if isinstance(parsed, dict) else []):
         if isinstance(item, dict) and item.get("key"):
             out[str(item["key"])] = {
@@ -48186,6 +49544,8 @@ def _light_screen_onchain_candidates(rows: list[dict[str, Any]], *, settings: di
                 "summary": str(item.get("summary") or ""),
                 "worthDeepResearch": bool(item.get("worthDeepResearch")),
             }
+    # 只缓存本轮真实调 DeepSeek 得到的新结果（缓存命中的不必重复写）
+    _light_screen_cached_store({k: v for k, v in out.items() if k in _miss_set}, now=_now)
     return out
 
 
@@ -48235,6 +49595,7 @@ def analyze_fast_onchain_candidates(rows: list[dict[str, Any]], *, lane="onchain
             *decision_fields,
         )},
     } for index, row in enumerate(rows, 1)]
+    _row_by_key = {onchain_candidate_key(row): row for row in rows}
     for model_row, row in zip(model_rows, rows):
         rapid_decision = rapid_decisions.get(model_row["key"])
         if isinstance(rapid_decision, dict):
@@ -48295,6 +49656,9 @@ def analyze_fast_onchain_candidates(rows: list[dict[str, Any]], *, lane="onchain
         "做有依据的早期研究卡：Meme解释具体人物/动物/梗的来源、情绪共鸣和传播机制；"
         "项目解释具体产品、服务谁、与同类有何差别、代币如何受益。"
         "同名不等于原项目，网站声称不等于已交付产品，多地址和单纯放量不等于独立买方。"
+        "热点 Meme 的官方性只进入身份账本：未确认官方必须如实写 independent-hotspot/unconfirmed，"
+        "但不能仅因非官方而降级。若热点仍新、映射贴合且成交/流动性/交易活跃/讨论或钱包质量形成承接，"
+        "可判 strong 或 leader/golden-dog；执行许可继续独立审计。"
         "verdict为strong（值得研究）、watch（继续观察）、weak或avoid（淘汰）。"
         "缺少题材、交易退出或合约身份证据时最多watch，不凭名称、涨幅或量化分判强。"
         "只返回JSON：{items:[{key,verdict,summary,identitySummary,frameworkAssessment:{version,potentialTier,opportunityScore,leaderScore,executionScore,riskScore,executionPermission,primaryDriver,leaderReason,nextTrigger,invalidation}}]}。"
@@ -48306,15 +49670,27 @@ def analyze_fast_onchain_candidates(rows: list[dict[str, Any]], *, lane="onchain
         {"rows": model_rows, "frameworkAssessmentSchema": FRAMEWORK_OUTPUT_SCHEMA},
         ensure_ascii=False, separators=(",", ":"),
     )}]
-    response = deepseek_chat(messages, {**settings, "maxTokens": 12000,
+    response = deepseek_chat(messages, {**settings, "maxTokens": 16000,
         "_analysisNoTimeout": True, "_analysisLane": lane,
         "_preferCodexCli": False, "_codexWebSearch": True,
         "_codexAllowDuringCooldown": True,
         "_codexModel": env_value("CODEX_CLI_ONCHAIN_MODEL", "gpt-6-astra"),
         "_codexReasoningEffort": env_value("CODEX_CLI_ONCHAIN_REASONING_EFFORT", "high")})
-    parsed = deepseek_extract_json(response.get("choices", [{}])[0].get("message", {}).get("content", ""))
+    _resp_choice = (response.get("choices") or [{}])[0] if isinstance(response, dict) else {}
+    _resp_msg = _resp_choice.get("message", {}) if isinstance(_resp_choice, dict) else {}
+    _resp_content = _resp_msg.get("content", "") or ""
+    parsed = deepseek_extract_json(_resp_content)
     _parsed_items = parsed.get("items", []) if isinstance(parsed, dict) else []
-    print(f"[DeepSeek-Depth] model={clean_model_provider(settings.get('provider'))} parsed_items={len(_parsed_items)}", flush=True)
+    if not _parsed_items:
+        print(
+            f"[DeepSeek-Depth] model={clean_model_provider(settings.get('provider'))} "
+            f"parsed_items=0 finish_reason={_resp_choice.get('finish_reason')!r} "
+            f"content_len={len(_resp_content)} reasoning_len={len(_resp_msg.get('reasoning_content') or '')} "
+            f"content_head={_resp_content[:200]!r}",
+            flush=True,
+        )
+    else:
+        print(f"[DeepSeek-Depth] model={clean_model_provider(settings.get('provider'))} parsed_items={len(_parsed_items)}", flush=True)
     batch_mainline = parsed.get("marketMainline") if isinstance(parsed.get("marketMainline"), dict) else {}
     allowed = {row["key"] for row in model_rows}
     results = {}
@@ -48348,6 +49724,9 @@ def analyze_fast_onchain_candidates(rows: list[dict[str, Any]], *, lane="onchain
             if not analysis.get("summary"):
                 print(f"[DeepSeek-Depth] {item.get('key')} dropped: no summary", flush=True)
                 continue
+            # 精简输出不返回 evidenceStatus，默认 partial（有 frameworkAssessment 分级即视为有部分证据，走 B 级弹窗）
+            if not analysis.get("evidenceStatus"):
+                analysis["evidenceStatus"] = "partial"
             if "frameworkAssessment" not in analysis:
                 analysis["frameworkAssessment"] = normalize_framework_assessment({})
             # 精简 schema 下 version 由代码保证，不再要求模型精确返回超长 version 字符串
@@ -48360,6 +49739,20 @@ def analyze_fast_onchain_candidates(rows: list[dict[str, Any]], *, lane="onchain
                 print(f"[DeepSeek-Depth] {item.get('key')} dropped: framework incomplete (verdict={analysis['verdict']}) fw_version={_fw.get('version')!r} tier={_fw.get('potentialTier')!r}", flush=True)
                 continue
             analysis["provider"] = response.get("_provider") or clean_model_provider(settings.get("provider"))
+            # C 级不再产出完整投研结果：grade=C 时把 framework version 置空，
+            # 下游 formal_research_worthy / framework_assessment_complete / 弹窗自然跳过，
+            # 仅保留 summary/identitySummary 供页面轻量展示「已研判」。省存储与后续处理。
+            _grade = golden_leader_alert_decision(
+                _row_by_key.get(item["key"], next(r for r in model_rows if r["key"] == item["key"])), analysis,
+            )["grade"]
+            if _grade == "C":
+                _fw = analysis.get("frameworkAssessment") if isinstance(analysis.get("frameworkAssessment"), dict) else {}
+                _fw = dict(_fw)
+                _fw["version"] = ""
+                analysis["frameworkAssessment"] = _fw
+                analysis["researchRoute"] = "gmgn-local"
+                analysis["provider"] = f"{analysis.get('provider', '')} · C级不产出"
+                print(f"[DeepSeek-Depth] {item.get('key')} grade=C: 不产出完整投研结果", flush=True)
             results[item["key"]] = analysis
     # 合并轻量预筛掉的候选：给轻量结论，frameworkAssessment.version 置空 → 不触发完整框架弹窗
     for row in all_rows:
@@ -48407,6 +49800,10 @@ def send_fast_onchain_alert(row: dict[str, Any], analysis: dict[str, Any], job: 
     execution_note = "执行许可" if permission == "ALLOW" else "仅研究，不可直接执行" if permission == "BLOCK" else "需补审后再决定"
     local_port = env_value("PORT") or env_value("XINGYUN_PORT") or "8765"
     local_url = f"http://127.0.0.1:{local_port}/price-watch.html?mode=chains"
+    # 弹窗「查看」应跳到该币 CA 对应的币安钱包中文交易页；无 CA 时才回退到链上总览。
+    contract = clean_feed_text(row.get("contractAddress"), 180)
+    wallet_url = binance_wallet_token_url(network, contract) if contract else ""
+    alert_url = wallet_url or local_url
 
     def symbol_first_popup_text(value: Any, *, title: bool = False) -> str:
         rendered = clean_feed_text(value, 700)
@@ -48427,14 +49824,14 @@ def send_fast_onchain_alert(row: dict[str, Any], analysis: dict[str, Any], job: 
         "source": "链上投研", "sourceLabel": "研",
         "sourceType": "onchain-chatgpt-research" if is_chatgpt_route else "onchain-v48-potential",
         "title": chat_popup_title if is_chatgpt_route else f"{decision['gradeLabel']} · {symbol}",
-        "body": chat_popup_body if is_chatgpt_route else (
-            f"{decision['label']} · {network} · 机会 {decision['opportunityScore']} / 龙头 {decision['leaderScore']} · "
-            f"{framework.get('primaryDriver') or analysis.get('summary') or '驱动待核验'} · "
-            f"{permission}（{execution_note}）· 风险 {decision['riskScore']} · "
-            f"下一步：{framework.get('nextTrigger') or framework.get('nextTransition') or analysis.get('nextFocus') or '继续验证'} · 发现后 {elapsed} 秒"
+        "body": chat_popup_body if is_chatgpt_route else symbol_first_popup_text(
+            # 中间小字只放一句话叙事概括（DeepSeek summary 本就要求 15-40 字说人话），
+            # 分数/许可/下一步等机器参数不再塞进弹窗。
+            analysis.get("summary") or framework.get("primaryDriver")
+            or analysis.get("identitySummary") or "叙事待核验"
         ),
-        "url": local_url,
-        "contractAddress": clean_feed_text(row.get("contractAddress"), 180),
+        "url": alert_url,
+        "contractAddress": contract,
         "chain": network,
         "time": int(job["analyzed_at"]),
         "priority": "聊天投研精选" if is_chatgpt_route else decision["label"], "queuePriority": 180,
@@ -48661,7 +50058,7 @@ def news_trade_dex_search_rows(query: Any, search_results: list[dict[str, Any]] 
         return rows
 
     gathered: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=min(3, len(terms))) as pool:
+    with ThreadPoolExecutor(max_workers=min(2, len(terms))) as pool:
         futures = [pool.submit(fetch, term) for term in terms]
         for future in as_completed(futures):
             try:
@@ -49269,7 +50666,7 @@ def news_trade_background_discovery(
 
     source_rows: list[dict[str, Any]] = []
     candidate_rows: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=min(4, len(selected))) as pool:
+    with ThreadPoolExecutor(max_workers=min(2, len(selected))) as pool:
         futures = [pool.submit(discover, row) for row in selected]
         for future in as_completed(futures):
             try:
@@ -49617,6 +51014,12 @@ def build_event_monitor_core_payload() -> dict[str, Any]:
         *(discovery.get("candidateRows") or []),
         *(global_hotspots.get("candidateRows") or []),
     ]
+    prepared_candidate_rows: list[dict[str, Any]] = []
+    for candidate_row in candidate_source_rows:
+        candidate = event_monitor_onchain_candidate(candidate_row)
+        if candidate:
+            candidate["_eventMonitorPrepared"] = True
+            prepared_candidate_rows.append(candidate)
     source_rows = [
         *event_monitor_source_rows(),
         *(discovery.get("sourceRows") or []),
@@ -49628,7 +51031,7 @@ def build_event_monitor_core_payload() -> dict[str, Any]:
         event = classify_event_monitor_row(
             row,
             now_ms,
-            candidate_source_rows=candidate_source_rows,
+            candidate_source_rows=prepared_candidate_rows,
         )
         if not event or event["id"] in seen:
             continue
@@ -49681,22 +51084,54 @@ def build_event_monitor_core_payload() -> dict[str, Any]:
     }
 
 
+EVENT_MONITOR_CORE_READ_CACHE_LOCK = threading.Lock()
+EVENT_MONITOR_CORE_READ_CACHE: dict[str, Any] = {
+    "signature": None,
+    "payload": {},
+}
+
+
+def read_event_monitor_core_snapshot() -> dict[str, Any]:
+    """Reuse the parsed, read-only core snapshot until its file changes."""
+    path = api_cache_path("event-monitor-core")
+    try:
+        stat = path.stat()
+    except OSError:
+        return {}
+    signature = (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+    with EVENT_MONITOR_CORE_READ_CACHE_LOCK:
+        if EVENT_MONITOR_CORE_READ_CACHE.get("signature") == signature:
+            payload = EVENT_MONITOR_CORE_READ_CACHE.get("payload")
+            return payload if isinstance(payload, dict) else {}
+    payload = read_json_cache(path)
+    if not payload:
+        return {}
+    with EVENT_MONITOR_CORE_READ_CACHE_LOCK:
+        EVENT_MONITOR_CORE_READ_CACHE["signature"] = signature
+        EVENT_MONITOR_CORE_READ_CACHE["payload"] = payload
+    return payload
+
+
 def cached_event_monitor_core_payload(*, force_refresh: bool = False) -> dict[str, Any]:
     """Single-flight the cold build and use stale-while-refresh afterwards."""
     cache_key = "event-monitor-core"
-    if not force_refresh and read_json_cache(api_cache_path(cache_key)):
+    cached_payload = {} if force_refresh else read_event_monitor_core_snapshot()
+    if cached_payload:
         return cached_api_payload(
             cache_key,
             build_event_monitor_core_payload,
             EVENT_MONITOR_CORE_CACHE_TTL_SECONDS,
             allow_sync_rebuild=False,
+            _cached_payload=cached_payload,
         )
     with EVENT_MONITOR_CORE_BUILD_LOCK:
+        cached_payload = {} if force_refresh else read_event_monitor_core_snapshot()
         return cached_api_payload(
             cache_key,
             build_event_monitor_core_payload,
             EVENT_MONITOR_CORE_CACHE_TTL_SECONDS,
             force_refresh=force_refresh,
+            _cached_payload=cached_payload,
         )
 
 
@@ -50565,6 +52000,25 @@ def sync_site_alert_feed(feed: dict[str, Any]) -> None:
         for event in events
         if clean_feed_text(event.get("sourceScope"), 60)
     } if feed["name"] == "newboards" else set()
+    x_watermarks = (
+        state.get("xTweetAnalysisWatermarks")
+        if isinstance(state.get("xTweetAnalysisWatermarks"), dict)
+        else {}
+    )
+    current_x_watermarks: dict[str, int] = {}
+    if feed["name"] == "x-kol":
+        now_ms = int(now * 1000)
+        for event in events:
+            source_key = x_tweet_analysis_source_key(event)
+            published_at = alert_event_ms(event.get("time"))
+            if (
+                source_key
+                and published_at > 0
+                and published_at <= now_ms + SITE_ALERT_FUTURE_TOLERANCE_MS
+            ):
+                current_x_watermarks[source_key] = max(
+                    current_x_watermarks.get(source_key, 0), published_at,
+                )
     fresh = [
         event
         for event in events
@@ -50575,9 +52029,32 @@ def sync_site_alert_feed(feed: dict[str, Any]) -> None:
         )
     ]
     if feed.get("name") == "x-kol":
-        # X tracking is now an input source, not a standalone alert channel.
-        # Priority identities flow into News Trade through event_monitor_source_rows;
-        # ordinary KOL posts stay visible only on the X tracking page.
+        # X tracking is an input source, not a raw popup channel.  Once the
+        # baseline is ready, every genuinely unseen important-person post
+        # enters the dedicated pinned-chat analysis bridge. A popup is emitted only when the
+        # matching structured result comes back.
+        if is_ready and fresh:
+            try:
+                important_posts = [
+                    event for event in fresh
+                    if (
+                        x_tweet_analysis_person_source_allowed(event)
+                        and x_tweet_analysis_source_key(event) in x_watermarks
+                        and alert_event_ms(event.get("time"))
+                        > int(safe_float(x_watermarks.get(x_tweet_analysis_source_key(event)), 0))
+                    )
+                ]
+                if important_posts:
+                    X_TWEET_ANALYSIS_QUEUE.enqueue(
+                        important_posts,
+                        min_published_at=int(X_TWEET_ANALYSIS_INCREMENTAL_STATE.get("cutoffMs") or 0),
+                        now_ms=int(now * 1000),
+                    )
+            except Exception as exc:
+                # Do not mark these source events seen: the next two-second
+                # source pass can retry without losing a post.
+                print(f"X tweet analysis queue failed: {safe_error_text(str(exc))}", file=sys.stderr)
+                return
         fresh = []
     failed = set()
     for event in fresh if is_ready else []:
@@ -50598,6 +52075,13 @@ def sync_site_alert_feed(feed: dict[str, Any]) -> None:
         SITE_ALERT_STATE['ready'] = sorted(set(SITE_ALERT_STATE.get('ready') or []) | {feed['name']})
         if feed['name'] == 'newboards':
             SITE_ALERT_STATE['newboardReadyScopes'] = sorted(set(SITE_ALERT_STATE.get('newboardReadyScopes') or []) | current_scopes)
+        if feed['name'] == 'x-kol':
+            stored_x_watermarks = SITE_ALERT_STATE.setdefault('xTweetAnalysisWatermarks', {})
+            for source_key, published_at in current_x_watermarks.items():
+                stored_x_watermarks[source_key] = max(
+                    int(safe_float(stored_x_watermarks.get(source_key), 0)),
+                    published_at,
+                )
     save_site_alert_state()
 
 
@@ -50717,6 +52201,18 @@ def start_wechat_auth_monitor() -> None:
     threading.Thread(target=wechat_auth_monitor_loop, daemon=True).start()
 
 
+def runtime_thread_groups() -> dict[str, int]:
+    groups: dict[str, int] = {}
+    for thread in threading.enumerate():
+        name = clean_feed_text(thread.name, 100) or "unnamed"
+        if "process_request_thread" in name:
+            name = "http-request"
+        else:
+            name = re.sub(r"_\d+$", "", name)
+        groups[name] = groups.get(name, 0) + 1
+    return dict(sorted(groups.items(), key=lambda item: (-item[1], item[0]))[:24])
+
+
 def health_payload() -> dict[str, Any]:
     checks: dict[str, Any] = {}
     ok = True
@@ -50780,9 +52276,35 @@ def health_payload() -> dict[str, Any]:
         },
         "runtime": {
             "activeThreads": threading.active_count(),
+            "threadGroups": runtime_thread_groups(),
+            "threadStackKb": THREAD_STACK_SIZE_BYTES // 1024 if THREAD_STACK_SIZE_BYTES else 0,
             "sharedPools": True,
             "timeframeWorkers": int(getattr(PRICE_STRUCTURE_TIMEFRAME_POOL, "_max_workers", 0)),
+            "entryDayTimeframeWorkers": int(
+                getattr(PRICE_STRUCTURE_ENTRY_DAY_TIMEFRAME_POOL, "_max_workers", 0)
+            ),
             "marketSourceWorkers": int(getattr(MARKET_SOURCE_POOL, "_max_workers", 0)),
+            "apiRefreshWorkers": int(getattr(API_REFRESH_POOL, "_max_workers", 0)),
+            "chainEcosystemWorkers": CHAIN_ECOSYSTEM_MONITOR.worker_count,
+            "httpRequests": {
+                "active": int(DASHBOARD_HTTP_RUNTIME.get("active", 0)),
+                "peak": int(DASHBOARD_HTTP_RUNTIME.get("peak", 0)),
+                "limit": DASHBOARD_HTTP_MAX_ACTIVE,
+            },
+            "outboundRequests": requests.stats(),
+            "onchainResearchIngest": {
+                "pending": len(ONCHAIN_RESEARCH_INGEST_PENDING),
+                "active": bool(
+                    ONCHAIN_RESEARCH_INGEST_THREAD
+                    and ONCHAIN_RESEARCH_INGEST_THREAD.is_alive()
+                ),
+                "limit": ONCHAIN_RESEARCH_INGEST_PENDING_LIMIT,
+            },
+            "monitorIdentityCache": {
+                "cached": len(MONITOR_BUY.identities.records),
+                "known": len(MONITOR_BUY.identities.known_keys),
+                "limit": MONITOR_BUY.identities.cache_size,
+            },
             "cacheEntries": {
                 "market": len(CACHE),
                 "onchainPools": len(PRICE_STRUCTURE_ONCHAIN_POOL_CACHE),
@@ -51070,6 +52592,55 @@ def sitemap_xml(handler: SimpleHTTPRequestHandler) -> str:
             f"  <url><loc>{html.escape(loc)}</loc><lastmod>{now}</lastmod><changefreq>{changefreq}</changefreq><priority>{priority}</priority></url>"
         )
     return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n" + "\n".join(items) + "\n</urlset>\n"
+
+
+DASHBOARD_HTTP_MAX_ACTIVE = max(
+    16,
+    min(96, int(float(os.getenv("DASHBOARD_HTTP_MAX_ACTIVE", "48") or "48"))),
+)
+DASHBOARD_HTTP_RUNTIME = {"active": 0, "peak": 0}
+DASHBOARD_HTTP_RUNTIME_LOCK = threading.Lock()
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """Thread-per-request compatibility with a hard memory ceiling.
+
+    Existing handlers remain unchanged, but browser polling can no longer
+    create an unlimited number of threads when an upstream request stalls.
+    Accepted connections wait for a slot instead of being dropped.
+    """
+
+    request_queue_size = 128
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._request_slots = threading.BoundedSemaphore(DASHBOARD_HTTP_MAX_ACTIVE)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        while not self._request_slots.acquire(timeout=0.25):
+            if SERVER_SHUTDOWN_EVENT.is_set():
+                self.shutdown_request(request)
+                return
+        with DASHBOARD_HTTP_RUNTIME_LOCK:
+            DASHBOARD_HTTP_RUNTIME["active"] += 1
+            DASHBOARD_HTTP_RUNTIME["peak"] = max(
+                DASHBOARD_HTTP_RUNTIME["peak"], DASHBOARD_HTTP_RUNTIME["active"]
+            )
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            with DASHBOARD_HTTP_RUNTIME_LOCK:
+                DASHBOARD_HTTP_RUNTIME["active"] = max(0, DASHBOARD_HTTP_RUNTIME["active"] - 1)
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with DASHBOARD_HTTP_RUNTIME_LOCK:
+                DASHBOARD_HTTP_RUNTIME["active"] = max(0, DASHBOARD_HTTP_RUNTIME["active"] - 1)
+            self._request_slots.release()
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -52140,6 +53711,19 @@ class Handler(SimpleHTTPRequestHandler):
                     item_filter=gmgn_trench_passes_chain_filters,
                     include_recent_rank_supplement=False,
                 )
+                research_candidates = [
+                    candidate
+                    for raw in trench_payload.get("items") or []
+                    for candidate in [gmgn_trench_research_candidate(
+                        raw, current_ms=int(time.time() * 1000),
+                    )]
+                    if candidate is not None
+                ]
+                if research_candidates:
+                    queue_onchain_research_ingest(
+                        research_candidates,
+                        match_recent_news=True,
+                    )
                 self.send_json(attach_trench_person_signals(attach_gmgn_native_trench_narrative(trench_payload)))
             except (TypeError, ValueError) as exc:
                 self.send_json({"ok": False, "items": [], "error": str(exc)}, status=400)
@@ -52157,6 +53741,12 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "仅限本机查看聊天投研队列"}, status=403)
                 return
             self.send_json(ONCHAIN_FAST_RESEARCH.chatgpt_research_status())
+            return
+        if parsed.path == "/api/x-tweet-analysis/status":
+            if not self.request_is_local_or_admin():
+                self.send_json({"ok": False, "error": "仅限本机查看推文分析队列"}, status=403)
+                return
+            self.send_json(X_TWEET_ANALYSIS_QUEUE.status())
             return
         if parsed.path == "/api/chain-ecosystem":
             try:
@@ -52465,6 +54055,73 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         route = parsed.path.rstrip("/")
         if not self.validate_post_request(route):
+            return
+        if route == "/api/x-tweet-analysis/claim":
+            if not self.request_is_local_or_admin() or not self.request_origin_allowed():
+                self.send_json({"ok": False, "error": "仅限本机领取推文分析任务"}, status=403)
+                return
+            try:
+                request_payload = self.read_json()
+                self.send_json(X_TWEET_ANALYSIS_QUEUE.claim(
+                    target_thread_id=request_payload.get("targetThreadId") or "",
+                    target_thread_title=request_payload.get("targetThreadTitle") or X_TWEET_ANALYSIS_CHAT_TITLE,
+                ))
+            except (TypeError, ValueError) as exc:
+                self.send_json({"ok": False, "error": safe_monitor_error(exc)}, status=400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": safe_monitor_error(exc)}, status=502)
+            return
+        if route == "/api/x-tweet-analysis/sent":
+            if not self.request_is_local_or_admin() or not self.request_origin_allowed():
+                self.send_json({"ok": False, "error": "仅限本机确认推文分析派送"}, status=403)
+                return
+            try:
+                request_payload = self.read_json()
+                self.send_json(X_TWEET_ANALYSIS_QUEUE.mark_sent(
+                    request_payload.get("jobId"), request_payload.get("claimToken"),
+                ))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": safe_monitor_error(exc)}, status=502)
+            return
+        if route in {"/api/x-tweet-analysis/result", "/api/x-tweet-analysis/result-and-claim"}:
+            if not self.request_is_local_or_admin() or not self.request_origin_allowed():
+                self.send_json({"ok": False, "error": "仅限本机回写推文分析结果"}, status=403)
+                return
+            try:
+                request_payload = self.read_json()
+                completed = X_TWEET_ANALYSIS_QUEUE.complete(
+                    request_payload.get("jobId"), request_payload.get("claimToken"),
+                    request_payload.get("analysis") or request_payload.get("result"),
+                    raw_response=request_payload.get("rawResponse") or "",
+                )
+                job = completed.get("job") if isinstance(completed.get("job"), dict) else {}
+                popup = {}
+                if completed.get("ok") and job and not int(safe_float(job.get("alerted_at"), 0)):
+                    popup = x_tweet_analysis_popup(job)
+                response = {**completed, "popup": popup}
+                if route.endswith("result-and-claim") and completed.get("ok"):
+                    response["next"] = X_TWEET_ANALYSIS_QUEUE.claim(
+                        target_thread_id=request_payload.get("targetThreadId") or job.get("target_thread_id") or "",
+                        target_thread_title=request_payload.get("targetThreadTitle") or X_TWEET_ANALYSIS_CHAT_TITLE,
+                    )
+                self.send_json(response)
+            except (TypeError, ValueError) as exc:
+                self.send_json({"ok": False, "error": safe_monitor_error(exc)}, status=400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": safe_monitor_error(exc)}, status=502)
+            return
+        if route == "/api/x-tweet-analysis/fail":
+            if not self.request_is_local_or_admin() or not self.request_origin_allowed():
+                self.send_json({"ok": False, "error": "仅限本机回写推文分析失败状态"}, status=403)
+                return
+            try:
+                request_payload = self.read_json()
+                self.send_json(X_TWEET_ANALYSIS_QUEUE.fail(
+                    request_payload.get("jobId"), request_payload.get("claimToken"),
+                    request_payload.get("error") or "聊天分析失败",
+                ))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": safe_monitor_error(exc)}, status=502)
             return
         if route == "/api/onchain-research-mode":
             if not self.request_is_local_or_admin() or not self.request_origin_allowed() or self.headers.get("Origin") == "null":
@@ -53355,11 +55012,11 @@ def main():
     # SO_REUSEADDR on Windows lets stale dashboard instances bind the same
     # address, so requests can randomly reach old code. Keep quick reuse on
     # Unix, but require one exclusive 8765 listener on this desktop app.
-    ThreadingHTTPServer.allow_reuse_address = os.name != "nt"
-    ThreadingHTTPServer.daemon_threads = True
-    ThreadingHTTPServer.block_on_close = False
+    BoundedThreadingHTTPServer.allow_reuse_address = os.name != "nt"
+    BoundedThreadingHTTPServer.daemon_threads = True
+    BoundedThreadingHTTPServer.block_on_close = False
     try:
-        server = ThreadingHTTPServer((args.host, args.port), Handler)
+        server = BoundedThreadingHTTPServer((args.host, args.port), Handler)
     except OSError as exc:
         if getattr(exc, "winerror", None) == 10048 or exc.errno in {48, 98, 10048}:
             print(f"端口 {args.port} 已在使用。已有服务可能正在后台运行，请先打开 http://{args.host}:{args.port}/ 检查；本次未重复启动监控。", flush=True)

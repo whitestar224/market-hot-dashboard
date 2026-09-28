@@ -274,6 +274,24 @@ class FastResearchTests(unittest.TestCase):
             {"chat-one", "chat-two"},
         )
 
+    def test_pending_backlog_does_not_consume_chat_concurrency(self):
+        fast = FastResearch(self.store, self.analyzer, self.sink, mode_provider=lambda: "deep")
+        fast.initialize()
+        fast.ingest([candidate("OPEN", address="0x" + "a" * 40)])
+
+        queued = fast.queue_chatgpt_research_batch(limit=3, max_concurrent=1)
+        status = fast.chatgpt_research_status()
+        claimed = fast.claim_chatgpt_research_batch(
+            limit=3, max_concurrent=1,
+            target_thread_id="chat-open", target_thread_title="一句话概括叙事",
+        )
+
+        self.assertEqual(queued["status"], "pending")
+        self.assertEqual(status["activeCount"], 0)
+        self.assertEqual(status["active"], [])
+        self.assertEqual(claimed["status"], "claimed")
+        self.assertEqual(claimed["targetThreadId"], "chat-open")
+
     def test_sent_chat_batch_cannot_be_requeued_by_fresh_scan(self):
         fast = FastResearch(self.store, self.analyzer, self.sink, mode_provider=lambda: "deep")
         fast.initialize()
@@ -708,6 +726,101 @@ class FastResearchTests(unittest.TestCase):
         self.assertEqual(queued["itemCount"], 1)
         self.assertEqual(fast._query("SELECT hour_start FROM onchain_chatgpt_research_batches")[0]["hour_start"], 0)
 
+    def test_hourly_mode_skips_stale_unsent_batches_before_queuing_latest_increment(self):
+        fast = FastResearch(self.store, self.analyzer, self.sink, mode_provider=lambda: "hourly")
+        fast.initialize()
+        cutoff = fast._query(
+            "SELECT applied_at FROM onchain_data_migrations WHERE name='chatgpt-incremental-only-v1'"
+        )[0]["applied_at"]
+        live_details = json.loads(fast._query(
+            "SELECT details_json FROM onchain_data_migrations WHERE name='chatgpt-live-stream-v3'"
+        )[0]["details_json"])
+        base = max(cutoff, int(live_details["cutoffMs"]), NOW)
+        for index in range(3):
+            fast._write("""INSERT INTO onchain_chatgpt_research_batches
+                (batch_id,lane,hour_start,status,item_count,prompt,created_at,updated_at)
+                VALUES(?, 'hourly', 0, 'pending', 25, '{}', ?, ?)""", (
+                    f"old-{index}", base + index + 1, base + index + 1,
+                ))
+
+        latest = {
+            **candidate(
+                "LATEST", network="bsc",
+                address="0x" + "9" * 40,
+            ),
+            "firstSeenAt": base + 20 * 60_000,
+            "provider": "gmgn-trenches",
+            "providers": ["gmgn-trenches"],
+            "gmgnTrenchBoardMember": True,
+            "boardResearchRequired": True,
+        }
+        fast.ingest([latest])
+        queued = fast.queue_chatgpt_research_batch(now_ms=base + 20 * 60_000 + 1)
+
+        self.assertEqual(queued["status"], "pending")
+        self.assertEqual(queued["itemCount"], 1)
+        batches = fast._query("""SELECT status,COUNT(*) total
+            FROM onchain_chatgpt_research_batches GROUP BY status""")
+        self.assertEqual({row["status"]: row["total"] for row in batches}, {
+            "pending": 1,
+            "skipped": 3,
+        })
+        items = fast._query("""SELECT i.job_key FROM onchain_chatgpt_research_items i
+            JOIN onchain_chatgpt_research_batches b ON b.batch_id=i.batch_id
+            WHERE b.status='pending'""")
+        self.assertEqual([row["job_key"] for row in items], [candidate_key(latest)])
+
+    def test_hourly_mode_puts_entire_accumulated_backlog_in_one_batch(self):
+        fast = FastResearch(self.store, self.analyzer, self.sink, mode_provider=lambda: "hourly")
+        fast.initialize()
+        live_details = json.loads(fast._query(
+            "SELECT details_json FROM onchain_data_migrations WHERE name='chatgpt-live-stream-v3'"
+        )[0]["details_json"])
+        base = max(int(live_details["cutoffMs"]), NOW)
+        rows = [{
+            **candidate(
+                f"BACKLOG{index}", network="bsc",
+                address="0x" + f"{index + 1:040x}",
+            ),
+            "firstSeenAt": base + index + 1,
+            "provider": "gmgn-trenches",
+            "providers": ["gmgn-trenches"],
+            "gmgnTrenchBoardMember": True,
+            "boardResearchRequired": True,
+        } for index in range(60)]
+        fast.ingest(rows)
+
+        queued = fast.queue_chatgpt_research_batch(
+            limit=25, now_ms=base + len(rows) + 1, max_concurrent=3,
+        )
+
+        self.assertEqual(queued["status"], "pending")
+        self.assertEqual(queued["itemCount"], 60)
+        batches = fast._query("SELECT batch_id,item_count FROM onchain_chatgpt_research_batches")
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(batches[0]["item_count"], 60)
+
+        later = [{
+            **candidate(
+                f"LATER{index}", network="bsc",
+                address="0x" + f"{index + 101:040x}",
+            ),
+            "firstSeenAt": base + 100 + index,
+            "provider": "gmgn-trenches",
+            "providers": ["gmgn-trenches"],
+            "gmgnTrenchBoardMember": True,
+            "boardResearchRequired": True,
+        } for index in range(10)]
+        fast.ingest(later)
+        merged = fast.queue_chatgpt_research_batch(
+            limit=25, now_ms=base + 200, max_concurrent=3,
+        )
+        self.assertEqual(merged["batchId"], queued["batchId"])
+        self.assertEqual(merged["itemCount"], 70)
+        self.assertEqual(fast._query(
+            "SELECT COUNT(*) total FROM onchain_chatgpt_research_batches"
+        )[0]["total"], 1)
+
     def test_chatgpt_lane_only_accepts_exact_visible_trench_board_members(self):
         fast = FastResearch(self.store, self.analyzer, self.sink, mode_provider=lambda: "hourly")
         fast.initialize()
@@ -818,8 +931,12 @@ class FastResearchTests(unittest.TestCase):
             hourly_batch_size=2,
         )
         fast.initialize()
+        live_cutoff = json.loads(fast._query(
+            "SELECT details_json FROM onchain_data_migrations WHERE name='chatgpt-live-stream-v3'"
+        )[0]["details_json"])["cutoffMs"]
         trench = {
             **candidate("TRENCH", address="0x" + "c" * 40),
+            "firstSeenAt": live_cutoff + 1,
             "provider": "gmgn-trenches", "providers": ["gmgn-trenches"],
             "gmgnTrenchBoardMember": True,
         }
@@ -828,7 +945,7 @@ class FastResearchTests(unittest.TestCase):
             "provider": "geckoterminal", "providers": ["geckoterminal"],
         }
         fast.ingest([trench, unrelated])
-        result = fast.run_hourly_trench_research(now_ms=NOW + 1)
+        result = fast.run_hourly_trench_research(now_ms=live_cutoff + 2)
 
         self.assertEqual(result["status"], "pending")
         self.assertEqual(result["itemCount"], 1)
@@ -855,16 +972,20 @@ class FastResearchTests(unittest.TestCase):
             hourly_concurrency=99,
         )
         fast.initialize()
+        live_cutoff = json.loads(fast._query(
+            "SELECT details_json FROM onchain_data_migrations WHERE name='chatgpt-live-stream-v3'"
+        )[0]["details_json"])["cutoffMs"]
         rows = [
             {
                 **candidate(f"TRENCH{number}", address="0x" + f"{number + 1:040x}"),
+                "firstSeenAt": live_cutoff + number + 1,
                 "provider": "gmgn-trenches", "providers": ["gmgn-trenches"],
                 "gmgnTrenchBoardMember": True,
             }
             for number in range(5)
         ]
         fast.ingest(rows)
-        next_hour = (NOW // 3_600_000 + 1) * 3_600_000
+        next_hour = live_cutoff + len(rows) + 1
 
         result = fast.run_hourly_trench_research(now_ms=next_hour + 1)
 

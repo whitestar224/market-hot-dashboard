@@ -334,7 +334,7 @@ class PersonalXMonitorPriorityTests(unittest.TestCase):
         }
         with (
             patch.object(server.CHAIN_ECOSYSTEM_MONITOR.store, "list_chains", return_value=[]),
-            patch.object(server.requests, "get", return_value=response),
+            patch.object(server.ONCHAIN_KLINE_HTTP_SESSION, "get", return_value=response),
         ):
             pool = server.price_structure_onchain_pool("PONS")
 

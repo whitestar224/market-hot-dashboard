@@ -8,6 +8,7 @@ unit test.
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import re
 from typing import Any, Iterable
@@ -77,21 +78,35 @@ DEFAULT_IMPORTANT_PEOPLE: tuple[dict[str, Any], ...] = (
 EXCLUDED_IMPORTANT_HANDLES = frozenset({"brian_armstrong"})
 
 # Individual alerts are intentionally much narrower than the ordinary X
-# tracking list.  Keep only people whose own statement can credibly move a
-# major asset, ecosystem, meme sector, ETF expectation or crypto policy.
-# Official project/exchange/chain accounts remain because an official mention
-# or repost of a meme can itself be a market-moving catalyst.
+# tracking list. Keep only personal accounts whose own statement can credibly
+# move a major asset, ecosystem, meme sector or crypto/AI narrative. Official
+# organizations are classified separately and never become 人物信号.
 MARKET_MOVING_PERSON_HANDLES = frozenset({
-    "cz_binance", "vitalikbuterin", "sunyuchentron", "aeyakovenko",
+    "cz_binance", "vitalikbuterin", "sunyuchentron", "aeyakovenko", "rajgokal",
     "sandeepnailwal", "stanikulechov", "haydenzadams", "sergeynazarov",
     "cryptohayes", "saylor", "bgarlinghouse", "paoloardoino", "jack",
     "balajis", "pmarca", "cathiedwood", "iohk_charles", "gavofyork",
-    "el33th4xor", "weremeow", "elonmusk", "sama", "finkd", "jtlonsdale",
-    "vladtenev", "davidsacks", "realdonaldtrump", "jdvance", "senlummis",
-    "erictrump", "donaldjtrumpjr", "novogratz", "raoulgmi", "cobie",
-    "blknoiz06", "muststopmurad", "gcrclassic", "adam3us", "jespow",
-    "runekek", "andrecronjetech", "matthuang", "ericbalchunas", "jseyff",
-    "nayibbukele", "jmilei", "mcuban", "chamath", "garrytan",
+    "el33th4xor", "ilblackdragon", "elibensasson", "alexgluchowski",
+    "weremeow", "novogratz", "adam3us", "runekek", "andrecronjetech",
+    "matthuang", "vladtenev",
+
+    # Technology and AI leaders.  These are personal accounts whose own words
+    # can redirect a major product narrative or create a short-lived meme wave.
+    "elonmusk", "sama", "finkd", "satyanadella", "sundarpichai", "lisasu",
+    "demishassabis", "mustafasuleyman", "jtlonsdale",
+
+    # Political sources are limited to major-power heads of state whose own
+    # statements repeatedly cause immediate global market repricing.
+    "realdonaldtrump",
+})
+
+
+# Exchange/company accounts are not people and are intentionally excluded even
+# from the passive official-source roster requested for project Meme discovery.
+EXCHANGE_OFFICIAL_HANDLES = frozenset({
+    "binance", "coinbase", "robinhoodapp", "krakenfx", "okx",
+    "bybit_official", "bitgetglobal", "mexc_official", "gate_io",
+    "kucoincom", "cryptocom", "gemini", "bitstamp", "htx_global",
 })
 
 
@@ -346,8 +361,11 @@ def token_identity(row: dict[str, Any]) -> str:
     return f"{network}:{contract if network == 'solana' else contract.casefold()}"
 
 
-def important_person_sources(saved_sources: Iterable[dict[str, Any]] = ()) -> list[dict[str, Any]]:
-    """Return high-impact individuals plus official crypto/project accounts."""
+def _important_sources(
+    saved_sources: Iterable[dict[str, Any]] = (),
+    *,
+    official: bool,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
     defaults = (*DEFAULT_IMPORTANT_PEOPLE, *DEFAULT_IMPORTANT_PROJECTS, *EXTENDED_IMPORTANT_SOURCES)
@@ -360,6 +378,10 @@ def important_person_sources(saved_sources: Iterable[dict[str, Any]] = ()) -> li
             continue
         category = str(raw.get("category") or "notable").strip().lower()
         is_official = category == "project_official"
+        if official != is_official:
+            continue
+        if is_official and folded_handle in EXCHANGE_OFFICIAL_HANDLES:
+            continue
         if not is_official and folded_handle not in MARKET_MOVING_PERSON_HANDLES:
             continue
         if category not in {"celebrity", "notable", "founder", "project_official"}:
@@ -378,6 +400,16 @@ def important_person_sources(saved_sources: Iterable[dict[str, Any]] = ()) -> li
             "enabled": raw.get("enabled") is not False,
         })
     return rows
+
+
+def important_person_sources(saved_sources: Iterable[dict[str, Any]] = ()) -> list[dict[str, Any]]:
+    """Return only personal accounts with credible short-term market impact."""
+    return _important_sources(saved_sources, official=False)
+
+
+def important_official_sources(saved_sources: Iterable[dict[str, Any]] = ()) -> list[dict[str, Any]]:
+    """Keep non-exchange official accounts as passive project/news sources."""
+    return _important_sources(saved_sources, official=True)
 
 
 def _post_text(item: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
@@ -426,10 +458,27 @@ def _distinctive_name_terms(row: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(terms))[:8]
 
 
+@functools.lru_cache(maxsize=8192)
+def _compiled_word_boundary_pattern(term: str) -> "re.Pattern[str]":
+    # Patterns are driven by unbounded token/symbol names; re's built-in cache
+    # (512 entries, cleared on overflow) thrashed and re-parsed on every call.
+    return re.compile(rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])", re.I)
+
+
+@functools.lru_cache(maxsize=8192)
+def _compiled_cashtag_pattern(symbol: str) -> "re.Pattern[str]":
+    return re.compile(rf"(?<![A-Za-z0-9])\${re.escape(symbol)}(?![A-Za-z0-9])", re.I)
+
+
+@functools.lru_cache(maxsize=8192)
+def _compiled_handle_pattern(handle: str) -> "re.Pattern[str]":
+    return re.compile(rf"(?<![A-Za-z0-9_])@{re.escape(handle)}(?![A-Za-z0-9_])", re.I)
+
+
 def _bounded_term(text: str, term: str) -> bool:
     if re.search(r"[\u3400-\u9fff]", term):
         return term.casefold() in text.casefold()
-    return bool(re.search(rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])", text, re.I))
+    return bool(_compiled_word_boundary_pattern(term).search(text))
 
 
 def _semantic_exact_name_term(row: dict[str, Any], text: str) -> str:
@@ -439,7 +488,7 @@ def _semantic_exact_name_term(row: dict[str, Any], text: str) -> str:
             if term.casefold() in text.casefold():
                 return term
             continue
-        match = re.search(rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])", text, re.I)
+        match = _compiled_word_boundary_pattern(term).search(text)
         if not match:
             continue
         context = text[max(0, match.start() - 100) : min(len(text), match.end() + 100)]
@@ -518,19 +567,19 @@ def match_person_post(
         # A bare word matching the account name is not enough.  GMGN projects
         # sometimes link a third-party post (for example @binance), so only an
         # explicit @mention/link/status/quote can establish the social edge.
-        handle_pattern = rf"(?<![A-Za-z0-9_])@{re.escape(official_handle)}(?![A-Za-z0-9_])" if official_handle else ""
+        handle_pattern = _compiled_handle_pattern(official_handle) if official_handle else None
         official_match = bool(
             official_handle
             and (
                 quote_handle.casefold() == official_handle.casefold()
-                or (handle_pattern and re.search(handle_pattern, text, re.I))
+                or (handle_pattern and handle_pattern.search(text))
                 or (official_status and official_status in text)
                 or (official_url and official_url.casefold() in text.casefold())
             )
         )
         if official_match:
             match_type, confidence, evidence_status = "official-x", 97, "person-x-official-handle"
-        elif symbol and re.search(rf"(?<![A-Za-z0-9])\${re.escape(symbol)}(?![A-Za-z0-9])", text, re.I):
+        elif symbol and _compiled_cashtag_pattern(symbol).search(text):
             match_type, confidence, evidence_status = "cashtag", 94, "person-x-cashtag"
         else:
             # A quote/repost is useful only when it carries a strong identity

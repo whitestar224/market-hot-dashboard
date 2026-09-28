@@ -845,7 +845,7 @@ class WechatOpportunityLifecycleTests(unittest.TestCase):
         self.assertEqual(payload["speech"], "群聊发现新 CA：DOGAI")
         self.assertEqual(
             payload["url"],
-            f"https://web3.binance.com/en/token/bsc/{contract}?ref=MQ6JD2X4",
+            f"https://web3.binance.com/zh-CN/token/bsc/{contract}?ref=MQ6JD2X4",
         )
         self.assertNotIn("price-watch", payload["url"])
 

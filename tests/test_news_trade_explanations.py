@@ -198,7 +198,7 @@ class ServerBindingTests(unittest.TestCase):
         import server
         event = server.rank_monitor_event("hot", {"sourceId": "binance-wallet-hot", "period": "4h",
             "periodLabel": "4 小时", "symbol": "小股东", "sourceTitle": "币安钱包热门榜",
-            "url": "https://web3.binance.com/en/token/bsc/0x" + "12"*20}, "new")
+            "url": "https://web3.binance.com/zh-CN/token/bsc/0x" + "12"*20}, "new")
         normalized = server.normalize_desktop_alert(event)
         self.assertRegex(normalized["explanationKey"], r"^[a-f0-9]{40}$")
         self.assertEqual(normalized["explanationContext"]["contract"], "0x" + "12"*20)
