@@ -1,0 +1,3950 @@
+{
+  "baseUrl": "http://127.0.0.1:8765",
+  "capturedAt": "2026-09-28T16:57:36+0800",
+  "endpointCount": 40,
+  "endpoints": {
+    "alert-inbox": {
+      "bytes": 31905,
+      "contentType": "application/json",
+      "elapsedMs": 2378,
+      "error": null,
+      "json": true,
+      "path": "/api/alert-inbox",
+      "shape": {
+        "items": [
+          {
+            "attempts": "int",
+            "body": "str",
+            "createdAt": "int",
+            "eventTime": "int",
+            "id": "int",
+            "kind": "str",
+            "readAt": "int",
+            "reason": "str",
+            "shownAt": "int",
+            "source": "str",
+            "state": "str",
+            "title": "str",
+            "url": "str"
+          }
+        ],
+        "nextBefore": "int",
+        "ok": "bool",
+        "pending": "int",
+        "unread": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "aster-contracts": {
+      "bytes": 34912,
+      "contentType": "application/json",
+      "elapsedMs": 3034,
+      "error": null,
+      "json": true,
+      "path": "/api/aster-contracts",
+      "shape": {
+        "_cache": {
+          "key": "str",
+          "stale": "bool",
+          "updatedAt": "int"
+        },
+        "count": "int",
+        "detectedCount": "int",
+        "items": [
+          {
+            "announcementAt": "int",
+            "announcementReason": "str",
+            "announcementSource": "str",
+            "assetType": "str",
+            "baseAsset": "str",
+            "buyIdentity": {
+              "reason": "str",
+              "status": "str",
+              "target": "null"
+            },
+            "contractStatus": "str",
+            "contractSymbols": [
+              [
+                "str"
+              ]
+            ],
+            "date": "int",
+            "firstDiscoveredAt": "int",
+            "group": "str",
+            "id": "str",
+            "lastSeenAt": "int",
+            "metric": "str",
+            "metrics": {
+              "like": "int",
+              "quote": "int",
+              "reply": "int",
+              "repost": "int",
+              "view": "int"
+            },
+            "officialAnnouncement": "bool",
+            "officialChannel": "str",
+            "officialTitle": "str",
+            "onboardDate": "int",
+            "quoteAsset": "str",
+            "source": "str",
+            "sourceLabel": "str",
+            "status": "str",
+            "subtitle": "str",
+            "symbol": "str",
+            "symbols": [
+              [
+                "str"
+              ]
+            ],
+            "tags": [
+              [
+                "str"
+              ]
+            ],
+            "title": "str",
+            "url": "str"
+          }
+        ],
+        "mode": "str",
+        "officialCount": "int",
+        "officialWebsiteCount": "int",
+        "officialXCount": "int",
+        "updatedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "automation-briefs": {
+      "bytes": 7140,
+      "contentType": "application/json",
+      "elapsedMs": 10441,
+      "error": null,
+      "json": true,
+      "path": "/api/automation-briefs",
+      "shape": {
+        "_cache": {
+          "key": "str",
+          "stale": "bool",
+          "updatedAt": "int"
+        },
+        "briefs": [
+          {
+            "completedAt": "int",
+            "content": "str",
+            "id": "str",
+            "name": "str",
+            "rrule": "str",
+            "sourceFile": "str",
+            "status": "str",
+            "updatedAt": "int"
+          }
+        ],
+        "remoteLoaded": "bool",
+        "remoteUpdatedAt": "int",
+        "source": "str",
+        "updatedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "binance-wallet-hot": {
+      "bytes": 14901,
+      "contentType": "application/json",
+      "elapsedMs": 2214,
+      "error": null,
+      "json": true,
+      "path": "/api/binance-wallet-hot",
+      "shape": {
+        "accent": "str",
+        "emptyMessage": "str",
+        "emptyTitle": "str",
+        "group": "str",
+        "id": "str",
+        "period": "str",
+        "periodLabel": "str",
+        "periodOptions": [
+          {
+            "label": "str",
+            "value": "str"
+          }
+        ],
+        "rows": [
+          {
+            "amount": "float",
+            "binanceAiNarrative": "str",
+            "binanceAiNarrativeAvailable": "bool",
+            "binanceAiNarrativeSource": "str",
+            "binanceAiNarrativeStatus": "str",
+            "chain": "str",
+            "chainLabel": "str",
+            "change": "str",
+            "contractAddress": "str",
+            "heat": "int",
+            "holders": "int",
+            "icon": "str",
+            "liquidity": "float",
+            "marketCap": "float",
+            "metricLabel": "str",
+            "name": "str",
+            "narrativeLabel": "str",
+            "narrativeLabels": [
+              [
+                "str"
+              ]
+            ],
+            "narrativeLevel": "str",
+            "narrativeScore": "float",
+            "note": "str",
+            "price": "str",
+            "rank": "int",
+            "symbol": "str",
+            "tags": [
+              [
+                "str"
+              ]
+            ],
+            "turnover": "str",
+            "url": "str"
+          }
+        ],
+        "sourceLabel": "str",
+        "sourceName": "str",
+        "status": "str",
+        "subtitle": "str",
+        "title": "str",
+        "updatedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "chain-ecosystem": {
+      "bytes": 293078,
+      "contentType": "application/json",
+      "elapsedMs": 2368,
+      "error": null,
+      "json": true,
+      "path": "/api/chain-ecosystem",
+      "shape": {
+        "_cache": {
+          "key": "str",
+          "stale": "bool",
+          "updatedAt": "int"
+        },
+        "aiAnalysisProvider": "str",
+        "aiAnalysisStatus": "str",
+        "aiCoverage": {
+          "pending": "int",
+          "ready": "int",
+          "total": "int"
+        },
+        "alerts": [],
+        "analysisMode": "str",
+        "chains": [
+          {
+            "aiAnalysisProvider": "str",
+            "aiAnalysisStatus": "str",
+            "chainId": "str",
+            "chainType": "str",
+            "createdAt": "int",
+            "docsUrl": "str",
+            "explorerUrl": "str",
+            "gasSymbol": "str",
+            "geckoterminalNetwork": "str",
+            "id": "int",
+            "marketCount": "int",
+            "name": "str",
+            "officialUrl": "str",
+            "projectCount": "int",
+            "rpcUrl": "str",
+            "scanEnabled": "bool",
+            "slug": "str",
+            "stage": "str",
+            "updatedAt": "int"
+          }
+        ],
+        "dailyResearch": {
+          "analysisTargetMet": {
+            "analyzed": "int",
+            "oldestPendingAt": "int",
+            "pendingInitial": "int",
+            "pendingOverMinute": "int",
+            "withinMinute": "int"
+          },
+          "analysisTargetMs": "int",
+          "availableDays": [
+            [
+              "str"
+            ]
+          ],
+          "benchmark": {
+            "caseCount": "int",
+            "cases": [
+              {
+                "category": "str",
+                "firstDecision": "str",
+                "firstScore": "null",
+                "hit": "bool",
+                "key": "str",
+                "launchAt": "int",
+                "name": "str",
+                "network": "str",
+                "reason": "str",
+                "replayable": "bool",
+                "symbol": "str"
+              }
+            ],
+            "categories": {
+              "meme": {
+                "caseCount": "int",
+                "hits": "int",
+                "recallPct": "null",
+                "replayable": "int"
+              },
+              "project": {
+                "caseCount": "int",
+                "hits": "int",
+                "recallPct": "null",
+                "replayable": "int"
+              }
+            },
+            "hits": "int",
+            "recallPct": "null",
+            "replayable": "int",
+            "status": "str",
+            "targetRecallPct": "int"
+          },
+          "currentDay": "str",
+          "day": "str",
+          "errors": [],
+          "fastResearchManaged": "bool",
+          "filtered": [],
+          "funnel": {
+            "discovered": "int",
+            "filtered": "int",
+            "provisional": "int",
+            "quantified": "int",
+            "selected": "int",
+            "warming": "int"
+          },
+          "gmgnTrenchOnly": "bool",
+          "hiddenNoiseCount": "int",
+          "historyPage": "int",
+          "historyPagination": {
+            "page": "int",
+            "pages": "int",
+            "total": "int"
+          },
+          "hourlyResearch": {
+            "analyzedCount": "int",
+            "batchSize": "int",
+            "candidateCount": "int",
+            "chatBatch": {
+              "attempts": "int",
+              "batchId": "str",
+              "claimedAt": "int",
+              "completedAt": "int",
+              "createdAt": "int",
+              "error": "str",
+              "includesFramework": "int",
+              "itemCount": "int",
+              "lane": "str",
+              "sentAt": "int",
+              "status": "str",
+              "targetThreadId": "str",
+              "targetThreadTitle": "str",
+              "updatedAt": "int"
+            },
+            "completedAt": "int",
+            "concurrency": "int",
+            "error": "str",
+            "failedCount": "int",
+            "hourEnd": "int",
+            "hourStart": "int",
+            "route": "str",
+            "selectedCount": "int",
+            "startedAt": "int",
+            "status": "str",
+            "updatedAt": "int"
+          },
+          "launchSources": [
+            {
+              "block": "int",
+              "error": "str",
+              "source": "str",
+              "updatedAt": "int"
+            }
+          ],
+          "networks": [
+            [
+              "str"
+            ]
+          ],
+          "pagination": {
+            "page": "int",
+            "pageSize": "int",
+            "pages": "int",
+            "total": "int"
+          },
+          "provisional": [],
+          "provisionalTotal": "int",
+          "rapidDecision": {
+            "agree": "int",
+            "analyzed": "int",
+            "compared": "int",
+            "deepResearch": "int",
+            "disagree": "int",
+            "jevAvgLatencyMs": "int",
+            "reject": "int",
+            "routedWithoutDeepResearch": "int",
+            "watch": "int"
+          },
+          "recommendationHistory": [],
+          "refreshing": "bool",
+          "researchAnalysisStatus": "str",
+          "researchMode": "str",
+          "researchModeConfig": {
+            "description": "str",
+            "label": "str",
+            "mode": "str",
+            "providerLabel": "str",
+            "updatedAt": "int"
+          },
+          "researchSource": "str",
+          "researchSourceCount": "int",
+          "researchSourceLabel": "str",
+          "researchSourceStatus": {},
+          "researchSystem": "str",
+          "reviewQueue": {
+            "eligible": "int",
+            "filteredByAi": "int",
+            "narrativeResonance": "int",
+            "needsEvidence": "int",
+            "newsTriggered": "int",
+            "pending": "int",
+            "provisional": "int",
+            "provisionalEligible": "int",
+            "quantified": "int",
+            "sameSymbolSuppressed": "int",
+            "selected": "int",
+            "unavailable": "int",
+            "upgrading": "int"
+          },
+          "sameSymbolSuppressed": "int",
+          "scoreVersion": "str",
+          "selected": [],
+          "selectedTotal": "int",
+          "sourceStatus": {
+            "arc": "str",
+            "bsc": "str",
+            "eth": "str",
+            "robinhood": "str",
+            "solana": "str"
+          },
+          "trainingReadiness": {
+            "calibratorReady": "bool",
+            "classCounts": {
+              "deep-research": "int",
+              "reject": "int",
+              "watch": "int"
+            },
+            "labeled": "int",
+            "note": "str",
+            "shadowReady": "bool",
+            "split": "str"
+          },
+          "trenchCandidateCount": "int",
+          "trenchCandidatePool": "null",
+          "trenchResearchIngestedAt": "int",
+          "updatedAt": "int",
+          "watching": [],
+          "watchingCount": "int"
+        },
+        "factsMode": "str",
+        "markets": [
+          {
+            "aiAnalysisProvider": "str",
+            "aiAnalysisStatus": "str",
+            "candidates": "mixed",
+            "chainId": "int",
+            "description": "str",
+            "dynamic": "bool",
+            "id": "int",
+            "key": "str",
+            "leaderStreak": "int",
+            "level": "str",
+            "name": "str",
+            "observedAt": "int",
+            "reviewStatus": "str",
+            "top": []
+          }
+        ],
+        "ok": "bool",
+        "potentialProjectCount": "int",
+        "potentialProjects": [
+          {
+            "aiAnalysisProvider": "str",
+            "aiAnalysisStatus": "str",
+            "assets": [
+              {
+                "chainId": "int",
+                "contractAddress": "str",
+                "firstTradeAt": "int",
+                "id": "int",
+                "name": "str",
+                "poolAddress": "str",
+                "projectId": "int",
+                "status": "str",
+                "symbol": "str",
+                "updatedAt": "int"
+              }
+            ],
+            "chainId": "int",
+            "createdAt": "int",
+            "description": "str",
+            "evidence": [],
+            "evidenceCount": "int",
+            "githubRepo": "str",
+            "id": "int",
+            "manual": "bool",
+            "markets": "mixed",
+            "name": "str",
+            "officialUrl": "str",
+            "potentialScore": "mixed",
+            "slug": "str",
+            "tokenStage": "str",
+            "updatedAt": "int"
+          }
+        ],
+        "projectCount": "int",
+        "projects": [
+          {
+            "aiAnalysisProvider": "str",
+            "aiAnalysisStatus": "str",
+            "assets": "mixed",
+            "chainId": "int",
+            "createdAt": "int",
+            "description": "str",
+            "evidence": [
+              {
+                "chainId": "int",
+                "confidence": "float",
+                "evidenceType": "str",
+                "externalId": "str",
+                "id": "int",
+                "observedAt": "int",
+                "payload": "mixed",
+                "source": "str",
+                "subjectId": "str",
+                "subjectType": "str",
+                "summary": "str",
+                "title": "str",
+                "url": "str"
+              }
+            ],
+            "evidenceCount": "int",
+            "githubRepo": "str",
+            "id": "int",
+            "manual": "bool",
+            "markets": [
+              {
+                "confidence": "float",
+                "level": "str",
+                "marketId": "int",
+                "marketKey": "str",
+                "name": "str",
+                "projectId": "int",
+                "reviewStatus": "str",
+                "role": "str",
+                "source": "str"
+              }
+            ],
+            "name": "str",
+            "officialUrl": "str",
+            "potentialScore": {
+              "components": {
+                "ecosystemRole": {
+                  "effectiveWeight": "int",
+                  "value": "int"
+                },
+                "officialProgress": {
+                  "effectiveWeight": "int",
+                  "value": "int"
+                }
+              },
+              "confidence": "int",
+              "score": "int"
+            },
+            "slug": "str",
+            "tokenStage": "str",
+            "updatedAt": "int"
+          }
+        ],
+        "refreshing": "bool",
+        "selectedChain": {
+          "aiAnalysisProvider": "str",
+          "aiAnalysisStatus": "str",
+          "chainId": "str",
+          "chainType": "str",
+          "createdAt": "int",
+          "docsUrl": "str",
+          "evidence": [
+            {
+              "chainId": "int",
+              "confidence": "float",
+              "evidenceType": "str",
+              "externalId": "str",
+              "id": "int",
+              "observedAt": "int",
+              "payload": {},
+              "source": "str",
+              "subjectId": "str",
+              "subjectType": "str",
+              "summary": "str",
+              "title": "str",
+              "url": "str"
+            }
+          ],
+          "explorerUrl": "str",
+          "gasSymbol": "str",
+          "geckoterminalNetwork": "str",
+          "id": "int",
+          "name": "str",
+          "officialUrl": "str",
+          "rpcUrl": "str",
+          "scanEnabled": "bool",
+          "slug": "str",
+          "stage": "str",
+          "updatedAt": "int"
+        },
+        "sourceHealth": [
+          {
+            "chainId": "int",
+            "failureStreak": "int",
+            "lastCheckedAt": "int",
+            "lastError": "str",
+            "lastSuccessAt": "int",
+            "provider": "str",
+            "status": "str"
+          }
+        ],
+        "stale": "bool",
+        "updatedAt": "int",
+        "warnings": [
+          [
+            "str"
+          ]
+        ]
+      },
+      "status": [
+        200
+      ]
+    },
+    "desktop-alert": {
+      "bytes": 460,
+      "contentType": "text/html",
+      "elapsedMs": 43,
+      "error": null,
+      "json": false,
+      "path": "/api/desktop-alert",
+      "shape": null,
+      "status": [
+        404
+      ]
+    },
+    "dragon-wave-feedback": {
+      "bytes": 65,
+      "contentType": "application/json",
+      "elapsedMs": 595,
+      "error": null,
+      "json": true,
+      "path": "/api/dragon-wave-feedback",
+      "shape": {
+        "error": "str",
+        "loginUrl": "str",
+        "ok": "bool"
+      },
+      "status": [
+        401
+      ]
+    },
+    "dragon-wave-precomputed": {
+      "bytes": 73,
+      "contentType": "application/json",
+      "elapsedMs": 618,
+      "error": null,
+      "json": true,
+      "path": "/api/dragon-wave-precomputed",
+      "shape": {
+        "available": "bool",
+        "error": "str",
+        "ok": "bool"
+      },
+      "status": [
+        400
+      ]
+    },
+    "event-flow": {
+      "bytes": 158,
+      "contentType": "application/json",
+      "elapsedMs": 2328,
+      "error": null,
+      "json": true,
+      "path": "/api/event-flow",
+      "shape": {
+        "activeIds": [],
+        "cursor": "int",
+        "hasMore": "bool",
+        "items": [],
+        "nextBefore": "null",
+        "ok": "bool",
+        "scope": "str",
+        "serverNow": "int",
+        "total": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "event-monitor": {
+      "bytes": 5306897,
+      "contentType": "application/json",
+      "elapsedMs": 2952,
+      "error": null,
+      "json": true,
+      "path": "/api/event-monitor",
+      "shape": {
+        "_cache": {
+          "key": "str",
+          "stale": "bool",
+          "updatedAt": "int"
+        },
+        "events": [
+          {
+            "analysisIntakeReason": "str",
+            "assets": "mixed",
+            "authorHandle": "str",
+            "body": "str",
+            "candidateTier": "str",
+            "capturedAt": "int",
+            "confirmation": [
+              [
+                "str"
+              ]
+            ],
+            "counterConsensusProfile": "mixed",
+            "curiosityProfile": {
+              "breakdown": {
+                "controversy": "int",
+                "discussion": "int",
+                "legendary": "int",
+                "novelty": "int",
+                "synergy": "int"
+              },
+              "controversyHits": [],
+              "discussionHits": [],
+              "labels": [],
+              "legendaryHits": [],
+              "noveltyHits": [],
+              "qualified": "bool",
+              "score": "int"
+            },
+            "desktopAlertKey": "str",
+            "directConfirmation": "bool",
+            "eventEntities": [
+              [
+                "str"
+              ]
+            ],
+            "eventHeatBreakdown": {
+              "points": {
+                "bigGossip": "float",
+                "crossPlatform": "float",
+                "followupStory": "float",
+                "noveltyContrast": "float",
+                "participation": "float",
+                "symbolizability": "float",
+                "velocity": "float"
+              },
+              "raw": {
+                "bigGossip": "float",
+                "crossPlatform": "float",
+                "followupStory": "float",
+                "noveltyContrast": "float",
+                "participation": "float",
+                "symbolizability": "float",
+                "velocity": "float"
+              },
+              "score": "int",
+              "weights": {
+                "bigGossip": "float",
+                "crossPlatform": "float",
+                "followupStory": "float",
+                "noveltyContrast": "float",
+                "participation": "float",
+                "symbolizability": "float",
+                "velocity": "float"
+              }
+            },
+            "eventHeatScore": "int",
+            "eventType": "str",
+            "evidence": [
+              [
+                "str"
+              ]
+            ],
+            "executionEligible": "bool",
+            "freshnessMinutes": "float",
+            "fullyFermented": "bool",
+            "id": "str",
+            "impliedGainPct": "float",
+            "isNewsTrade": "bool",
+            "marketConfirmation": "bool",
+            "memeCandidates": "mixed",
+            "memeOpportunity": "mixed",
+            "nameBinding": "mixed",
+            "newsKeywords": [
+              [
+                "str"
+              ]
+            ],
+            "newsTradePhase": "str",
+            "newsTradePhaseLabel": "str",
+            "newsTradePhaseReason": "str",
+            "newsTradeUrgencyScore": "int",
+            "onchainTradeScore": "int",
+            "scheduledAt": "int",
+            "score": "int",
+            "source": "str",
+            "sourceAuthority": "str",
+            "sourceEvidence": {
+              "authorHandle": "str",
+              "capturedAt": "int",
+              "claimStatus": "str",
+              "publishedAt": "int",
+              "source": "str",
+              "url": "str",
+              "xCategory": "str",
+              "xCategoryLabel": "str"
+            },
+            "sourceLabel": "str",
+            "sourceType": "str",
+            "template": "str",
+            "templateName": "str",
+            "thesis": "str",
+            "timestamp": "int",
+            "title": "str",
+            "topicKey": "str",
+            "url": "str",
+            "xCategory": "str",
+            "xCategoryLabel": "str",
+            "xMemePotential": {
+              "category": "str",
+              "evaluated": "bool",
+              "label": "str",
+              "level": "str",
+              "onchainMapped": "bool",
+              "participationTerms": [],
+              "qualified": "bool",
+              "reasons": [],
+              "role": "str",
+              "score": "int",
+              "signals": [],
+              "symbolizableTerms": []
+            }
+          }
+        ],
+        "execution": {
+          "configured": "bool",
+          "liveEnabled": "bool",
+          "maxOrderUsdt": "float",
+          "missingConfiguration": [
+            [
+              "str"
+            ]
+          ],
+          "requiresConfirmation": "bool"
+        },
+        "mergedItems": [
+          {
+            "aiAnalysisStatus": "str",
+            "analysisIntakeReason": "str",
+            "assets": "mixed",
+            "authorHandle": "str",
+            "body": "str",
+            "candidateTier": "str",
+            "candidateTierLabel": "str",
+            "capturedAt": "int",
+            "confirmation": [
+              [
+                "str"
+              ]
+            ],
+            "corePropagationLogic": "str",
+            "counterConsensusProfile": "mixed",
+            "curiosityProfile": "mixed",
+            "desktopAlertKey": "str",
+            "directConfirmation": "bool",
+            "enteredAt": "int",
+            "eventEntities": "mixed",
+            "eventHeatBreakdown": {
+              "points": {
+                "bigGossip": "float",
+                "crossPlatform": "float",
+                "followupStory": "float",
+                "noveltyContrast": "float",
+                "participation": "float",
+                "symbolizability": "float",
+                "velocity": "float"
+              },
+              "raw": {
+                "bigGossip": "float",
+                "crossPlatform": "float",
+                "followupStory": "float",
+                "noveltyContrast": "float",
+                "participation": "float",
+                "symbolizability": "float",
+                "velocity": "float"
+              },
+              "score": "int",
+              "weights": {
+                "bigGossip": "float",
+                "crossPlatform": "float",
+                "followupStory": "float",
+                "noveltyContrast": "float",
+                "participation": "float",
+                "symbolizability": "float",
+                "velocity": "float"
+              }
+            },
+            "eventHeatScore": "int",
+            "eventStage": "str",
+            "eventStageLabel": "str",
+            "eventType": "str",
+            "evidence": [
+              [
+                "str"
+              ]
+            ],
+            "executionEligible": "bool",
+            "explicitCryptoMapping": "bool",
+            "firstSeenAt": "int",
+            "freshnessMinutes": "float",
+            "fullyFermented": "bool",
+            "id": "str",
+            "impliedGainPct": "float",
+            "informationSources": [
+              {
+                "authorHandle": "str",
+                "capturedAt": "int",
+                "claimStatus": "str",
+                "desktopAlertKey": "str",
+                "publishedAt": "int",
+                "source": "str",
+                "sourceLabel": "str",
+                "sourceType": "str",
+                "storyBeat": "str",
+                "timestamp": "int",
+                "title": "str",
+                "url": "str",
+                "xCategory": "str",
+                "xCategoryLabel": "str"
+              }
+            ],
+            "invalidationConditions": [
+              [
+                "str"
+              ]
+            ],
+            "isHotTopic": "bool",
+            "isNewTopic": "bool",
+            "isNewsTrade": "bool",
+            "lastSeenAt": "int",
+            "latestCatalyst": {
+              "storyBeat": "str",
+              "timestamp": "int",
+              "title": "str"
+            },
+            "marketConfirmation": "bool",
+            "memeCandidates": "mixed",
+            "memeOpportunity": "mixed",
+            "mergedDuplicateCount": "int",
+            "mergedKind": "str",
+            "nameBinding": "mixed",
+            "newsCount": "int",
+            "newsKeywords": [
+              [
+                "str"
+              ]
+            ],
+            "newsTradePhase": "str",
+            "newsTradePhaseLabel": "str",
+            "newsTradePhaseReason": "str",
+            "newsTradeUrgencyScore": "int",
+            "onchainTradeScore": "int",
+            "politicalMilitary": "bool",
+            "relatedNews": [
+              {
+                "authorHandle": "str",
+                "capturedAt": "int",
+                "claimStatus": "str",
+                "desktopAlertKey": "str",
+                "publishedAt": "int",
+                "source": "str",
+                "sourceLabel": "str",
+                "sourceType": "str",
+                "storyBeat": "str",
+                "timestamp": "int",
+                "title": "str",
+                "url": "str",
+                "xCategory": "str",
+                "xCategoryLabel": "str"
+              }
+            ],
+            "scheduledAt": "int",
+            "score": "int",
+            "securityScore": "mixed",
+            "securityStatus": "str",
+            "source": "str",
+            "sourceActive": "bool",
+            "sourceAuthority": "str",
+            "sourceCount": "int",
+            "sourceEvidence": {
+              "authorHandle": "str",
+              "capturedAt": "int",
+              "claimStatus": "str",
+              "publishedAt": "int",
+              "source": "str",
+              "url": "str",
+              "xCategory": "str",
+              "xCategoryLabel": "str"
+            },
+            "sourceLabel": "str",
+            "sourceType": "str",
+            "sources": [
+              [
+                "str"
+              ]
+            ],
+            "template": "str",
+            "templateName": "str",
+            "thesis": "str",
+            "timestamp": "int",
+            "title": "str",
+            "topicKey": "str",
+            "topicMetrics": {
+              "contentCounts": {
+                "1h": "int",
+                "24h": "int",
+                "6h": "int"
+              },
+              "contentGrowth": {
+                "oneHourVsPriorFiveHourRate": "float",
+                "sixHourVsPriorEighteenHourRate": "float"
+              },
+              "coverageNote": "str",
+              "crossPlatformScore": "float",
+              "discussionSignalCount": "int",
+              "discussionSignals": [],
+              "hasNewPlot": "bool",
+              "lowBase": "bool",
+              "platformCount": "int",
+              "platforms": [
+                [
+                  "str"
+                ]
+              ],
+              "searchSignalCount": "int",
+              "searchVolumeAvailable": "bool",
+              "storyBeats": [
+                [
+                  "str"
+                ]
+              ],
+              "velocityScore": "float"
+            },
+            "topicScore": "int",
+            "updatedAt": "int",
+            "url": "str",
+            "watchReasons": "mixed",
+            "weightBreakdown": "mixed",
+            "xCategory": "str",
+            "xCategoryLabel": "str",
+            "xMemePotential": "mixed"
+          }
+        ],
+        "newsTrades": [
+          {
+            "aiAnalysisStatus": "str",
+            "analysisIntakeReason": "str",
+            "assets": "mixed",
+            "authorHandle": "str",
+            "body": "str",
+            "candidateTier": "str",
+            "candidateTierLabel": "str",
+            "capturedAt": "int",
+            "confirmation": [
+              [
+                "str"
+              ]
+            ],
+            "corePropagationLogic": "str",
+            "counterConsensusProfile": "mixed",
+            "curiosityProfile": "mixed",
+            "desktopAlertKey": "str",
+            "directConfirmation": "bool",
+            "enteredAt": "int",
+            "eventEntities": "mixed",
+            "eventHeatBreakdown": {
+              "points": {
+                "bigGossip": "float",
+                "crossPlatform": "float",
+                "followupStory": "float",
+                "noveltyContrast": "float",
+                "participation": "float",
+                "symbolizability": "float",
+                "velocity": "float"
+              },
+              "raw": {
+                "bigGossip": "float",
+                "crossPlatform": "float",
+                "followupStory": "float",
+                "noveltyContrast": "float",
+                "participation": "float",
+                "symbolizability": "float",
+                "velocity": "float"
+              },
+              "score": "int",
+              "weights": {
+                "bigGossip": "float",
+                "crossPlatform": "float",
+                "followupStory": "float",
+                "noveltyContrast": "float",
+                "participation": "float",
+                "symbolizability": "float",
+                "velocity": "float"
+              }
+            },
+            "eventHeatScore": "int",
+            "eventStage": "str",
+            "eventStageLabel": "str",
+            "eventType": "str",
+            "evidence": [
+              [
+                "str"
+              ]
+            ],
+            "executionEligible": "bool",
+            "explicitCryptoMapping": "bool",
+            "firstSeenAt": "int",
+            "freshnessMinutes": "float",
+            "fullyFermented": "bool",
+            "id": "str",
+            "impliedGainPct": "float",
+            "informationSources": [
+              {
+                "authorHandle": "str",
+                "capturedAt": "int",
+                "claimStatus": "str",
+                "desktopAlertKey": "str",
+                "publishedAt": "int",
+                "source": "str",
+                "sourceLabel": "str",
+                "sourceType": "str",
+                "storyBeat": "str",
+                "timestamp": "int",
+                "title": "str",
+                "url": "str",
+                "xCategory": "str",
+                "xCategoryLabel": "str"
+              }
+            ],
+            "invalidationConditions": [
+              [
+                "str"
+              ]
+            ],
+            "isHotTopic": "bool",
+            "isNewTopic": "bool",
+            "isNewsTrade": "bool",
+            "lastSeenAt": "int",
+            "latestCatalyst": {
+              "storyBeat": "str",
+              "timestamp": "int",
+              "title": "str"
+            },
+            "marketConfirmation": "bool",
+            "memeCandidates": "mixed",
+            "memeOpportunity": "mixed",
+            "nameBinding": "mixed",
+            "newsCount": "int",
+            "newsKeywords": [
+              [
+                "str"
+              ]
+            ],
+            "newsTradePhase": "str",
+            "newsTradePhaseLabel": "str",
+            "newsTradePhaseReason": "str",
+            "newsTradeUrgencyScore": "int",
+            "onchainTradeScore": "int",
+            "politicalMilitary": "bool",
+            "relatedNews": [
+              {
+                "authorHandle": "str",
+                "capturedAt": "int",
+                "claimStatus": "str",
+                "desktopAlertKey": "str",
+                "publishedAt": "int",
+                "source": "str",
+                "sourceLabel": "str",
+                "sourceType": "str",
+                "storyBeat": "str",
+                "timestamp": "int",
+                "title": "str",
+                "url": "str",
+                "xCategory": "str",
+                "xCategoryLabel": "str"
+              }
+            ],
+            "scheduledAt": "int",
+            "score": "int",
+            "securityScore": "mixed",
+            "securityStatus": "str",
+            "source": "str",
+            "sourceActive": "bool",
+            "sourceAuthority": "str",
+            "sourceCount": "int",
+            "sourceEvidence": {
+              "authorHandle": "str",
+              "capturedAt": "int",
+              "claimStatus": "str",
+              "publishedAt": "int",
+              "source": "str",
+              "url": "str",
+              "xCategory": "str",
+              "xCategoryLabel": "str"
+            },
+            "sourceLabel": "str",
+            "sourceType": "str",
+            "sources": [
+              [
+                "str"
+              ]
+            ],
+            "template": "str",
+            "templateName": "str",
+            "thesis": "str",
+            "timestamp": "int",
+            "title": "str",
+            "topicKey": "str",
+            "topicMetrics": "mixed",
+            "topicScore": "int",
+            "updatedAt": "int",
+            "url": "str",
+            "watchReasons": "mixed",
+            "weightBreakdown": "mixed",
+            "xCategory": "str",
+            "xCategoryLabel": "str",
+            "xMemePotential": "mixed"
+          }
+        ],
+        "ok": "bool",
+        "summary": {
+          "assets": "int",
+          "duplicatesRemoved": "int",
+          "events": "int",
+          "globalHotspotAttemptsToday": "int",
+          "globalHotspotCandidates": "int",
+          "globalHotspotNextAllowedAt": "int",
+          "globalHotspotSources": "int",
+          "mergedItems": "int",
+          "newsTrades": "int",
+          "newsflashAnalysis": "int",
+          "onchainTrendCandidates": "int",
+          "priorityXAnalysis": "int",
+          "reverseDiscoveredSources": "int",
+          "templates": {
+            "anchor-policy": "int",
+            "counter-consensus-culture": "int",
+            "instant-repricing": "int",
+            "kol-latency": "int",
+            "listing-latency": "int",
+            "meme-catalyst": "int",
+            "project-x-meme": "int"
+          },
+          "topics": "int"
+        },
+        "templates": [
+          {
+            "description": "str",
+            "id": "str",
+            "name": "str"
+          }
+        ],
+        "updatedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "exchange-ai-narratives": {
+      "bytes": 460,
+      "contentType": "text/html",
+      "elapsedMs": 813,
+      "error": null,
+      "json": false,
+      "path": "/api/exchange-ai-narratives",
+      "shape": null,
+      "status": [
+        404
+      ]
+    },
+    "global-hotspots": {
+      "bytes": 159171,
+      "contentType": "application/json",
+      "elapsedMs": 45,
+      "error": null,
+      "json": true,
+      "path": "/api/global-hotspots",
+      "shape": {
+        "attemptsToday": "int",
+        "candidateRows": [
+          {
+            "amount": "float",
+            "chain": "str",
+            "chainLabel": "str",
+            "change24hPercent": "mixed",
+            "contractAddress": "str",
+            "eventRootEntity": "str",
+            "heat": "float",
+            "hotspotEventId": "str",
+            "liquidityUsd": "mixed",
+            "marketCapUsd": "float",
+            "name": "str",
+            "note": "str",
+            "pairCreatedAt": "int",
+            "priceChange": "mixed",
+            "priceUsd": "float",
+            "symbol": "str",
+            "tradeUrl": "str",
+            "transactions24h": "float",
+            "url": "str",
+            "venue": "str",
+            "volume24hUsd": "float"
+          }
+        ],
+        "day": "str",
+        "events": [
+          {
+            "capturedAt": "int",
+            "entityNames": [
+              [
+                "str"
+              ]
+            ],
+            "evidence": [
+              {
+                "title": "str",
+                "url": "str"
+              }
+            ],
+            "hotnessScore": "int",
+            "id": "str",
+            "memeThesis": "str",
+            "occurredAt": "int",
+            "primaryUrl": "str",
+            "searchTerms": [
+              [
+                "str"
+              ]
+            ],
+            "summary": "str",
+            "title": "str"
+          }
+        ],
+        "lastAttemptAt": "int",
+        "lastError": "str",
+        "lastSuccessAt": "int",
+        "nextAllowedAt": "int",
+        "ok": "bool",
+        "provider": "str",
+        "running": "bool",
+        "sourceRows": [
+          {
+            "body": "str",
+            "capturedAt": "int",
+            "claimStatus": "str",
+            "eventRootEntity": "str",
+            "evidence": [
+              {
+                "title": "str",
+                "url": "str"
+              }
+            ],
+            "hotnessScore": "int",
+            "id": "str",
+            "source": "str",
+            "sourceLabel": "str",
+            "sourceType": "str",
+            "symbol": "str",
+            "timestamp": "int",
+            "title": "str",
+            "url": "str"
+          }
+        ],
+        "updatedAt": "int",
+        "version": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "gmgn-hot-search": {
+      "bytes": 267433,
+      "contentType": "application/json",
+      "elapsedMs": 85,
+      "error": null,
+      "json": true,
+      "path": "/api/gmgn-hot-search",
+      "shape": {
+        "_cache": {
+          "key": "str",
+          "stale": "bool",
+          "updatedAt": "int"
+        },
+        "accent": "str",
+        "cacheStale": "bool",
+        "chainOptions": [
+          {
+            "label": "str",
+            "value": "str"
+          }
+        ],
+        "emptyMessage": "str",
+        "emptyTitle": "str",
+        "gmgnRateLimit": {
+          "active": "bool",
+          "retryAfterSeconds": "int",
+          "retryAt": "int"
+        },
+        "group": "str",
+        "id": "str",
+        "period": "str",
+        "periodBoards": [
+          {
+            "chain": "str",
+            "label": "str",
+            "period": "str",
+            "rows": "mixed",
+            "status": "str"
+          }
+        ],
+        "periodOptions": [
+          {
+            "label": "str",
+            "value": "str"
+          }
+        ],
+        "readOnly": "bool",
+        "readOnlyMode": "str",
+        "rows": [
+          {
+            "amount": "float",
+            "buys": "int",
+            "chain": "str",
+            "chainLabel": "str",
+            "change": "str",
+            "contractAddress": "str",
+            "heat": "int",
+            "holderCount": "int",
+            "icon": "str",
+            "icons": [
+              [
+                "str"
+              ]
+            ],
+            "liquidityUsd": "float",
+            "marketCapUsd": "float",
+            "name": "str",
+            "note": "str",
+            "period": "str",
+            "price": "str",
+            "rank": "int",
+            "searchHeat": "int",
+            "sells": "int",
+            "symbol": "str",
+            "tags": [
+              [
+                "str"
+              ]
+            ],
+            "transactions": "int",
+            "turnover": "str",
+            "url": "str"
+          }
+        ],
+        "sourceLabel": "str",
+        "sourceName": "str",
+        "status": "str",
+        "subtitle": "str",
+        "title": "str",
+        "updatedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "health": {
+      "bytes": 2316,
+      "contentType": "application/json",
+      "elapsedMs": 2889,
+      "error": null,
+      "json": true,
+      "path": "/api/health",
+      "shape": {
+        "checks": {
+          "database": {
+            "ok": "bool"
+          },
+          "runtimeCache": {
+            "ok": "bool",
+            "path": "str"
+          }
+        },
+        "env": "str",
+        "monitors": {
+          "desktopAlerts": "bool",
+          "newCoinLowActivityUnavailable": "int",
+          "newCoinLowActivityUnavailableExcluded": "int",
+          "newCoinLowInactiveExcluded": "int",
+          "newCoinLowInventory": "int",
+          "newCoinLowMonitorMode": "str",
+          "newCoinLowMonitorWorkers": "int",
+          "newCoinLowScanned": "int",
+          "newCoinLowStructure": "bool",
+          "priceWatch": "bool",
+          "siteAlerts": "bool",
+          "structureEventContexts": "int",
+          "structureMonitorMode": "str",
+          "structureMonitorWorkers": "int",
+          "structurePrearm": "bool",
+          "structurePrearmForecastMinutes": "float",
+          "structurePrearmIntervalSeconds": "float",
+          "structurePrearmStatus": {
+            "alerts": "int",
+            "candidateSources": {},
+            "candidates": "int",
+            "elapsedMs": "int",
+            "lastDecisions": [],
+            "lastRunAt": "int",
+            "ok": "bool",
+            "quoteFailures": "int",
+            "quotes": "int",
+            "skipReasons": {}
+          },
+          "structureSignals": "bool",
+          "structureStrategyVersion": "str",
+          "wechatAuth": "bool"
+        },
+        "ok": "bool",
+        "runtime": {
+          "activeThreads": "int",
+          "apiRefreshWorkers": "int",
+          "cacheEntries": {
+            "logos": "int",
+            "market": "int",
+            "momentum": "int",
+            "newsDiscovery": "int",
+            "newsSecurity": "int",
+            "onchainCandles": "int",
+            "onchainPools": "int"
+          },
+          "chainEcosystemWorkers": "int",
+          "entryDayTimeframeWorkers": "int",
+          "httpRequests": {
+            "active": "int",
+            "limit": "int",
+            "peak": "int"
+          },
+          "marketSourceWorkers": "int",
+          "monitorIdentityCache": {
+            "cached": "int",
+            "known": "int",
+            "limit": "int"
+          },
+          "onchainResearchIngest": {
+            "active": "bool",
+            "limit": "int",
+            "pending": "int"
+          },
+          "outboundRequests": {
+            "active": "int",
+            "limit": "int",
+            "peak": "int"
+          },
+          "sharedPools": "bool",
+          "threadGroups": {
+            "MainThread": "int",
+            "Thread-2 (site_alert_monitor_loop)": "int",
+            "Thread-6 (binance_wallet_hot_alert_monitor_loop)": "int",
+            "ThreadPoolExecutor-996": "int",
+            "api-refresh": "int",
+            "ave-chain-hot": "int",
+            "binance-ai-narrative": "int",
+            "buy-read": "int",
+            "chain-ecosystem-refresh": "int",
+            "dragon-wave-scan": "int",
+            "entry-day-timeframe": "int",
+            "exchange-ai-trench": "int",
+            "http-request": "int",
+            "jev-person-semantic": "int",
+            "market-quote": "int",
+            "market-source": "int",
+            "market-timeframe": "int",
+            "new-coin-low-scan": "int",
+            "news-trade-security": "int",
+            "newsflash-route": "int",
+            "onchain-fast": "int",
+            "trench-person-fast": "int",
+            "wallet-balance-warm": "int",
+            "x-kol-mirror": "int",
+            "x-kol-source": "int"
+          },
+          "threadStackKb": "int",
+          "timeframeWorkers": "int"
+        },
+        "service": "str",
+        "time": "int",
+        "version": "str"
+      },
+      "status": [
+        200
+      ]
+    },
+    "highlight-rankings": {
+      "bytes": 41698,
+      "contentType": "application/json",
+      "elapsedMs": 1144,
+      "error": null,
+      "json": true,
+      "path": "/api/gainers-rankings",
+      "shape": {
+        "_cache": {
+          "key": "str",
+          "stale": "bool",
+          "updatedAt": "int"
+        },
+        "sources": [
+          {
+            "accent": "str",
+            "emptyMessage": "str",
+            "emptyTitle": "str",
+            "group": "str",
+            "id": "str",
+            "rows": "mixed",
+            "sourceLabel": "str",
+            "sourceName": "str",
+            "status": "str",
+            "subtitle": "str",
+            "title": "str",
+            "updatedAt": "int"
+          }
+        ],
+        "updatedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "listing-events": {
+      "bytes": 39579,
+      "contentType": "application/json",
+      "elapsedMs": 1112,
+      "error": null,
+      "json": true,
+      "path": "/api/listing-events",
+      "shape": {
+        "_cache": {
+          "key": "str",
+          "stale": "bool",
+          "updatedAt": "int"
+        },
+        "sections": [
+          {
+            "accent": "str",
+            "emptyMessage": "str",
+            "id": "str",
+            "rows": "mixed",
+            "sourceName": "str",
+            "status": "str",
+            "subtitle": "str",
+            "title": "str",
+            "updatedAt": "int"
+          }
+        ],
+        "updatedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "market-hot": {
+      "bytes": 2238392,
+      "contentType": "application/json",
+      "elapsedMs": 2484,
+      "error": null,
+      "json": true,
+      "path": "/api/market-hot",
+      "shape": {
+        "_cache": {
+          "key": "str",
+          "stale": "bool",
+          "updatedAt": "int"
+        },
+        "smartPriority": {
+          "defaultPeriod": "str",
+          "formula": {
+            "narrative": "int"
+          },
+          "mode": "str",
+          "periods": {
+            "1h": {
+              "historySamples": "int",
+              "historyStatus": "str",
+              "period": "str",
+              "rows": [
+                {
+                  "ageMinutes": "float",
+                  "amount": "float",
+                  "binanceWalletUrl": "str",
+                  "buyIdentity": {
+                    "expiresAt": "int",
+                    "reason": "str",
+                    "source": "str",
+                    "status": "str",
+                    "target": {
+                      "address": "str",
+                      "chainId": "int",
+                      "kind": "str",
+                      "symbol": "str"
+                    }
+                  },
+                  "buys": "int",
+                  "candidateType": "str",
+                  "chain": "str",
+                  "chainLabel": "str",
+                  "change": "str",
+                  "changeNumber": "float",
+                  "confidence": "float",
+                  "contractAddress": "str",
+                  "decision": "str",
+                  "dexId": "str",
+                  "filterSignals": "mixed",
+                  "filterWarnings": "mixed",
+                  "firstSeenAt": "int",
+                  "gmgnNarrative": "str",
+                  "gmgnNarrativeSource": "str",
+                  "gmgnSourceIndex": "int",
+                  "group": "str",
+                  "heat": "float",
+                  "heatChange": "float",
+                  "holderCount": "int",
+                  "icon": "str",
+                  "icons": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "imageUrl": "str",
+                  "isCurrent": "bool",
+                  "lastSeenAt": "int",
+                  "launchFacts": "mixed",
+                  "launchStage": "str",
+                  "launchpad": "str",
+                  "liquidityUsd": "float",
+                  "marketCapUsd": "float",
+                  "metrics": "mixed",
+                  "name": "str",
+                  "narrativeContext": "mixed",
+                  "narrativeLabel": "str",
+                  "narrativeLabels": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "narrativeLevel": "str",
+                  "narrativeScore": "float",
+                  "network": "str",
+                  "newInWindow": "bool",
+                  "note": "str",
+                  "observedAt": "int",
+                  "originalBoard": "str",
+                  "originalRank": "int",
+                  "originalSource": {
+                    "accent": "str",
+                    "group": "str",
+                    "id": "str",
+                    "sourceLabel": "str",
+                    "title": "str"
+                  },
+                  "period": "str",
+                  "periodMetrics": {
+                    "1h": {
+                      "amount": "float",
+                      "change": "str",
+                      "changeValue": "float",
+                      "transactions": "int",
+                      "turnover": "str"
+                    },
+                    "24h": {
+                      "amount": "float",
+                      "change": "str",
+                      "changeValue": "float",
+                      "transactions": "int",
+                      "turnover": "str"
+                    },
+                    "4h": {
+                      "amount": "float",
+                      "change": "str",
+                      "changeValue": "float",
+                      "transactions": "int",
+                      "turnover": "str"
+                    }
+                  },
+                  "persistencePct": "int",
+                  "poolAddress": "str",
+                  "poolCreatedAt": "int",
+                  "price": "str",
+                  "priorityReasons": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "priorityScore": "float",
+                  "priorityTier": "str",
+                  "provider": "str",
+                  "providers": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "rank": "int",
+                  "rankChange": "int",
+                  "reasons": "mixed",
+                  "receivedAt": "int",
+                  "recentHeatScore": "float",
+                  "risks": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "searchHeat": "int",
+                  "selectedScore": "float",
+                  "sells": "int",
+                  "sourceAccent": "str",
+                  "sourceCount": "int",
+                  "sourceGroup": "str",
+                  "sourceId": "str",
+                  "sourceIds": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "sourceLabel": "str",
+                  "sourceLabels": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "sourceRank": "int",
+                  "sourceTitle": "str",
+                  "symbol": "str",
+                  "tags": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "tradeScore": "float",
+                  "tradeUrl": "str",
+                  "transactions": "int",
+                  "turnover": "str",
+                  "url": "str",
+                  "volume24hUsd": "float",
+                  "walletProfile": "mixed",
+                  "xOriginal": {
+                    "followers": "int",
+                    "handle": "str",
+                    "isTweet": "bool",
+                    "publishedAt": "int",
+                    "statusId": "str",
+                    "text": "str",
+                    "url": "str"
+                  }
+                }
+              ],
+              "windowSeconds": "int"
+            },
+            "24h": {
+              "historySamples": "int",
+              "historyStatus": "str",
+              "period": "str",
+              "rows": [
+                {
+                  "ageMinutes": "float",
+                  "amount": "float",
+                  "binanceWalletUrl": "str",
+                  "buyIdentity": {
+                    "expiresAt": "int",
+                    "reason": "str",
+                    "source": "str",
+                    "status": "str",
+                    "target": {
+                      "address": "str",
+                      "chainId": "int",
+                      "kind": "str",
+                      "symbol": "str"
+                    }
+                  },
+                  "buys": "int",
+                  "candidateType": "str",
+                  "chain": "str",
+                  "chainLabel": "str",
+                  "change": "str",
+                  "changeNumber": "float",
+                  "confidence": "float",
+                  "contractAddress": "str",
+                  "decision": "str",
+                  "dexId": "str",
+                  "filterSignals": "mixed",
+                  "filterWarnings": "mixed",
+                  "firstSeenAt": "int",
+                  "gmgnNarrative": "str",
+                  "gmgnNarrativeSource": "str",
+                  "gmgnSourceIndex": "int",
+                  "group": "str",
+                  "heat": "float",
+                  "heatChange": "float",
+                  "holderCount": "int",
+                  "icon": "str",
+                  "icons": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "imageUrl": "str",
+                  "isCurrent": "bool",
+                  "lastSeenAt": "int",
+                  "launchFacts": "mixed",
+                  "launchStage": "str",
+                  "launchpad": "str",
+                  "liquidityUsd": "float",
+                  "marketCapUsd": "float",
+                  "metrics": "mixed",
+                  "name": "str",
+                  "narrativeContext": "mixed",
+                  "narrativeLabel": "str",
+                  "narrativeLabels": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "narrativeLevel": "str",
+                  "narrativeScore": "float",
+                  "network": "str",
+                  "newInWindow": "bool",
+                  "note": "str",
+                  "observedAt": "int",
+                  "originalBoard": "str",
+                  "originalRank": "int",
+                  "originalSource": {
+                    "accent": "str",
+                    "group": "str",
+                    "id": "str",
+                    "sourceLabel": "str",
+                    "title": "str"
+                  },
+                  "period": "str",
+                  "persistencePct": "int",
+                  "poolAddress": "str",
+                  "poolCreatedAt": "int",
+                  "price": "str",
+                  "priorityReasons": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "priorityScore": "float",
+                  "priorityTier": "str",
+                  "provider": "str",
+                  "providers": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "rank": "int",
+                  "rankChange": "int",
+                  "reasons": "mixed",
+                  "receivedAt": "int",
+                  "recentHeatScore": "float",
+                  "risks": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "searchHeat": "int",
+                  "selectedScore": "float",
+                  "sells": "int",
+                  "sourceAccent": "str",
+                  "sourceCount": "int",
+                  "sourceGroup": "str",
+                  "sourceId": "str",
+                  "sourceIds": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "sourceLabel": "str",
+                  "sourceLabels": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "sourceRank": "int",
+                  "sourceTitle": "str",
+                  "symbol": "str",
+                  "tags": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "tradeScore": "float",
+                  "tradeUrl": "str",
+                  "transactions": "int",
+                  "turnover": "str",
+                  "url": "str",
+                  "walletProfile": "mixed",
+                  "xOriginal": {
+                    "followers": "int",
+                    "handle": "str",
+                    "isTweet": "bool",
+                    "publishedAt": "int",
+                    "statusId": "str",
+                    "text": "str",
+                    "url": "str"
+                  }
+                }
+              ],
+              "windowSeconds": "int"
+            },
+            "6h": {
+              "historySamples": "int",
+              "historyStatus": "str",
+              "period": "str",
+              "rows": [
+                {
+                  "ageMinutes": "float",
+                  "amount": "float",
+                  "binanceWalletUrl": "str",
+                  "buyIdentity": {
+                    "expiresAt": "int",
+                    "reason": "str",
+                    "source": "str",
+                    "status": "str",
+                    "target": {
+                      "address": "str",
+                      "chainId": "int",
+                      "kind": "str",
+                      "symbol": "str"
+                    }
+                  },
+                  "buys": "int",
+                  "candidateType": "str",
+                  "chain": "str",
+                  "chainLabel": "str",
+                  "change": "str",
+                  "changeNumber": "float",
+                  "confidence": "float",
+                  "contractAddress": "str",
+                  "decision": "str",
+                  "dexId": "str",
+                  "filterSignals": "mixed",
+                  "filterWarnings": "mixed",
+                  "firstSeenAt": "int",
+                  "gmgnNarrative": "str",
+                  "gmgnNarrativeSource": "str",
+                  "gmgnSourceIndex": "int",
+                  "group": "str",
+                  "heat": "float",
+                  "heatChange": "float",
+                  "holderCount": "int",
+                  "icon": "str",
+                  "icons": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "imageUrl": "str",
+                  "isCurrent": "bool",
+                  "lastSeenAt": "int",
+                  "launchFacts": "mixed",
+                  "launchStage": "str",
+                  "launchpad": "str",
+                  "liquidityUsd": "float",
+                  "marketCapUsd": "float",
+                  "metrics": "mixed",
+                  "name": "str",
+                  "narrativeContext": "mixed",
+                  "narrativeLabel": "str",
+                  "narrativeLabels": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "narrativeLevel": "str",
+                  "narrativeScore": "float",
+                  "network": "str",
+                  "newInWindow": "bool",
+                  "note": "str",
+                  "observedAt": "int",
+                  "originalBoard": "str",
+                  "originalRank": "int",
+                  "originalSource": {
+                    "accent": "str",
+                    "group": "str",
+                    "id": "str",
+                    "sourceLabel": "str",
+                    "title": "str"
+                  },
+                  "period": "str",
+                  "persistencePct": "int",
+                  "poolAddress": "str",
+                  "poolCreatedAt": "int",
+                  "price": "str",
+                  "priorityReasons": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "priorityScore": "float",
+                  "priorityTier": "str",
+                  "provider": "str",
+                  "providers": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "rank": "int",
+                  "rankChange": "int",
+                  "reasons": "mixed",
+                  "receivedAt": "int",
+                  "recentHeatScore": "float",
+                  "risks": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "searchHeat": "int",
+                  "selectedScore": "float",
+                  "sells": "int",
+                  "sourceAccent": "str",
+                  "sourceCount": "int",
+                  "sourceGroup": "str",
+                  "sourceId": "str",
+                  "sourceIds": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "sourceLabel": "str",
+                  "sourceLabels": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "sourceRank": "int",
+                  "sourceTitle": "str",
+                  "symbol": "str",
+                  "tags": [
+                    [
+                      "str"
+                    ]
+                  ],
+                  "tradeScore": "float",
+                  "tradeUrl": "str",
+                  "transactions": "int",
+                  "turnover": "str",
+                  "url": "str",
+                  "walletProfile": "mixed",
+                  "xOriginal": {
+                    "followers": "int",
+                    "handle": "str",
+                    "isTweet": "bool",
+                    "publishedAt": "int",
+                    "statusId": "str",
+                    "text": "str",
+                    "url": "str"
+                  }
+                }
+              ],
+              "windowSeconds": "int"
+            }
+          },
+          "sort": "str",
+          "updatedAt": "int"
+        },
+        "sources": [
+          {
+            "_cache": {
+              "key": "str",
+              "stale": "bool",
+              "updatedAt": "int"
+            },
+            "accent": "str",
+            "aiPolicy": "str",
+            "aiProvider": "str",
+            "cacheStale": "bool",
+            "chainBoards": [
+              {
+                "chain": "str",
+                "error": "str",
+                "label": "str",
+                "rows": [
+                  {
+                    "amount": "float",
+                    "chain": "str",
+                    "chainLabel": "str",
+                    "change": "str",
+                    "contractAddress": "str",
+                    "heat": "int",
+                    "icon": "str",
+                    "icons": [
+                      [
+                        "str"
+                      ]
+                    ],
+                    "liquidityUsd": "float",
+                    "marketCapUsd": "float",
+                    "name": "str",
+                    "note": "str",
+                    "period": "str",
+                    "periodMetrics": {
+                      "1h": {
+                        "amount": "...",
+                        "change": "...",
+                        "changeValue": "...",
+                        "transactions": "...",
+                        "turnover": "..."
+                      },
+                      "24h": {
+                        "amount": "...",
+                        "change": "...",
+                        "changeValue": "...",
+                        "transactions": "...",
+                        "turnover": "..."
+                      },
+                      "4h": {
+                        "amount": "...",
+                        "change": "...",
+                        "changeValue": "...",
+                        "transactions": "...",
+                        "turnover": "..."
+                      }
+                    },
+                    "price": "str",
+                    "rank": "int",
+                    "symbol": "str",
+                    "tags": [
+                      [
+                        "str"
+                      ]
+                    ],
+                    "transactions": "int",
+                    "turnover": "str",
+                    "url": "str",
+                    "volume24hUsd": "float"
+                  }
+                ],
+                "status": "str"
+              }
+            ],
+            "chainFilters": {
+              "arc": {
+                "excludeLaunchpads": [
+                  [
+                    "str"
+                  ]
+                ],
+                "imageNotDuplicate": "bool",
+                "minMarketCapUsd": "float",
+                "notHoneypot": "bool",
+                "requireSocial": "bool"
+              },
+              "bsc": {
+                "excludeLaunchpads": [
+                  [
+                    "str"
+                  ]
+                ],
+                "imageNotDuplicate": "bool",
+                "minMarketCapUsd": "float",
+                "requireSocial": "bool"
+              },
+              "eth": {
+                "imageNotDuplicate": "bool",
+                "minMarketCapUsd": "float",
+                "requireSocial": "bool"
+              },
+              "robinhood": {
+                "excludeLaunchpads": [
+                  [
+                    "str"
+                  ]
+                ],
+                "imageNotDuplicate": "bool",
+                "minMarketCapUsd": "float",
+                "notHoneypot": "bool",
+                "requireSocial": "bool"
+              },
+              "solana": {
+                "excludeLaunchpads": [
+                  [
+                    "str"
+                  ]
+                ],
+                "imageNotDuplicate": "bool",
+                "minMarketCapUsd": "float",
+                "requireSocial": "bool"
+              }
+            },
+            "chainOptions": [
+              {
+                "label": "str",
+                "value": "str"
+              }
+            ],
+            "currentCount": "int",
+            "currentFetchedCount": "int",
+            "currentRawCount": "int",
+            "emptyMessage": "str",
+            "emptyTitle": "str",
+            "excludeFromTotal": "bool",
+            "gmgnRateLimit": {
+              "active": "bool",
+              "retryAfterSeconds": "int",
+              "retryAt": "int"
+            },
+            "group": "str",
+            "historyCount": "int",
+            "historyScope": "str",
+            "historyUpdatedAt": "int",
+            "id": "str",
+            "incrementalResearchError": "str",
+            "incrementalResearchIngested": "int",
+            "live": "bool",
+            "period": "str",
+            "periodBoards": [
+              {
+                "chain": "str",
+                "label": "str",
+                "period": "str",
+                "rows": "mixed",
+                "status": "str"
+              }
+            ],
+            "periodLabel": "str",
+            "periodOptions": [
+              {
+                "label": "str",
+                "value": "str"
+              }
+            ],
+            "rateLimited": "bool",
+            "readOnly": "bool",
+            "readOnlyMode": "str",
+            "refreshIntervalSeconds": "int",
+            "retryAfterSeconds": "int",
+            "rows": "mixed",
+            "scrollableHistory": "bool",
+            "sourceLabel": "str",
+            "sourceName": "str",
+            "sourceOnline": "int",
+            "sourceTotal": "int",
+            "status": "str",
+            "subtitle": "str",
+            "summaryRows": [
+              {
+                "ageMinutes": "float",
+                "amount": "float",
+                "binanceWalletUrl": "str",
+                "buyIdentity": {
+                  "expiresAt": "int",
+                  "reason": "str",
+                  "source": "str",
+                  "status": "str",
+                  "target": {
+                    "address": "str",
+                    "chainId": "int",
+                    "kind": "str",
+                    "symbol": "str"
+                  }
+                },
+                "candidateType": "str",
+                "chain": "str",
+                "chainLabel": "str",
+                "change": "str",
+                "confidence": "float",
+                "contractAddress": "str",
+                "decision": "str",
+                "dexId": "str",
+                "filterSignals": "mixed",
+                "filterWarnings": "mixed",
+                "firstSeenAt": "int",
+                "gmgnNarrative": "str",
+                "gmgnNarrativeSource": "str",
+                "gmgnSourceIndex": "int",
+                "heat": "int",
+                "icon": "str",
+                "imageUrl": "str",
+                "isCurrent": "bool",
+                "lastSeenAt": "int",
+                "launchFacts": "mixed",
+                "launchStage": "str",
+                "launchpad": "str",
+                "liquidityUsd": "float",
+                "marketCapUsd": "float",
+                "metrics": "mixed",
+                "name": "str",
+                "narrativeContext": "mixed",
+                "network": "str",
+                "note": "str",
+                "observedAt": "int",
+                "poolAddress": "str",
+                "poolCreatedAt": "int",
+                "price": "str",
+                "provider": "str",
+                "providers": [
+                  [
+                    "str"
+                  ]
+                ],
+                "rank": "int",
+                "reasons": [
+                  [
+                    "str"
+                  ]
+                ],
+                "receivedAt": "int",
+                "risks": [
+                  [
+                    "str"
+                  ]
+                ],
+                "selectedScore": "float",
+                "symbol": "str",
+                "tradeUrl": "str",
+                "transactions": "int",
+                "turnover": "str",
+                "url": "str",
+                "walletProfile": "mixed",
+                "xOriginal": {
+                  "followers": "int",
+                  "handle": "str",
+                  "isTweet": "bool",
+                  "publishedAt": "int",
+                  "statusId": "str",
+                  "text": "str",
+                  "url": "str"
+                }
+              }
+            ],
+            "title": "str",
+            "updatedAt": "int",
+            "visibleRows": "int"
+          }
+        ],
+        "updatedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "new-coin-low-structures": {
+      "bytes": 15538,
+      "contentType": "application/json",
+      "elapsedMs": 900,
+      "error": null,
+      "json": true,
+      "path": "/api/new-coin-low-structures",
+      "shape": {
+        "items": [
+          {
+            "adaptiveContext": {
+              "buyIdentity": {
+                "reason": "str",
+                "status": "str",
+                "target": "null"
+              },
+              "label": "str",
+              "mode": "str",
+              "observedAt": "int",
+              "sourceKind": "str",
+              "sourceName": "str",
+              "symbol": "str"
+            },
+            "alertHintCount": "int",
+            "alertHints": [],
+            "broadcastEligibility": {
+              "allowedIntervals": [
+                [
+                  "str"
+                ]
+              ],
+              "capitalConfirmed": "bool",
+              "deepDrawdown": "bool",
+              "drawdownPct": "float",
+              "eligible": "bool",
+              "eventContext": "null",
+              "eventDrivenReset": "bool",
+              "eventPriceResponse": "bool",
+              "explicitMainWave": "bool",
+              "extremeHeat": "bool",
+              "heat": "int",
+              "historyAgeDays": "float",
+              "hotRank": "null",
+              "marketRegimeReset": "bool",
+              "newCoin": "bool",
+              "officialNewContractWindow": "bool",
+              "reason": "str",
+              "recentMainWave": "bool",
+              "regimeResetScore": "int",
+              "repricing": {
+                "qualified": "bool",
+                "reason": "str"
+              }
+            },
+            "buyIdentity": {
+              "reason": "str",
+              "status": "str",
+              "target": "null"
+            },
+            "chain": "str",
+            "chainLabel": "str",
+            "checkedAt": "int",
+            "contractAddress": "str",
+            "contractSelectionEvidence": {},
+            "contractSelectionReason": "str",
+            "contractSelectionSource": "str",
+            "currentPrice": "float",
+            "error": "str",
+            "frames": [
+              {
+                "alertHint": "null",
+                "confidence": "int",
+                "key": "str",
+                "label": "str",
+                "pattern": "str",
+                "pending": "null",
+                "resistance": "null",
+                "signal": "null",
+                "stage": "str",
+                "summary": "str",
+                "support": "null"
+              }
+            ],
+            "icon": "str",
+            "lowPositionContext": {
+              "ageDays": "float",
+              "drawdownPct": "float",
+              "listedAt": "int",
+              "qualified": "bool",
+              "rangePositionPct": "float",
+              "reason": "str",
+              "recentRangePct": "float",
+              "risingLow": "bool"
+            },
+            "marketActivity": {
+              "active": "bool",
+              "ageDays": "float",
+              "reason": "str",
+              "source": "str",
+              "status": "str",
+              "thresholdUsd": "float",
+              "turnover24hUsd": "float"
+            },
+            "monitorPool": "str",
+            "monitorPoolEnteredAt": "int",
+            "name": "str",
+            "newCoinFirstListedAt": "int",
+            "newCoinFirstSource": "str",
+            "newCoinListedAt": "int",
+            "newCoinListingHistory": [
+              {
+                "listedAt": "int",
+                "pair": "str",
+                "source": "str"
+              }
+            ],
+            "newCoinSource": "str",
+            "newCoinSources": [
+              [
+                "str"
+              ]
+            ],
+            "personalXMentionedAt": "int",
+            "personalXPriority": "bool",
+            "provider": "str",
+            "signalCount": "int",
+            "signals": [],
+            "strategy": "str",
+            "strategyVersion": "str",
+            "structure1mEnabled": "bool",
+            "structure1mLabel": "str",
+            "structure1mMode": "str",
+            "structure1mOverride": "int",
+            "structureIntervalOverrides": {},
+            "structureIntervalStates": {
+              "1h": {
+                "enabled": "bool",
+                "interval": "str",
+                "intervalLabel": "str",
+                "label": "str",
+                "mode": "str",
+                "override": "int"
+              },
+              "4h": {
+                "enabled": "bool",
+                "interval": "str",
+                "intervalLabel": "str",
+                "label": "str",
+                "mode": "str",
+                "override": "int"
+              }
+            },
+            "structureMembershipSources": [],
+            "symbol": "str",
+            "timeframeProviders": {
+              "1d": "str",
+              "1h": "str",
+              "4h": "str"
+            },
+            "wallet4hFirstSeenAt": "int",
+            "wallet4hLastSeenAt": "int"
+          }
+        ],
+        "ok": "bool",
+        "summary": {
+          "activityGraceDays": "float",
+          "activityThresholdUsd": "float",
+          "activityUnavailable": "int",
+          "activityUnavailableExcluded": "int",
+          "activityUnavailableMaxAgeDays": "float",
+          "candidates": "int",
+          "inactiveExcluded": "int",
+          "inventory": "int",
+          "monitorMode": "str",
+          "scanned": "int"
+        },
+        "updatedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "new-coin-rankings": {
+      "bytes": 571062,
+      "contentType": "application/json",
+      "elapsedMs": 646,
+      "error": null,
+      "json": true,
+      "path": "/api/new-coin-rankings",
+      "shape": {
+        "_cache": {
+          "key": "str",
+          "stale": "bool",
+          "updatedAt": "int"
+        },
+        "sections": [
+          {
+            "accent": "str",
+            "emptyMessage": "str",
+            "emptyTitle": "str",
+            "group": "str",
+            "id": "str",
+            "listingInventory": [
+              {
+                "asset": "str",
+                "listedAt": "int"
+              }
+            ],
+            "listingInventoryComplete": "bool",
+            "rows": "mixed",
+            "sourceLabel": "str",
+            "sourceName": "str",
+            "status": "str",
+            "subtitle": "str",
+            "title": "str",
+            "updatedAt": "int"
+          }
+        ],
+        "updatedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "newsflash": {
+      "bytes": 77197,
+      "contentType": "application/json",
+      "elapsedMs": 371,
+      "error": null,
+      "json": true,
+      "path": "/api/newsflash",
+      "shape": {
+        "_cache": {
+          "key": "str",
+          "stale": "bool",
+          "updatedAt": "int"
+        },
+        "deduplicatedCount": "int",
+        "items": [
+          {
+            "add_time": "int",
+            "content": "str",
+            "duplicateCount": "int",
+            "explanationEligible": "bool",
+            "explanationKey": "str",
+            "explanationReason": "str",
+            "explanationTitle": "str",
+            "id": "str",
+            "image": "str",
+            "links": "mixed",
+            "source": "str",
+            "sourceId": "str",
+            "sourceLabel": "str",
+            "sourcePriority": "int",
+            "sources": [
+              {
+                "id": "str",
+                "label": "str",
+                "name": "str",
+                "url": "str"
+              }
+            ],
+            "title": "str",
+            "url": "str"
+          }
+        ],
+        "rawCount": "int",
+        "semanticDeduplicatedCount": "int",
+        "sourceCount": "int",
+        "sources": [
+          {
+            "count": "int",
+            "id": "str",
+            "name": "str",
+            "status": "str"
+          }
+        ],
+        "updatedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "onchain-research-mode": {
+      "bytes": 301,
+      "contentType": "application/json",
+      "elapsedMs": 726,
+      "error": null,
+      "json": true,
+      "path": "/api/onchain-research-mode",
+      "shape": {
+        "description": "str",
+        "label": "str",
+        "mode": "str",
+        "ok": "bool",
+        "providerLabel": "str",
+        "updatedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "onchain-trenches": {
+      "bytes": 99338,
+      "contentType": "application/json",
+      "elapsedMs": 7491,
+      "error": null,
+      "json": true,
+      "path": "/api/onchain-trenches",
+      "shape": {
+        "aiAnalysisProvider": "str",
+        "aiAnalysisStatus": "str",
+        "aiCoverage": {
+          "pending": "int",
+          "ready": "int",
+          "total": "int"
+        },
+        "aiEvidenceScope": "str",
+        "aiRequestPolicy": "str",
+        "cooldownUntil": "int",
+        "counts": {
+          "binance": "int",
+          "gmgn": "int"
+        },
+        "errors": [],
+        "filters": {
+          "network": "str",
+          "personalGmgnPresetApplied": "bool",
+          "query": "str",
+          "source": "str"
+        },
+        "gmgnApi": {
+          "authMode": "str",
+          "configured": "bool",
+          "dedicatedEgressConfigured": "bool",
+          "personalKeyUsed": "bool",
+          "source": "str",
+          "transport": "str"
+        },
+        "items": [
+          {
+            "ageMinutes": "float",
+            "aiAnalysisProvider": "str",
+            "aiAnalysisStatus": "str",
+            "binanceWalletUrl": "str",
+            "buyIdentity": "mixed",
+            "candidateType": "str",
+            "confidence": "int",
+            "contractAddress": "str",
+            "decision": "str",
+            "dexId": "str",
+            "filterSignals": "mixed",
+            "filterWarnings": "mixed",
+            "firstSeenAt": "int",
+            "gmgnNarrative": "str",
+            "gmgnNarrativeSource": "str",
+            "gmgnSourceIndex": "int",
+            "imageUrl": "str",
+            "launchFacts": "mixed",
+            "launchStage": "str",
+            "launchpad": "str",
+            "memeScore": "float",
+            "metrics": "mixed",
+            "name": "str",
+            "narrativeContext": "mixed",
+            "network": "str",
+            "observedAt": "int",
+            "poolAddress": "str",
+            "poolCreatedAt": "int",
+            "projectScore": "float",
+            "provider": "str",
+            "providers": [
+              [
+                "str"
+              ]
+            ],
+            "reasons": "mixed",
+            "risks": [
+              [
+                "str"
+              ]
+            ],
+            "scoreVersion": "str",
+            "selectedScore": "float",
+            "symbol": "str",
+            "tradeUrl": "str",
+            "trenchSources": [
+              [
+                "str"
+              ]
+            ],
+            "walletProfile": "mixed",
+            "xOriginal": {
+              "followers": "int",
+              "handle": "str",
+              "isTweet": "bool",
+              "publishedAt": "int",
+              "statusId": "str",
+              "text": "str",
+              "url": "str"
+            }
+          }
+        ],
+        "live": "bool",
+        "networks": [
+          [
+            "str"
+          ]
+        ],
+        "ok": "bool",
+        "page": "int",
+        "pageSize": "int",
+        "pages": "int",
+        "rateLimited": "bool",
+        "retryAfterSeconds": "int",
+        "sourceStatus": {
+          "arc/gmgn-trenches": "str",
+          "bsc/gmgn-trenches": "str",
+          "eth/gmgn-trenches": "str",
+          "robinhood/gmgn-trenches": "str",
+          "solana/gmgn-trenches": "str"
+        },
+        "stage": "str",
+        "total": "int",
+        "unfilteredTotal": "int",
+        "updatedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "personal-x-monitor": {
+      "bytes": 11660,
+      "contentType": "application/json",
+      "elapsedMs": 8823,
+      "error": null,
+      "json": true,
+      "path": "/api/personal-x-monitor",
+      "shape": {
+        "account": {
+          "avatar": "str",
+          "displayName": "str",
+          "handle": "str",
+          "id": "str",
+          "provider": "str",
+          "status": "str"
+        },
+        "cached": "bool",
+        "error": "str",
+        "historyRestored": "bool",
+        "items": [
+          {
+            "avatar": "str",
+            "entryType": "str",
+            "fullText": "str",
+            "handle": "str",
+            "id": "str",
+            "matchedKeywords": [],
+            "metrics": {
+              "like": "int",
+              "quote": "int",
+              "reply": "int",
+              "repost": "int",
+              "view": "int"
+            },
+            "provider": "str",
+            "publishedAt": "int",
+            "quote": {},
+            "sourceId": "str",
+            "sourceName": "str",
+            "text": "str",
+            "title": "str",
+            "tweetId": "str",
+            "url": "str"
+          }
+        ],
+        "message": "str",
+        "officialApiCostGuard": {
+          "blocked": "bool",
+          "date": "str",
+          "endpoints": {
+            "filtered-stream-connect": "int",
+            "filtered-stream-rules-list": "int"
+          },
+          "estimatedUsd": "float",
+          "hardDailyBudgetUsd": "float",
+          "postReadLimit": "int",
+          "postReads": "int",
+          "remainingBudgetUsd": "float",
+          "remainingPostReads": "int",
+          "remainingRequests": "int",
+          "requestCount": "int",
+          "requestLimit": "int",
+          "userReads": "int"
+        },
+        "ok": "bool",
+        "pending": "bool",
+        "realtime": "bool",
+        "sources": [
+          {
+            "avatar": "str",
+            "category": "str",
+            "createdAt": "int",
+            "displayName": "str",
+            "enabled": "bool",
+            "feedUrl": "str",
+            "feedUrls": [
+              [
+                "str"
+              ]
+            ],
+            "fetchLimit": "int",
+            "handle": "str",
+            "id": "str",
+            "itemsReturned": "int",
+            "keywords": [],
+            "lastCheckAt": "int",
+            "lastOkAt": "int",
+            "limited": "bool",
+            "priority": "bool",
+            "provider": "str",
+            "status": "str"
+          }
+        ],
+        "stale": "bool",
+        "summary": {
+          "connected": "bool",
+          "historyRestored": "bool",
+          "lastPublishedAt": "int",
+          "posts": "int",
+          "tacticalSignals": "int",
+          "transport": "str"
+        },
+        "tacticalSignalTypes": [
+          {
+            "key": "str",
+            "label": "str"
+          }
+        ],
+        "tacticalSignals": [],
+        "transport": "str",
+        "updatedAt": "int",
+        "upstreamMode": "str"
+      },
+      "status": [
+        200
+      ]
+    },
+    "price-structures": {
+      "bytes": 248698,
+      "contentType": "application/json",
+      "elapsedMs": 520,
+      "error": null,
+      "json": true,
+      "path": "/api/price-structures",
+      "shape": {
+        "items": [
+          {
+            "adaptiveContext": "mixed",
+            "alertHintCount": "int",
+            "alertHints": [],
+            "broadcastEligibility": "mixed",
+            "buyIdentity": "mixed",
+            "chain": "str",
+            "chainLabel": "str",
+            "checkedAt": "int",
+            "contractAddress": "str",
+            "contractSelectionEvidence": "mixed",
+            "contractSelectionReason": "str",
+            "contractSelectionSource": "str",
+            "currentPrice": "float",
+            "error": "str",
+            "frames": "mixed",
+            "heat": "float",
+            "hotRank": "int",
+            "icon": "str",
+            "lowPositionContext": {},
+            "marketActivity": "mixed",
+            "monitorPool": "str",
+            "monitorPoolEnteredAt": "int",
+            "name": "str",
+            "newCoinFirstListedAt": "int",
+            "newCoinFirstSource": "str",
+            "newCoinListedAt": "int",
+            "newCoinListingHistory": [],
+            "newCoinSource": "str",
+            "newCoinSources": [],
+            "newContractListedAt": "int",
+            "newContractPriority": "bool",
+            "newContractSource": "str",
+            "personalXMentionedAt": "int",
+            "personalXPriority": "bool",
+            "provider": "str",
+            "signalCount": "int",
+            "signals": [],
+            "strategy": "str",
+            "strategyVersion": "str",
+            "structure1mEnabled": "bool",
+            "structure1mLabel": "str",
+            "structure1mMode": "str",
+            "structure1mOverride": "int",
+            "structureIntervalOverrides": {},
+            "structureIntervalStates": {
+              "15m": {
+                "enabled": "bool",
+                "interval": "str",
+                "intervalLabel": "str",
+                "label": "str",
+                "mode": "str",
+                "override": "int"
+              },
+              "1d": {
+                "enabled": "bool",
+                "interval": "str",
+                "intervalLabel": "str",
+                "label": "str",
+                "mode": "str",
+                "override": "int"
+              },
+              "1h": {
+                "enabled": "bool",
+                "interval": "str",
+                "intervalLabel": "str",
+                "label": "str",
+                "mode": "str",
+                "override": "int"
+              },
+              "1m": {
+                "enabled": "bool",
+                "interval": "str",
+                "intervalLabel": "str",
+                "label": "str",
+                "mode": "str",
+                "override": "int"
+              },
+              "4h": {
+                "enabled": "bool",
+                "interval": "str",
+                "intervalLabel": "str",
+                "label": "str",
+                "mode": "str",
+                "override": "int"
+              },
+              "5m": {
+                "enabled": "bool",
+                "interval": "str",
+                "intervalLabel": "str",
+                "label": "str",
+                "mode": "str",
+                "override": "int"
+              }
+            },
+            "structureMembershipSources": [
+              [
+                "str"
+              ]
+            ],
+            "symbol": "str",
+            "timeframeProviders": {
+              "15m": "str",
+              "1d": "str",
+              "1h": "str",
+              "1m": "str",
+              "4h": "str",
+              "5m": "str"
+            },
+            "wallet4hFirstSeenAt": "int",
+            "wallet4hLastSeenAt": "int",
+            "walletHotRank": "int"
+          }
+        ],
+        "ok": "bool",
+        "summary": {
+          "activityThresholdUsd": "float",
+          "alerts": "int",
+          "available": "int",
+          "inactiveExcluded": "int",
+          "monitorMode": "str",
+          "signals": "int",
+          "strategy": "str",
+          "timeframes": "int",
+          "total": "int"
+        },
+        "updatedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "price-watch": {
+      "bytes": 174119,
+      "contentType": "application/json",
+      "elapsedMs": 2598,
+      "error": null,
+      "json": true,
+      "path": "/api/price-watch",
+      "shape": {
+        "items": [
+          {
+            "aveHot": "bool",
+            "aveHotFirstSeenAt": "int",
+            "aveHotLastSeenAt": "int",
+            "aveHotRank": "int",
+            "binanceFuturesGainersLastSeenAt": "int",
+            "binanceFuturesGainersRank": "int",
+            "binanceGainersLastSeenAt": "int",
+            "binanceGainersRank": "int",
+            "binanceWalletHot": "bool",
+            "binanceWalletHotFirstSeenAt": "int",
+            "binanceWalletHotLastSeenAt": "int",
+            "binanceWalletHotRank": "int",
+            "buyIdentity": "mixed",
+            "chain": "str",
+            "chainLabel": "str",
+            "confirmable": "bool",
+            "contractAddress": "str",
+            "currentPrice": "float",
+            "deadAt": "int",
+            "deadReason": "str",
+            "distancePct": "float",
+            "error": "str",
+            "expiresAt": "int",
+            "fibCandidate": "bool",
+            "fibDistance05Pct": "mixed",
+            "fibDistance0618Pct": "mixed",
+            "fibImpulseGainPct": "mixed",
+            "fibLaunchAt": "int",
+            "fibLaunchLow": "mixed",
+            "fibLevel05": "mixed",
+            "fibLevel0618": "mixed",
+            "fibStatus": "str",
+            "fibSwingHigh": "mixed",
+            "fibSwingHighAt": "int",
+            "firstSeenAt": "int",
+            "firstValidConfirmedAt": "int",
+            "firstValidDistancePct": "null",
+            "firstValidEpisode": "int",
+            "firstValidPrice": "null",
+            "firstValidProvider": "str",
+            "firstValidReferenceHigh": "null",
+            "gainersExpiresAt": "int",
+            "gainersFirstSeenAt": "int",
+            "gainersPriority": "bool",
+            "hasConfirmedFirst": "bool",
+            "icon": "str",
+            "isConfirmedEpisode": "bool",
+            "isFirstCandidate": "bool",
+            "isLaterEpisode": "bool",
+            "lastCheckedAt": "int",
+            "lastQuoteSuccessAt": "int",
+            "lastSeenAt": "int",
+            "latestAlertAt": "int",
+            "latestAlertEpisode": "int",
+            "mainWaveQualified": "bool",
+            "mainWaveReason": "str",
+            "manual": "bool",
+            "marketActivity": "mixed",
+            "name": "str",
+            "newContract1mActive": "bool",
+            "newContract1mExpiresAt": "int",
+            "newContractListedAt": "int",
+            "newContractPair": "str",
+            "newContractPriority": "bool",
+            "newContractSource": "str",
+            "okxGainersLastSeenAt": "int",
+            "okxGainersRank": "int",
+            "opportunityActive": "bool",
+            "opportunityFirstSeenAt": "int",
+            "opportunityLastSeenAt": "int",
+            "opportunityManualRemovedAt": "int",
+            "opportunitySource": "str",
+            "opportunitySources": "mixed",
+            "origin": "str",
+            "oversoldAlertEpisode": "int",
+            "oversoldCandidate": "bool",
+            "oversoldDistancePct": "mixed",
+            "oversoldDrawdownPct": "float",
+            "oversoldLastAlertAt": "int",
+            "oversoldRangeHigh": "mixed",
+            "oversoldRangeLow": "float",
+            "oversoldStatus": "str",
+            "personalXMentionedAt": "int",
+            "personalXPriority": "bool",
+            "personalXSourceName": "str",
+            "personalXSourceText": "str",
+            "priorHighAbsentAt": "int",
+            "priorHighEnabled": "bool",
+            "priorHighExcludedAt": "int",
+            "provider": "str",
+            "quoteFailureStreak": "int",
+            "setupType": "str",
+            "signalLabel": "str",
+            "stageHighLabel": "str",
+            "status": "str",
+            "structure1mOverride": "int",
+            "structureHigh": "mixed",
+            "structureIntervalOverrides": {},
+            "structureLow": "mixed",
+            "symbol": "str",
+            "tradeUrl": "str",
+            "weekHigh": "float"
+          }
+        ],
+        "monitorActive": "bool",
+        "ok": "bool",
+        "stale": "bool",
+        "summary": {
+          "activityThresholdUsd": "float",
+          "activityUnavailable": "int",
+          "auto": "int",
+          "ave": "int",
+          "binanceWallet": "int",
+          "fibMinImpulseGainPct": "float",
+          "fibThresholdPct": "float",
+          "gainers": "int",
+          "gainersPromotionDays": "int",
+          "inactiveExcluded": "int",
+          "limit": "null",
+          "manual": "int",
+          "near": "int",
+          "newContract": "int",
+          "opportunity": "int",
+          "oversold": "int",
+          "oversoldDrawdownPct": "float",
+          "oversoldNear": "int",
+          "oversoldThresholdPct": "float",
+          "personalX": "int",
+          "priorHighAuto": "int",
+          "priorHighAve": "int",
+          "priorHighBinanceWallet": "int",
+          "priorHighExcluded": "int",
+          "priorHighGainers": "int",
+          "priorHighManual": "int",
+          "priorHighNewContract": "int",
+          "priorHighPersonalX": "int",
+          "priorHighTotal": "int",
+          "retentionDays": "int",
+          "thresholdPct": "float",
+          "total": "int",
+          "unlimited": "bool",
+          "windowDays": "int"
+        },
+        "updatedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "rotation-map": {
+      "bytes": 101991,
+      "contentType": "application/json",
+      "elapsedMs": 950,
+      "error": null,
+      "json": true,
+      "path": "/api/rotation-map",
+      "shape": {
+        "_cache": {
+          "key": "str",
+          "stale": "bool",
+          "updatedAt": "int"
+        },
+        "maps": [
+          {
+            "candidates": "mixed",
+            "chain": "str",
+            "disclaimer": "str",
+            "family": "str",
+            "familyLabels": [
+              [
+                "str"
+              ]
+            ],
+            "familyMembers": [
+              {
+                "buyIdentity": {
+                  "reason": "str",
+                  "status": "str",
+                  "target": "null"
+                },
+                "exchange": "str",
+                "familyRole": "str",
+                "icon": "str",
+                "name": "str",
+                "symbol": "str",
+                "tradable": "bool"
+              }
+            ],
+            "id": "str",
+            "leader": "mixed",
+            "mappingStatus": "str",
+            "themes": [
+              [
+                "str"
+              ]
+            ]
+          }
+        ],
+        "ok": "bool",
+        "summary": {
+          "aiProvider": "str",
+          "aiStatus": "str",
+          "aiUpdatedAt": "int",
+          "analyzing": "int",
+          "candidates": "int",
+          "leaderScanned": "int",
+          "leaders": "int",
+          "mapped": "int",
+          "qualified": "int",
+          "semanticRows": "int",
+          "thresholdPct": "float"
+        },
+        "updatedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "rss-items": {
+      "bytes": 111,
+      "contentType": "application/json",
+      "elapsedMs": 24116,
+      "error": null,
+      "json": true,
+      "path": "/api/rss-items",
+      "shape": {
+        "authenticated": "bool",
+        "exists": "bool",
+        "items": [],
+        "ok": "bool",
+        "shared": "bool",
+        "updatedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "rss-sources": {
+      "bytes": 17536,
+      "contentType": "application/json",
+      "elapsedMs": 32037,
+      "error": null,
+      "json": true,
+      "path": "/api/rss-sources",
+      "shape": {
+        "authenticated": "bool",
+        "exists": "bool",
+        "ok": "bool",
+        "shared": "bool",
+        "sources": [
+          {
+            "cover": "str",
+            "createdAt": "int",
+            "description": "str",
+            "etag": "str",
+            "feedUrl": "str",
+            "id": "str",
+            "lastFetchedAt": "int",
+            "lastModified": "str",
+            "lastNewCount": "int",
+            "lastSkippedExisting": "int",
+            "mpId": "str",
+            "platform": "str",
+            "query": "str",
+            "seedUrl": "str",
+            "siteUrl": "str",
+            "title": "str",
+            "type": "str"
+          }
+        ],
+        "updatedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "self-optimization-status": {
+      "bytes": 35370,
+      "contentType": "application/json",
+      "elapsedMs": 143,
+      "error": null,
+      "json": true,
+      "path": "/api/self-optimization-status",
+      "shape": {
+        "active": "bool",
+        "intervalSeconds": "int",
+        "job": {
+          "error": "str",
+          "finishedAt": "int",
+          "id": "str",
+          "status": "str",
+          "suggestionId": "str"
+        },
+        "lastCheckStatus": "str",
+        "lastCheckedAt": "int",
+        "lastError": "str",
+        "ok": "bool",
+        "suggestions": [
+          {
+            "actionable": "bool",
+            "benefit": "str",
+            "category": "str",
+            "confidence": "int",
+            "confirmedAt": "int",
+            "createdAt": "int",
+            "evidence": [
+              [
+                "str"
+              ]
+            ],
+            "fingerprint": "str",
+            "id": "str",
+            "improvement": "str",
+            "priority": "str",
+            "problem": "str",
+            "scope": "str",
+            "status": "str",
+            "title": "str"
+          }
+        ]
+      },
+      "status": [
+        200
+      ]
+    },
+    "service-liveness": {
+      "bytes": 584,
+      "contentType": "application/json",
+      "elapsedMs": 147,
+      "error": null,
+      "json": true,
+      "path": "/api/service-liveness",
+      "shape": {
+        "aiStartup": {
+          "attemptedAt": "int",
+          "completedAt": "int",
+          "error": "str",
+          "provider": "str",
+          "requeued": "int",
+          "status": "str"
+        },
+        "networkRoute": {
+          "checkedAt": "int",
+          "generation": "int",
+          "healthy": "bool",
+          "mode": "str",
+          "reachableTargets": "int",
+          "reason": "str",
+          "route": "str",
+          "started": "bool",
+          "targetCount": "int"
+        },
+        "ok": "bool",
+        "pid": "int",
+        "service": "str"
+      },
+      "status": [
+        200
+      ]
+    },
+    "site-alert-monitor-status": {
+      "bytes": 56,
+      "contentType": "application/json",
+      "elapsedMs": 416,
+      "error": null,
+      "json": true,
+      "path": "/api/site-alert-monitor-status",
+      "shape": {
+        "active": "bool",
+        "ok": "bool",
+        "startedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "smart-money-monitor": {
+      "bytes": 143633,
+      "contentType": "application/json",
+      "elapsedMs": 3802,
+      "error": null,
+      "json": true,
+      "path": "/api/smart-money-monitor",
+      "shape": {
+        "events": [
+          {
+            "alertedAt": "int",
+            "blockRef": "str",
+            "buyIdentity": "mixed",
+            "chain": "str",
+            "chainLabel": "str",
+            "details": {
+              "classification": "str",
+              "readOnly": "bool"
+            },
+            "eventKey": "str",
+            "id": "int",
+            "observedAt": "int",
+            "paymentAmount": "float",
+            "paymentAsset": "str",
+            "paymentUsd": "float",
+            "popupEligible": "bool",
+            "priceUsd": "float",
+            "symbol": "str",
+            "tokenAddress": "str",
+            "tokenAmount": "float",
+            "transactionHash": "str",
+            "transactionUrl": "str",
+            "walletAddress": "str",
+            "walletNickname": "str"
+          }
+        ],
+        "health": [
+          {
+            "chain": "str",
+            "chainLabel": "str",
+            "cursor_value": "str",
+            "last_checked_at": "int",
+            "last_ok_at": "int",
+            "message": "str",
+            "status": "str"
+          }
+        ],
+        "ok": "bool",
+        "summary": {
+          "alertThresholdUsd": "float",
+          "enabledWallets": "int",
+          "events": "int",
+          "readOnly": "bool",
+          "running": "bool",
+          "todayEligibleBuys": "int",
+          "wallets": "int"
+        },
+        "supportedChains": [
+          {
+            "id": "str",
+            "label": "str",
+            "vmType": "str"
+          }
+        ],
+        "updatedAt": "int",
+        "wallets": [
+          {
+            "address": "str",
+            "alertThresholdUsd": "float",
+            "chain": "str",
+            "chainLabel": "str",
+            "createdAt": "int",
+            "enabled": "bool",
+            "id": "int",
+            "nickname": "str",
+            "sourceEvidence": "str",
+            "sourceKind": "str",
+            "sourceName": "str",
+            "sourceUrl": "str",
+            "updatedAt": "int"
+          }
+        ]
+      },
+      "status": [
+        200
+      ]
+    },
+    "strategy-board": {
+      "bytes": 158192,
+      "contentType": "application/json",
+      "elapsedMs": 22437,
+      "error": null,
+      "json": true,
+      "path": "/api/strategy-board",
+      "shape": {
+        "authenticated": "bool",
+        "exchangeAccounts": [],
+        "liveTradingEnabled": "bool",
+        "ok": "bool",
+        "positionSync": [],
+        "positions": [],
+        "signals": [
+          {
+            "aveHot": "bool",
+            "aveHotFirstSeenAt": "int",
+            "aveHotLastSeenAt": "int",
+            "aveHotRank": "int",
+            "binanceFuturesGainersLastSeenAt": "int",
+            "binanceFuturesGainersRank": "int",
+            "binanceGainersLastSeenAt": "int",
+            "binanceGainersRank": "int",
+            "binanceWalletHot": "bool",
+            "binanceWalletHotFirstSeenAt": "int",
+            "binanceWalletHotLastSeenAt": "int",
+            "binanceWalletHotRank": "int",
+            "chain": "str",
+            "chainLabel": "str",
+            "confirmable": "bool",
+            "contractAddress": "str",
+            "currentPrice": "float",
+            "deadAt": "int",
+            "deadReason": "str",
+            "distancePct": "mixed",
+            "error": "str",
+            "exchanges": [
+              {
+                "id": "str",
+                "label": "str",
+                "liveConfigured": "bool",
+                "marketKnown": "bool",
+                "priority": "int",
+                "recommended": "bool"
+              }
+            ],
+            "expiresAt": "int",
+            "fibCandidate": "bool",
+            "fibDistance05Pct": "mixed",
+            "fibDistance0618Pct": "mixed",
+            "fibImpulseGainPct": "mixed",
+            "fibLaunchAt": "int",
+            "fibLaunchLow": "mixed",
+            "fibLevel05": "mixed",
+            "fibLevel0618": "mixed",
+            "fibStatus": "str",
+            "fibSwingHigh": "mixed",
+            "fibSwingHighAt": "int",
+            "firstSeenAt": "int",
+            "firstValidConfirmedAt": "int",
+            "firstValidDistancePct": "null",
+            "firstValidEpisode": "int",
+            "firstValidPrice": "null",
+            "firstValidProvider": "str",
+            "firstValidReferenceHigh": "null",
+            "gainersExpiresAt": "int",
+            "gainersFirstSeenAt": "int",
+            "gainersPriority": "bool",
+            "hasConfirmedFirst": "bool",
+            "icon": "str",
+            "isConfirmedEpisode": "bool",
+            "isFirstCandidate": "bool",
+            "isLaterEpisode": "bool",
+            "lastCheckedAt": "int",
+            "lastQuoteSuccessAt": "int",
+            "lastSeenAt": "int",
+            "latestAlertAt": "int",
+            "latestAlertEpisode": "int",
+            "mainWaveQualified": "bool",
+            "mainWaveReason": "str",
+            "manual": "bool",
+            "marketActivity": {},
+            "name": "str",
+            "newContract1mActive": "bool",
+            "newContract1mExpiresAt": "int",
+            "newContractListedAt": "int",
+            "newContractPair": "str",
+            "newContractPriority": "bool",
+            "newContractSource": "str",
+            "okxGainersLastSeenAt": "int",
+            "okxGainersRank": "int",
+            "opportunityActive": "bool",
+            "opportunityFirstSeenAt": "int",
+            "opportunityLastSeenAt": "int",
+            "opportunityManualRemovedAt": "int",
+            "opportunitySource": "str",
+            "opportunitySources": [],
+            "origin": "str",
+            "oversoldAlertEpisode": "int",
+            "oversoldCandidate": "bool",
+            "oversoldDistancePct": "mixed",
+            "oversoldDrawdownPct": "float",
+            "oversoldLastAlertAt": "int",
+            "oversoldRangeHigh": "mixed",
+            "oversoldRangeLow": "float",
+            "oversoldStatus": "str",
+            "personalXMentionedAt": "int",
+            "personalXPriority": "bool",
+            "personalXSourceName": "str",
+            "personalXSourceText": "str",
+            "phase": "int",
+            "priorHighAbsentAt": "int",
+            "priorHighEnabled": "bool",
+            "priorHighExcludedAt": "int",
+            "provider": "str",
+            "quoteFailureStreak": "int",
+            "setupType": "str",
+            "signalLabel": "str",
+            "stageHighLabel": "str",
+            "status": "str",
+            "strategyBreakoutLow": "null",
+            "strategyEngine": "str",
+            "strategyFrame": "mixed",
+            "strategyGrade": "str",
+            "strategyInterval": "str",
+            "strategyMonitorPool": "str",
+            "strategyPattern": "str",
+            "strategyPending": "null",
+            "strategyPredicted": "bool",
+            "strategyReady": "bool",
+            "strategySignal": "null",
+            "strategySignalActionable": "bool",
+            "strategySignalInvalidReason": "str",
+            "strategyStopDistancePct": "null",
+            "strategyStopLossPrice": "null",
+            "strategyStopLossReason": "str",
+            "strategyStopLossSource": "str",
+            "strategyStopLossSourceLabel": "str",
+            "strategyVersion": "str",
+            "structure1mOverride": "int",
+            "structureHigh": "float",
+            "structureIntervalOverrides": {},
+            "structureLow": "float",
+            "symbol": "str",
+            "tradeUrl": "str",
+            "weekHigh": "float"
+          }
+        ],
+        "summary": {
+          "awaitingConfirmation": "int",
+          "openPositions": "int",
+          "ready": "int",
+          "structured": "int",
+          "watching": "int"
+        },
+        "updatedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "strategy-exchanges": {
+      "bytes": 65,
+      "contentType": "application/json",
+      "elapsedMs": 62,
+      "error": null,
+      "json": true,
+      "path": "/api/strategy-exchanges",
+      "shape": {
+        "error": "str",
+        "loginUrl": "str",
+        "ok": "bool"
+      },
+      "status": [
+        401
+      ]
+    },
+    "todo-state": {
+      "bytes": 65,
+      "contentType": "application/json",
+      "elapsedMs": 41,
+      "error": null,
+      "json": true,
+      "path": "/api/todo-state",
+      "shape": {
+        "error": "str",
+        "loginUrl": "str",
+        "ok": "bool"
+      },
+      "status": [
+        401
+      ]
+    },
+    "turnover-rankings": {
+      "bytes": 39466,
+      "contentType": "application/json",
+      "elapsedMs": 2388,
+      "error": null,
+      "json": true,
+      "path": "/api/turnover-rankings",
+      "shape": {
+        "_cache": {
+          "key": "str",
+          "stale": "bool",
+          "updatedAt": "int"
+        },
+        "sources": [
+          {
+            "accent": "str",
+            "emptyMessage": "str",
+            "emptyTitle": "str",
+            "group": "str",
+            "id": "str",
+            "rows": "mixed",
+            "sourceLabel": "str",
+            "sourceName": "str",
+            "status": "str",
+            "subtitle": "str",
+            "title": "str",
+            "updatedAt": "int"
+          }
+        ],
+        "updatedAt": "int"
+      },
+      "status": [
+        200
+      ]
+    },
+    "wechat-account-status": {
+      "bytes": 400,
+      "contentType": "application/json",
+      "elapsedMs": 4686,
+      "error": null,
+      "json": true,
+      "path": "/api/wechat-account-status",
+      "shape": {
+        "accounts": [
+          {
+            "checked": "bool",
+            "cooldownUntil": "int",
+            "id": "str",
+            "lastCheckAt": "int",
+            "lastError": "str",
+            "lastOkAt": "int",
+            "name": "str",
+            "source": "str",
+            "status": "str",
+            "valid": "bool"
+          }
+        ],
+        "activeCount": "int",
+        "authorized": "bool",
+        "invalidCount": "int",
+        "needsAuth": "bool",
+        "ok": "bool",
+        "platformUrl": "str"
+      },
+      "status": [
+        200
+      ]
+    },
+    "wechat-group-monitor": {
+      "bytes": 65,
+      "contentType": "application/json",
+      "elapsedMs": 30,
+      "error": null,
+      "json": true,
+      "path": "/api/wechat-group-monitor",
+      "shape": {
+        "error": "str",
+        "loginUrl": "str",
+        "ok": "bool"
+      },
+      "status": [
+        401
+      ]
+    },
+    "x-kol-feed": {
+      "bytes": 65,
+      "contentType": "application/json",
+      "elapsedMs": 18,
+      "error": null,
+      "json": true,
+      "path": "/api/x-kol-feed",
+      "shape": {
+        "error": "str",
+        "loginUrl": "str",
+        "ok": "bool"
+      },
+      "status": [
+        401
+      ]
+    },
+    "x-kol-sources": {
+      "bytes": 65,
+      "contentType": "application/json",
+      "elapsedMs": 14,
+      "error": null,
+      "json": true,
+      "path": "/api/x-kol-sources",
+      "shape": {
+        "error": "str",
+        "loginUrl": "str",
+        "ok": "bool"
+      },
+      "status": [
+        401
+      ]
+    }
+  },
+  "updatedAt": "2026-09-28T17:00:34+0800"
+}

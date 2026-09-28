@@ -1,0 +1,3434 @@
+{
+  "source": "server.py",
+  "totalLines": 55130,
+  "topLevelFunctions": 1369,
+  "topLevelNames": 2279,
+  "moduleLevelVariables": 762,
+  "globalDeclarations": 364958,
+  "clusters": [
+    {
+      "domain": "misc",
+      "functionCount": 824,
+      "functions": [
+        "_backfill_wechat_group_ai_row",
+        "_binance_wallet_kline_raw",
+        "_event_monitor_term_pattern",
+        "_extract_last_balanced_json",
+        "_fetch_new_coin_low_market_activity",
+        "_future_event_seen_keys",
+        "_future_event_todo_project_name",
+        "_future_event_todo_user",
+        "_gmgn_trench_x_external_url",
+        "_gmgn_trench_x_post_cached",
+        "_light_screen_cached_lookup",
+        "_light_screen_cached_store",
+        "_light_screen_onchain_candidates",
+        "_okx_dex_kline_raw",
+        "_onchain_kline_cache_prune_locked",
+        "_price_watch_nested_rows",
+        "_restore_global_monitor_symbol_db",
+        "_store_chat_hourly_summary",
+        "_store_gmgn_trench_x_post",
+        "_x_kol_api_cost_snapshot_from_state",
+        "_x_kol_api_cost_state_unlocked",
+        "a_share_new_stock_events",
+        "a_share_new_stock_section",
+        "add_price_watch_symbol",
+        "add_query_params",
+        "admin_clear_cache_payload",
+        "admin_count",
+        "admin_create_user",
+        "admin_delete_user",
+        "admin_refresh_cache_payload",
+        "admin_set_user",
+        "admin_summary_payload",
+        "admin_user",
+        "admin_user_rows",
+        "ai_startup_reconnect_once",
+        "ai_startup_reconnect_snapshot",
+        "aicoin_app_data_dir",
+        "aicoin_cached_payload_token",
+        "aicoin_cdp_ready",
+        "aicoin_client_hot_payload"
+      ],
+      "externalFunctionCount": 253,
+      "externalFunctions": [
+        "alert_body_join",
+        "alert_dedupe_keys",
+        "alert_dedupe_title",
+        "alert_event_ms",
+        "alert_text",
+        "aster_contract_rows",
+        "aster_contracts_payload",
+        "aster_listing_announcement_rows",
+        "auth_db",
+        "binance_alpha_timestamp_ms",
+        "binance_futures_contract_status",
+        "binance_listing_events",
+        "binance_wallet_4h_structure_identity",
+        "binance_wallet_4h_structure_rows",
+        "binance_wallet_ai_narrative_from_payload",
+        "binance_wallet_contract_url",
+        "binance_wallet_hot_alert_monitor_loop",
+        "binance_wallet_hot_popup_summary",
+        "binance_wallet_hot_source",
+        "binance_wallet_hot_source_from_payload",
+        "binance_wallet_token_url",
+        "cache_wechat_source_alias",
+        "cached",
+        "cached_api_payload",
+        "cached_event_monitor_core_payload",
+        "cached_newsflash_explanation_profile",
+        "cached_source_fallback",
+        "chain_ecosystem_ai_worker",
+        "desktop_alert_bridge_url",
+        "desktop_alert_delivery_tick",
+        "desktop_alert_flow_aliases",
+        "desktop_alert_is_news_trade_intake",
+        "desktop_alert_is_price_watch",
+        "desktop_alert_marker_id",
+        "desktop_alert_monitor_symbol",
+        "desktop_alert_needs_immediate_news_trade_status",
+        "desktop_alert_political_military_reason",
+        "desktop_alert_process_is_running",
+        "desktop_alert_queue_priority",
+        "desktop_alert_queue_worker"
+      ],
+      "externalDomains": [
+        "alert",
+        "auth_config",
+        "binance",
+        "dragon_wave",
+        "logging",
+        "market",
+        "news",
+        "onchain",
+        "persistence",
+        "price_structure",
+        "price_watch",
+        "smart_money",
+        "social_x",
+        "strategy",
+        "wechat"
+      ],
+      "globalsUsedCount": 560,
+      "globalsUsed": [
+        "AESGCM",
+        "AICOIN_CDP_RELAUNCH_LOCK",
+        "AICOIN_DEFAULT_PUBLIC_KEY",
+        "AICOIN_DEFAULT_PUBLIC_KEY_VERSION",
+        "AICOIN_PAYLOAD_TOKEN_PATH",
+        "AI_STARTUP_RECONNECT_LOCK",
+        "AI_STARTUP_RECONNECT_STATE",
+        "ALERT_DELIVERY_STORE",
+        "API_CACHE_WRITE_LOCK",
+        "API_REFRESHING",
+        "API_REFRESH_LOCK",
+        "API_REFRESH_POOL",
+        "API_REFRESH_STALL_LOGGED",
+        "API_REFRESH_STUCK_SECONDS",
+        "ASTER_TRADE_URL",
+        "ATTENTION_STAGES",
+        "AUTH_DB_LOCK",
+        "AUTH_DB_PATH",
+        "AUTH_EMAIL_CODES",
+        "AUTH_EMAIL_CODE_TTL_SECONDS",
+        "AUTH_EMAIL_LOCK",
+        "AUTH_LOGIN_ATTEMPTS",
+        "AUTH_LOGIN_LOCK",
+        "AUTH_PASSWORD_ITERATIONS",
+        "AUTH_PHONE_CODES",
+        "AUTH_PHONE_CODE_TTL_SECONDS",
+        "AUTH_PHONE_LOCK",
+        "AUTH_SESSION_COOKIE",
+        "AUTH_SESSION_DAYS",
+        "AUTOMATION_BRIEFS_BUNDLED_PATH",
+        "AUTOMATION_BRIEFS_DEFAULT_REMOTE_URL",
+        "AUTOMATION_BRIEFS_REMOTE_CACHE_PATH",
+        "AUTOMATION_BRIEF_IDS",
+        "AUTOMATION_BRIEF_PLACEHOLDER",
+        "AVE_CHAIN_POOL",
+        "AVE_HOT_ALERT_INTERVAL_SECONDS",
+        "AVE_HOT_ALERT_LOCK",
+        "AVE_HOT_ALERT_STATE_PATH",
+        "AVE_HOT_ALERT_STATE_VERSION",
+        "AVE_HOT_CHAINS",
+        "AVE_HOT_DEFAULT_PERIOD",
+        "AVE_HOT_PERIODS",
+        "AVE_TOKEN_CACHE_PATH",
+        "Any",
+        "BINANCE_AI_NARRATIVE_POOL",
+        "BINANCE_WALLET_4H_STRUCTURE_LOCK",
+        "BINANCE_WALLET_4H_STRUCTURE_PATH",
+        "BINANCE_WALLET_4H_STRUCTURE_RETENTION_SECONDS",
+        "BINANCE_WALLET_4H_STRUCTURE_SYNC_SECONDS",
+        "BINANCE_WALLET_AI_NARRATIVE_CACHE",
+        "BINANCE_WALLET_AI_NARRATIVE_CACHE_LOCK",
+        "BINANCE_WALLET_AI_NARRATIVE_CACHE_MAX_ENTRIES",
+        "BINANCE_WALLET_AI_NARRATIVE_CACHE_TTL_SECONDS",
+        "BINANCE_WALLET_AI_NARRATIVE_NEGATIVE_TTL_SECONDS",
+        "BINANCE_WALLET_AI_NARRATIVE_PATH",
+        "BINANCE_WALLET_HOT_ALERT_LOCK",
+        "BINANCE_WALLET_HOT_ALERT_STATE_PATH",
+        "BINANCE_WALLET_HOT_ALERT_STATE_VERSION",
+        "BINANCE_WALLET_HOT_PERIODS",
+        "BINANCE_WALLET_HOT_REENTRY_SECONDS"
+      ],
+      "globalWriters": [
+        "AI_STARTUP_RECONNECT_STARTED",
+        "AVE_HOT_ALERT_MONITOR_ACTIVE",
+        "BINANCE_WALLET_4H_STRUCTURE_ACTIVE",
+        "BINANCE_WALLET_4H_STRUCTURE_LAST_SYNC_AT",
+        "BINANCE_WALLET_HOT_ALERT_MONITOR_ACTIVE",
+        "CHAT_HOURLY_SUMMARY_STARTED",
+        "CODEX_CLI_UNAVAILABLE_UNTIL",
+        "DESKTOP_ALERT_QUEUE_ACTIVE",
+        "DESKTOP_ALERT_SEEN_LOADED",
+        "DISCORD_NEWSFLASH_BRIDGE_PROCESS",
+        "FIELD_KEY_CACHE",
+        "GLOBAL_HOTSPOT_MONITOR_ACTIVE",
+        "LLM_API_UNAVAILABLE_UNTIL",
+        "LOCAL_TRANSLATION_PROCESS",
+        "NEWSFLASH_SEMANTIC_AI_RETRY_AFTER",
+        "NEWS_EXPLANATIONS",
+        "NEW_COIN_LOW_ACTIVITY_CACHE",
+        "NEW_COIN_LOW_MONITOR_ACTIVE",
+        "ONCHAIN_RESEARCH_INGEST_THREAD",
+        "PRICE_MONITOR_ACTIVITY_STATES",
+        "PRICE_MONITOR_ACTIVITY_SUMMARY",
+        "PRICE_STRUCTURE_MONITOR_ACTIVE",
+        "PRICE_STRUCTURE_PREARM_MONITOR_ACTIVE",
+        "PRICE_WATCH_MONITOR_ACTIVE",
+        "PRICE_WATCH_REALTIME_PROCESS",
+        "RANK_AI_RETRY_AFTER",
+        "ROTATION_AI_RETRY_AFTER",
+        "SELF_OPTIMIZATION_INTERVAL_SECONDS",
+        "SELF_OPTIMIZATION_MONITOR_ACTIVE",
+        "SELF_OPTIMIZATION_STARTUP_DELAY_SECONDS",
+        "SELF_OPTIMIZATION_SUGGESTION_COOLDOWN_SECONDS",
+        "SERVER_RUNTIME_ACTIVE",
+        "SITE_ALERT_MONITOR_ACTIVE",
+        "SITE_ALERT_MONITOR_STARTED_AT",
+        "SITE_ALERT_STATE",
+        "SITE_ALERT_STATE_LOADED",
+        "TRENCH_PERSON_ACTIVITY_THREAD",
+        "TRENCH_PERSON_REPLAY_PENDING",
+        "TRENCH_PERSON_REPLAY_THREAD",
+        "TRENCH_PERSON_WATCH_STARTED",
+        "WECHAT_AUTH_ALERT_LAST_AT",
+        "WECHAT_AUTH_MONITOR_ACTIVE",
+        "WECHAT_GROUP_MONITOR_STARTED",
+        "X_KOL_OFFICIAL_STREAM_RESPONSE",
+        "X_KOL_OFFICIAL_STREAM_STARTED",
+        "X_KOL_PRIORITY_STARTED"
+      ],
+      "selfContained": false
+    },
+    {
+      "domain": "social_x",
+      "functionCount": 101,
+      "functions": [
+        "personal_x_monitor_backfill_seconds",
+        "personal_x_monitor_payload",
+        "personal_x_onchain_identity_from_text",
+        "x_kol_ai_filter_events",
+        "x_kol_ai_filter_signature",
+        "x_kol_allow_shared_stream_rules",
+        "x_kol_api_cached_profile",
+        "x_kol_api_cost_claim_request",
+        "x_kol_api_cost_day",
+        "x_kol_api_cost_record_resources",
+        "x_kol_api_cost_snapshot",
+        "x_kol_api_daily_budget_usd",
+        "x_kol_api_daily_post_limit",
+        "x_kol_api_daily_request_limit",
+        "x_kol_api_since_id",
+        "x_kol_avatar_url",
+        "x_kol_build_official_stream_item",
+        "x_kol_category_label",
+        "x_kol_feed_payload",
+        "x_kol_fetch_api_source",
+        "x_kol_fetch_fxtwitter_timeline",
+        "x_kol_fetch_limit",
+        "x_kol_fetch_priority_rss_source",
+        "x_kol_fetch_public_timeline",
+        "x_kol_fetch_rss_source",
+        "x_kol_fetch_rss_template",
+        "x_kol_fxtwitter_fallback_enabled",
+        "x_kol_fxtwitter_quote",
+        "x_kol_http_get",
+        "x_kol_http_proxy_candidates",
+        "x_kol_http_session",
+        "x_kol_include_replies",
+        "x_kol_include_retweets",
+        "x_kol_item_key",
+        "x_kol_item_matches",
+        "x_kol_keyword_hits",
+        "x_kol_merge_realtime_payload",
+        "x_kol_normalize_url",
+        "x_kol_official_api_enabled",
+        "x_kol_official_paid_source_allowed"
+      ],
+      "externalFunctionCount": 36,
+      "externalFunctions": [
+        "_x_kol_api_cost_snapshot_from_state",
+        "_x_kol_api_cost_state_unlocked",
+        "admin_user",
+        "alert_body_join",
+        "clean_feed_text",
+        "deepseek_chat",
+        "deepseek_enabled",
+        "deepseek_extract_json",
+        "deepseek_settings_signature",
+        "ensure_x_kol_realtime_worker",
+        "env_flag",
+        "hydrate_x_kol_realtime_history",
+        "launch_desktop_alert",
+        "libretranslate_translate",
+        "load_x_kol_sources",
+        "normalize_x_handle",
+        "normalize_x_keywords",
+        "normalize_x_kol_ai_filter_result",
+        "normalize_x_source",
+        "parse_feed_datetime",
+        "parse_xml_feed",
+        "persist_x_kol_realtime_payload",
+        "publish_x_kol_realtime_payload",
+        "read_json_cache",
+        "register_x_kol_official_stream_user",
+        "safe_float",
+        "stable_feed_id",
+        "strategy_tactical_signal_rows",
+        "system_llm_settings",
+        "translation_cache_get",
+        "translation_cache_put",
+        "trench_person_activity_document",
+        "update_x_kol_official_stream_health",
+        "user_runtime_dir",
+        "write_json_cache",
+        "x_rss_templates"
+      ],
+      "externalDomains": [
+        "alert",
+        "misc",
+        "persistence",
+        "strategy"
+      ],
+      "globalsUsedCount": 73,
+      "globalsUsed": [
+        "Any",
+        "HEADERS",
+        "PERSIST_CACHE_DIR",
+        "PERSONAL_X_MONITOR_BACKFILL_DEFAULT_DAYS",
+        "Path",
+        "RSS_FETCH_MAX_BYTES",
+        "SERVER_SHUTDOWN_EVENT",
+        "TRENCH_PERSON_DEFAULT_REFRESH_SECONDS",
+        "TRENCH_PERSON_OFFICIAL_REFRESH_SECONDS",
+        "TRENCH_PERSON_SECONDARY_REFRESH_SECONDS",
+        "X_KOL_AI_FILTER_CACHE_PATH",
+        "X_KOL_API_COST_LOCK",
+        "X_KOL_API_COST_STATE_PATH",
+        "X_KOL_CATEGORIES",
+        "X_KOL_FETCH_LIMIT",
+        "X_KOL_FXTWITTER_BASE_URL",
+        "X_KOL_FXTWITTER_TIMEOUT_SECONDS",
+        "X_KOL_HARD_DAILY_BUDGET_USD",
+        "X_KOL_HARD_DAILY_REQUEST_LIMIT",
+        "X_KOL_HTTP_ROUTE",
+        "X_KOL_HTTP_ROUTE_LOCK",
+        "X_KOL_HTTP_ROUTE_TTL_SECONDS",
+        "X_KOL_HTTP_THREAD_LOCAL",
+        "X_KOL_OFFICIAL_STREAM_HEALTH",
+        "X_KOL_OFFICIAL_STREAM_LOCK",
+        "X_KOL_OFFICIAL_STREAM_USERS",
+        "X_KOL_OFFICIAL_STREAM_WAKE",
+        "X_KOL_PRIORITY_WAKE",
+        "X_KOL_PUBLIC_TIMELINE_TIMEOUT_SECONDS",
+        "X_KOL_REALTIME_API_INTERVAL_SECONDS",
+        "X_KOL_REALTIME_CONDITION",
+        "X_KOL_REALTIME_RSS_INTERVAL_SECONDS",
+        "X_KOL_REALTIME_SNAPSHOTS",
+        "X_KOL_REALTIME_WAKE_EVENTS",
+        "X_KOL_RETENTION_MS",
+        "X_KOL_RSS_CIRCUIT_BASE_SECONDS",
+        "X_KOL_RSS_CIRCUIT_MAX_SECONDS",
+        "X_KOL_RSS_MIRROR_ATTEMPTS",
+        "X_KOL_RSS_MIRROR_HEALTH",
+        "X_KOL_RSS_MIRROR_HEALTH_LOCK",
+        "X_KOL_RSS_MIRROR_POOL",
+        "X_KOL_RSS_PREFERENCE_LOCK",
+        "X_KOL_RSS_PREFERRED_TEMPLATES",
+        "X_KOL_RSS_SOURCE_POOL",
+        "X_KOL_RSS_TIMEOUT_SECONDS",
+        "X_KOL_RSS_USER_AGENT",
+        "X_KOL_SOURCES_PATH",
+        "X_KOL_STANDARD_POST_READ_USD",
+        "X_KOL_STANDARD_USER_READ_USD",
+        "X_OFFICIAL_API_ALL_ACCOUNTS_USER_APPROVED",
+        "X_OFFICIAL_API_APPROVED_PERSONAL_HANDLE",
+        "X_OFFICIAL_API_HISTORY_USER_APPROVED",
+        "X_OFFICIAL_API_REST_POLL_USER_APPROVED",
+        "X_OFFICIAL_API_USER_APPROVED",
+        "X_TWEET_ANALYSIS_PERSON_HANDLES",
+        "X_TWEET_ANALYSIS_QUEUE",
+        "as_completed",
+        "datetime",
+        "hashlib",
+        "important_official_sources"
+      ],
+      "globalWriters": [
+        "X_KOL_OFFICIAL_STREAM_RESPONSE",
+        "X_KOL_OFFICIAL_STREAM_RULE_SIGNATURE"
+      ],
+      "selfContained": false
+    },
+    {
+      "domain": "price_structure",
+      "functionCount": 77,
+      "functions": [
+        "new_coin_low_activity_state",
+        "new_coin_low_apply_monitor_preferences",
+        "new_coin_low_inventory_rows",
+        "new_coin_low_position_context",
+        "new_coin_low_row_admitted",
+        "new_coin_low_row_within_age",
+        "new_coin_low_structure_monitor_loop",
+        "new_coin_low_structure_payload",
+        "price_structure_1m_override_for_symbol",
+        "price_structure_1m_state",
+        "price_structure_alert_interval_allowed",
+        "price_structure_alert_source_labels",
+        "price_structure_allows_short_history",
+        "price_structure_broadcast_allowed",
+        "price_structure_broadcast_eligibility",
+        "price_structure_cache_key",
+        "price_structure_candles_from_aster",
+        "price_structure_candles_from_binance",
+        "price_structure_candles_from_binance_wallet",
+        "price_structure_candles_from_bitget",
+        "price_structure_candles_from_gate",
+        "price_structure_candles_from_geckoterminal",
+        "price_structure_candles_from_htx",
+        "price_structure_candles_from_hyperliquid",
+        "price_structure_candles_from_kucoin",
+        "price_structure_candles_from_okx",
+        "price_structure_candles_from_okx_dex",
+        "price_structure_candles_from_onchain_fallbacks",
+        "price_structure_contract_evidence_key",
+        "price_structure_excluded_symbols",
+        "price_structure_frame_is_observation",
+        "price_structure_frame_is_prearm_watchable",
+        "price_structure_geckoterminal_base_candles",
+        "price_structure_geckoterminal_network",
+        "price_structure_interval_ms",
+        "price_structure_interval_overrides_for_symbol",
+        "price_structure_interval_states",
+        "price_structure_intraday_repricing",
+        "price_structure_known_asset_metadata",
+        "price_structure_latest_snapshot_payload"
+      ],
+      "externalFunctionCount": 39,
+      "externalFunctions": [
+        "_binance_wallet_kline_raw",
+        "_okx_dex_kline_raw",
+        "_onchain_kline_cache_prune_locked",
+        "api_cache_path",
+        "aster_contract_rows",
+        "auth_db",
+        "binance_price_watch_pair",
+        "binance_wallet_4h_structure_rows",
+        "clean_feed_text",
+        "clean_price_watch_symbol",
+        "crypto_icon_url",
+        "ensure_binance_futures_candles_have_volume",
+        "ensure_binance_futures_contract_trading",
+        "fetch_new_coin_low_market_activity",
+        "filter_price_monitor_cold_archives",
+        "filter_price_monitor_rows_by_activity",
+        "htx_contract_date_ms",
+        "hydrate_new_coin_low_snapshot",
+        "is_price_watch_auto_crypto_candidate",
+        "launch_price_structure_prearm_alert",
+        "merge_new_coin_low_listing_candidate",
+        "monitor_alert_replay_gap_is_stale",
+        "normalize_new_coin_low_structure_item",
+        "parse_price_structure_interval_overrides",
+        "personal_x_onchain_identity_from_text",
+        "price_monitor_retention_local_day_start_ms",
+        "price_watch_active_rows",
+        "price_watch_aicoin_source",
+        "price_watch_fib_structure",
+        "read_json_cache",
+        "reconcile_price_structure_exclusions",
+        "refresh_new_coin_low_structure_item",
+        "refresh_price_structure_strategy_monitor_item",
+        "row_dict",
+        "safe_error_text",
+        "safe_float",
+        "strategy_active_adaptive_contexts",
+        "strategy_adaptive_context_for_symbol",
+        "write_json_cache"
+      ],
+      "externalDomains": [
+        "auth_config",
+        "binance",
+        "misc",
+        "persistence",
+        "price_watch",
+        "social_x",
+        "strategy"
+      ],
+      "globalsUsedCount": 112,
+      "globalsUsed": [
+        "ASTER_TRADE_URL",
+        "AUTH_DB_LOCK",
+        "Any",
+        "BINANCE_WALLET_KLINE_CHAINS",
+        "BINANCE_WALLET_KLINE_INTERVALS",
+        "CHAIN_ECOSYSTEM_MONITOR",
+        "GAINERS_MONITOR_PROMOTION_SECONDS",
+        "HEADERS",
+        "MARKET_SOURCE_POOL",
+        "NEW_COIN_LOW_ACTIVITY_GRACE_DAYS",
+        "NEW_COIN_LOW_ACTIVITY_SUMMARY",
+        "NEW_COIN_LOW_ADMISSION_SOURCES",
+        "NEW_COIN_LOW_INVENTORY_CACHE",
+        "NEW_COIN_LOW_INVENTORY_CACHE_SECONDS",
+        "NEW_COIN_LOW_ITEMS",
+        "NEW_COIN_LOW_LISTING_HISTORY_PATH",
+        "NEW_COIN_LOW_LOCK",
+        "NEW_COIN_LOW_MAX_AGE_SECONDS",
+        "NEW_COIN_LOW_MIN_TURNOVER_24H_USD",
+        "NEW_COIN_LOW_MONITOR_ACTIVE",
+        "NEW_COIN_LOW_MONITOR_INTERVAL_SECONDS",
+        "NEW_COIN_LOW_MONITOR_WORKERS",
+        "NEW_COIN_LOW_SNAPSHOT_PATH",
+        "NEW_COIN_LOW_STRUCTURE_INTERVALS",
+        "NEW_COIN_LOW_UNAVAILABLE_MAX_AGE_DAYS",
+        "OKX_DEX_KLINE_BARS",
+        "OKX_DEX_KLINE_CHAINS",
+        "ONCHAIN_KLINE_HTTP_SESSION",
+        "PERSONAL_X_MONITOR_RETENTION_SECONDS",
+        "PRICE_MONITOR_ACTIVITY_SUMMARY",
+        "PRICE_STRUCTURE_CACHE",
+        "PRICE_STRUCTURE_CACHE_LOCK",
+        "PRICE_STRUCTURE_CANDLE_LIMIT",
+        "PRICE_STRUCTURE_CHAIN_FROM_GT_NETWORK",
+        "PRICE_STRUCTURE_DEEP_DRAWDOWN_PCT",
+        "PRICE_STRUCTURE_EVENT_CONTEXTS",
+        "PRICE_STRUCTURE_EVENT_CONTEXT_LOCK",
+        "PRICE_STRUCTURE_EXTREME_HEAT_MAX_RANK",
+        "PRICE_STRUCTURE_EXTREME_HEAT_MIN",
+        "PRICE_STRUCTURE_FAST_PROVIDER_LIMIT",
+        "PRICE_STRUCTURE_INTERVAL_LABELS",
+        "PRICE_STRUCTURE_MOMENTUM_CACHE",
+        "PRICE_STRUCTURE_MOMENTUM_CACHE_LOCK",
+        "PRICE_STRUCTURE_MOMENTUM_CACHE_TTL_SECONDS",
+        "PRICE_STRUCTURE_MONITOR_HUNG_FUTURE_SECONDS",
+        "PRICE_STRUCTURE_MONITOR_INTERVAL_SECONDS",
+        "PRICE_STRUCTURE_MONITOR_WORKERS",
+        "PRICE_STRUCTURE_NEW_COIN_MAX_AGE_DAYS",
+        "PRICE_STRUCTURE_OBSERVATION_MAX_OVERSHOOT_PCT",
+        "PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE",
+        "PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE_LOCK",
+        "PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE_TTL_SECONDS",
+        "PRICE_STRUCTURE_ONCHAIN_CANDLE_ERROR_CACHE",
+        "PRICE_STRUCTURE_ONCHAIN_CANDLE_ERROR_TTL_SECONDS",
+        "PRICE_STRUCTURE_ONCHAIN_CANDLE_INFLIGHT",
+        "PRICE_STRUCTURE_ONCHAIN_CANDLE_STALE_TTL_SECONDS",
+        "PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE",
+        "PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE_LOCK",
+        "PRICE_STRUCTURE_ONCHAIN_KLINE_CACHE_TTL_SECONDS",
+        "PRICE_STRUCTURE_ONCHAIN_KLINE_ERROR_CACHE"
+      ],
+      "globalWriters": [
+        "NEW_COIN_LOW_ACTIVITY_SUMMARY",
+        "NEW_COIN_LOW_INVENTORY_CACHE",
+        "PRICE_STRUCTURE_DISK_CACHE_HYDRATED",
+        "PRICE_STRUCTURE_RECENT_LISTING_INDEX_CACHE",
+        "PRICE_STRUCTURE_WATCH_ROWS_CACHE",
+        "PRICE_STRUCTURE_WATCH_ROWS_REFRESHING"
+      ],
+      "selfContained": false
+    },
+    {
+      "domain": "news",
+      "functionCount": 68,
+      "functions": [
+        "news_trade_ai_is_popup_opportunity",
+        "news_trade_ai_model_rows",
+        "news_trade_ai_opportunity_symbols",
+        "news_trade_ai_prompt",
+        "news_trade_ai_request_payload",
+        "news_trade_ai_topic_signature",
+        "news_trade_ai_worker",
+        "news_trade_alert_monitor_loop",
+        "news_trade_alert_snapshot",
+        "news_trade_alert_transition_reason",
+        "news_trade_analysis_source_allowed",
+        "news_trade_analysis_source_kind",
+        "news_trade_attach_ai",
+        "news_trade_attach_security",
+        "news_trade_background_discovery",
+        "news_trade_cached_dex_search_rows",
+        "news_trade_cached_public_search_rows",
+        "news_trade_candidate_trade_urls",
+        "news_trade_confirm_preview",
+        "news_trade_dex_search_rows",
+        "news_trade_env_number",
+        "news_trade_execution_cost_estimate",
+        "news_trade_execution_readiness",
+        "news_trade_existing_topics",
+        "news_trade_fetch_security",
+        "news_trade_filter_topic_analysis_sources",
+        "news_trade_finalize_security",
+        "news_trade_geckoterminal_rows_from_payload",
+        "news_trade_goplus_security",
+        "news_trade_honeypot_security",
+        "news_trade_local_search_rows",
+        "news_trade_merge_security",
+        "news_trade_merge_topic_records",
+        "news_trade_notification_asset",
+        "news_trade_popup_events",
+        "news_trade_pre_token_meme_potential",
+        "news_trade_public_search_rows",
+        "news_trade_refresh_pooled_topic",
+        "news_trade_search_preview",
+        "news_trade_search_terms"
+      ],
+      "externalFunctionCount": 67,
+      "externalFunctions": [
+        "admin_user",
+        "alert_body_join",
+        "alert_event_ms",
+        "alert_text",
+        "classify_event_monitor_row",
+        "clean_api_key",
+        "clean_feed_text",
+        "clean_model_name",
+        "clean_model_provider",
+        "clean_price_watch_symbol",
+        "deepseek_chat",
+        "deepseek_enabled",
+        "deepseek_extract_json",
+        "env_flag",
+        "env_value",
+        "event_monitor_asset_relation",
+        "event_monitor_chain_meta",
+        "event_monitor_cluster_topics",
+        "event_monitor_counter_consensus_profile",
+        "event_monitor_curiosity_profile",
+        "event_monitor_hot_entities",
+        "event_monitor_merge_candidate",
+        "event_monitor_metric_score",
+        "event_monitor_name_binding",
+        "event_monitor_news_keywords",
+        "event_monitor_news_trade_phase",
+        "event_monitor_onchain_source_rows",
+        "event_monitor_onchain_trade_score",
+        "event_monitor_payload",
+        "event_monitor_source_rows",
+        "event_monitor_topic_key",
+        "event_monitor_topic_stage",
+        "incremental_items",
+        "is_admin",
+        "is_excluded_crypto_asset",
+        "is_generic_wechat_title",
+        "is_legacy_wechat_source",
+        "is_wechat_platform_mp_id",
+        "js_stable_key",
+        "load_user_payload"
+      ],
+      "externalDomains": [
+        "alert",
+        "misc",
+        "persistence",
+        "social_x",
+        "strategy",
+        "wechat"
+      ],
+      "globalsUsedCount": 57,
+      "globalsUsed": [
+        "Any",
+        "BeautifulSoup",
+        "HEADERS",
+        "NEWSFLASH_EXPLANATION_EVENT_RE",
+        "NEWSFLASH_EXPLANATION_HOT_RE",
+        "NEWSFLASH_EXPLANATION_MEME_RE",
+        "NEWSFLASH_EXPLANATION_SYMBOL_STOPWORDS",
+        "NEWSFLASH_SEMANTIC_AI_CACHE_PATH",
+        "NEWSFLASH_SEMANTIC_AI_LOCK",
+        "NEWS_TRADE_AI_CACHE_PATH",
+        "NEWS_TRADE_AI_INFLIGHT",
+        "NEWS_TRADE_AI_LOCK",
+        "NEWS_TRADE_AI_POOL",
+        "NEWS_TRADE_AI_RETRY_AFTER",
+        "NEWS_TRADE_ALERT_STATE_LOCK",
+        "NEWS_TRADE_ALERT_STATE_PATH",
+        "NEWS_TRADE_CONFIG",
+        "NEWS_TRADE_DISCOVERY_CACHE",
+        "NEWS_TRADE_DISCOVERY_CACHE_LOCK",
+        "NEWS_TRADE_DISCOVERY_CACHE_TTL_SECONDS",
+        "NEWS_TRADE_KEYWORD_STOPWORDS",
+        "NEWS_TRADE_NETWORK_FEE_DEFAULT_USD",
+        "NEWS_TRADE_SEARCH_LOCK",
+        "NEWS_TRADE_SEARCH_PREVIEWS",
+        "NEWS_TRADE_SEARCH_PREVIEW_TTL_SECONDS",
+        "NEWS_TRADE_SECURITY_CACHE",
+        "NEWS_TRADE_SECURITY_CACHE_LOCK",
+        "NEWS_TRADE_SECURITY_CACHE_TTL_SECONDS",
+        "NEWS_TRADE_SECURITY_INFLIGHT",
+        "NEWS_TRADE_SECURITY_NEGATIVE_TTL_SECONDS",
+        "NEWS_TRADE_SECURITY_POOL",
+        "NEWS_TRADE_TOPIC_POOL_LOCK",
+        "PERSIST_CACHE_DIR",
+        "Path",
+        "RSS_FETCH_MAX_BYTES",
+        "SERVER_SHUTDOWN_EVENT",
+        "ThreadPoolExecutor",
+        "USER_SCOPE_RSS_ITEMS",
+        "USER_SCOPE_RSS_SOURCES",
+        "X_NEWS_TRADE_CATEGORY_IDS",
+        "as_completed",
+        "attention_evidence",
+        "attention_window",
+        "datetime",
+        "explanation_context",
+        "explanation_key",
+        "hashlib",
+        "json",
+        "monitor_buy_chain_id",
+        "os",
+        "parsedate_to_datetime",
+        "quote",
+        "re",
+        "requests",
+        "secrets",
+        "sys",
+        "time"
+      ],
+      "globalWriters": [
+        "NEWSFLASH_SEMANTIC_AI_RETRY_AFTER"
+      ],
+      "selfContained": false
+    },
+    {
+      "domain": "price_watch",
+      "functionCount": 59,
+      "functions": [
+        "price_watch_active_rows",
+        "price_watch_aicoin_source",
+        "price_watch_alias_key",
+        "price_watch_aster_new_contract_source",
+        "price_watch_ave_source",
+        "price_watch_bullish_acceleration_launch",
+        "price_watch_candles_from_binance",
+        "price_watch_candles_from_bitget",
+        "price_watch_candles_from_bitget_futures",
+        "price_watch_candles_from_gate",
+        "price_watch_candles_from_hyperliquid",
+        "price_watch_candles_from_kucoin",
+        "price_watch_candles_from_okx",
+        "price_watch_daily_candles_from_binance",
+        "price_watch_daily_candles_from_bitget_futures",
+        "price_watch_daily_candles_from_okx",
+        "price_watch_dexscreener_chain",
+        "price_watch_explicit_market_source",
+        "price_watch_extended_snapshot_providers",
+        "price_watch_fib_structure",
+        "price_watch_flow_signal_reference_is_current",
+        "price_watch_gainers_active",
+        "price_watch_identity_large_exchange_contract",
+        "price_watch_large_exchange_contract",
+        "price_watch_live_sample_is_fresh",
+        "price_watch_live_transition_is_current",
+        "price_watch_main_wave_quality",
+        "price_watch_main_wave_stage_context",
+        "price_watch_manual_asset_resolution",
+        "price_watch_manual_discovery_rows",
+        "price_watch_monitor_loop",
+        "price_watch_new_contract_prior_high_source_approved",
+        "price_watch_numeric",
+        "price_watch_oversold_structure",
+        "price_watch_payload",
+        "price_watch_prefers_binance_wallet",
+        "price_watch_prior_high_setup",
+        "price_watch_prior_high_source_enabled",
+        "price_watch_provider_source_key",
+        "price_watch_public_item"
+      ],
+      "externalFunctionCount": 48,
+      "externalFunctions": [
+        "_price_watch_nested_rows",
+        "api_cache_path",
+        "apply_price_watch_realtime_quotes",
+        "aster_listing_announcement_rows",
+        "auth_db",
+        "binance_price_watch_pair",
+        "binance_wallet_token_url",
+        "bool_value",
+        "clean_feed_text",
+        "clean_price_watch_symbol",
+        "crypto_icon_url",
+        "deliver_desktop_alerts_now",
+        "ensure_binance_futures_candles_have_volume",
+        "ensure_binance_futures_contract_trading",
+        "env_value",
+        "fetch_price_watch_realtime_quotes",
+        "fetch_price_watch_snapshot",
+        "filter_price_monitor_cold_archives",
+        "filter_price_monitor_high_frequency_rows",
+        "filter_price_monitor_rows_by_activity",
+        "launch_price_watch_alert",
+        "new_contract_1m_expires_at",
+        "parse_json_list",
+        "parse_price_structure_interval_overrides",
+        "price_structure_broadcast_eligibility",
+        "price_structure_candles_from_aster",
+        "price_structure_candles_from_gate",
+        "price_structure_candles_from_geckoterminal",
+        "price_structure_candles_from_htx",
+        "price_structure_candles_from_hyperliquid",
+        "price_structure_candles_from_kucoin",
+        "price_structure_candles_from_onchain_fallbacks",
+        "price_structure_monitor_symbol",
+        "read_json_cache",
+        "record_price_watch_flow_event",
+        "rotation_trade_url",
+        "row_dict",
+        "safe_error_text",
+        "safe_float",
+        "send_price_watch_discord_alerts"
+      ],
+      "externalDomains": [
+        "auth_config",
+        "binance",
+        "market",
+        "misc",
+        "persistence",
+        "price_structure",
+        "strategy"
+      ],
+      "globalsUsedCount": 99,
+      "globalsUsed": [
+        "ASTER_TRADE_URL",
+        "AUTH_DB_LOCK",
+        "Any",
+        "BINANCE_WALLET_4H_STRUCTURE_RETENTION_SECONDS",
+        "GAINERS_MONITOR_PROMOTION_SECONDS",
+        "HEADERS",
+        "MONITOR_BUY",
+        "NEW_CONTRACT_MONITOR_RETENTION_SECONDS",
+        "PERSIST_CACHE_DIR",
+        "PERSONAL_X_MONITOR_RETENTION_SECONDS",
+        "PRICE_MONITOR_ACTIVITY_SUMMARY",
+        "PRICE_MONITOR_SOURCE_GRACE_SECONDS",
+        "PRICE_WATCH_ADD_JOBS",
+        "PRICE_WATCH_ADD_JOBS_LOCK",
+        "PRICE_WATCH_CONSOLIDATION_BARS",
+        "PRICE_WATCH_CONSOLIDATION_NET_PCT",
+        "PRICE_WATCH_CONSOLIDATION_RANGE_PCT",
+        "PRICE_WATCH_FIB_ACCEL_MIN_BULL_RATIO",
+        "PRICE_WATCH_FIB_ACCEL_MIN_EFFICIENCY",
+        "PRICE_WATCH_FIB_ACCEL_MIN_GAIN_PCT",
+        "PRICE_WATCH_FIB_ACCEL_MIN_RATIO_JUMP",
+        "PRICE_WATCH_FIB_ACCEL_MIN_WINDOW_DAYS",
+        "PRICE_WATCH_FIB_ACCEL_NEW_LEG_CORRECTION_PCT",
+        "PRICE_WATCH_FIB_ACCEL_WINDOW_DAYS",
+        "PRICE_WATCH_FIB_BASE_CLOSE_RANGE_PCT",
+        "PRICE_WATCH_FIB_BASE_LOOKBACK_DAYS",
+        "PRICE_WATCH_FIB_BASE_TOLERANCE_PCT",
+        "PRICE_WATCH_FIB_BREAKOUT_CANDLE_GAIN_PCT",
+        "PRICE_WATCH_FIB_CYCLE_RECOVERY_PCT",
+        "PRICE_WATCH_FIB_CYCLE_RESET_CLOSE_PCT",
+        "PRICE_WATCH_FIB_CYCLE_RESET_DRAWDOWN_PCT",
+        "PRICE_WATCH_FIB_DAILY_LIMIT",
+        "PRICE_WATCH_FIB_DEPARTURE_PCT",
+        "PRICE_WATCH_FIB_EXPLOSIVE_GAIN_PCT",
+        "PRICE_WATCH_FIB_EXPLOSIVE_MIN_EFFICIENCY",
+        "PRICE_WATCH_FIB_MAX_IMPULSE_DAYS",
+        "PRICE_WATCH_FIB_MAX_PATH_DRAWDOWN_PCT",
+        "PRICE_WATCH_FIB_MIN_EARLY_LIFT_PCT",
+        "PRICE_WATCH_FIB_MIN_IMPULSE_DAYS",
+        "PRICE_WATCH_FIB_MIN_IMPULSE_GAIN_PCT",
+        "PRICE_WATCH_FIB_MIN_POSITIVE_DAY_RATIO",
+        "PRICE_WATCH_FIB_MIN_TREND_EFFICIENCY",
+        "PRICE_WATCH_FIB_PRE_BREAKOUT_MAX_GAIN_PCT",
+        "PRICE_WATCH_FIB_RECENT_HIGH_DAYS",
+        "PRICE_WATCH_FIB_STRONG_DEPARTURE_PCT",
+        "PRICE_WATCH_FIB_SUSTAINED_BASE_DAYS",
+        "PRICE_WATCH_FIB_THRESHOLD_PCT",
+        "PRICE_WATCH_INTERVAL_SECONDS",
+        "PRICE_WATCH_LIVE_SAMPLE_MAX_GAP_MS",
+        "PRICE_WATCH_MONITOR_ACTIVE",
+        "PRICE_WATCH_OVERSOLD_DRAWDOWN_PCT",
+        "PRICE_WATCH_OVERSOLD_MIN_BARS_SINCE_LOW",
+        "PRICE_WATCH_OVERSOLD_MIN_STAGE_GAIN_PCT",
+        "PRICE_WATCH_OVERSOLD_RETEST_DEPTH_PCT",
+        "PRICE_WATCH_OVERSOLD_THRESHOLD_PCT",
+        "PRICE_WATCH_PROCESS_BASELINED_SYMBOLS",
+        "PRICE_WATCH_PROCESS_BASELINE_LOCK",
+        "PRICE_WATCH_PROVIDER_SOURCE_KEYS",
+        "PRICE_WATCH_REALTIME_EXCHANGES",
+        "PRICE_WATCH_REALTIME_HTTP_CLIENTS"
+      ],
+      "globalWriters": [
+        "PRICE_WATCH_REALTIME_SSL_CONTEXT",
+        "PRICE_WATCH_SNAPSHOT_BUILD_STARTED_AT",
+        "PRICE_WATCH_SNAPSHOT_BUILD_THREAD",
+        "PRICE_WATCH_SNAPSHOT_CACHE",
+        "PRICE_WATCH_SNAPSHOT_CACHE_AT",
+        "PRICE_WATCH_SNAPSHOT_STALL_LOGGED"
+      ],
+      "selfContained": false
+    },
+    {
+      "domain": "wechat",
+      "functionCount": 51,
+      "functions": [
+        "wechat_account_status_payload",
+        "wechat_article_id",
+        "wechat_auth_monitor_loop",
+        "wechat_auth_poll_worker",
+        "wechat_auth_probe_url",
+        "wechat_auth_schedule_hours",
+        "wechat_env_account",
+        "wechat_error_requires_auth",
+        "wechat_existing_authorized_payload",
+        "wechat_group_analysis_result",
+        "wechat_group_monitor_loop",
+        "wechat_group_monitor_payload",
+        "wechat_group_monitor_rows",
+        "wechat_group_monitor_status_label",
+        "wechat_group_monitor_user_id",
+        "wechat_history_items_for_source",
+        "wechat_login_account_from_result",
+        "wechat_login_begin_payload",
+        "wechat_login_poll_payload",
+        "wechat_mp_fetch_payload",
+        "wechat_opportunities_match",
+        "wechat_opportunity_content_key",
+        "wechat_opportunity_content_quality",
+        "wechat_opportunity_display_symbols",
+        "wechat_opportunity_event_kind",
+        "wechat_opportunity_exchange_key",
+        "wechat_opportunity_exchange_trade_url",
+        "wechat_opportunity_exchanges",
+        "wechat_opportunity_identity_symbols",
+        "wechat_opportunity_near_symbol_match",
+        "wechat_opportunity_semantic_key",
+        "wechat_opportunity_text_similarity",
+        "wechat_opportunity_trade_action",
+        "wechat_platform_account",
+        "wechat_platform_accounts",
+        "wechat_platform_articles",
+        "wechat_platform_articles_pages",
+        "wechat_platform_candidate_paths",
+        "wechat_platform_headers",
+        "wechat_platform_request"
+      ],
+      "externalFunctionCount": 48,
+      "externalFunctions": [
+        "admin_user",
+        "auth_db",
+        "bool_value",
+        "cache_wechat_source_alias",
+        "cached_wechat_source_alias",
+        "chat_ca_concrete_narrative",
+        "chat_contract_display_symbols",
+        "chat_contract_market_identity",
+        "chat_contract_metadata_narrative",
+        "chat_hourly_summary_rows",
+        "chat_opportunity_contract_candidates",
+        "chat_opportunity_contract_identity",
+        "chat_opportunity_plain_narrative",
+        "clean_feed_text",
+        "clean_price_watch_symbol",
+        "cleanup_runtime_ephemeral_files",
+        "dedupe_wechat_opportunity_records",
+        "deepseek_chat",
+        "deepseek_enabled",
+        "deepseek_extract_json",
+        "deepseek_flat_text",
+        "ensure_default_qq_group_monitor",
+        "env_value",
+        "incremental_items",
+        "is_generic_wechat_title",
+        "is_wechat_platform_mp_id",
+        "iter_nested_dicts",
+        "jwt_payload",
+        "launch_desktop_alert",
+        "llm_settings_for_user",
+        "next_wechat_auth_check_time",
+        "normalize_wechat_article_url",
+        "notify_wechat_auth_required",
+        "parse_json_list",
+        "parse_wechat_article",
+        "poll_wechat_group_monitors_once",
+        "public_wechat_account",
+        "read_wechat_account_cache",
+        "recent_feed_items",
+        "row_dict"
+      ],
+      "externalDomains": [
+        "auth_config",
+        "misc",
+        "news",
+        "persistence"
+      ],
+      "globalsUsedCount": 36,
+      "globalsUsed": [
+        "ASTER_TRADE_URL",
+        "AUTH_DB_LOCK",
+        "Any",
+        "BytesIO",
+        "CHAT_OPPORTUNITY_EXCHANGE_ALIASES",
+        "CHAT_OPPORTUNITY_EXCHANGE_LABELS",
+        "CHAT_OPPORTUNITY_SECONDARY_CONTRACT_PATTERN",
+        "DEFAULT_QQ_GROUP_NAME",
+        "DEFAULT_QQ_SENDER_FILTER",
+        "HEADERS",
+        "PERSIST_CACHE_DIR",
+        "Path",
+        "RSS_RETENTION_MS",
+        "SERVER_SHUTDOWN_EVENT",
+        "WECHAT_AUTH_ALERT_LOCK",
+        "WECHAT_AUTH_POLLING_UUIDS",
+        "WECHAT_AUTH_SCHEDULE_HOURS",
+        "WECHAT_AUTH_VALIDATE_INTERVAL_SECONDS",
+        "WECHAT_GROUP_MONITOR_STARTED",
+        "WECHAT_GROUP_OPPORTUNITY_DEDUP_SECONDS",
+        "WECHAT_PLATFORM_AUTO_PAGE_LIMIT",
+        "WECHAT_PLATFORM_BACKFILL_PAGE_LIMIT",
+        "base64",
+        "datetime",
+        "extract_candidate_symbols",
+        "json",
+        "normalize_chat_platform",
+        "normalize_group_name",
+        "os",
+        "parse_qs",
+        "quote",
+        "re",
+        "requests",
+        "sys",
+        "time",
+        "urlparse"
+      ],
+      "globalWriters": [],
+      "selfContained": false
+    },
+    {
+      "domain": "strategy",
+      "functionCount": 44,
+      "functions": [
+        "aster_contract_announcement_rows",
+        "aster_contract_rows",
+        "aster_contracts_payload",
+        "aster_listing_announcement_rows",
+        "aster_official_listing_rows",
+        "aster_official_x_listing_rows",
+        "exchange_ai_narrative_for_item",
+        "exchange_ai_narratives_payload",
+        "exchange_ai_result_from_binance",
+        "strategy_active_adaptive_contexts",
+        "strategy_adaptive_context_for_symbol",
+        "strategy_adaptive_context_state",
+        "strategy_adaptive_stage_from_text",
+        "strategy_adaptive_symbols_from_text",
+        "strategy_asset_row",
+        "strategy_board_signals",
+        "strategy_break_even",
+        "strategy_clamp",
+        "strategy_clear_exchange_cache",
+        "strategy_credentials_complete",
+        "strategy_dragon_wave_context",
+        "strategy_dragon_wave_items",
+        "strategy_dragon_wave_signal_candidates",
+        "strategy_environment_exchange_credentials",
+        "strategy_exchange_account",
+        "strategy_exchange_accounts",
+        "strategy_exchange_availability",
+        "strategy_exchange_cache_get",
+        "strategy_exchange_cache_set",
+        "strategy_exchange_configured",
+        "strategy_exchange_credentials",
+        "strategy_exchange_settings_payload",
+        "strategy_live_enabled",
+        "strategy_live_positions",
+        "strategy_max_notional",
+        "strategy_order_preview",
+        "strategy_orders_payload",
+        "strategy_paper_positions",
+        "strategy_risk_tier",
+        "strategy_stop_loss_plan"
+      ],
+      "externalFunctionCount": 33,
+      "externalFunctions": [
+        "auth_db",
+        "binance_futures_account",
+        "binance_futures_positions",
+        "clean_exchange_credential",
+        "clean_feed_text",
+        "clean_price_watch_symbol",
+        "clean_strategy_exchange",
+        "crypto_icon_url",
+        "decrypt_field",
+        "env_value",
+        "fetch_binance_wallet_ai_narrative",
+        "fetch_bitget_exchange_ai_narrative",
+        "fetch_bitget_official_coin_identity",
+        "hydrate_new_coin_low_snapshot",
+        "mask_api_key",
+        "merge_strategy_positions",
+        "new_coin_low_row_admitted",
+        "normalize_exchange_ai_binance_chain",
+        "okx_futures_account",
+        "okx_futures_positions",
+        "price_structure_latest_snapshot_payload",
+        "price_watch_active_rows",
+        "price_watch_public_item",
+        "read_json_cache",
+        "safe_error_text",
+        "safe_float",
+        "stable_feed_id",
+        "write_audit_log",
+        "write_json_cache",
+        "x_kol_fetch_api_source",
+        "x_kol_fetch_rss_source",
+        "x_kol_official_paid_source_allowed",
+        "x_kol_token"
+      ],
+      "externalDomains": [
+        "auth_config",
+        "binance",
+        "misc",
+        "persistence",
+        "price_structure",
+        "price_watch",
+        "social_x"
+      ],
+      "globalsUsedCount": 42,
+      "globalsUsed": [
+        "ASTER_ANNOUNCEMENT_API_URL",
+        "ASTER_ANNOUNCEMENT_BOOTSTRAP_FUTURE_MS",
+        "ASTER_ANNOUNCEMENT_BOOTSTRAP_LOOKBACK_MS",
+        "ASTER_ANNOUNCEMENT_LOCK",
+        "ASTER_ANNOUNCEMENT_RETENTION_MS",
+        "ASTER_ANNOUNCEMENT_STATE_PATH",
+        "ASTER_ANNOUNCEMENT_URL",
+        "ASTER_CONTRACT_STATUSES",
+        "ASTER_CROSS_SOURCE_DEDUPE_MS",
+        "ASTER_FUTURES_EXCHANGE_INFO_URL",
+        "ASTER_INVENTORY_RETENTION_MS",
+        "ASTER_TRADE_URL",
+        "ASTER_X_HANDLE",
+        "ASTER_X_LISTING_CACHE_PATH",
+        "ASTER_X_LISTING_CACHE_TTL_MS",
+        "ASTER_X_LISTING_LOCK",
+        "AUTH_DB_LOCK",
+        "Any",
+        "BINANCE_AI_NARRATIVE_POOL",
+        "EXCHANGE_AI_NARRATIVE_ALLOWED_SOURCES",
+        "EXCHANGE_AI_NARRATIVE_MAX_ITEMS",
+        "EXCHANGE_AI_SYMBOL_IDENTITY_SOURCES",
+        "EXCHANGE_AI_TRENCH_POOL",
+        "HEADERS",
+        "NEW_COIN_LOW_ITEMS",
+        "NEW_COIN_LOW_LOCK",
+        "NEW_COIN_LOW_MONITOR_ACTIVE",
+        "STRATEGY_ADAPTIVE_CONTEXT_LOCK",
+        "STRATEGY_ADAPTIVE_CONTEXT_PATH",
+        "STRATEGY_DEFAULT_STOP_PCT",
+        "STRATEGY_EXCHANGE_CACHE",
+        "STRATEGY_EXCHANGE_CACHE_LOCK",
+        "STRATEGY_EXCHANGE_DEFINITIONS",
+        "STRATEGY_FEE_BUFFER_PCT",
+        "STRATEGY_POSITION_CACHE_SECONDS",
+        "TRUTHY_ENV_VALUES",
+        "as_completed",
+        "extract_candidate_symbols",
+        "extract_explicit_candidate_symbols",
+        "re",
+        "requests",
+        "time"
+      ],
+      "globalWriters": [],
+      "selfContained": false
+    },
+    {
+      "domain": "market",
+      "functionCount": 36,
+      "functions": [
+        "gainers_rankings_payload",
+        "market_amount_text",
+        "market_display_name",
+        "market_hot_response_payload",
+        "market_narrative_decorate_source",
+        "market_payload",
+        "market_priority_current_assets",
+        "market_priority_external_boosts",
+        "market_priority_lean_history_rows",
+        "market_priority_narrative_profile",
+        "market_priority_payload",
+        "market_priority_record_snapshot",
+        "market_priority_trade_score",
+        "market_priority_update_history",
+        "market_priority_window_rows",
+        "rotation_ai_candidate_rows",
+        "rotation_ai_entity_claim_invalid",
+        "rotation_ai_leader_snapshot",
+        "rotation_ai_prompt",
+        "rotation_ai_row_fingerprint",
+        "rotation_ai_worker",
+        "rotation_alert_map_snapshot",
+        "rotation_change_value",
+        "rotation_dynamic_members",
+        "rotation_leader_metrics_from_price_watch",
+        "rotation_map_payload",
+        "rotation_market_number",
+        "rotation_market_ticker",
+        "rotation_meme_family_context",
+        "rotation_metric",
+        "rotation_relation_relevance",
+        "rotation_row_themes",
+        "rotation_theme_groups",
+        "rotation_ticker_index",
+        "rotation_trade_url",
+        "turnover_rankings_payload"
+      ],
+      "externalFunctionCount": 62,
+      "externalFunctions": [
+        "alert_text",
+        "api_cache_path",
+        "auth_db",
+        "binance_futures_contract_status",
+        "binance_wallet_hot_source",
+        "cached_api_payload",
+        "cached_or_fallback_source",
+        "cached_source_fallback",
+        "clean_feed_text",
+        "clean_model_provider",
+        "clean_price_watch_symbol",
+        "crypto_icon_url",
+        "deepseek_chat",
+        "deepseek_enabled",
+        "deepseek_extract_json",
+        "deepseek_load_discussion_items",
+        "deepseek_row_discussion_context",
+        "deepseek_row_taxonomy_context",
+        "fetch_aicoin",
+        "fetch_ave_hot",
+        "fetch_binance",
+        "fetch_binance_futures_gainers",
+        "fetch_binance_gainers",
+        "fetch_bitget",
+        "fetch_bitget_gainers",
+        "fetch_cn_stock_gainers",
+        "fetch_futu_gainers",
+        "fetch_futu_hot",
+        "fetch_futu_turnover",
+        "fetch_gmgn_hot_search",
+        "fetch_gmgn_trenches_hot_board",
+        "fetch_okx",
+        "fetch_okx_dex_gainers",
+        "fetch_okx_dex_hot",
+        "fetch_okx_gainers",
+        "fetch_okx_turnover",
+        "fetch_ths_hot",
+        "is_excluded_crypto_asset",
+        "merge_rotation_ai_leader",
+        "money_usd"
+      ],
+      "externalDomains": [
+        "alert",
+        "auth_config",
+        "binance",
+        "misc",
+        "persistence",
+        "price_watch"
+      ],
+      "globalsUsedCount": 23,
+      "globalsUsed": [
+        "Any",
+        "MARKET_PRIORITY_HISTORY_SECONDS",
+        "MARKET_PRIORITY_SNAPSHOT_INTERVAL_SECONDS",
+        "MARKET_PRIORITY_WINDOWS",
+        "MARKET_SOURCE_POOL",
+        "PERSIST_CACHE_DIR",
+        "PERSONAL_X_MONITOR_RETENTION_SECONDS",
+        "RANK_MONITOR_LOCK",
+        "RANK_MONITOR_STATE_PATH",
+        "ROTATION_AI_CACHE_PATH",
+        "ROTATION_AI_INCREMENT_BATCH_SIZE",
+        "ROTATION_AI_LOCK",
+        "ROTATION_AI_POOL",
+        "ROTATION_AI_RETRY_AFTER",
+        "ROTATION_LEADER_MIN_GAIN_PCT",
+        "ROTATION_MAX_CANDIDATES",
+        "ROTATION_MAX_LEADERS",
+        "hashlib",
+        "json",
+        "math",
+        "re",
+        "sys",
+        "time"
+      ],
+      "globalWriters": [
+        "ROTATION_AI_INFLIGHT",
+        "ROTATION_AI_RETRY_AFTER"
+      ],
+      "selfContained": false
+    },
+    {
+      "domain": "onchain",
+      "functionCount": 25,
+      "functions": [
+        "chain_ecosystem_ai_market_asset_key",
+        "chain_ecosystem_ai_prompt",
+        "chain_ecosystem_ai_subject_signature",
+        "chain_ecosystem_ai_subjects",
+        "chain_ecosystem_ai_worker",
+        "chain_ecosystem_attach_ai",
+        "gmgn_hot_aggregate_rows",
+        "gmgn_hot_change",
+        "gmgn_hot_rank_source",
+        "gmgn_hot_rows_from_tokens",
+        "gmgn_trench_board_rows",
+        "gmgn_trench_daily_research_payload",
+        "gmgn_trench_display_keys",
+        "gmgn_trench_history_identity",
+        "gmgn_trench_history_record",
+        "gmgn_trench_realtime_rows",
+        "gmgn_trench_research_candidate",
+        "gmgn_trench_unique_rows",
+        "gmgn_trench_x_post_from_fxtwitter",
+        "gmgn_trench_x_post_payload",
+        "onchain_market_mainline_context",
+        "onchain_research_ingest_identity",
+        "onchain_research_ingest_worker",
+        "onchain_research_mode_payload",
+        "onchain_trench_ai_subjects"
+      ],
+      "externalFunctionCount": 36,
+      "externalFunctions": [
+        "_gmgn_trench_x_external_url",
+        "_gmgn_trench_x_post_cached",
+        "_store_gmgn_trench_x_post",
+        "attach_gmgn_trench_research",
+        "binance_wallet_contract_url",
+        "chain_display_label",
+        "clean_api_key",
+        "clean_feed_text",
+        "clean_model_name",
+        "clean_model_provider",
+        "codex_cli_fallback_available",
+        "crypto_icon_url",
+        "date_yyyy_mm_dd",
+        "deepseek_chat",
+        "deepseek_enabled",
+        "deepseek_extract_json",
+        "enrich_trench_candidate_from_news_trade_hotspot",
+        "env_value",
+        "fetch_gmgn_trenches_hot_board",
+        "global_hotspot_snapshot",
+        "money_usd",
+        "normalize_asset_symbol",
+        "normalize_chain_ecosystem_ai_analysis",
+        "normalize_gmgn_hot_period",
+        "normalize_onchain_research_mode",
+        "normalize_x_handle",
+        "parse_feed_datetime",
+        "pct",
+        "price_usd",
+        "read_json_cache",
+        "safe_float",
+        "save_chain_ecosystem_ai_updates",
+        "system_llm_settings",
+        "unique_values",
+        "x_kol_http_get",
+        "x_kol_tweet_url"
+      ],
+      "externalDomains": [
+        "binance",
+        "misc",
+        "persistence",
+        "smart_money",
+        "social_x"
+      ],
+      "globalsUsedCount": 35,
+      "globalsUsed": [
+        "Any",
+        "CHAIN_ECOSYSTEM_AI_CACHE_PATH",
+        "CHAIN_ECOSYSTEM_AI_INFLIGHT",
+        "CHAIN_ECOSYSTEM_AI_LOCK",
+        "CHAIN_ECOSYSTEM_AI_POOL",
+        "CHAIN_ECOSYSTEM_AI_RETRY_AFTER",
+        "GMGN_HOT_CHAINS",
+        "GMGN_MAX_DUPLICATE_FAMILY_SIZE",
+        "GMGN_TRENCH_X_POST_CACHE_TTL_SECONDS",
+        "GMGN_TRENCH_X_POST_MIN_INTERVAL_SECONDS",
+        "GMGN_TRENCH_X_POST_NEGATIVE_TTL_SECONDS",
+        "GMGN_TRENCH_X_POST_REQUEST_LOCK",
+        "ONCHAIN_FAST_RESEARCH",
+        "ONCHAIN_RESEARCH_DEFAULT_NETWORKS",
+        "ONCHAIN_RESEARCH_INGEST_LOCK",
+        "ONCHAIN_RESEARCH_INGEST_PENDING",
+        "ONCHAIN_RESEARCH_MODE_LOCK",
+        "ONCHAIN_RESEARCH_MODE_STATE_PATH",
+        "RANK_BROADCAST_MUTED_SOURCE_IDS",
+        "SERVER_SHUTDOWN_EVENT",
+        "X_KOL_FXTWITTER_BASE_URL",
+        "X_KOL_FXTWITTER_TIMEOUT_SECONDS",
+        "gmgn_trench_passes_chain_filters",
+        "hashlib",
+        "json",
+        "math",
+        "onchain_candidate_key",
+        "quote",
+        "re",
+        "safe_monitor_error",
+        "sys",
+        "threading",
+        "time",
+        "unicodedata",
+        "urlparse"
+      ],
+      "globalWriters": [
+        "GMGN_TRENCH_X_POST_NEXT_REQUEST_AT",
+        "ONCHAIN_RESEARCH_INGEST_THREAD"
+      ],
+      "selfContained": false
+    },
+    {
+      "domain": "alert",
+      "functionCount": 22,
+      "functions": [
+        "alert_body_join",
+        "alert_dedupe_keys",
+        "alert_dedupe_title",
+        "alert_event_ms",
+        "alert_text",
+        "desktop_alert_bridge_url",
+        "desktop_alert_delivery_tick",
+        "desktop_alert_flow_aliases",
+        "desktop_alert_interval_seconds",
+        "desktop_alert_is_news_trade_intake",
+        "desktop_alert_is_price_watch",
+        "desktop_alert_is_structure_observation",
+        "desktop_alert_marker_id",
+        "desktop_alert_monitor_symbol",
+        "desktop_alert_needs_immediate_news_trade_status",
+        "desktop_alert_political_military_reason",
+        "desktop_alert_price_watch_suppression_reason",
+        "desktop_alert_process_is_running",
+        "desktop_alert_queue_priority",
+        "desktop_alert_queue_worker",
+        "desktop_alert_runtime_suppression_reason",
+        "desktop_alert_source_is_muted"
+      ],
+      "externalFunctionCount": 20,
+      "externalFunctions": [
+        "clean_feed_text",
+        "env_value",
+        "filter_price_monitor_cold_archives",
+        "gmgn_hot_rank_source",
+        "js_stable_key",
+        "js_stable_part",
+        "newsflash_stable_key",
+        "next_desktop_alert_slot",
+        "normalize_x_handle",
+        "parse_feed_datetime",
+        "price_monitor_row_has_cold_archive",
+        "price_structure_monitor_symbol",
+        "price_structure_symbol_excluded",
+        "price_watch_prior_high_source_enabled",
+        "rank_monitor_hot_new_is_silent",
+        "record_event_flow_popup",
+        "safe_error_text",
+        "safe_float",
+        "spawn_desktop_alert_process",
+        "x_kol_status_identity"
+      ],
+      "externalDomains": [
+        "misc",
+        "news",
+        "onchain",
+        "price_structure",
+        "price_watch",
+        "social_x"
+      ],
+      "globalsUsedCount": 45,
+      "globalsUsed": [
+        "ALERT_DELIVERY_STORE",
+        "AUTH_DB_PATH",
+        "Any",
+        "DESKTOP_ALERT_CRITICAL_INTERVAL_SECONDS",
+        "DESKTOP_ALERT_CRITICAL_PRIORITY",
+        "DESKTOP_ALERT_DELIVERIES",
+        "DESKTOP_ALERT_DELIVERY_TICK_LOCK",
+        "DESKTOP_ALERT_GENERAL_PROCESSES",
+        "DESKTOP_ALERT_GEOPOLITICAL_ACTOR_PATTERN",
+        "DESKTOP_ALERT_LOCK",
+        "DESKTOP_ALERT_MAX_CONCURRENT_SLOTS",
+        "DESKTOP_ALERT_MILITARY_PATTERN",
+        "DESKTOP_ALERT_MIN_INTERVAL_SECONDS",
+        "DESKTOP_ALERT_PERSONAL_PNL_PATTERN",
+        "DESKTOP_ALERT_POLITICAL_ACTOR_PATTERN",
+        "DESKTOP_ALERT_POLITICAL_FIGURE_PATTERN",
+        "DESKTOP_ALERT_POLITICAL_PATTERN",
+        "DESKTOP_ALERT_POSITION_CHANGE_PATTERN",
+        "DESKTOP_ALERT_PRICE_WATCH_AUTO_CLOSE_MS",
+        "DESKTOP_ALERT_QUEUE_WAKE",
+        "DESKTOP_ALERT_STRUCTURE_AUTO_CLOSE_MS",
+        "DESKTOP_ALERT_STRUCTURE_PROCESSES",
+        "DESKTOP_ALERT_URGENT_INTERVAL_SECONDS",
+        "DESKTOP_ALERT_WHALE_PNL_PATTERN",
+        "EVENT_FLOW_STORE",
+        "EXCLUDED_IMPORTANT_HANDLES",
+        "NEWS_TRADE_IMMEDIATE_INTAKE_PATTERN",
+        "ONCHAIN_RANK_DESKTOP_ALERT_SOURCE_IDS",
+        "ONCHAIN_RANK_SOURCE_PATTERN",
+        "PRICE_WATCH_LIVE_SAMPLE_MAX_GAP_MS",
+        "RANK_BROADCAST_MUTED_SOURCE_IDS",
+        "RANK_LEADER_ALERT_PATTERN",
+        "SECONDARY_RANK_LEADER_ALLOWED_SOURCE_IDS",
+        "SERVER_SHUTDOWN_EVENT",
+        "STOCK_RANK_DESKTOP_ALERT_SOURCE_IDS",
+        "TRENCH_PERSON_ALERT_MAX_AGE_MS",
+        "TRENCH_PERSON_ALERT_NOT_BEFORE_MS",
+        "X_TWEET_ANALYSIS_PERSON_HANDLES",
+        "article_alias",
+        "hashlib",
+        "re",
+        "source_family",
+        "sqlite3",
+        "sys",
+        "time"
+      ],
+      "globalWriters": [
+        "DESKTOP_ALERT_ACTIVE_PROCESS",
+        "DESKTOP_ALERT_ACTIVE_PROCESS_SLOT",
+        "DESKTOP_ALERT_LAST_LAUNCHED_AT",
+        "DESKTOP_ALERT_LAST_LAUNCHED_PRIORITY",
+        "DESKTOP_ALERT_QUEUE_ACTIVE"
+      ],
+      "selfContained": false
+    },
+    {
+      "domain": "binance",
+      "functionCount": 20,
+      "functions": [
+        "binance_alpha_timestamp_ms",
+        "binance_futures_account",
+        "binance_futures_contract_status",
+        "binance_futures_error_message",
+        "binance_futures_positions",
+        "binance_futures_signed_get",
+        "binance_listing_events",
+        "binance_price_watch_pair",
+        "binance_wallet_4h_structure_identity",
+        "binance_wallet_4h_structure_rows",
+        "binance_wallet_ai_narrative_available",
+        "binance_wallet_ai_narrative_from_payload",
+        "binance_wallet_contract_url",
+        "binance_wallet_hot_alert_monitor_loop",
+        "binance_wallet_hot_popup_summary",
+        "binance_wallet_hot_research_rows",
+        "binance_wallet_hot_source",
+        "binance_wallet_hot_source_from_payload",
+        "binance_wallet_icon_url",
+        "binance_wallet_token_url"
+      ],
+      "externalFunctionCount": 27,
+      "externalFunctions": [
+        "cached_or_fallback_source",
+        "chat_opportunity_plain_narrative",
+        "clean_exchange_credential",
+        "clean_feed_text",
+        "clean_price_watch_symbol",
+        "crypto_icon_url",
+        "extract_listing_symbols",
+        "fetch_binance_wallet_hot",
+        "is_excluded_crypto_asset",
+        "js_stable_key",
+        "market_narrative_decorate_source",
+        "money_usd",
+        "normalize_asset_symbol",
+        "normalize_binance_wallet_hot_period",
+        "parse_binance_futures_account",
+        "pct",
+        "price_usd",
+        "price_watch_symbol_without_quote",
+        "read_json_cache",
+        "safe_error_text",
+        "safe_float",
+        "source_template",
+        "strategy_credentials_complete",
+        "strategy_exchange_cache_get",
+        "strategy_exchange_cache_set",
+        "strategy_exchange_credentials",
+        "sync_binance_wallet_hot_alert_feed"
+      ],
+      "externalDomains": [
+        "market",
+        "misc",
+        "persistence",
+        "price_watch",
+        "strategy"
+      ],
+      "globalsUsedCount": 27,
+      "globalsUsed": [
+        "Any",
+        "BINANCE_FUTURES_STATUS_CACHE",
+        "BINANCE_FUTURES_STATUS_LOCK",
+        "BINANCE_FUTURES_STATUS_TTL_SECONDS",
+        "BINANCE_NATIVE_PRICE_WATCH_PAIRS",
+        "BINANCE_WALLET_4H_STRUCTURE_ACTIVE",
+        "BINANCE_WALLET_4H_STRUCTURE_LOCK",
+        "BINANCE_WALLET_4H_STRUCTURE_PATH",
+        "BINANCE_WALLET_4H_STRUCTURE_RETENTION_SECONDS",
+        "BINANCE_WALLET_CHAIN_META",
+        "BINANCE_WALLET_HOT_ALERT_INTERVAL_SECONDS",
+        "BINANCE_WALLET_HOT_PERIODS",
+        "BINANCE_WALLET_KLINE_CHAINS",
+        "BINANCE_WALLET_REFERRAL_CODE",
+        "CACHE",
+        "HEADERS",
+        "ONCHAIN_FAST_RESEARCH",
+        "SERVER_SHUTDOWN_EVENT",
+        "hashlib",
+        "hmac",
+        "json",
+        "quote",
+        "re",
+        "requests",
+        "sys",
+        "time",
+        "urlencode"
+      ],
+      "globalWriters": [
+        "BINANCE_FUTURES_STATUS_UPDATED_AT"
+      ],
+      "selfContained": false
+    },
+    {
+      "domain": "smart_money",
+      "functionCount": 13,
+      "functions": [
+        "global_hotspot_candidate_matches",
+        "global_hotspot_claim_batch",
+        "global_hotspot_day_key",
+        "global_hotspot_enrich_candidate",
+        "global_hotspot_identity_text",
+        "global_hotspot_match_event",
+        "global_hotspot_monitor_loop",
+        "global_hotspot_prompt",
+        "global_hotspot_public_url",
+        "global_hotspot_research_rows",
+        "global_hotspot_snapshot",
+        "global_hotspot_source_row",
+        "global_hotspot_text_list"
+      ],
+      "externalFunctionCount": 7,
+      "externalFunctions": [
+        "clean_feed_text",
+        "read_json_cache",
+        "run_global_hotspot_batch",
+        "safe_error_text",
+        "safe_float",
+        "unique_values",
+        "write_json_cache"
+      ],
+      "externalDomains": [
+        "misc",
+        "persistence"
+      ],
+      "globalsUsedCount": 17,
+      "globalsUsed": [
+        "Any",
+        "GLOBAL_HOTSPOT_DAILY_MAX_BATCHES",
+        "GLOBAL_HOTSPOT_INTERVAL_SECONDS",
+        "GLOBAL_HOTSPOT_LOCK",
+        "GLOBAL_HOTSPOT_STATE_PATH",
+        "NEWS_TRIGGER_VERSION",
+        "Path",
+        "SERVER_SHUTDOWN_EVENT",
+        "datetime",
+        "json",
+        "promote_resonance_priority",
+        "re",
+        "sys",
+        "time",
+        "timedelta",
+        "timezone",
+        "urlparse"
+      ],
+      "globalWriters": [],
+      "selfContained": false
+    },
+    {
+      "domain": "persistence",
+      "functionCount": 12,
+      "functions": [
+        "cache_wechat_source_alias",
+        "cached",
+        "cached_api_payload",
+        "cached_chain_ecosystem_view",
+        "cached_event_monitor_core_payload",
+        "cached_newsflash_explanation_profile",
+        "cached_or_fallback_source",
+        "cached_source_copy",
+        "cached_source_fallback",
+        "cached_wechat_source_alias",
+        "read_json_cache",
+        "write_json_cache"
+      ],
+      "externalFunctionCount": 21,
+      "externalFunctions": [
+        "alert_text",
+        "api_cache_path",
+        "api_refresh_inflight",
+        "build_event_monitor_core_payload",
+        "newsflash_explanation_profile",
+        "payload_cache_time",
+        "prune_timestamped_cache",
+        "public_wechat_source_alias",
+        "read_event_monitor_core_snapshot",
+        "read_wechat_source_alias_cache",
+        "refresh_api_cache_now",
+        "safe_error_text",
+        "source_cache_path",
+        "source_fallback_allowed",
+        "source_has_rows",
+        "source_template",
+        "trigger_api_refresh",
+        "wechat_source_alias_key",
+        "with_cache_meta",
+        "write_price_structure_snapshot",
+        "write_wechat_source_alias_cache"
+      ],
+      "externalDomains": [
+        "alert",
+        "misc",
+        "news",
+        "wechat"
+      ],
+      "globalsUsedCount": 16,
+      "globalsUsed": [
+        "Any",
+        "CACHE",
+        "CACHE_LOCK",
+        "CACHE_MAX_ENTRIES",
+        "CACHE_TTL",
+        "EVENT_MONITOR_CORE_BUILD_LOCK",
+        "EVENT_MONITOR_CORE_CACHE_TTL_SECONDS",
+        "MONITOR_BUY",
+        "PRICE_STRUCTURE_SNAPSHOT_PATH",
+        "Path",
+        "json",
+        "os",
+        "paginate_research",
+        "re",
+        "threading",
+        "time"
+      ],
+      "globalWriters": [],
+      "selfContained": false
+    },
+    {
+      "domain": "dragon_wave",
+      "functionCount": 6,
+      "functions": [
+        "dragon_wave_feedback_display_index",
+        "dragon_wave_feedback_feature_tokens",
+        "dragon_wave_feedback_for_user",
+        "dragon_wave_feedback_optimization",
+        "dragon_wave_monitor_node_binary",
+        "dragon_wave_supervised_prototype_profile"
+      ],
+      "externalFunctionCount": 3,
+      "externalFunctions": [
+        "load_user_payload",
+        "normalize_dragon_wave_feedback",
+        "safe_float"
+      ],
+      "externalDomains": [
+        "misc"
+      ],
+      "globalsUsedCount": 7,
+      "globalsUsed": [
+        "Any",
+        "DRAGON_WAVE_FEEDBACK_INDEX_SIGNAL_FIELDS",
+        "Path",
+        "USER_SCOPE_DRAGON_WAVE_FEEDBACK",
+        "math",
+        "os",
+        "shutil"
+      ],
+      "globalWriters": [],
+      "selfContained": false
+    },
+    {
+      "domain": "seo",
+      "functionCount": 6,
+      "functions": [
+        "inject_seo_into_html",
+        "normalized_page_path",
+        "robots_txt",
+        "seo_head_block",
+        "seo_schema_for_page",
+        "sitemap_xml"
+      ],
+      "externalFunctionCount": 6,
+      "externalFunctions": [
+        "canonical_url",
+        "inject_site_footer",
+        "refresh_stylesheet_version",
+        "request_base_url",
+        "request_base_url_for_schema",
+        "strip_runtime_seo_tags"
+      ],
+      "externalDomains": [
+        "misc"
+      ],
+      "globalsUsedCount": 8,
+      "globalsUsed": [
+        "Any",
+        "SEO_NOINDEX_PATHS",
+        "SEO_PUBLIC_PAGES",
+        "SimpleHTTPRequestHandler",
+        "datetime",
+        "html",
+        "json",
+        "re"
+      ],
+      "globalWriters": [],
+      "selfContained": false
+    },
+    {
+      "domain": "auth_config",
+      "functionCount": 3,
+      "functions": [
+        "auth_db",
+        "session_files_for_threads",
+        "todo_state_payload"
+      ],
+      "externalFunctionCount": 3,
+      "externalFunctions": [
+        "load_user_payload",
+        "normalize_todo_payload",
+        "user_payload_exists"
+      ],
+      "externalDomains": [
+        "misc"
+      ],
+      "globalsUsedCount": 7,
+      "globalsUsed": [
+        "AUTH_DB_PATH",
+        "Any",
+        "CODEX_HOME",
+        "Path",
+        "USER_SCOPE_TODO",
+        "sqlite3",
+        "time"
+      ],
+      "globalWriters": [],
+      "selfContained": false
+    },
+    {
+      "domain": "logging",
+      "functionCount": 1,
+      "functions": [
+        "login_rate_limited"
+      ],
+      "externalFunctionCount": 0,
+      "externalFunctions": [],
+      "externalDomains": [],
+      "globalsUsedCount": 3,
+      "globalsUsed": [
+        "AUTH_LOGIN_ATTEMPTS",
+        "AUTH_LOGIN_LOCK",
+        "time"
+      ],
+      "globalWriters": [],
+      "selfContained": true
+    },
+    {
+      "domain": "ops_health",
+      "functionCount": 1,
+      "functions": [
+        "health_payload"
+      ],
+      "externalFunctionCount": 7,
+      "externalFunctions": [
+        "auth_db",
+        "env_flag",
+        "env_value",
+        "init_auth_db",
+        "is_production_mode",
+        "runtime_thread_groups",
+        "safe_float"
+      ],
+      "externalDomains": [
+        "auth_config",
+        "misc"
+      ],
+      "globalsUsedCount": 44,
+      "globalsUsed": [
+        "API_REFRESH_POOL",
+        "AUTH_DB_LOCK",
+        "Any",
+        "CACHE",
+        "CHAIN_ECOSYSTEM_MONITOR",
+        "DASHBOARD_HTTP_MAX_ACTIVE",
+        "DASHBOARD_HTTP_RUNTIME",
+        "LOGO_CACHE",
+        "MARKET_SOURCE_POOL",
+        "MONITOR_BUY",
+        "NEWS_TRADE_DISCOVERY_CACHE",
+        "NEWS_TRADE_SECURITY_CACHE",
+        "NEW_COIN_LOW_ACTIVITY_SUMMARY",
+        "NEW_COIN_LOW_INVENTORY_CACHE",
+        "NEW_COIN_LOW_ITEMS",
+        "NEW_COIN_LOW_LOCK",
+        "NEW_COIN_LOW_MONITOR_ACTIVE",
+        "NEW_COIN_LOW_MONITOR_WORKERS",
+        "ONCHAIN_RESEARCH_INGEST_PENDING",
+        "ONCHAIN_RESEARCH_INGEST_PENDING_LIMIT",
+        "ONCHAIN_RESEARCH_INGEST_THREAD",
+        "PERSIST_CACHE_DIR",
+        "PRICE_STRUCTURE_ENTRY_DAY_TIMEFRAME_POOL",
+        "PRICE_STRUCTURE_EVENT_CONTEXTS",
+        "PRICE_STRUCTURE_EVENT_CONTEXT_LOCK",
+        "PRICE_STRUCTURE_MOMENTUM_CACHE",
+        "PRICE_STRUCTURE_MONITOR_ACTIVE",
+        "PRICE_STRUCTURE_MONITOR_WORKERS",
+        "PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE",
+        "PRICE_STRUCTURE_ONCHAIN_POOL_CACHE",
+        "PRICE_STRUCTURE_PREARM_FORECAST_MINUTES",
+        "PRICE_STRUCTURE_PREARM_INTERVAL_SECONDS",
+        "PRICE_STRUCTURE_PREARM_MONITOR_ACTIVE",
+        "PRICE_STRUCTURE_PREARM_STATUS",
+        "PRICE_STRUCTURE_PREARM_STATUS_LOCK",
+        "PRICE_STRUCTURE_STRATEGY_VERSION",
+        "PRICE_STRUCTURE_TIMEFRAME_POOL",
+        "PRICE_WATCH_MONITOR_ACTIVE",
+        "SITE_ALERT_MONITOR_ACTIVE",
+        "THREAD_STACK_SIZE_BYTES",
+        "WECHAT_AUTH_MONITOR_ACTIVE",
+        "requests",
+        "threading",
+        "time"
+      ],
+      "globalWriters": [],
+      "selfContained": false
+    }
+  ],
+  "hotGlobals": [
+    {
+      "name": "Any",
+      "userCount": 1030,
+      "kind": "import",
+      "sampleUsers": [
+        "_backfill_wechat_group_ai_row",
+        "_fetch_new_coin_low_market_activity",
+        "_future_event_todo_user",
+        "_gmgn_trench_x_external_url",
+        "_gmgn_trench_x_post_cached",
+        "_light_screen_cached_lookup",
+        "_light_screen_cached_store",
+        "_light_screen_onchain_candidates"
+      ]
+    },
+    {
+      "name": "time",
+      "userCount": 376,
+      "kind": "import",
+      "sampleUsers": [
+        "_backfill_wechat_group_ai_row",
+        "_fetch_new_coin_low_market_activity",
+        "_gmgn_trench_x_post_cached",
+        "_light_screen_onchain_candidates",
+        "_store_chat_hourly_summary",
+        "_store_gmgn_trench_x_post",
+        "add_price_watch_symbol",
+        "admin_refresh_cache_payload"
+      ]
+    },
+    {
+      "name": "re",
+      "userCount": 194,
+      "kind": "import",
+      "sampleUsers": [
+        "_event_monitor_term_pattern",
+        "_fetch_new_coin_low_market_activity",
+        "a_share_new_stock_events",
+        "aicoin_client_hot_payload",
+        "aicoin_token_candidates",
+        "alert_body_join",
+        "alert_dedupe_title",
+        "alert_text"
+      ]
+    },
+    {
+      "name": "requests",
+      "userCount": 103,
+      "kind": "variable",
+      "sampleUsers": [
+        "_fetch_new_coin_low_market_activity",
+        "aicoin_cdp_ready",
+        "aicoin_client_hot_payload",
+        "aicoin_decrypt_response",
+        "aicoin_rest_hot_payload",
+        "allinvest_logo_candidates",
+        "aster_contract_rows",
+        "aster_official_listing_rows"
+      ]
+    },
+    {
+      "name": "HEADERS",
+      "userCount": 95,
+      "kind": "variable",
+      "sampleUsers": [
+        "_binance_wallet_kline_raw",
+        "_fetch_new_coin_low_market_activity",
+        "_okx_dex_kline_raw",
+        "aicoin_encrypted_headers",
+        "allinvest_logo_candidates",
+        "aster_contract_rows",
+        "aster_official_listing_rows",
+        "ave_vemachine_path"
+      ]
+    },
+    {
+      "name": "json",
+      "userCount": 84,
+      "kind": "import",
+      "sampleUsers": [
+        "_extract_last_balanced_json",
+        "_light_screen_onchain_candidates",
+        "_store_chat_hourly_summary",
+        "ai_startup_reconnect_once",
+        "aicoin_client_hot_payload",
+        "aicoin_decrypt_response",
+        "aicoin_encrypt_body",
+        "analyze_fast_onchain_candidates"
+      ]
+    },
+    {
+      "name": "AUTH_DB_LOCK",
+      "userCount": 75,
+      "kind": "variable",
+      "sampleUsers": [
+        "_store_chat_hourly_summary",
+        "admin_count",
+        "admin_delete_user",
+        "admin_set_user",
+        "admin_summary_payload",
+        "admin_user",
+        "admin_user_rows",
+        "apply_price_watch_realtime_quotes"
+      ]
+    },
+    {
+      "name": "sys",
+      "userCount": 60,
+      "kind": "import",
+      "sampleUsers": [
+        "_fetch_new_coin_low_market_activity",
+        "ai_startup_reconnect_once",
+        "ave_hot_alert_monitor_loop",
+        "binance_wallet_hot_alert_monitor_loop",
+        "chain_ecosystem_ai_worker",
+        "chat_hourly_summary_loop",
+        "cleanup_excluded_monitor_symbol_snapshots",
+        "desktop_alert_delivery_tick"
+      ]
+    },
+    {
+      "name": "os",
+      "userCount": 51,
+      "kind": "import",
+      "sampleUsers": [
+        "aicoin_app_data_dir",
+        "aicoin_cookie_values",
+        "aicoin_encrypt_body",
+        "ave_browser_leveldb_dirs",
+        "cached_api_payload",
+        "claim_desktop_alert_marker",
+        "codex_cli_proxy_environment",
+        "codex_cli_sanitized_environment"
+      ]
+    },
+    {
+      "name": "threading",
+      "userCount": 48,
+      "kind": "import",
+      "sampleUsers": [
+        "add_price_watch_symbol",
+        "confirm_self_optimization",
+        "ensure_desktop_alert_worker",
+        "ensure_x_kol_realtime_worker",
+        "health_payload",
+        "main",
+        "new_coin_low_inventory_rows",
+        "onchain_research_ingest_worker"
+      ]
+    },
+    {
+      "name": "Path",
+      "userCount": 44,
+      "kind": "import",
+      "sampleUsers": [
+        "aicoin_app_data_dir",
+        "aicoin_cookie_values",
+        "aicoin_exe_path",
+        "api_cache_path",
+        "ave_browser_leveldb_dirs",
+        "ave_vemachine_path",
+        "cached_source_fallback",
+        "cleanup_excluded_monitor_symbol_snapshots"
+      ]
+    },
+    {
+      "name": "hashlib",
+      "userCount": 34,
+      "kind": "import",
+      "sampleUsers": [
+        "_okx_dex_kline_raw",
+        "binance_futures_account",
+        "binance_futures_positions",
+        "binance_futures_signed_get",
+        "chain_ecosystem_ai_subject_signature",
+        "chat_hourly_scope_key",
+        "decode_field_key",
+        "deepseek_row_hash"
+      ]
+    },
+    {
+      "name": "SERVER_SHUTDOWN_EVENT",
+      "userCount": 31,
+      "kind": "variable",
+      "sampleUsers": [
+        "ave_hot_alert_monitor_loop",
+        "binance_wallet_hot_alert_monitor_loop",
+        "chat_hourly_summary_loop",
+        "desktop_alert_queue_worker",
+        "ensure_desktop_alert_worker",
+        "filter_price_monitor_rows_by_activity",
+        "global_hotspot_monitor_loop",
+        "main"
+      ]
+    },
+    {
+      "name": "PERSIST_CACHE_DIR",
+      "userCount": 28,
+      "kind": "variable",
+      "sampleUsers": [
+        "admin_clear_cache_payload",
+        "api_cache_path",
+        "ave_vemachine_path",
+        "cleanup_runtime_ephemeral_files",
+        "deepseek_load_discussion_items",
+        "ensure_local_translation_service",
+        "event_monitor_onchain_source_rows",
+        "event_monitor_source_rows"
+      ]
+    },
+    {
+      "name": "sqlite3",
+      "userCount": 28,
+      "kind": "import",
+      "sampleUsers": [
+        "_restore_global_monitor_symbol_db",
+        "admin_create_user",
+        "aicoin_cookie_values",
+        "auth_db",
+        "automation_run_threads",
+        "delete_price_watch_prior_high_state",
+        "desktop_alert_price_watch_suppression_reason",
+        "exclude_monitor_symbol_globally"
+      ]
+    },
+    {
+      "name": "urlparse",
+      "userCount": 26,
+      "kind": "import",
+      "sampleUsers": [
+        "_gmgn_trench_x_external_url",
+        "add_query_params",
+        "allinvest_logo_candidates",
+        "clean_avatar_url",
+        "clean_model_url",
+        "eastmoney_clist_payload",
+        "ensure_local_translation_service",
+        "event_monitor_contract_from_url"
+      ]
+    },
+    {
+      "name": "datetime",
+      "userCount": 24,
+      "kind": "import",
+      "sampleUsers": [
+        "_okx_dex_kline_raw",
+        "a_share_new_stock_events",
+        "date_yyyy_mm_dd",
+        "event_monitor_topic_key",
+        "format_chat_hourly_summary",
+        "global_hotspot_day_key",
+        "global_hotspot_prompt",
+        "htx_contract_date_ms"
+      ]
+    },
+    {
+      "name": "quote",
+      "userCount": 22,
+      "kind": "import",
+      "sampleUsers": [
+        "a_share_new_stock_events",
+        "binance_wallet_contract_url",
+        "fetch_bitget_exchange_ai_narrative",
+        "fetch_hyperliquid_new_markets",
+        "fetch_sogou_wechat_articles",
+        "gmgn_hot_rows_from_tokens",
+        "gmgn_trench_x_post_payload",
+        "news_trade_candidate_trade_urls"
+      ]
+    },
+    {
+      "name": "as_completed",
+      "userCount": 19,
+      "kind": "import",
+      "sampleUsers": [
+        "_fetch_new_coin_low_market_activity",
+        "eastmoney_stock_quotes",
+        "enrich_binance_wallet_ai_narratives",
+        "exchange_ai_narratives_payload",
+        "fetch_ave_hot",
+        "fetch_price_structure_item",
+        "fetch_price_watch_realtime_quotes",
+        "filter_price_monitor_rows_by_activity"
+      ]
+    },
+    {
+      "name": "PRICE_STRUCTURE_CACHE",
+      "userCount": 16,
+      "kind": "variable",
+      "sampleUsers": [
+        "add_price_watch_symbol",
+        "cold_archive_price_monitor_symbols",
+        "exclude_monitor_symbol_globally",
+        "price_structure_latest_snapshot_payload",
+        "price_structure_payload",
+        "record_price_monitor_retention_failures",
+        "refresh_price_structure_strategy_monitor_item",
+        "set_price_structure_1m_override"
+      ]
+    },
+    {
+      "name": "PRICE_STRUCTURE_CACHE_LOCK",
+      "userCount": 16,
+      "kind": "variable",
+      "sampleUsers": [
+        "add_price_watch_symbol",
+        "cold_archive_price_monitor_symbols",
+        "exclude_monitor_symbol_globally",
+        "price_structure_latest_snapshot_payload",
+        "price_structure_payload",
+        "record_price_monitor_retention_failures",
+        "refresh_price_structure_strategy_monitor_item",
+        "set_price_structure_1m_override"
+      ]
+    },
+    {
+      "name": "ROOT",
+      "userCount": 15,
+      "kind": "variable",
+      "sampleUsers": [
+        "discord_newsflash_project_root",
+        "ensure_local_translation_service",
+        "load_local_env",
+        "read_repeated_email_smtp_configs",
+        "refresh_stylesheet_version",
+        "run_dragon_wave_monitor_strategy",
+        "self_optimization_apply_changes",
+        "self_optimization_assert_live_unchanged"
+      ]
+    },
+    {
+      "name": "BeautifulSoup",
+      "userCount": 15,
+      "kind": "import",
+      "sampleUsers": [
+        "bitget_exchange_ai_from_html",
+        "clean_feed_text",
+        "clean_html",
+        "fetch_futu_gainers",
+        "fetch_futu_hot",
+        "fetch_futu_turnover",
+        "fetch_okx_dex_hot_live",
+        "fetch_okx_futures_ssr_rank"
+      ]
+    },
+    {
+      "name": "math",
+      "userCount": 14,
+      "kind": "import",
+      "sampleUsers": [
+        "chain_ecosystem_ai_subjects",
+        "dragon_wave_feedback_feature_tokens",
+        "dragon_wave_feedback_optimization",
+        "event_monitor_metric_score",
+        "feedback_json_value",
+        "market_priority_trade_score",
+        "onchain_trench_ai_subjects",
+        "price_structure_onchain_contract_evidence"
+      ]
+    },
+    {
+      "name": "normalize_chat_platform",
+      "userCount": 14,
+      "kind": "import",
+      "sampleUsers": [
+        "_backfill_wechat_group_ai_row",
+        "backfill_recent_chat_group_signal_mentions",
+        "backfill_wechat_group_opportunity_watch_pool",
+        "chat_hourly_scope_key",
+        "claim_chat_contract_alert",
+        "enqueue_chat_message_forward",
+        "generate_chat_hourly_summaries",
+        "persist_wechat_group_analysis"
+      ]
+    },
+    {
+      "name": "base64",
+      "userCount": 13,
+      "kind": "import",
+      "sampleUsers": [
+        "_okx_dex_kline_raw",
+        "aicoin_decrypt_response",
+        "aicoin_encrypt_body",
+        "b64url_decode",
+        "b64url_encode",
+        "decode_field_key",
+        "hash_password",
+        "jwt_payload"
+      ]
+    },
+    {
+      "name": "normalize_group_name",
+      "userCount": 13,
+      "kind": "import",
+      "sampleUsers": [
+        "backfill_recent_chat_group_signal_mentions",
+        "chat_hourly_scope_key",
+        "enqueue_chat_message_forward",
+        "ensure_default_qq_group_monitor",
+        "format_chat_hourly_summary",
+        "generate_chat_hourly_summaries",
+        "poll_wechat_group_monitors_once",
+        "process_chat_message_forward_outbox"
+      ]
+    },
+    {
+      "name": "safe_monitor_error",
+      "userCount": 12,
+      "kind": "import",
+      "sampleUsers": [
+        "attach_gmgn_trench_research",
+        "gmgn_trench_daily_research_payload",
+        "onchain_research_ingest_worker",
+        "process_trench_person_activity",
+        "publish_x_kol_realtime_payload",
+        "queue_price_watch_symbol_add",
+        "spawn_background_news_ingest",
+        "start_onchain_research_bridge"
+      ]
+    },
+    {
+      "name": "ONCHAIN_FAST_RESEARCH",
+      "userCount": 12,
+      "kind": "variable",
+      "sampleUsers": [
+        "ai_startup_reconnect_once",
+        "ave_hot_alert_monitor_loop",
+        "backfill_recent_chat_group_signal_mentions",
+        "binance_wallet_hot_alert_monitor_loop",
+        "chain_ecosystem_attach_ai",
+        "main",
+        "persist_x_kol_realtime_payload",
+        "poll_wechat_group_monitors_once"
+      ]
+    },
+    {
+      "name": "NEWS_TRADE_CONFIG",
+      "userCount": 12,
+      "kind": "variable",
+      "sampleUsers": [
+        "classify_event_monitor_row",
+        "event_monitor_cluster_topics",
+        "event_monitor_counter_consensus_profile",
+        "event_monitor_event_heat_score",
+        "event_monitor_merge_candidate",
+        "event_monitor_onchain_candidate",
+        "event_monitor_onchain_trade_score",
+        "event_monitor_topic_stage"
+      ]
+    },
+    {
+      "name": "html",
+      "userCount": 11,
+      "kind": "import",
+      "sampleUsers": [
+        "a_share_new_stock_events",
+        "bitget_exchange_ai_from_html",
+        "clean_feed_text",
+        "fetch_futu_gainers",
+        "fetch_futu_hot",
+        "fetch_futu_turnover",
+        "fetch_okx_futures_ssr_rank",
+        "futu_recent_listing_events"
+      ]
+    },
+    {
+      "name": "subprocess",
+      "userCount": 11,
+      "kind": "import",
+      "sampleUsers": [
+        "ave_generate_auth_with_node",
+        "codex_cli_chat",
+        "ensure_aicoin_cdp_ready",
+        "ensure_local_translation_service",
+        "run_dragon_wave_monitor_strategy",
+        "self_optimization_run_codex",
+        "self_optimization_validate_workspace",
+        "spawn_desktop_alert_process"
+      ]
+    },
+    {
+      "name": "ThreadPoolExecutor",
+      "userCount": 9,
+      "kind": "import",
+      "sampleUsers": [
+        "eastmoney_stock_quotes",
+        "fetch_hyperliquid_new_markets",
+        "new_coin_low_structure_monitor_loop",
+        "news_trade_background_discovery",
+        "news_trade_dex_search_rows",
+        "news_trade_trending_onchain_rows",
+        "price_structure_strategy_monitor_loop",
+        "price_watch_realtime_source_pool"
+      ]
+    },
+    {
+      "name": "urljoin",
+      "userCount": 9,
+      "kind": "import",
+      "sampleUsers": [
+        "atom_entry_link",
+        "ave_icon_url",
+        "fetch_futu_gainers",
+        "fetch_futu_turnover",
+        "fetch_okx_dex_hot_live",
+        "fetch_sogou_wechat_articles",
+        "futu_recent_listing_events",
+        "okx_listing_events"
+      ]
+    },
+    {
+      "name": "attach_listing_inventory",
+      "userCount": 9,
+      "kind": "import",
+      "sampleUsers": [
+        "fetch_aster_new_coins",
+        "fetch_binance_alpha_new_coins",
+        "fetch_binance_new_coins",
+        "fetch_bitget_new_coins",
+        "fetch_gate_new_coins",
+        "fetch_htx_new_coins",
+        "fetch_hyperliquid_new_markets",
+        "fetch_okx_new_coins"
+      ]
+    },
+    {
+      "name": "NEW_COIN_LOW_ITEMS",
+      "userCount": 9,
+      "kind": "variable",
+      "sampleUsers": [
+        "cleanup_excluded_monitor_symbol_snapshots",
+        "health_payload",
+        "hydrate_new_coin_low_snapshot",
+        "new_coin_low_structure_monitor_loop",
+        "new_coin_low_structure_payload",
+        "price_structure_prearm_candidates",
+        "queue_excluded_monitor_symbol_snapshot_cleanup",
+        "refresh_new_coin_low_structure_item"
+      ]
+    },
+    {
+      "name": "secrets",
+      "userCount": 8,
+      "kind": "import",
+      "sampleUsers": [
+        "create_session",
+        "encrypt_field",
+        "field_encryption_key",
+        "hash_password",
+        "issue_email_code",
+        "issue_phone_code",
+        "news_trade_search_preview",
+        "unique_username"
+      ]
+    },
+    {
+      "name": "timezone",
+      "userCount": 8,
+      "kind": "import",
+      "sampleUsers": [
+        "_okx_dex_kline_raw",
+        "format_chat_hourly_summary",
+        "global_hotspot_day_key",
+        "global_hotspot_prompt",
+        "htx_contract_date_ms",
+        "new_contract_1m_expires_at",
+        "price_monitor_retention_local_day_start_ms",
+        "x_kol_api_cost_day"
+      ]
+    },
+    {
+      "name": "CHAIN_ECOSYSTEM_MONITOR",
+      "userCount": 8,
+      "kind": "variable",
+      "sampleUsers": [
+        "health_payload",
+        "load_v44_research_marks",
+        "main",
+        "price_structure_onchain_contract_evidence",
+        "price_structure_onchain_pool",
+        "send_chain_ecosystem_desktop_alert",
+        "start_chain_ecosystem_monitor",
+        "start_monitor_identity_preflight"
+      ]
+    },
+    {
+      "name": "MARKET_SOURCE_POOL",
+      "userCount": 8,
+      "kind": "variable",
+      "sampleUsers": [
+        "_fetch_new_coin_low_market_activity",
+        "filter_price_monitor_rows_by_activity",
+        "first_listing_additional_inventories",
+        "health_payload",
+        "market_payload",
+        "new_coin_low_inventory_rows",
+        "sync_price_watch_gainers_candidates",
+        "sync_price_watch_monitor"
+      ]
+    },
+    {
+      "name": "closing",
+      "userCount": 8,
+      "kind": "import",
+      "sampleUsers": [
+        "_store_chat_hourly_summary",
+        "add_price_watch_symbol",
+        "backfill_recent_chat_group_signal_mentions",
+        "chat_hourly_summary_rows",
+        "claim_chat_hourly_popup",
+        "generate_chat_hourly_summaries",
+        "price_watch_manual_asset_resolution",
+        "record_chat_group_signal_mention"
+      ]
+    },
+    {
+      "name": "hmac",
+      "userCount": 7,
+      "kind": "import",
+      "sampleUsers": [
+        "_okx_dex_kline_raw",
+        "binance_futures_signed_get",
+        "field_blind_index",
+        "okx_private_signed_get",
+        "verify_email_code",
+        "verify_password",
+        "verify_phone_code"
+      ]
+    },
+    {
+      "name": "MONITOR_BUY",
+      "userCount": 7,
+      "kind": "variable",
+      "sampleUsers": [
+        "health_payload",
+        "main",
+        "price_watch_payload",
+        "shutdown_shared_executors",
+        "start_monitor_identity_preflight",
+        "sync_price_watch_monitor",
+        "write_json_cache"
+      ]
+    },
+    {
+      "name": "PRICE_STRUCTURE_SNAPSHOT_PATH",
+      "userCount": 7,
+      "kind": "variable",
+      "sampleUsers": [
+        "price_monitor_retention_snapshot_index",
+        "price_structure_known_asset_metadata",
+        "price_structure_latest_snapshot_payload",
+        "price_structure_payload",
+        "queue_excluded_monitor_symbol_snapshot_cleanup",
+        "refresh_price_structure_strategy_monitor_item",
+        "write_json_cache"
+      ]
+    },
+    {
+      "name": "onchain_candidate_key",
+      "userCount": 7,
+      "kind": "import",
+      "sampleUsers": [
+        "_light_screen_onchain_candidates",
+        "analyze_fast_onchain_candidates",
+        "attach_gmgn_trench_research",
+        "attach_v44_research_marks_to_gmgn_trenches",
+        "gmgn_trench_daily_research_payload",
+        "load_v44_research_marks",
+        "send_fast_onchain_news_resonance_alert"
+      ]
+    },
+    {
+      "name": "timedelta",
+      "userCount": 7,
+      "kind": "import",
+      "sampleUsers": [
+        "format_chat_hourly_summary",
+        "global_hotspot_day_key",
+        "global_hotspot_prompt",
+        "htx_contract_date_ms",
+        "new_contract_1m_expires_at",
+        "next_wechat_auth_check_time",
+        "price_monitor_retention_local_day_start_ms"
+      ]
+    },
+    {
+      "name": "shutil",
+      "userCount": 7,
+      "kind": "import",
+      "sampleUsers": [
+        "codex_cli_chat",
+        "codex_cli_executable",
+        "dragon_wave_monitor_node_binary",
+        "self_optimization_apply_changes",
+        "self_optimization_copy_source_tree",
+        "self_optimization_execute_job",
+        "self_optimization_validate_workspace"
+      ]
+    },
+    {
+      "name": "SELF_OPTIMIZATION_STATE_PATH",
+      "userCount": 7,
+      "kind": "variable",
+      "sampleUsers": [
+        "confirm_self_optimization",
+        "run_self_optimization_check",
+        "self_optimization_execute_job",
+        "self_optimization_monitor_loop",
+        "self_optimization_recover_interrupted_job",
+        "self_optimization_state_payload",
+        "self_optimization_update_job"
+      ]
+    },
+    {
+      "name": "ALERT_DELIVERY_STORE",
+      "userCount": 7,
+      "kind": "variable",
+      "sampleUsers": [
+        "desktop_alert_delivery_tick",
+        "launch_desktop_alert",
+        "launch_price_watch_alert",
+        "main",
+        "news_explanation_service",
+        "next_desktop_alert_slot",
+        "suppress_desktop_alerts_for_monitor_symbol"
+      ]
+    },
+    {
+      "name": "EVENT_FLOW_STORE",
+      "userCount": 7,
+      "kind": "variable",
+      "sampleUsers": [
+        "desktop_alert_source_is_muted",
+        "main",
+        "reconcile_price_watch_flow_signals",
+        "record_event_flow_news",
+        "record_event_flow_popup",
+        "record_news_trade_intake_flow",
+        "record_price_watch_flow_event"
+      ]
+    },
+    {
+      "name": "NEW_COIN_LOW_LOCK",
+      "userCount": 7,
+      "kind": "variable",
+      "sampleUsers": [
+        "cleanup_excluded_monitor_symbol_snapshots",
+        "health_payload",
+        "new_coin_low_structure_monitor_loop",
+        "new_coin_low_structure_payload",
+        "price_structure_prearm_candidates",
+        "refresh_new_coin_low_structure_item",
+        "strategy_dragon_wave_items"
+      ]
+    },
+    {
+      "name": "X_KOL_REALTIME_CONDITION",
+      "userCount": 7,
+      "kind": "variable",
+      "sampleUsers": [
+        "ensure_x_kol_realtime_worker",
+        "hydrate_x_kol_realtime_history",
+        "publish_x_kol_realtime_payload",
+        "wake_all_x_kol_realtime_workers",
+        "x_kol_publish_official_stream_event",
+        "x_kol_realtime_snapshot",
+        "x_kol_realtime_worker"
+      ]
+    },
+    {
+      "name": "CHAIN_ECOSYSTEM_AI_LOCK",
+      "userCount": 6,
+      "kind": "variable",
+      "sampleUsers": [
+        "attach_onchain_trench_ai",
+        "chain_ecosystem_ai_worker",
+        "chain_ecosystem_attach_ai",
+        "clear_ai_failure_cooldowns",
+        "maintain_runtime_memory",
+        "save_chain_ecosystem_ai_updates"
+      ]
+    },
+    {
+      "name": "PRICE_MONITOR_RETENTION_ARCHIVES_LOCK",
+      "userCount": 6,
+      "kind": "variable",
+      "sampleUsers": [
+        "cold_archive_price_monitor_symbols",
+        "filter_price_monitor_cold_archives",
+        "init_auth_db",
+        "price_monitor_row_has_cold_archive",
+        "record_price_monitor_retention_failures",
+        "temporarily_exclude_monitor_symbol"
+      ]
+    },
+    {
+      "name": "PRICE_MONITOR_RETENTION_ARCHIVES",
+      "userCount": 6,
+      "kind": "variable",
+      "sampleUsers": [
+        "cold_archive_price_monitor_symbols",
+        "filter_price_monitor_cold_archives",
+        "init_auth_db",
+        "price_monitor_row_has_cold_archive",
+        "record_price_monitor_retention_failures",
+        "temporarily_exclude_monitor_symbol"
+      ]
+    },
+    {
+      "name": "BINANCE_WALLET_4H_STRUCTURE_RETENTION_SECONDS",
+      "userCount": 6,
+      "kind": "variable",
+      "sampleUsers": [
+        "binance_wallet_4h_structure_rows",
+        "price_watch_prior_high_source_enabled",
+        "price_watch_public_item",
+        "record_binance_wallet_4h_structure_source",
+        "sync_price_watch_aicoin_candidates",
+        "sync_price_watch_binance_wallet_candidates"
+      ]
+    },
+    {
+      "name": "ASTER_TRADE_URL",
+      "userCount": 6,
+      "kind": "variable",
+      "sampleUsers": [
+        "_fetch_new_coin_low_market_activity",
+        "aster_contract_rows",
+        "fetch_aster_new_coins",
+        "price_structure_candles_from_aster",
+        "price_watch_realtime_exchange_quotes",
+        "wechat_opportunity_exchange_trade_url"
+      ]
+    },
+    {
+      "name": "extract_candidate_symbols",
+      "userCount": 6,
+      "kind": "import",
+      "sampleUsers": [
+        "chat_message_is_forwardable",
+        "chat_message_signal_profile",
+        "enqueue_chat_message_forward",
+        "poll_wechat_group_monitors_once",
+        "strategy_adaptive_symbols_from_text",
+        "wechat_group_analysis_result"
+      ]
+    },
+    {
+      "name": "PERSONAL_X_MONITOR_RETENTION_SECONDS",
+      "userCount": 6,
+      "kind": "variable",
+      "sampleUsers": [
+        "filter_price_monitor_rows_by_activity",
+        "market_priority_external_boosts",
+        "price_structure_priority_context",
+        "price_watch_prior_high_source_enabled",
+        "price_watch_public_item",
+        "sync_price_watch_aicoin_candidates"
+      ]
+    },
+    {
+      "name": "PRICE_WATCH_RETENTION_SECONDS",
+      "userCount": 6,
+      "kind": "variable",
+      "sampleUsers": [
+        "exclude_monitor_symbol_globally",
+        "price_structure_watch_rows_uncached",
+        "price_watch_active_rows",
+        "price_watch_prior_high_source_enabled",
+        "price_watch_public_item",
+        "sync_price_watch_aicoin_candidates"
+      ]
+    }
+  ],
+  "reboundNames": [
+    {
+      "name": "CODEX_CLI_UNAVAILABLE_UNTIL",
+      "writerCount": 3,
+      "sampleWriters": [
+        "ai_startup_reconnect_once",
+        "clear_ai_failure_cooldowns",
+        "codex_cli_chat"
+      ],
+      "referencedBy": 1
+    },
+    {
+      "name": "LLM_API_UNAVAILABLE_UNTIL",
+      "writerCount": 3,
+      "sampleWriters": [
+        "ai_startup_reconnect_once",
+        "clear_ai_failure_cooldowns",
+        "deepseek_chat"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "ONCHAIN_RESEARCH_INGEST_THREAD",
+      "writerCount": 2,
+      "sampleWriters": [
+        "onchain_research_ingest_worker",
+        "queue_onchain_research_ingest"
+      ],
+      "referencedBy": 1
+    },
+    {
+      "name": "ROTATION_AI_RETRY_AFTER",
+      "writerCount": 2,
+      "sampleWriters": [
+        "clear_ai_failure_cooldowns",
+        "rotation_ai_worker"
+      ],
+      "referencedBy": 1
+    },
+    {
+      "name": "X_KOL_OFFICIAL_STREAM_RESPONSE",
+      "writerCount": 2,
+      "sampleWriters": [
+        "wake_x_kol_official_stream",
+        "x_kol_official_stream_worker"
+      ],
+      "referencedBy": 1
+    },
+    {
+      "name": "DISCORD_NEWSFLASH_BRIDGE_PROCESS",
+      "writerCount": 2,
+      "sampleWriters": [
+        "start_discord_newsflash_bridge",
+        "stop_discord_newsflash_bridge"
+      ],
+      "referencedBy": 1
+    },
+    {
+      "name": "TRENCH_PERSON_ACTIVITY_THREAD",
+      "writerCount": 2,
+      "sampleWriters": [
+        "queue_trench_person_activity",
+        "trench_person_activity_worker"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "TRENCH_PERSON_REPLAY_THREAD",
+      "writerCount": 2,
+      "sampleWriters": [
+        "queue_trench_person_activity_replay",
+        "trench_person_activity_replay_worker"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "TRENCH_PERSON_REPLAY_PENDING",
+      "writerCount": 2,
+      "sampleWriters": [
+        "queue_trench_person_activity_replay",
+        "trench_person_activity_replay_worker"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "NEWSFLASH_SEMANTIC_AI_RETRY_AFTER",
+      "writerCount": 2,
+      "sampleWriters": [
+        "clear_ai_failure_cooldowns",
+        "newsflash_ai_semantic_dedupe"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "ROTATION_AI_INFLIGHT",
+      "writerCount": 2,
+      "sampleWriters": [
+        "rotation_ai_leader_snapshot",
+        "rotation_ai_worker"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "RANK_AI_RETRY_AFTER",
+      "writerCount": 2,
+      "sampleWriters": [
+        "clear_ai_failure_cooldowns",
+        "rank_ai_chat"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "DESKTOP_ALERT_QUEUE_ACTIVE",
+      "writerCount": 2,
+      "sampleWriters": [
+        "desktop_alert_queue_worker",
+        "ensure_desktop_alert_worker"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "PRICE_STRUCTURE_RECENT_LISTING_INDEX_CACHE",
+      "writerCount": 2,
+      "sampleWriters": [
+        "new_coin_low_inventory_rows",
+        "price_structure_recent_listing_index"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "PRICE_WATCH_REALTIME_PROCESS",
+      "writerCount": 2,
+      "sampleWriters": [
+        "start_price_watch_realtime_process",
+        "stop_price_watch_realtime_process"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "NEW_COIN_LOW_MONITOR_ACTIVE",
+      "writerCount": 1,
+      "sampleWriters": [
+        "start_new_coin_low_structure_monitor"
+      ],
+      "referencedBy": 4
+    },
+    {
+      "name": "PRICE_MONITOR_ACTIVITY_SUMMARY",
+      "writerCount": 1,
+      "sampleWriters": [
+        "filter_price_monitor_rows_by_activity"
+      ],
+      "referencedBy": 3
+    },
+    {
+      "name": "PRICE_WATCH_MONITOR_ACTIVE",
+      "writerCount": 1,
+      "sampleWriters": [
+        "start_price_watch_monitor"
+      ],
+      "referencedBy": 3
+    },
+    {
+      "name": "SITE_ALERT_MONITOR_ACTIVE",
+      "writerCount": 1,
+      "sampleWriters": [
+        "start_site_alert_monitor"
+      ],
+      "referencedBy": 3
+    },
+    {
+      "name": "SELF_OPTIMIZATION_INTERVAL_SECONDS",
+      "writerCount": 1,
+      "sampleWriters": [
+        "start_self_optimization_monitor"
+      ],
+      "referencedBy": 2
+    },
+    {
+      "name": "NEW_COIN_LOW_ACTIVITY_SUMMARY",
+      "writerCount": 1,
+      "sampleWriters": [
+        "new_coin_low_inventory_rows"
+      ],
+      "referencedBy": 2
+    },
+    {
+      "name": "NEW_COIN_LOW_INVENTORY_CACHE",
+      "writerCount": 1,
+      "sampleWriters": [
+        "new_coin_low_inventory_rows"
+      ],
+      "referencedBy": 2
+    },
+    {
+      "name": "PRICE_STRUCTURE_MONITOR_ACTIVE",
+      "writerCount": 1,
+      "sampleWriters": [
+        "start_price_structure_strategy_monitor"
+      ],
+      "referencedBy": 2
+    },
+    {
+      "name": "SITE_ALERT_STATE",
+      "writerCount": 1,
+      "sampleWriters": [
+        "load_site_alert_state"
+      ],
+      "referencedBy": 2
+    },
+    {
+      "name": "WECHAT_AUTH_MONITOR_ACTIVE",
+      "writerCount": 1,
+      "sampleWriters": [
+        "start_wechat_auth_monitor"
+      ],
+      "referencedBy": 2
+    },
+    {
+      "name": "BINANCE_WALLET_4H_STRUCTURE_ACTIVE",
+      "writerCount": 1,
+      "sampleWriters": [
+        "sync_binance_wallet_4h_structure_history"
+      ],
+      "referencedBy": 1
+    },
+    {
+      "name": "SELF_OPTIMIZATION_SUGGESTION_COOLDOWN_SECONDS",
+      "writerCount": 1,
+      "sampleWriters": [
+        "start_self_optimization_monitor"
+      ],
+      "referencedBy": 1
+    },
+    {
+      "name": "SELF_OPTIMIZATION_MONITOR_ACTIVE",
+      "writerCount": 1,
+      "sampleWriters": [
+        "start_self_optimization_monitor"
+      ],
+      "referencedBy": 1
+    },
+    {
+      "name": "SELF_OPTIMIZATION_STARTUP_DELAY_SECONDS",
+      "writerCount": 1,
+      "sampleWriters": [
+        "start_self_optimization_monitor"
+      ],
+      "referencedBy": 1
+    },
+    {
+      "name": "DESKTOP_ALERT_ACTIVE_PROCESS_SLOT",
+      "writerCount": 1,
+      "sampleWriters": [
+        "desktop_alert_delivery_tick"
+      ],
+      "referencedBy": 1
+    },
+    {
+      "name": "DESKTOP_ALERT_ACTIVE_PROCESS",
+      "writerCount": 1,
+      "sampleWriters": [
+        "desktop_alert_delivery_tick"
+      ],
+      "referencedBy": 1
+    },
+    {
+      "name": "PRICE_WATCH_SNAPSHOT_CACHE",
+      "writerCount": 1,
+      "sampleWriters": [
+        "price_watch_snapshot_payload"
+      ],
+      "referencedBy": 1
+    },
+    {
+      "name": "NEW_COIN_LOW_ACTIVITY_CACHE",
+      "writerCount": 1,
+      "sampleWriters": [
+        "_fetch_new_coin_low_market_activity"
+      ],
+      "referencedBy": 1
+    },
+    {
+      "name": "PRICE_STRUCTURE_PREARM_MONITOR_ACTIVE",
+      "writerCount": 1,
+      "sampleWriters": [
+        "start_price_structure_strategy_monitor"
+      ],
+      "referencedBy": 1
+    },
+    {
+      "name": "CHAT_HOURLY_SUMMARY_STARTED",
+      "writerCount": 1,
+      "sampleWriters": [
+        "start_chat_hourly_summary_monitor"
+      ],
+      "referencedBy": 1
+    },
+    {
+      "name": "WECHAT_GROUP_MONITOR_STARTED",
+      "writerCount": 1,
+      "sampleWriters": [
+        "start_wechat_group_monitor"
+      ],
+      "referencedBy": 1
+    },
+    {
+      "name": "SITE_ALERT_MONITOR_STARTED_AT",
+      "writerCount": 1,
+      "sampleWriters": [
+        "start_site_alert_monitor"
+      ],
+      "referencedBy": 1
+    },
+    {
+      "name": "SERVER_RUNTIME_ACTIVE",
+      "writerCount": 1,
+      "sampleWriters": [
+        "main"
+      ],
+      "referencedBy": 1
+    },
+    {
+      "name": "FIELD_KEY_CACHE",
+      "writerCount": 1,
+      "sampleWriters": [
+        "field_encryption_key"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "LOCAL_TRANSLATION_PROCESS",
+      "writerCount": 1,
+      "sampleWriters": [
+        "ensure_local_translation_service"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "GMGN_TRENCH_X_POST_NEXT_REQUEST_AT",
+      "writerCount": 1,
+      "sampleWriters": [
+        "gmgn_trench_x_post_payload"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "WECHAT_AUTH_ALERT_LAST_AT",
+      "writerCount": 1,
+      "sampleWriters": [
+        "notify_wechat_auth_required"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "BINANCE_WALLET_4H_STRUCTURE_LAST_SYNC_AT",
+      "writerCount": 1,
+      "sampleWriters": [
+        "sync_binance_wallet_4h_structure_history"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "TRENCH_PERSON_WATCH_STARTED",
+      "writerCount": 1,
+      "sampleWriters": [
+        "start_trench_person_watch_monitor"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "AI_STARTUP_RECONNECT_STARTED",
+      "writerCount": 1,
+      "sampleWriters": [
+        "start_ai_startup_reconnect"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "NEWS_EXPLANATIONS",
+      "writerCount": 1,
+      "sampleWriters": [
+        "news_explanation_service"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "DESKTOP_ALERT_LAST_LAUNCHED_AT",
+      "writerCount": 1,
+      "sampleWriters": [
+        "desktop_alert_delivery_tick"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "DESKTOP_ALERT_LAST_LAUNCHED_PRIORITY",
+      "writerCount": 1,
+      "sampleWriters": [
+        "desktop_alert_delivery_tick"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "DESKTOP_ALERT_SEEN_LOADED",
+      "writerCount": 1,
+      "sampleWriters": [
+        "launch_desktop_alert"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "BINANCE_FUTURES_STATUS_UPDATED_AT",
+      "writerCount": 1,
+      "sampleWriters": [
+        "binance_futures_contract_status"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "PRICE_WATCH_SNAPSHOT_CACHE_AT",
+      "writerCount": 1,
+      "sampleWriters": [
+        "price_watch_snapshot_payload"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "PRICE_WATCH_SNAPSHOT_BUILD_STARTED_AT",
+      "writerCount": 1,
+      "sampleWriters": [
+        "price_watch_snapshot_payload"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "PRICE_WATCH_SNAPSHOT_BUILD_THREAD",
+      "writerCount": 1,
+      "sampleWriters": [
+        "price_watch_snapshot_payload"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "PRICE_WATCH_SNAPSHOT_STALL_LOGGED",
+      "writerCount": 1,
+      "sampleWriters": [
+        "price_watch_snapshot_payload"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "PRICE_STRUCTURE_WATCH_ROWS_CACHE",
+      "writerCount": 1,
+      "sampleWriters": [
+        "price_structure_watch_rows"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "PRICE_STRUCTURE_WATCH_ROWS_REFRESHING",
+      "writerCount": 1,
+      "sampleWriters": [
+        "price_structure_watch_rows"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "PRICE_STRUCTURE_DISK_CACHE_HYDRATED",
+      "writerCount": 1,
+      "sampleWriters": [
+        "price_structure_payload"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "PRICE_MONITOR_ACTIVITY_STATES",
+      "writerCount": 1,
+      "sampleWriters": [
+        "filter_price_monitor_rows_by_activity"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "PRICE_WATCH_REALTIME_SSL_CONTEXT",
+      "writerCount": 1,
+      "sampleWriters": [
+        "price_watch_realtime_http_client"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "X_KOL_OFFICIAL_STREAM_RULE_SIGNATURE",
+      "writerCount": 1,
+      "sampleWriters": [
+        "x_kol_reconcile_official_stream_rules"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "X_KOL_OFFICIAL_STREAM_STARTED",
+      "writerCount": 1,
+      "sampleWriters": [
+        "register_x_kol_official_stream_user"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "X_KOL_PRIORITY_STARTED",
+      "writerCount": 1,
+      "sampleWriters": [
+        "start_x_kol_priority_monitor"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "SITE_ALERT_STATE_LOADED",
+      "writerCount": 1,
+      "sampleWriters": [
+        "load_site_alert_state"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "BINANCE_WALLET_HOT_ALERT_MONITOR_ACTIVE",
+      "writerCount": 1,
+      "sampleWriters": [
+        "start_binance_wallet_hot_alert_monitor"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "AVE_HOT_ALERT_MONITOR_ACTIVE",
+      "writerCount": 1,
+      "sampleWriters": [
+        "start_ave_hot_alert_monitor"
+      ],
+      "referencedBy": 0
+    },
+    {
+      "name": "GLOBAL_HOTSPOT_MONITOR_ACTIVE",
+      "writerCount": 1,
+      "sampleWriters": [
+        "start_global_hotspot_monitor"
+      ],
+      "referencedBy": 0
+    }
+  ],
+  "multiAssignedNames": [],
+  "unclassifiedFunctions": [
+    "_backfill_wechat_group_ai_row",
+    "_binance_wallet_kline_raw",
+    "_event_monitor_term_pattern",
+    "_extract_last_balanced_json",
+    "_fetch_new_coin_low_market_activity",
+    "_future_event_seen_keys",
+    "_future_event_todo_project_name",
+    "_future_event_todo_user",
+    "_gmgn_trench_x_external_url",
+    "_gmgn_trench_x_post_cached",
+    "_light_screen_cached_lookup",
+    "_light_screen_cached_store",
+    "_light_screen_onchain_candidates",
+    "_okx_dex_kline_raw",
+    "_onchain_kline_cache_prune_locked",
+    "_price_watch_nested_rows",
+    "_restore_global_monitor_symbol_db",
+    "_store_chat_hourly_summary",
+    "_store_gmgn_trench_x_post",
+    "_x_kol_api_cost_snapshot_from_state",
+    "_x_kol_api_cost_state_unlocked",
+    "a_share_new_stock_events",
+    "a_share_new_stock_section",
+    "add_price_watch_symbol",
+    "add_query_params",
+    "admin_clear_cache_payload",
+    "admin_count",
+    "admin_create_user",
+    "admin_delete_user",
+    "admin_refresh_cache_payload",
+    "admin_set_user",
+    "admin_summary_payload",
+    "admin_user",
+    "admin_user_rows",
+    "ai_startup_reconnect_once",
+    "ai_startup_reconnect_snapshot",
+    "aicoin_app_data_dir",
+    "aicoin_cached_payload_token",
+    "aicoin_cdp_ready",
+    "aicoin_client_hot_payload",
+    "aicoin_cookie_values",
+    "aicoin_decrypt_response",
+    "aicoin_encrypt_body",
+    "aicoin_encrypted_headers",
+    "aicoin_exe_path",
+    "aicoin_hot_items_from_root",
+    "aicoin_price",
+    "aicoin_response_message",
+    "aicoin_rest_hot_payload",
+    "aicoin_source_from_payload",
+    "aicoin_token_candidates",
+    "aicoin_unavailable",
+    "allinvest_logo_candidates",
+    "analyze_fast_onchain_candidates",
+    "api_cache_path",
+    "api_refresh_inflight",
+    "apply_price_watch_realtime_quotes",
+    "apply_trench_person_signal_to_research",
+    "atom_entry_link",
+    "attach_gmgn_native_trench_narrative",
+    "attach_gmgn_trench_research",
+    "attach_onchain_trench_ai",
+    "attach_trench_person_signals",
+    "attach_v44_research_marks_to_gmgn_trenches",
+    "automation_brief_has_content",
+    "automation_brief_time_ms",
+    "automation_briefs_payload",
+    "automation_briefs_remote_url",
+    "automation_config",
+    "automation_run_threads",
+    "ave_api_base",
+    "ave_asset_fields",
+    "ave_auth_values",
+    "ave_browser_leveldb_dirs",
+    "ave_extract_auth_from_browser_storage",
+    "ave_extract_items",
+    "ave_generate_auth_with_node",
+    "ave_hot_alert_monitor_loop",
+    "ave_hot_all_rows",
+    "ave_hot_period_metrics"
+  ]
+}

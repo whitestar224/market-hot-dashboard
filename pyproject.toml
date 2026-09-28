@@ -1,0 +1,75 @@
+[project]
+name = "xingyunshe-market-dashboard"
+version = "1.0.0"
+description = "星云社跨市场热门榜雷达桌面端 —— 后端服务"
+requires-python = ">=3.13"
+readme = "README.md"
+license = { text = "SEE LICENSE IN LICENSE" }
+
+# 运行期依赖的权威声明在 requirements.txt（保持既有约定不变）。
+# 这里只放工具链配置，避免改变任何运行行为。
+
+# ---------------------------------------------------------------------------
+# ruff：仅做 lint 检查与安全的自动修复，【不启用强制格式化】。
+#
+# 原因：server.py 有 55,130 行、chain_ecosystem_monitor.py 有 5,582 行。
+# 对其执行 `ruff format` 会产生数万行的纯格式 diff，导致：
+#   1) 重构批次无法被人工审查（真假改动混在一起）
+#   2) 与备选方案/后续批次产生大规模冲突
+# 因此格式化必须按文件、按批次逐步引入，绝不全局执行。
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+exclude = [
+    ".git",
+    ".runtime",
+    ".runtime-cache",
+    ".runtime-tools",
+    "__pycache__",
+    "node_modules",
+    "deliverables",
+    "backtest-backup",
+    "release",
+    "dist-backend",
+    "desktop-private",
+    "web/static",
+]
+
+[tool.ruff.lint]
+# E/W = pycodestyle，F = pyflakes，I = isort，UP = pyupgrade，B = bugbear
+select = ["E", "F", "I", "UP", "B"]
+# 这些规则对既有巨型单体会产生海量噪音，重构期间先忽略，逐步收紧。
+ignore = [
+    "E501",   # 行太长：由 line-length 之外的既有风格决定，不强制
+    "E402",   # 模块级 import 不在顶部：单体里大量存在
+    "E731",   # lambda 赋值
+    "E741",   # 易混淆变量名
+    "F841",   # 未使用局部变量：既有代码里存在刻意保留的调试变量
+    "F401",   # 未使用 import：兼容再导出（from X import *）需要
+    "B008",   # 函数默认参数里调用函数：既有模式
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 单体文件在拆分完成前，只检查最严重的错误
+"server.py" = ["E", "F", "I", "UP", "B"]
+"chain_ecosystem_monitor.py" = ["E", "F", "I", "UP", "B"]
+"onchain_fast_research.py" = ["E", "F", "I", "UP", "B"]
+# 测试文件允许 assert 之外的宽松写法
+"tests/**" = ["E", "F", "I", "UP", "B"]
+
+# ---------------------------------------------------------------------------
+# pytest：统一测试入口。注意 tests/ 下同时存在 Node 的 *.test.js，
+# 必须限定 python_files，避免误收集。
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-q --tb=short"
+norecursedirs = ["node_modules", ".git", ".runtime*", "deliverables", "backtest-backup"]
+
+[tool.coverage.run]
+source = ["src", "."]
+omit = ["tests/*", "node_modules/*", "deliverables/*"]
