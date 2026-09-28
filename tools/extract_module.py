@@ -267,13 +267,7 @@ def run(args: argparse.Namespace) -> int:
     print()
 
     # 原文件需要的再导出名：移除区间后，仍被引用的名字
-    remaining_refs: set[str] = set()
-    for i, line in enumerate(lines, start=1):
-        if start <= i <= end:
-            continue
-        for name in requested:
-            if re.search(rf"\b{re.escape(name)}\b", line):
-                remaining_refs.add(name)
+    remaining_refs = _referenced_outside(lines, set(requested), set(range(start, end + 1)))
 
     print(f"原文件仍引用的名字（需再导出）: {sorted(remaining_refs)}")
     module_dotted = args.target.replace("/", ".").removesuffix(".py")
@@ -327,17 +321,336 @@ def run(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="从单体机械抽取连贯代码块")
+def _free_names_of_stmt(node: ast.AST) -> set[str]:
+    """对任意语句做【作用域感知】的自由名收集。
+
+    不能简单地 ast.walk 取所有 Load 名：那会把 lambda 参数、推导式变量、
+    with-as、for 目标、海象赋值等局部绑定也当成模块级依赖，
+    从而在新模块里生成 `from ... import key` 这种荒唐 import。
+    """
+    bound: set[str] = set()
+    loads: set[str] = set()
+
+    class _V(ast.NodeVisitor):
+        def visit_Name(self, n: ast.Name) -> None:
+            if isinstance(n.ctx, ast.Load):
+                loads.add(n.id)
+            else:
+                bound.add(n.id)
+
+        def _bind_target(self, target: ast.AST) -> None:
+            for t in ast.walk(target):
+                if isinstance(t, ast.Name):
+                    bound.add(t.id)
+
+        def visit_arg(self, n: ast.arg) -> None:
+            bound.add(n.arg)
+
+        def visit_Lambda(self, n: ast.Lambda) -> None:
+            a = n.args
+            for x in list(a.args) + list(a.kwonlyargs) + list(a.posonlyargs):
+                bound.add(x.arg)
+            if a.vararg:
+                bound.add(a.vararg.arg)
+            if a.kwarg:
+                bound.add(a.kwarg.arg)
+            self.generic_visit(n)
+
+        def visit_comprehension(self, n: ast.comprehension) -> None:
+            self.visit(n.iter)          # 可迭代表达式在外层作用域求值
+            self._bind_target(n.target)
+            for cond in n.ifs:
+                self.visit(cond)
+
+        def visit_With(self, n) -> None:
+            for item in n.items:
+                self.visit(item.context_expr)
+                if item.optional_vars is not None:
+                    self._bind_target(item.optional_vars)
+            for s in n.body:
+                self.visit(s)
+
+        def visit_NamedExpr(self, n: ast.NamedExpr) -> None:
+            self.visit(n.value)
+            self._bind_target(n.target)
+
+        def visit_ExceptHandler(self, n: ast.ExceptHandler) -> None:
+            if n.name:
+                bound.add(n.name)
+            self.generic_visit(n)
+
+        def visit_Import(self, n: ast.Import) -> None:
+            for al in n.names:
+                bound.add((al.asname or al.name).split(".")[0])
+
+        def visit_ImportFrom(self, n: ast.ImportFrom) -> None:
+            for al in n.names:
+                bound.add(al.asname or al.name)
+
+    _V().visit(node)
+    return loads - bound
+
+
+def _referenced_outside(lines: list[str], names: set[str], skip: set[int]) -> set[str]:
+    """在 lines 中找出仍然引用了 names 的名字（跳过 skip 里的行号）。
+
+    性能注意：早期实现是「逐行 × 逐名字 re.search」，在 55k 行 × 560 个名字
+    下需要 3000 万次正则编译，直接把进程卡死。这里改成一条合并正则扫一遍。
+    """
+    if not names:
+        return set()
+    big = re.compile(r"\b(?:" + "|".join(re.escape(n) for n in sorted(names)) + r")\b")
+    found: set[str] = set()
+    for i, line in enumerate(lines, start=1):
+        if i in skip:
+            continue
+        if any(ch in line for ch in ("(", "=", ".", "[", " ", ",")):
+            found.update(big.findall(line))
+    return found & names
+
+
+def _declared_names(node: ast.AST) -> set[str]:
+    """取一条顶层语句声明的名字（赋值目标 / try 体内的赋值目标）。"""
+    names: set[str] = set()
+    if isinstance(node, ast.Assign):
+        for t in node.targets:
+            if isinstance(t, ast.Name):
+                names.add(t.id)
+    elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        names.add(node.target.id)
+    elif isinstance(node, ast.Try):
+        for sub in node.body:
+            names |= _declared_names(sub)
+        for handler in node.handlers:      # else 分支里也可能赋值（如 try/except 回退）
+            for sub in handler.body:
+                names |= _declared_names(sub)
+        for sub in node.orelse:
+            names |= _declared_names(sub)
+        for sub in node.finalbody:
+            names |= _declared_names(sub)
+    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        names.add(node.name)
+    elif isinstance(node, ast.ClassDef):
+        names.add(node.name)
+    return names
+
+
+def _extend_up(lines: list[str], node: ast.AST, floor: int) -> int:
+    """把语句起点向上扩展到其紧邻的注释/空行，让注释跟着语句一起搬走。
+
+    floor 为上一条顶层语句的结束行，扩展不会越过它。
+    """
+    i = node.lineno - 1  # 1-based -> index of the line above
+    while i > floor:
+        stripped = lines[i - 1].strip()
+        if stripped == "" or stripped.startswith("#"):
+            i -= 1
+        else:
+            break
+    return i + 1  # 1-based start
+
+
+def run_range(args: argparse.Namespace) -> int:
+    """区间抽取模式：把 [start, end] 内的顶层语句搬到新模块，可排除指定名字。
+
+    用途：像 `CACHE` / 各种锁与缓存这类散布在大段「状态声明区」里的原语，
+    无法按连续块整体搬移（中间夹着被 global 重绑定的名字，必须留下）。
+    """
+    src = Path(args.source)
+    text = src.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+    tree = ast.parse(text, filename=str(src))
+
+    m = re.fullmatch(r"(\d+)-(\d+)", args.range.strip())
+    if not m:
+        print("--range 格式应为 START-END", file=sys.stderr)
+        return 2
+    a, b = int(m.group(1)), int(m.group(2))
+
+    keep_names = {n.strip() for n in args.keep.split(",") if n.strip()}
+    keep_lines = {int(x) for x in args.keep_lines.split(",") if x.strip().isdigit()}
+
+    body = [n for n in tree.body if n.lineno >= a and n.lineno <= b]
+    if not body:
+        print("区间内没有顶层语句", file=sys.stderr)
+        return 2
+
+    moved: list[ast.AST] = []
+    kept: list[ast.AST] = []
+    deferred: list[ast.AST] = []   # 无声明名的语句（Expr/If/For/With）默认保留
+    for node in body:
+        names = _declared_names(node)
+        if any(l in keep_lines for l in range(node.lineno, node.end_lineno + 1)):
+            kept.append(node)
+        elif names & keep_names:
+            kept.append(node)
+        elif not names:
+            deferred.append(node)
+        else:
+            moved.append(node)
+
+    if deferred:
+        print("以下语句无声明名且未被显式排除，默认保留在原文件（如需搬移请用 --keep-lines 之外的方式扩展工具）：")
+        for n in deferred:
+            snippet = lines[n.lineno - 1].strip()[:80]
+            print(f"    第 {n.lineno} 行: {snippet}")
+
+    moved_names = {n for node in moved for n in _declared_names(node)}
+    kept_names = {n for node in kept for n in _declared_names(node)}
+    print()
+    print("=" * 74)
+    print(f"区间抽取 {src} 第 {a}-{b} 行")
+    print(f"  搬移语句 : {len(moved)} 条 / {len(moved_names)} 个名字")
+    print(f"  保留语句 : {len(kept)} 条（含重绑定或显式排除）/ {len(kept_names)} 个名字")
+    if deferred:
+        print(f"  默认保留 : {len(deferred)} 条")
+    print()
+
+    # 依赖分析
+    specs, _ = analyze_source_imports(tree)
+    free: set[str] = set()
+    for node in moved:
+        free |= _free_names_of_stmt(node)
+    unresolved = free - moved_names
+    builtins_ = set(dir(__builtins__)) | {"__name__", "__file__", "__doc__"}
+    unresolved = {n for n in unresolved if n not in builtins_}
+    stdlib_needed = {n for n in unresolved
+                     if n in STDLIB_HINTS or (specs.get(n) and specs[n][1].split(".")[0] in STDLIB_HINTS)}
+    thirdparty = unresolved - stdlib_needed
+
+    # 关键风险：被搬移的语句引用了「留在原文件里」的名字 —— 由于新模块会被提前
+    # import，而该名字在原文件中尚未执行到，会产生 NameError / 取到未初始化值。
+    # 注意：判断基准是原文件的【全部】顶层名字，而不只是本区间内保留的那些；
+    # 区间之前定义的 SHARED_HTTP_SESSION 之类同样属于此风险。
+    all_top_names = {n for node in tree.body for n in _declared_names(node)}
+    hazard = {n for n in thirdparty if n in all_top_names and n not in moved_names}
+    external = thirdparty - hazard
+
+    print(f"stdlib 依赖 : {sorted(stdlib_needed)}")
+    print(f"三方依赖    : {sorted(external)}")
+    if hazard:
+        print(f"⚠ 顺序风险：被搬移语句引用了留在原文件的名字 {sorted(hazard)}")
+        print("  这些名字在原文件中定义得更晚，新模块提前 import 时会取不到值。")
+        print("  处理：把它们加入 --keep 让引用方也留下，或确认它们确为纯常量后加 --resolve。")
+    else:
+        print("✓ 无顺序风险")
+    print()
+
+    # 生成新模块
+    header = [
+        '"""从 server.py 抽取的模块（Phase 3 拆分）。',
+        "",
+        f"来源: {src} 第 {a}-{b} 行（区间抽取）",
+        "本文件内容由 tools/extract_module.py 机械搬移，未做任何语义修改。",
+        "",
+        "注意：这是【共享可变状态】的集中地。上层模块一律 `from app.core.state import X`",
+        "引用同名对象，绝不可重新 Lock()/新建 dict —— 否则会出现第二把锁，",
+        "互斥静默失效（表现为偶发而非必现，极难排查）。",
+        '"""',
+        "",
+        "from __future__ import annotations",
+        "",
+    ]
+    import_block = []
+    for extra in (args.extra_import.split(";") if args.extra_import else []):
+        if extra.strip():
+            import_block.append(extra.strip())
+    import_block.extend(_import_lines_for(stdlib_needed, specs))
+    import_block.extend(_import_lines_for(external, specs))
+
+    # 逐条取源码（含其上方紧邻注释）
+    segments: list[str] = []
+    prev_end = 0
+    spans: list[tuple[int, int]] = []
+    for node in moved:
+        st = _extend_up(lines, node, prev_end)
+        en = node.end_lineno
+        segments.append("".join(lines[st - 1:en]).rstrip() + "\n")
+        spans.append((st, en))
+        prev_end = en
+
+    module_src = "\n".join(header)
+    module_src += ("\n".join(import_block) + "\n\n\n") if import_block else "\n"
+    module_src += "\n\n".join(segments)
+
+    out_path = PROJECT_ROOT / args.out_root / args.target
+    print("新模块预览（前 20 行）:")
+    for line in module_src.splitlines()[:20]:
+        print("   | " + line)
+    print()
+
+    # 再导出名单：搬走的名字里，原文件仍然用到的
+    moved_spans = set()
+    for st, en in spans:
+        moved_spans.update(range(st, en + 1))
+    remaining_refs = _referenced_outside(lines, moved_names, moved_spans)
+    print(f"需再导出 {len(remaining_refs)} 个名字（原文件仍引用）")
+    module_dotted = args.target.replace("/", ".").removesuffix(".py")
+    reexport = ""
+    if remaining_refs:
+        reexport = f"from {module_dotted} import (\n" + "".join(
+            f"    {n},\n" for n in sorted(remaining_refs)) + ")\n"
+    print()
+
+    if not args.apply:
+        print("（dry-run，未写入任何文件；加 --apply 执行）")
+        return 0
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.exists() and not args.force:
+        print(f"目标已存在，拒绝覆盖: {out_path}（加 --force 覆盖）", file=sys.stderr)
+        return 2
+    out_path.write_text(module_src, encoding="utf-8")
+    backup = src.with_suffix(src.suffix + ".extractbak")
+    backup.write_text(text, encoding="utf-8")
+
+    # 删除搬移区间（自下而上删除，避免行号漂移）
+    keep_line_flags = [True] * (len(lines) + 1)
+    for st, en in spans:
+        for i in range(st, en + 1):
+            keep_line_flags[i] = False
+    new_lines = [ln for i, ln in enumerate(lines, start=1) if keep_line_flags[i]]
+
+    if reexport:
+        marker = (f"\n# ---- 由 tools/extract_module.py 区间抽取至 {args.target} ----\n"
+                  f"{reexport}\n")
+        insert_at = 0
+        for i, line in enumerate(new_lines):
+            if line.startswith("class ") or line.startswith("def "):
+                insert_at = i
+                break
+        while insert_at > 0 and new_lines[insert_at - 1].strip() == "":
+            insert_at -= 1
+        new_lines = new_lines[:insert_at] + [marker] + new_lines[insert_at:]
+
+    src.write_text("".join(new_lines), encoding="utf-8")
+    print(f"✓ 新模块: {out_path}")
+    print(f"✓ 原文件: {src}（备份 {backup.name}）  行数 {len(lines)} -> {len(''.join(new_lines).splitlines(keepends=True))}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="从单体机械抽取代码块（连续块或区间）")
     parser.add_argument("--source", required=True)
     parser.add_argument("--target", required=True, help="相对 --out-root 的路径，如 app/api/seo.py")
     parser.add_argument("--out-root", default="src")
-    parser.add_argument("--names", required=True, help="逗号分隔的顶层定义名")
+    parser.add_argument("--names", default="", help="逗号分隔的顶层定义名（连续块模式）")
+    parser.add_argument("--range", default="", help="START-END 区间抽取模式")
+    parser.add_argument("--keep", default="", help="区间模式：保留在原文件的名字（逗号分隔），如 global 重绑定名")
+    parser.add_argument("--keep-lines", default="", help="区间模式：保留在原文件的行号（逗号分隔）")
     parser.add_argument("--extra-import", default="", help="额外附加到新模块的 import 行（分号分隔）")
     parser.add_argument("--resolve", default="",
                         help="本地依赖的新家，NAME=模块路径，逗号分隔（如 ROOT=app.core.paths）")
     parser.add_argument("--anchor", default="")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--force", action="store_true")
-    return run(parser.parse_args())
+    parsed = parser.parse_args()
+    if parsed.range:
+        return run_range(parsed)
+    if not parsed.names:
+        print("必须提供 --names（连续块模式）或 --range（区间模式）", file=sys.stderr)
+        return 2
+    return run(parsed)
 
 
 if __name__ == "__main__":

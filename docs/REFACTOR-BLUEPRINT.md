@@ -419,3 +419,66 @@ Python `urllib` 在 Windows 上既读环境变量也读注册表，`NO_PROXY` �
    → `dragon_wave` → `strategy` → `market` → `news` / `wechat` / `price_watch` /
    `price_structure` / `social_x` → `misc`（最后，且必须先二次细分）
 
+---
+
+### 批次 3：共享状态区（app/core/state.py）✅ 已完成并验证
+
+**内容**：把 `server.py` 第 253–1499 行的「模块级声明区」（锁、缓存、单例 Store 引用、
+常量，共 562 条语句 / 561 个名字）机械搬移到 `src/app/core/state.py`。
+`server.py` 顶部 `from app.core.state import (...)` 统一再导出（538 个名字），
+其余 58 个名字（66 个 `global` 重绑定名 + 2 个特殊处理）**刻意保留在 server.py**。
+
+`server.py` 行数：54,867 → 54,265（本次 -602 行）；`state.py` 2,296 行，语法/导入均通过。
+
+**为什么这么拆**：这个 1,247 行的连续区是「共享可变状态」的注册表（119 把锁、
+几十个缓存 dict、`CHAIN_ECOSYSTEM_MONITOR` 等单例）。它不依赖任何上层函数，
+是唯一能安全整体搬迁的自包含块；搬走后为后续 `ops_health` / `alert` / `onchain`
+等业务簇腾出清晰的「状态归属」。
+
+**验收结果（四道闸门）**：
+1. **导入级**（`verify_split.py`）：导入成功、ROOT 正确、运行时隔离生效；
+   - 对象同一性：**550 项全部与 server 命名空间为同一对象**（23 项 server 已不再引用，属正常跳过）；
+   - **零第二把锁**、**零重绑定名字泄漏**（66 个 `global` 名一个都没漏进模块）；
+   - 残留重复定义检查已加强到覆盖全部 599 个搬走的名字，无残留。
+2. **静态页面逐字节比对**（`ab_verify.py` gate 2）：19 个页面/SEO 生成物**全部逐字节一致**。
+3. **API 结构指纹 A/B**（`ab_verify.py` gate 3，同条件冷启动、旧 HEAD vs 新工作区）：
+   40 端点**全部通过，0 回归 0 警告**（可用性旧 20/40 → 新 20/40，结构差异 0）。
+4. **单测**：见下方「坑 6」。
+
+**新增工具（本批次产出）**：
+- `tools/ab_verify.py` —— 同条件 A/B 对照器（新旧两实例**并发**运行、独立运行时目录、
+  交替重探消抖、按进程树清理、静态页面逐字节比对 + API 结构指纹比对，二者合一）。
+- `tools/run_tests.py` —— 统一 Python 测试入口（stdlib unittest discover + faulthandler 看门狗
+  + `XINGYUN_RUNTIME_DIR` 隔离；也是 Phase 2「统一测试入口」的落地）。
+- `tools/ab_tests.py` —— 两轮测试日志的失败集差集比对器（区分「新增失败=回归 /
+  两边都失败=既有问题 / 消失=改善」）。
+
+**坑 6：测试套件并非「全绿才算过」，必须做新旧失败集差集** 🔴
+本项目的单测有**先于重构就存在的死锁/陈旧用例**：
+- `test_service_guard.py::test_port_binding_precedes_background_and_database_startup`
+  用 AST 找 `calls["ThreadingHTTPServer"]`，但代码早已改名 `BoundedThreadingHTTPServer`
+  —— 在重构前备份提交 `a67f03b` 里就已经是这个名字，测试从没更新过（陈旧）。
+- `test_alert_delivery.py::test_ten_critical_signals_all_get_display_opportunity`
+  在 `alert_delivery.py:52` 的 `sqlite3.connect` 上**永久阻塞**（等一把被后台
+  `session-buy-revoke` 线程占住的 DB 事务）。**在旧版 worktree 上同样复现**（相同 5 分钟超时）。
+- `test_binance_wallet_structure_pool.py::...contract_identity` 在
+  `price_structure_watch_rows` 的冷启动 180s 忙等里卡住（测试环境没有 `price_watch_assets`
+  表 → 刷新线程永远失败 → 缓存永远填不上）。**新旧两版同步卡在同一处**。
+- `test_strategy_adaptive_context.py::test_acceleration_...` 报 `'NoneType' object is not
+  subscriptable` —— **新旧两版同样 1 error**。
+
+因此验收线是「**新版失败集 ⊆ 旧版失败集**」，由 `tools/ab_tests.py` 自动判定；
+绝不能用「全绿」当线（否则要么误判回归、要么为了变绿去改运行代码）。
+
+**坑 7：「未再导出」是回归，不是无害信息** 🔴（本批次真正踩中）
+初次抽取把 23 个名字搬进 `state.py` 却没在 `server.py` 再导出，我误判为「server 自身
+不再引用 = 安全」。但 `test_price_structure_exclusion.py` / `test_binance_wallet_prior_high.py`
+通过 `server.PRICE_STRUCTURE_REENTRY_*` 访问这些常量 → `AttributeError`（3 个用例回归）。
+`verify_split.py` 的 AST 分析只看 `server.py` 内部引用，看不到 tests/其他模块的外部引用，
+所以「未再导出」被当成信息项放过了。**正解：凡 server.py 之外仍可能通过 `server.NAME`
+访问的公开名字，一律在 server.py 再导出（成本为零）；真正只在本模块内部使用的少数名字
+才列入 `internal` 白名单。** 本批次已把 22 个名字全部再导出，仅 `configured_runtime_dir`
+（仅用于推导 `PERSIST_CACHE_DIR`）列为 internal。`verify_split.py` 已把「未再导出且不在
+白名单」升级为警告。
+
+

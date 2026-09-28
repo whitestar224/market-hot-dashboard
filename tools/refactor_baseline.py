@@ -117,12 +117,21 @@ GET_ENDPOINTS: list[tuple[str, str]] = [
 # 采集时不记录它们的值，只记录类型。
 VOLATILE_HINT_KEYS = frozenset({"updatedAt", "generatedAt", "timestamp", "ts", "serverTime"})
 
+# 易变键字典：这些字段本身是一个 dict，但其【键】是运行时生成、每次进程都不一样的
+# 名字（典型：/api/health 的 runtime.threadGroups，键是线程名 "Thread-29 (_send_ping)"）。
+# 键集合无法跨进程稳定比较，因此把它们折叠成 {"*": <单个样本值的形状>}，
+# 只比「线程条目长什么样」，不比「具体有哪些线程」。
+VOLATILE_KEY_DICTS = frozenset({
+    "threadGroups",
+    "threadStackSummary",
+})
+
 MAX_DEPTH = 8
 LIST_SHAPE_SAMPLE = 24  # 列表项形状最多合并前 N 个元素，避免超大数组拖慢
 REQUEST_TIMEOUT = 25  # 可被 --timeout 覆盖；部分端点当前基线即 >25s
 
 
-def shape_of(value: Any, depth: int = 0) -> Any:
+def shape_of(value: Any, depth: int = 0, field_name: str = "") -> Any:
     """把任意 JSON 值折叠成【结构指纹】，丢弃易变的具体数值。"""
     if depth > MAX_DEPTH:
         return "..."
@@ -137,7 +146,11 @@ def shape_of(value: Any, depth: int = 0) -> Any:
     if isinstance(value, str):
         return "str"
     if isinstance(value, dict):
-        return {str(k): shape_of(v, depth + 1) for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))}
+        if field_name in VOLATILE_KEY_DICTS:
+            # 键集合跨进程不稳定：折叠成单个代表样本的形状
+            sample = next(iter(value.values()), None)
+            return {"*": shape_of(sample, depth + 1)}
+        return {str(k): shape_of(v, depth + 1, str(k)) for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))}
     if isinstance(value, (list, tuple)):
         merged: dict[str, Any] = {}
         has_complex = False
