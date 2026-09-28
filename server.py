@@ -172,6 +172,10 @@ from app.api.seo import (
     sitemap_xml,
 )
 
+# ---- 批次 4：ops_health 域抽出至 app/api/health.py
+# 注意：health_payload 会懒 import server（见 health.py docstring）读运行时状态。
+from app.api.health import health_payload, runtime_thread_groups
+
 # ---- 由 tools/extract_module.py 区间抽取至 app/core/state.py ----
 from app.core.state import (
     AICOIN_CDP_RELAUNCH_LOCK,
@@ -51631,125 +51635,6 @@ def start_wechat_auth_monitor() -> None:
         return
     WECHAT_AUTH_MONITOR_ACTIVE = True
     threading.Thread(target=wechat_auth_monitor_loop, daemon=True).start()
-
-
-def runtime_thread_groups() -> dict[str, int]:
-    groups: dict[str, int] = {}
-    for thread in threading.enumerate():
-        name = clean_feed_text(thread.name, 100) or "unnamed"
-        if "process_request_thread" in name:
-            name = "http-request"
-        else:
-            name = re.sub(r"_\d+$", "", name)
-        groups[name] = groups.get(name, 0) + 1
-    return dict(sorted(groups.items(), key=lambda item: (-item[1], item[0]))[:24])
-
-
-def health_payload() -> dict[str, Any]:
-    checks: dict[str, Any] = {}
-    ok = True
-    try:
-        init_auth_db()
-        with AUTH_DB_LOCK, auth_db() as conn:
-            conn.execute("SELECT 1").fetchone()
-        checks["database"] = {"ok": True}
-    except Exception as exc:
-        ok = False
-        checks["database"] = {"ok": False, "error": str(exc)[:180]}
-
-    try:
-        PERSIST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        probe = PERSIST_CACHE_DIR / ".healthcheck"
-        probe.write_text(str(time.time()), encoding="utf-8")
-        probe.unlink(missing_ok=True)
-        checks["runtimeCache"] = {"ok": True, "path": str(PERSIST_CACHE_DIR)}
-    except Exception as exc:
-        ok = False
-        checks["runtimeCache"] = {"ok": False, "error": str(exc)[:180]}
-
-    with PRICE_STRUCTURE_PREARM_STATUS_LOCK:
-        prearm_status = dict(PRICE_STRUCTURE_PREARM_STATUS)
-    with PRICE_STRUCTURE_EVENT_CONTEXT_LOCK:
-        structure_event_context_count = len(PRICE_STRUCTURE_EVENT_CONTEXTS)
-    with NEW_COIN_LOW_LOCK:
-        new_coin_low_scanned = len(NEW_COIN_LOW_ITEMS)
-    new_coin_low_inventory = len(NEW_COIN_LOW_INVENTORY_CACHE[1]) if NEW_COIN_LOW_INVENTORY_CACHE else 0
-    return {
-        "ok": ok,
-        "service": "xingyunshe-market-hot-dashboard",
-        "env": env_value("XINGYUN_ENV", "development") or "development",
-        "time": int(time.time() * 1000),
-        "version": env_value("XINGYUN_VERSION", "local"),
-        "checks": checks,
-        "monitors": {
-            "siteAlerts": SITE_ALERT_MONITOR_ACTIVE,
-            "wechatAuth": WECHAT_AUTH_MONITOR_ACTIVE,
-            "desktopAlerts": not env_flag("XINGYUN_DISABLE_DESKTOP_ALERT", default=is_production_mode()),
-            "priceWatch": PRICE_WATCH_MONITOR_ACTIVE,
-            "structureSignals": PRICE_STRUCTURE_MONITOR_ACTIVE,
-            "structureMonitorMode": "parallel-priority",
-            "structureMonitorWorkers": PRICE_STRUCTURE_MONITOR_WORKERS,
-            "structureStrategyVersion": PRICE_STRUCTURE_STRATEGY_VERSION,
-            "structurePrearm": PRICE_STRUCTURE_PREARM_MONITOR_ACTIVE,
-            "structurePrearmIntervalSeconds": PRICE_STRUCTURE_PREARM_INTERVAL_SECONDS,
-            "structurePrearmForecastMinutes": PRICE_STRUCTURE_PREARM_FORECAST_MINUTES,
-            "structurePrearmStatus": prearm_status,
-            "structureEventContexts": structure_event_context_count,
-            "newCoinLowStructure": NEW_COIN_LOW_MONITOR_ACTIVE,
-            "newCoinLowMonitorMode": "parallel-priority",
-            "newCoinLowMonitorWorkers": NEW_COIN_LOW_MONITOR_WORKERS,
-            "newCoinLowInventory": new_coin_low_inventory,
-            "newCoinLowScanned": new_coin_low_scanned,
-            "newCoinLowInactiveExcluded": int(safe_float(NEW_COIN_LOW_ACTIVITY_SUMMARY.get("excluded"), 0)),
-            "newCoinLowActivityUnavailable": int(safe_float(NEW_COIN_LOW_ACTIVITY_SUMMARY.get("unavailable"), 0)),
-            "newCoinLowActivityUnavailableExcluded": int(safe_float(
-                NEW_COIN_LOW_ACTIVITY_SUMMARY.get("unavailableExcluded"), 0
-            )),
-        },
-        "runtime": {
-            "activeThreads": threading.active_count(),
-            "threadGroups": runtime_thread_groups(),
-            "threadStackKb": THREAD_STACK_SIZE_BYTES // 1024 if THREAD_STACK_SIZE_BYTES else 0,
-            "sharedPools": True,
-            "timeframeWorkers": int(getattr(PRICE_STRUCTURE_TIMEFRAME_POOL, "_max_workers", 0)),
-            "entryDayTimeframeWorkers": int(
-                getattr(PRICE_STRUCTURE_ENTRY_DAY_TIMEFRAME_POOL, "_max_workers", 0)
-            ),
-            "marketSourceWorkers": int(getattr(MARKET_SOURCE_POOL, "_max_workers", 0)),
-            "apiRefreshWorkers": int(getattr(API_REFRESH_POOL, "_max_workers", 0)),
-            "chainEcosystemWorkers": CHAIN_ECOSYSTEM_MONITOR.worker_count,
-            "httpRequests": {
-                "active": int(DASHBOARD_HTTP_RUNTIME.get("active", 0)),
-                "peak": int(DASHBOARD_HTTP_RUNTIME.get("peak", 0)),
-                "limit": DASHBOARD_HTTP_MAX_ACTIVE,
-            },
-            "outboundRequests": requests.stats(),
-            "onchainResearchIngest": {
-                "pending": len(ONCHAIN_RESEARCH_INGEST_PENDING),
-                "active": bool(
-                    ONCHAIN_RESEARCH_INGEST_THREAD
-                    and ONCHAIN_RESEARCH_INGEST_THREAD.is_alive()
-                ),
-                "limit": ONCHAIN_RESEARCH_INGEST_PENDING_LIMIT,
-            },
-            "monitorIdentityCache": {
-                "cached": len(MONITOR_BUY.identities.records),
-                "known": len(MONITOR_BUY.identities.known_keys),
-                "limit": MONITOR_BUY.identities.cache_size,
-            },
-            "cacheEntries": {
-                "market": len(CACHE),
-                "onchainPools": len(PRICE_STRUCTURE_ONCHAIN_POOL_CACHE),
-                "onchainCandles": len(PRICE_STRUCTURE_ONCHAIN_CANDLE_CACHE),
-                "momentum": len(PRICE_STRUCTURE_MOMENTUM_CACHE),
-                "newsDiscovery": len(NEWS_TRADE_DISCOVERY_CACHE),
-                "newsSecurity": len(NEWS_TRADE_SECURITY_CACHE),
-                "logos": len(LOGO_CACHE),
-            },
-        },
-    }
-
-
 
 
 DASHBOARD_HTTP_MAX_ACTIVE = max(

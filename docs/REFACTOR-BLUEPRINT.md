@@ -481,4 +481,42 @@ Python `urllib` 在 Windows 上既读环境变量也读注册表，`NO_PROXY` �
 （仅用于推导 `PERSIST_CACHE_DIR`）列为 internal。`verify_split.py` 已把「未再导出且不在
 白名单」升级为警告。
 
+---
+
+### 批次 4：ops_health 域（app/api/health.py）✅ 已完成并验证
+
+**内容**：把 `runtime_thread_groups` + `health_payload`（原 server.py 第 51636-51750 行，
+连续 115 行）搬到 `src/app/api/health.py`。`server.py` 54287 → 54172 行（-115）。
+
+**核心难点与解法：跨模块读「运行时可变状态」** —— `health_payload` 是纯读函数（无
+`globalWriters`），但它读 9 个 `global` 重绑定名（`SITE_ALERT_MONITOR_ACTIVE`、
+`NEW_COIN_LOW_MONITOR_ACTIVE`、`NEW_COIN_LOW_ACTIVITY_SUMMARY`、`ONCHAIN_RESEARCH_INGEST_THREAD`
+等）+ 8 个尚未拆分的 server 本地函数/名字（`auth_db`/`init_auth_db`/`clean_feed_text`/
+`safe_float`/`MONITOR_BUY`/`DASHBOARD_HTTP_RUNTIME`/`DASHBOARD_HTTP_MAX_ACTIVE`/`requests`）。
+这些名字的值由 server.py 里各监控循环 `global X` 更新，**不能用 `from app.core.state import X`
+绑定**（会拿到永不更新的副本）。解法：**函数体内 `import server`（懒加载）**，用
+`_server().NAME` 读取——`health_payload` 只在 HTTP 请求时调用，那时 server.py 早已完整加载，
+`sys.modules["server"]` 就是那个唯一、状态实时更新的模块对象。其余锁/缓存/池/常量已搬到
+state.py 且是同一对象，直接 `from app.core.state import`。
+
+**这是拆分「读运行时状态的函数」的标准手法**，后续拆 alert/onchain 等含 `globalWriters`
+的簇时，读侧照此办理（写侧仍需保留在 server.py，见坑 1）。
+
+**验收结果**：
+- `verify_split`：导入成功、ROOT 正确、零重绑定泄漏、零残留重复定义
+- 静态页面 19/19 逐字节一致
+- API A/B：40 端点重探后 0 回归（`personal-x-monitor`/`strategy-board` 首采的结构差异是
+  冷启动时序抖动，重探后一致；`health` 的 `TimeoutError`/`RemoteDisconnected` 是冷启动
+  并发实例的网络抖动，批次 3 亦出现，`health_payload` 单独实测 116-358ms 无开销）
+- 单测：`test_price_structure_recognition`（引用 `server.health_payload()`）在旧版 worktree
+  同样 2F/6E，属既有问题，非本批次引入
+
+### 后续批次顺序（据此更新）
+
+1. ~~批次 1 核心层~~ 2. ~~批次 2 seo~~ 3. ~~批次 3 共享状态区~~ 4. ~~批次 4 ops_health~~
+5. **`auth_config`**（3 函数、0 重绑定、最干净）→ `smart_money`（13 函数、0 重绑定）
+   → `binance` → `alert` → `onchain` → `dragon_wave` / `strategy` / `market`
+   → `news` / `wechat` / `price_watch` / `price_structure` / `social_x` → `misc`（最后）
+
+
 
