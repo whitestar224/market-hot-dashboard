@@ -133,6 +133,35 @@ from wechat_group_monitor import (
     send_text_to_wechat,
 )
 
+# ---------------------------------------------------------------------------
+# Phase 3 拆分：把 src/ 加入模块搜索路径，并导入已抽出的核心层。
+#
+# 顺序要求：
+#   1. sys.path 注入必须【先于】任何 app.* 导入
+#   2. 本段必须【早于】文件中所有模块级代码（已核验：最早的模块级引用在第 49892 行）
+#
+# 这些名字原先在 server.py 里就地定义（ROOT 在 199 行、env 系列在 1455/1509/10040 行）。
+# 抽出后 server.py 不再定义它们，全部由 app.core 提供；引用点无需任何改动，
+# 因为名字在 server 模块命名空间里依然解析到同一个对象。
+# ---------------------------------------------------------------------------
+_SRC_DIR = Path(__file__).resolve().parent / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from app.core.config import (  # noqa: E402
+    PRODUCTION_ENV_VALUES,
+    TRUTHY_ENV_VALUES,
+    cookie_secure_enabled,
+    env_flag,
+    env_value,
+    expose_dev_code,
+    is_production_mode,
+    is_raw_production_mode,
+    raw_env_flag,
+    raw_env_value,
+)
+from app.core.paths import CODEX_HOME, ROOT  # noqa: E402
+
 
 class _SharedRequestsFacade:
     """Keep requests' public API while routing one-shot calls through keep-alive pools."""
@@ -196,8 +225,8 @@ requests = _SharedRequestsFacade(
 )
 
 
-ROOT = Path(os.getenv("XINGYUN_APP_ROOT") or Path(__file__).resolve().parent).resolve()
-CODEX_HOME = Path(os.getenv("CODEX_HOME") or (Path.home() / ".codex"))
+# ROOT / CODEX_HOME 已抽到 src/app/core/paths.py（见文件顶部导入）。
+# 注意：路径推导依赖 __file__ 深度，不能机械搬移，详见该模块的说明。
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1453,23 +1482,8 @@ EXCLUDED_FUTU_HK_HOT_CODES = {"00700", "09988", "01810", "03690"}
 EXCLUDED_FUTU_HK_HOT_NAMES = ("腾讯", "阿里", "小米", "美团", "tencent", "alibaba", "xiaomi", "meituan")
 
 
-TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
-PRODUCTION_ENV_VALUES = {"prod", "production", "online"}
-
-
-def raw_env_value(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
-
-
-def raw_env_flag(name: str, default: bool = False) -> bool:
-    value = raw_env_value(name)
-    if value == "":
-        return default
-    return value.lower() in TRUTHY_ENV_VALUES
-
-
-def is_raw_production_mode() -> bool:
-    return raw_env_value("XINGYUN_ENV").lower() in PRODUCTION_ENV_VALUES
+# TRUTHY_ENV_VALUES / PRODUCTION_ENV_VALUES / raw_env_value / raw_env_flag /
+# is_raw_production_mode 已抽到 src/app/core/config.py（见文件顶部导入）。
 
 
 def load_local_env() -> None:
@@ -1506,21 +1520,8 @@ load_local_env()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
-def is_production_mode() -> bool:
-    return raw_env_value("XINGYUN_ENV").lower() in PRODUCTION_ENV_VALUES
-
-
-def env_flag(name: str, default: bool = False) -> bool:
-    return raw_env_flag(name, default)
-
-
-def expose_dev_code(name: str) -> bool:
-    return env_flag(name, default=not is_production_mode())
-
-
-def cookie_secure_enabled() -> bool:
-    public_base = raw_env_value("XINGYUN_PUBLIC_BASE_URL").lower()
-    return env_flag("XINGYUN_COOKIE_SECURE", default=public_base.startswith("https://"))
+# is_production_mode / env_flag / expose_dev_code / cookie_secure_enabled
+# 已抽到 src/app/core/config.py（见文件顶部导入）。
 
 
 def b64url_encode(data: bytes) -> str:
@@ -10037,8 +10038,8 @@ def source_template(
     }
 
 
-def env_value(name: str, default: str = "") -> str:
-    return raw_env_value(name, default)
+# env_value 原先就地定义在此（第 ~10040 行），已抽到 src/app/core/config.py
+# 与其余 env 辅助函数合并为单一来源（见文件顶部导入）。
 
 
 def okx_web_headers() -> dict[str, str]:

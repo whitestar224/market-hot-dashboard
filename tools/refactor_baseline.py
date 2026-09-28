@@ -33,10 +33,37 @@ import json
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
+
+# ⚠️ 必须绕过代理直连本机服务。
+#
+# 实测教训：本项目运行环境设有系统级 HTTP_PROXY（会变，见过 7890 / 62151）。
+# Python urllib 在 Windows 上既读环境变量【也读注册表】，NO_PROXY 环境变量
+# 不一定能覆盖，结果对 127.0.0.1 的请求被送进代理，代理返回
+# 502 "upstream connect failed" 或直接超时。
+#
+# 这会造成灾难性后果：【每一个批次的验证都会误报回归】，而实际代码是好的。
+# 因此对 loopback 地址强制使用空 ProxyHandler，彻底不经过代理。
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+
+
+def _is_loopback(url: str) -> bool:
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    return host in _LOOPBACK_HOSTS or host.startswith("127.")
+
+
+def _open(url: str, timeout: int):
+    req = urllib.request.Request(url, headers={"Accept": "application/json,*/*", "Connection": "close"})
+    if _is_loopback(url):
+        return _NO_PROXY_OPENER.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BASELINE = PROJECT_ROOT / "tests" / "fixtures" / "refactor-baseline" / "golden-master.json"
@@ -162,8 +189,7 @@ def fetch(base_url: str, path: str, timeout: int = REQUEST_TIMEOUT) -> dict[str,
     url = base_url.rstrip("/") + path
     started = time.perf_counter()
     try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json,*/*", "Connection": "close"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _open(url, timeout) as resp:
             raw = resp.read()
             status = resp.status
             ctype = resp.headers.get("Content-Type", "")

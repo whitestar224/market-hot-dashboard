@@ -358,5 +358,64 @@ git reset --hard backup-pre-refactor-20260928      # 完全回到重构前
 |---|---|
 | `tools/refactor_baseline.py` | Golden Master 采集与结构比对 |
 | `tools/split_analyzer.py` | AST 依赖分析与拆分边界计算 |
+| `tools/extract_module.py` | 从单体机械抽取连贯代码块（AST 定位、生成新模块、算导入） |
+| `tools/verify_split.py` | 批次验证器（导入检查 / ROOT 校验 / 残留重复定义检查） |
 | `tests/fixtures/refactor-baseline/golden-master.json` | 40 端点结构基线 |
 | `tests/fixtures/refactor-baseline/split-plan.json` | 18 域簇 + 66 重绑定名 + 依赖图 |
+
+---
+
+## 9. 批次记录与踩坑（增量更新）
+
+### 批次 1：核心层（paths + config）✅ 已完成并验证
+
+**内容**：把 `ROOT` / `CODEX_HOME` 抽到 `src/app/core/paths.py`，
+把 10 个 env 辅助函数（原先散落在第 ~1455、~1509、~10040 三处）合并到 `src/app/core/config.py`。
+`server.py` 顶部注入 `sys.path` 后统一导入，引用点零改动。
+
+**验收结果**：全部通过
+- `verify_split.py`：导入成功、ROOT 正确、12 个名字就位、无残留重复定义
+- 静态/SEO 端点**逐字节一致**（robots.txt / sitemap.xml / index.html / gainers.html / newsflash.html / price-watch.html）
+- A/B 对照（同一空库、旧码 vs 新码）：**结构指纹零差异**
+
+### 踩坑记录（重要，后续批次必须遵守）
+
+**坑 1：`ROOT` 不能机械搬移** 🔴
+原式 `Path(__file__).resolve().parent` 依赖文件深度。搬到 `src/app/core/` 后
+`__file__` 变了，`ROOT` 会静默指向错误目录 → 静态文件全部 404 且无任何报错。
+正解：用「向上查找含 server.py/index.html 的目录」自纠正，而不是按固定深度推算。
+
+**坑 2：验证工具被系统代理劫持** 🔴
+本项目运行环境有系统级 `HTTP_PROXY`（见过 7890，本次实测为 62151，**会变**）。
+Python `urllib` 在 Windows 上既读环境变量也读注册表，`NO_PROXY` 不一定生效 →
+对 `127.0.0.1` 的请求被送进代理，返回 `502 upstream connect failed` 或超时。
+**后果极严重：每个批次都会误报回归，而代码其实是好的。**
+正解：`refactor_baseline.py` 对 loopback 地址强制使用空 `ProxyHandler`（已修复）。
+用 `curl` 手工核对时也必须加 `--noproxy '*'`。
+
+**坑 3：A/B 对照不可省** 🟠
+只把「新实例 vs 线上基线」比会误判：线上是热缓存 + 已填充数据库，
+新实例是冷启动 + 空库。实测发现 `price-watch` 返回 502、`market-hot`/`price-structures`
+超时 —— 但在**旧代码的冷启动实例上同样复现**，证明是环境现象而非回归。
+正解：**同条件 A/B**——用 `git show HEAD:server.py` 取旧码，
+两版各起一次（各自全新空运行时目录、相同预热时长），再互比。
+脚本见本文件第 4 节验证流程。
+
+**坑 4：临时实例会被回收，必须单次命令内完成** 🟠
+会话内 `&` 启动的进程在命令返回后即被回收。启动 → 探测 → 比对 → 关闭
+必须写在**同一次命令**里。
+
+**坑 5：模块级副作用** 🟡
+导入 `server.py` 会创建 `ChainEcosystemStore` / `MonitorBuyService` 等并做会话维护。
+因此验证一律设 `XINGYUN_RUNTIME_DIR=<临时目录>` 隔离，避免触碰线上数据。
+
+### 后续批次顺序（据此更新）
+
+~~1. logging~~ → 已并入批次 1 范围之外；核心层已就绪，下一步：
+
+1. **批次 2：seo 域**（274 行连续块 / 16 个顶层定义 / 搬走后仅剩 stdlib 依赖，无循环导入）
+   —— 已 dry-run 验证，用 `tools/extract_module.py` 执行
+2. 批次 3+：`ops_health` → `auth_config` → `smart_money` → `binance` → `alert` → `onchain`
+   → `dragon_wave` → `strategy` → `market` → `news` / `wechat` / `price_watch` /
+   `price_structure` / `social_x` → `misc`（最后，且必须先二次细分）
+
