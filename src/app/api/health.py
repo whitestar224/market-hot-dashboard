@@ -36,7 +36,6 @@ from typing import Any
 from app.core.config import env_flag, env_value, is_production_mode
 from app.core.state import (
     API_REFRESH_POOL,
-    AUTH_DB_LOCK,
     CACHE,
     CHAIN_ECOSYSTEM_MONITOR,
     LOGO_CACHE,
@@ -96,7 +95,11 @@ def health_payload() -> dict[str, Any]:
     ok = True
     try:
         server.init_auth_db()
-        with AUTH_DB_LOCK, server.auth_db() as conn:
+        # SELECT 1 is a pure read; SQLite WAL is concurrency-safe for readers, so
+        # do NOT take AUTH_DB_LOCK here. Taking the global lock on the liveness
+        # probe made /api/health hang whenever a background writer held the lock
+        # for a long time, which defeated the whole point of a health endpoint.
+        with server.auth_db() as conn:
             conn.execute("SELECT 1").fetchone()
         checks["database"] = {"ok": True}
     except Exception as exc:
