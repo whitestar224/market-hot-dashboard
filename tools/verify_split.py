@@ -72,6 +72,14 @@ EXTRACTED = {
         ],
         "internal": [],
     },
+    "app.api.dragon_wave": {
+        "reexported": [
+            "dragon_wave_feedback_display_index", "dragon_wave_feedback_feature_tokens",
+            "dragon_wave_feedback_for_user", "dragon_wave_feedback_optimization",
+            "dragon_wave_supervised_prototype_profile", "merge_dragon_wave_feedback",
+        ],
+        "internal": [],
+    },
     "app.core.state": {
         # check_all_identity：把模块导出的全部公开名字逐个与 server 命名空间做
         # `is` 同一性比对。这对锁/缓存是生死线 —— 若出现「两把不同的锁」，
