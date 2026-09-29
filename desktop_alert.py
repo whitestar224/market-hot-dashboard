@@ -218,6 +218,53 @@ def limited_lines(value: str, max_lines: int) -> str:
     return "\n".join(clipped)
 
 
+def _chrome_executable() -> str | None:
+    """Locate the local Chrome executable, preferring the user's logged-in profile.
+
+    We deliberately launch Chrome directly (instead of ``webbrowser.open``) so the
+    opened Binance Wallet token page reuses the *existing* Chrome window and its
+    Default-profile login cookies, instead of a fresh, unauthenticated session.
+    """
+    candidates = [
+        os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%ProgramW6432%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def open_external_url(url: str) -> bool:
+    """Open *url* in Chrome (reusing its logged-in profile) when available.
+
+    Falls back to the system default browser when Chrome cannot be located or
+    fails to launch. Returns True when a launcher was invoked without error.
+    """
+    target = str(url or "").strip()
+    if not target:
+        return False
+    chrome = _chrome_executable()
+    if chrome:
+        try:
+            subprocess.Popen(
+                [chrome, target],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                close_fds=True,
+            )
+            return True
+        except Exception:
+            pass
+    try:
+        return webbrowser.open(target)
+    except Exception:
+        return False
+
+
 def looks_english(value: object) -> bool:
     text = " ".join(str(value or "").split())
     if len(text) < 12:
@@ -676,7 +723,7 @@ def show_popup(payload: dict, slot: int) -> int:
         if contract_address:
             copy_contract()
         if url:
-            webbrowser.open(url)
+            open_external_url(url)
         # Opening the target must not dismiss the popup: the user may still want
         # to read the Binance AI narrative or copy the CA from the same card.
 

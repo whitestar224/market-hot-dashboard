@@ -123,7 +123,7 @@ class PopupContractCopyTests(unittest.TestCase):
                             "copy_text_to_clipboard",
                             return_value=clipboard_available,
                         ) as copy,
-                        patch.object(desktop_alert.webbrowser, "open") as open_url,
+                        patch.object(desktop_alert, "open_external_url") as open_url,
                     ):
                         desktop_alert.show_popup({
                             "kind": kind,
