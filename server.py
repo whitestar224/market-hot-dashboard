@@ -9421,6 +9421,8 @@ EXCHANGE_AI_NARRATIVE_ALLOWED_SOURCES = {
     "binance-gainers",
     "binance-futures-gainers",
     "binance-wallet-hot",
+    "gmgn-hot-search",
+    "gmgn-trenches",
     "okx",
     "okx-gainers",
     "okx-turnover",
@@ -22754,6 +22756,13 @@ def normalize_desktop_alert(payload: dict[str, Any]) -> dict[str, Any]:
         "authorHandle": alert_text(payload.get("authorHandle"), 80),
         "sourceId": alert_text(payload.get("sourceId"), 120),
         "alertPeriod": alert_text(payload.get("alertPeriod"), 12),
+        "binanceAiNarrative": alert_text(payload.get("binanceAiNarrative") or payload.get("exchangeAiNarrative"), 1600),
+        "binanceAiNarrativeSource": alert_text(
+            payload.get("binanceAiNarrativeSource") or payload.get("exchangeAiNarrativeSource"), 80
+        ),
+        "binanceAiNarrativeStatus": alert_text(
+            payload.get("binanceAiNarrativeStatus") or payload.get("exchangeAiNarrativeStatus"), 40
+        ),
         "opportunityPolicyVersion": int(safe_float(payload.get("opportunityPolicyVersion"), 0)),
         "listingPolicyVersion": int(safe_float(payload.get("listingPolicyVersion"), 0)),
         "originalText": alert_text(payload.get("originalText"), 1800),

@@ -251,6 +251,34 @@ def fetch_translation(endpoint: str, text: str) -> str:
     return clamp_text(payload.get("translation") or "", 360)
 
 
+def fetch_binance_ai_narrative(port: int, source_id: str, chain: str, contract_address: str, key: str) -> dict:
+    """Ask the monitor service for a token's Binance AI narrative via the shared
+    exchange-AI endpoint.  Positive and negative results are cached server-side,
+    so this is a cheap read for already-analyzed contracts."""
+    data = json.dumps(
+        {"items": [{"key": key, "sourceId": source_id, "chain": chain, "contractAddress": contract_address}]},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/exchange-ai-narratives",
+        data=data,
+        headers={"Content-Type": "application/json", "User-Agent": "XingyunSociety/desktop-alert"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read(400_000).decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read(400_000).decode("utf-8"))
+        except Exception:
+            payload = {}
+    items = payload.get("items") if isinstance(payload, dict) else []
+    if not isinstance(items, list) or not items:
+        return {}
+    return items[0] if isinstance(items[0], dict) else {}
+
+
 def post_price_watch_confirmation(endpoint: str, symbol: str, episode: int) -> dict:
     data = json.dumps(
         {"action": "confirm", "symbol": symbol, "episode": episode},
@@ -530,6 +558,10 @@ def show_popup(payload: dict, slot: int) -> int:
     priority = clamp_text(payload.get("priority") or "实时", 8)
     url = str(payload.get("url") or "").strip()
     contract_address = str(payload.get("contractAddress") or payload.get("contract") or "").strip()
+    chain = str(payload.get("chain") or "").strip()
+    source_id = str(payload.get("sourceId") or "").strip()
+    ai_narrative = clamp_text(payload.get("binanceAiNarrative") or "", 1600)
+    ai_narrative_port = int(payload.get("explanationPort") or os.getenv("XYS_ALERT_PORT") or 8765)
     translation_text = clamp_text(payload.get("translationText") or "", 1800)
     translate_endpoint = str(payload.get("translateEndpoint") or "").strip()
     can_translate = bool(translation_text and translate_endpoint and looks_english(translation_text))
@@ -645,7 +677,8 @@ def show_popup(payload: dict, slot: int) -> int:
             copy_contract()
         if url:
             webbrowser.open(url)
-        close()
+        # Opening the target must not dismiss the popup: the user may still want
+        # to read the Binance AI narrative or copy the CA from the same card.
 
     close_btn = tk.Button(
         top,
@@ -660,6 +693,107 @@ def show_popup(payload: dict, slot: int) -> int:
         font=("Microsoft YaHei UI", 9, "bold"),
     )
     close_btn.pack(side="right", padx=(4, 14), pady=(12, 7))
+
+    # Binance AI narrative: a small icon that lights up once the token's
+    # narrative is available, hovered to reveal the text in a floating tooltip.
+    ai_narrative_state = {"text": ai_narrative, "tooltip": None}
+    ai_btn = None
+    if contract_address and chain and source_id:
+        def make_narrative_tooltip(text_value: str) -> None:
+            hide_narrative_tooltip()
+            tip = tk.Toplevel(root)
+            tip.overrideredirect(True)
+            tip.attributes("-topmost", True)
+            tip.configure(bg="#fff8f7" if is_red else "#f8fcff")
+            wrap = tk.Label(
+                tip,
+                text=soft_wrap_text(clamp_text(text_value, 1600), 46),
+                bg="#fff8f7" if is_red else "#f8fcff",
+                fg="#344047",
+                justify="left",
+                padx=12,
+                pady=10,
+                wraplength=340,
+                font=("Microsoft YaHei UI", 9),
+            )
+            wrap.pack()
+            tip.update_idletasks()
+            x = ai_btn.winfo_rootx() + ai_btn.winfo_width() // 2 - tip.winfo_width() // 2
+            y = ai_btn.winfo_rooty() + ai_btn.winfo_height() + 6
+            # Keep the tooltip on-screen near the card.
+            x = max(8, min(x, ai_btn.winfo_screenwidth() - tip.winfo_width() - 8))
+            tip.geometry(f"+{x}+{y}")
+            ai_narrative_state["tooltip"] = tip
+
+        def hide_narrative_tooltip() -> None:
+            tip = ai_narrative_state.get("tooltip")
+            if tip is not None:
+                try:
+                    tip.destroy()
+                except Exception:
+                    pass
+                ai_narrative_state["tooltip"] = None
+
+        def show_ai_narrative() -> None:
+            text_value = ai_narrative_state.get("text")
+            if text_value:
+                make_narrative_tooltip(text_value)
+
+        def on_ai_enter(_event=None) -> None:
+            show_ai_narrative()
+
+        def on_ai_leave(_event=None) -> None:
+            hide_narrative_tooltip()
+
+        def load_ai_narrative() -> None:
+            try:
+                result = fetch_binance_ai_narrative(
+                    ai_narrative_port, source_id, chain, contract_address, payload.get("key") or ""
+                )
+                text_value = clamp_text(
+                    result.get("exchangeAiNarrative") or result.get("binanceAiNarrative") or "", 1600
+                )
+                if text_value and root.winfo_exists():
+                    root.after(0, lambda: apply_ai_narrative(text_value))
+            except Exception:
+                pass
+
+        def apply_ai_narrative(text_value: str) -> None:
+            if not ai_btn or not root.winfo_exists():
+                return
+            ai_narrative_state["text"] = text_value
+            ai_btn.configure(
+                text="✦",
+                bg="#fff3d6",
+                fg="#b5861a",
+                activebackground="#ffe9b8",
+                cursor="hand2",
+                state="normal",
+            )
+            ai_btn.bind("<Enter>", on_ai_enter)
+            ai_btn.bind("<Leave>", on_ai_leave)
+            ai_btn.bind("<Button-1>", lambda _e: show_ai_narrative())
+
+        ai_btn = tk.Button(
+            top,
+            text="✦",
+            command=None,
+            bg=action_bg if not ai_narrative else "#fff3d6",
+            fg="#c9a24b" if not ai_narrative else "#b5861a",
+            activebackground=action_active_bg,
+            relief="flat",
+            width=3,
+            height=1,
+            state="disabled" if not ai_narrative else "normal",
+            cursor="arrow",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            takefocus=0,
+        )
+        ai_btn.pack(side="right", padx=(4, 0), pady=(12, 7))
+        if ai_narrative:
+            apply_ai_narrative(ai_narrative)
+        else:
+            threading.Thread(target=load_ai_narrative, daemon=True).start()
 
     if url:
         view_btn = tk.Button(
