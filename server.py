@@ -22,6 +22,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import signal
 import threading
 import time
 import tomllib
@@ -18227,6 +18228,17 @@ def market_payload() -> dict[str, Any]:
     }
 
 
+def market_source_worker_enabled() -> bool:
+    """微服务化开关：主进程是否把 market 12 源抓取让渡给独立 market-worker 子进程。
+
+    默认 False —— 单进程行为与之前**逐字节一致**。仅当 service_guard 以
+    ``XINGYUN_MARKET_WORKER=1`` 环境变量同时拉起 market-worker 时才置 True，
+    此时主进程的 ``market_hot_response_payload`` 改为读 worker 写的磁盘快照，
+    不再自行触发 12 源重建（消除请求线程 / GIL 被网络抓取拖慢的可能）。
+    """
+    return env_value("XINGYUN_MARKET_WORKER", "0") in {"1", "true", "yes", "on"}
+
+
 def market_hot_response_payload(*, force_refresh: bool = False) -> dict[str, Any]:
     """Serve the composite cache while keeping the independent GMGN board fresh.
 
@@ -18234,7 +18246,21 @@ def market_hot_response_payload(*, force_refresh: bool = False) -> dict[str, Any
     bounded window even when the background worker is stuck on a downstream
     lock (chain-store, AICoin API, etc.).
     """
-    if force_refresh:
+    if market_source_worker_enabled():
+        # 进程级拆分：12 源抓取由 market-worker 子进程独占（写 api_cache_path("market-hot")）。
+        # 主进程只读快照，绝不触发同步/后台重建，请求线程永不等待网络抓取。
+        cached_payload = read_json_cache(api_cache_path("market-hot"))
+        if cached_payload:
+            age = time.time() - payload_cache_time(cached_payload)
+            payload = with_cache_meta("market-hot", cached_payload, stale=age > 60)
+        else:
+            # 冷启动 worker 尚未产出首份快照：返回空结构（页面有兜底），不阻塞、不自行抓取。
+            payload = with_cache_meta(
+                "market-hot",
+                {"updatedAt": int(time.time() * 1000), "sources": [], "smartPriority": {}},
+                stale=True,
+            )
+    elif force_refresh:
         cached_payload = read_json_cache(api_cache_path("market-hot"))
         cache_age = time.time() - payload_cache_time(cached_payload) if cached_payload else 10**9
         if cached_payload and cache_age <= 180:
@@ -53356,6 +53382,86 @@ def stop_discord_newsflash_bridge() -> None:
             pass
 
 
+def market_worker_loop(interval: float) -> int:
+    """微服务化：market 12 源抓取下沉到独立子进程（market-worker）。
+
+    复用主进程完全相同的 ``market_payload()``，把结果写到 ``api_cache_path("market-hot")``
+    （各源在 ``cached_or_fallback_source`` 内仍各自写独立 ``source_cache_path``）。
+    主进程 ``market_hot_response_payload`` 改为读这个磁盘快照，从而把 12 源并发抓取的
+    网络/GIL 压力从 HTTP 进程剥离。本函数只在 ``--worker-market`` 模式下运行，正常
+    主进程启动路径不受影响（零行为变化）。
+
+    通信协议：结果 → 磁盘快照（原子 tmp+rename）；退出 → stop 文件 / SIGTERM；
+    心跳 → status.json 的 ``workers.market`` 段。
+    """
+    stop_file = os.environ.get("XINGYUN_SERVICE_STOP_FILE")
+    SERVICE_DIR = PERSIST_CACHE_DIR / "service"
+
+    def _stop_requested() -> bool:
+        if stop_file and Path(stop_file).exists():
+            return True
+        return (SERVICE_DIR / "manual-stop").exists()
+
+    def _write_heartbeat(status: str, last_error: str = "") -> None:
+        try:
+            SERVICE_DIR.mkdir(parents=True, exist_ok=True)
+            status_path = SERVICE_DIR / "status.json"
+            payload: dict[str, Any] = {}
+            if status_path.exists():
+                try:
+                    payload = json.loads(status_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    payload = {}
+            workers = payload.setdefault("workers", {})
+            workers["market"] = {
+                "pid": os.getpid(),
+                "status": status,
+                "lastError": last_error,
+                "updatedAt": int(time.time() * 1000),
+            }
+            tmp = status_path.with_suffix(".market.tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+            tmp.replace(status_path)
+        except OSError:
+            pass  # 心跳是遥测，绝不应终止 worker
+
+    print(f"[market-worker] start pid={os.getpid()} interval={interval}s", flush=True)
+    stopping = threading.Event()
+
+    def _handle_term(_signum, _frame):
+        stopping.set()
+
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _handle_term)
+
+    _write_heartbeat("starting")
+    while not stopping.is_set() and not _stop_requested():
+        try:
+            _write_heartbeat("running")
+            payload = market_payload()
+            # 与主进程 refresh_api_cache_now 相同的复合缓存签名，供 payload_cache_time 读年龄。
+            payload = dict(payload)
+            payload["_cache"] = {
+                "key": "market-hot",
+                "updatedAt": int(time.time() * 1000),
+                "stale": False,
+            }
+            with API_CACHE_WRITE_LOCK:
+                write_json_cache(api_cache_path("market-hot"), payload)
+            _write_heartbeat("ok")
+        except Exception as exc:
+            _write_heartbeat("error", str(exc)[:180])
+            traceback.print_exc()
+        for _ in range(max(1, int(interval))):
+            if stopping.is_set() or _stop_requested():
+                break
+            time.sleep(1)
+
+    _write_heartbeat("stopped")
+    print(f"[market-worker] stopped", flush=True)
+    return 0
+
+
 def main():
     global SERVER_RUNTIME_ACTIVE
     parser = argparse.ArgumentParser()
@@ -53366,7 +53472,13 @@ def main():
         default_port = 8765
     parser.add_argument("--host", default=default_host)
     parser.add_argument("--port", type=int, default=default_port)
+    parser.add_argument("--worker-market", action="store_true", help="以 market-worker 子进程模式运行（不监听 HTTP，只抓 12 源写快照）")
+    parser.add_argument("--worker-market-interval", type=float, default=60.0, help="market-worker 抓取间隔（秒）")
     args = parser.parse_args()
+    if args.worker_market:
+        # 子进程模式：绕过 HTTP 绑定与全部监控循环，只跑 market 抓取循环。
+        # 复用与主进程相同的运行时目录，直接写共享快照。
+        return market_worker_loop(args.worker_market_interval)
     # SO_REUSEADDR on Windows lets stale dashboard instances bind the same
     # address, so requests can randomly reach old code. Keep quick reuse on
     # Unix, but require one exclusive 8765 listener on this desktop app.

@@ -98,6 +98,52 @@ def save_state(**fields):
     return False
 
 
+def supervise_market_worker(interval=60.0):
+    """监督 market-worker 子进程（进程级拆分：12 源抓取下沉）。
+
+    与主进程守护并行运行：随主进程常驻拉起 ``server.py --worker-market``，
+    监测退出/停止文件，意外退出立即重启（崩溃即拉起，快照不 stale）。
+    仅在 ``XINGYUN_MARKET_WORKER=1`` 时由 supervise() 启动。
+    """
+    worker_logger = logging.getLogger("market-worker-output")
+    worker_logger.setLevel(logging.INFO)
+    worker_logger.addHandler(RotatingFileHandler(RUNTIME / "market-worker.log", maxBytes=4_000_000, backupCount=2, encoding="utf-8"))
+    restarts = 0
+    while not STOP.exists():
+        env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8",
+               "XINGYUN_SERVICE_STOP_FILE": str(STOP), "XINGYUN_MARKET_WORKER": "1"}
+        child = subprocess.Popen(
+            [sys.executable, str(ROOT / "server.py"), "--worker-market", "--worker-market-interval", str(interval)],
+            cwd=ROOT, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        def drain(stream):
+            with stream:
+                for line in iter(lambda: stream.readline(65536), b""):
+                    worker_logger.info("%s", line.decode("utf-8", errors="replace").rstrip())
+        threading.Thread(target=drain, args=(child.stdout,), daemon=True, name="market-worker-log-drain").start()
+        worker_logger.info("market-worker started pid=%s restarts=%s", child.pid, restarts)
+        while child.poll() is None and not STOP.exists():
+            for _ in range(10):
+                if STOP.exists() or child.poll() is not None:
+                    break
+                time.sleep(1)
+        if STOP.exists():
+            stop_child(child)
+            break
+        code = child.poll()
+        if code in {0, 98}:
+            worker_logger.info("market-worker intentional exit, no restart: %s", code)
+            break
+        restarts += 1
+        worker_logger.warning("market-worker unexpected exit code=%s, restarting (attempt %s)", code, restarts)
+        for _ in range(retry_delay(1)):
+            if STOP.exists():
+                break
+            time.sleep(1)
+    worker_logger.info("market-worker supervision stopped")
+
+
 def supervise(host="127.0.0.1", port=8765):
     lock = acquire_lock()
     if lock is None:
@@ -119,6 +165,17 @@ def supervise(host="127.0.0.1", port=8765):
         server_logger.setLevel(logging.INFO)
         server_logger.addHandler(RotatingFileHandler(RUNTIME / "server.log", maxBytes=8_000_000, backupCount=2, encoding="utf-8"))
         failures = restarts = 0
+        # 进程级拆分：market 12 源抓取由独立子进程承担（仅当显式 opt-in）。
+        # 只启动一次（放在主进程重启循环之外），避免主进程崩溃重启时叠加出
+        # 第二个 market-worker 并发写同一份快照。STOP 文件会一并终止 worker 监督线程。
+        if os.environ.get("XINGYUN_MARKET_WORKER", "0") in {"1", "true", "yes", "on"}:
+            market_interval = float(os.environ.get("XINGYUN_MARKET_WORKER_INTERVAL", "60") or "60")
+            threading.Thread(
+                target=supervise_market_worker,
+                args=(market_interval,),
+                daemon=True,
+                name="market-worker-supervisor",
+            ).start()
         while not STOP.exists():
             env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8",
                    "XINGYUN_SERVICE_STOP_FILE": str(STOP)}

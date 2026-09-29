@@ -1,9 +1,24 @@
 # 微服务化设计蓝图（进程级拆分）
 
-> 状态：设计蓝图（第一阶段交付物，待评审后分阶段实施）
+> 状态：**阶段 2/3 已落地**（market 12 源已下沉为独立 market-worker 子进程）；阶段 4（ingest）待做
 > 日期：2026-09-29
 > 约束：进程级拆分 + 保持桌面端单机部署（不引入 Docker/K8s/云服务/消息中间件）
 > 铁律：**不改变任何页面、任何 API 契约、任何用户可见行为**
+
+### 已落地（2026-09-29）
+
+- **market-worker 子进程**（阶段 2/3 合流）：`server.py --worker-market` 复用主进程
+  完全相同的 `market_payload()`，把 12 源并发抓取 + `smartPriority` 结果写到
+  `api_cache_path("market-hot")`（各源仍各自写独立 `source-cache/market-hot_*.json`）。
+  - 主进程 `market_hot_response_payload` 通过 `market_source_worker_enabled()`
+    （读 `XINGYUN_MARKET_WORKER`）决定走「读快照」还是「原单进程路径」。
+  - **默认关闭**：无 env 时 `market_source_worker_enabled()` 返回 False，行为与重构前
+    逐字节一致；`启动后台服务.cmd` 已 `set XINGYUN_MARKET_WORKER=1` 开启。
+  - `service_guard.py` 新增 `supervise_market_worker()`：随主进程常驻拉起 worker、
+    意外退出立即重启、日志抽到 `market-worker.log`。
+- **为什么第一刀选 market 而非 event-monitor-core**：market 12 源各自写独立缓存文件、
+  `market_priority_*` 状态已落盘（`rank_monitor_state.json`），拆分最干净、无损；
+  event-monitor-core 依赖其他监控循环维护的进程内内存行，需先重设计数据流（风险更高）。
 
 ## 1. 目标与边界
 
