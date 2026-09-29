@@ -22,10 +22,12 @@ import os
 import shutil
 import sys
 import time
+from pathlib import Path
 
-DB_PATH = r"C:\Users\ZhuanZ1\Desktop\交易\market-hot-dashboard\.runtime-cache\chain_ecosystem.db"
-BACKUP_DIR = r"C:\Users\ZhuanZ1\Desktop\交易\market-hot-dashboard\backtest-backup"
-RETENTION_DAYS = 14
+ROOT = Path(__file__).resolve().parent
+DB_PATH = os.environ.get("CHAIN_ECOSYSTEM_DB") or str(ROOT / ".runtime-cache" / "chain_ecosystem.db")
+BACKUP_DIR = os.environ.get("BACKTEST_BACKUP_DIR") or str(ROOT / "backtest-backup")
+RETENTION_DAYS = int(os.environ.get("PRUNE_RETENTION_DAYS", "14"))
 BATCH_SIZE = 5000  # 每批删除行数
 
 
@@ -58,7 +60,9 @@ def main():
 
     if dry_run:
         print("[prune] === DRY RUN，仅统计 ===")
-        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=60)
+        # 服务运行时主库被写锁占用，dry-run 用 immutable 只读打开即可安全统计，
+        # 绝不触碰线上数据（这正是一线运维最常用的「先看再删」姿势）。
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro&immutable=1", uri=True, timeout=60)
         cur = conn.cursor()
         plan = {
             "onchain_fast_jobs (screened/unavailable < cut14)": (

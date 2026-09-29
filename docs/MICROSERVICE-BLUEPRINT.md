@@ -20,6 +20,29 @@
   `market_priority_*` 状态已落盘（`rank_monitor_state.json`），拆分最干净、无损；
   event-monitor-core 依赖其他监控循环维护的进程内内存行，需先重设计数据流（风险更高）。
 
+### 阶段 4（ingest 下沉）—— 调查结论：不可无损拆，改做 DB 瘦身（2026-09-29）
+
+**为什么不硬拆 ingest**：`ingest` 是读-改-写原子事务，评分器
+（`evaluate_onchain_candidate`）、enricher 回调（`global_hotspot_enrich_candidate`，
+读主进程内存热点缓存）、chat 交叉验证（读 `onchain_chat_evidence`）、DeepSeek 分析器、
+弹窗 sink 全在同一把 `_store_write_lock` 里，且都依赖主进程内存态。拆成子进程要么复制
+半个 server.py，要么把「评分」与「落库」解耦——但评分本身就要读库（old jobs/candidates/
+chat evidence），无法只交「写」。加上日志显示 `buffer_ingest`（2026-09-25 已落地）已让
+写锁不再报超时，硬拆收益不确定、回归风险高。
+
+**真正的瓶颈是 DB 膨胀，不是锁**：`chain_ecosystem.db` 617MB，其中
+`onchain_fast_jobs.candidate_json` 占 228MB（`screened` 状态 6.3 万行占 159MB）。
+根因是 `screened`（已判定不值得投研）候选币**没有运行时淘汰机制**，市场刷新循环每次
+UPSERT 都重写它们完整的 candidate_json，导致 14 天前就该淘汰的 5.7 万行僵尸数据持续累积。
+
+**落地（治标，确定收益 ~200MB）**：`prune_chain_ecosystem.py`（14 天淘汰 + 分批删除 +
+VACUUM）已存在；本次完善了相对路径 + 服务运行时 `immutable` 安全 dry-run，并新增
+`清理数据库.cmd` 一键脚本（停服 → 备份 → prune --backup → 重启）。需停服窗口执行。
+
+**治本（待做，需谨慎）**：在 `ingest` 加短路——`status='screened'` 且 `first_seen_at`
+超 N 天且无新证据的老候选跳过重写 candidate_json（只轻量更新 updated_at/quote_due_at），
+从源头阻止僵尸数据累积。属核心写路径，需四闸门验收 + 充分回测。
+
 ## 1. 目标与边界
 
 把 `server.py` 单进程里的「CPU 密集 / 易阻塞」模块拆成**独立子进程 worker**，主进程
