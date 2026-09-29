@@ -39,9 +39,15 @@ UPSERT 都重写它们完整的 candidate_json，导致 14 天前就该淘汰的
 VACUUM）已存在；本次完善了相对路径 + 服务运行时 `immutable` 安全 dry-run，并新增
 `清理数据库.cmd` 一键脚本（停服 → 备份 → prune --backup → 重启）。需停服窗口执行。
 
-**治本（待做，需谨慎）**：在 `ingest` 加短路——`status='screened'` 且 `first_seen_at`
-超 N 天且无新证据的老候选跳过重写 candidate_json（只轻量更新 updated_at/quote_due_at），
-从源头阻止僵尸数据累积。属核心写路径，需四闸门验收 + 充分回测。
+**治本（已落地，2026-09-29）**：在 `ingest` 加短路——`status='screened'` 且 `first_seen_at`
+超阈值（默认 7 天，`SCREENED_SKIP_REWRITE_AGE_MS`）且无新叙事证据的老候选跳过重写
+candidate_json（只轻量 UPDATE updated_at/quote_due_at/symbol/name），从源头阻止僵尸数据累积。
+- 条件严格：old 且本次均 screened、首见超阈值、`evidence_digest` 未变、无 newsResonance、
+  无 board membership upgrade。任何新证据或状态跃迁都走完整 UPSERT。
+- 开关：`SCREENED_SKIP_REWRITE_ENABLED`（默认 1）。短路只省 UPSERT 写放大（DB 膨胀根因），
+  不省 evaluate/enrich 的 CPU（评分仍要跑，因为要先算出本次 decision 才能判断是否 screened）。
+- 验收：新增 2 个单测（正向短路 + 反向新证据重写）通过；4 个核心 ingest 测试无回归；
+  2 个 board membership 测试为**既有陈旧用例**（旧版同样失败，非回归）。
 
 ## 1. 目标与边界
 

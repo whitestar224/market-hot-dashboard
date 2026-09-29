@@ -109,6 +109,47 @@ class FastResearchTests(unittest.TestCase):
         self.fast.emit_alerts()
         self.assertEqual(self.sink.call_count, 12)
 
+    def test_screened_old_candidate_skips_candidate_json_rewrite_without_new_evidence(self):
+        # 治本短路：已判定 screened 的老币，无新叙事证据时跳过重写 candidate_json，
+        # 从源头阻止 onchain_fast_jobs 僵尸数据累积（DB 膨胀根因）。
+        row = {"network": "bsc", "contractAddress": "0x" + "c" * 40, "symbol": "WEAK",
+               "name": "WEAK", "firstSeenAt": NOW, "poolCreatedAt": NOW - 20_000,
+               "observedAt": NOW, "providers": ["geckoterminal"], "dexId": "test",
+               "metrics": {"liquidityUsd": 500, "volumeH1Usd": 100, "transactionsH1": 1,
+                           "buysH1": 1, "sellsH1": 0}}
+        self.fast.ingest([row])
+        key = candidate_key(row)
+        job = self.fast._query("SELECT status, candidate_json FROM onchain_fast_jobs WHERE key=?", (key,))[0]
+        self.assertEqual(job["status"], "screened")
+        # 模拟老币：first_seen_at 改到阈值之外（30 天前）
+        self.fast._write("UPDATE onchain_fast_jobs SET first_seen_at=? WHERE key=?", (NOW - 30 * 86400_000, key))
+        # 注入哨兵字段，验证短路时 candidate_json 不被整段重写
+        sentinel = json.loads(job["candidate_json"])
+        sentinel["__sentinel__"] = "KEEP_ME"
+        self.fast._write("UPDATE onchain_fast_jobs SET candidate_json=? WHERE key=?", (json.dumps(sentinel, ensure_ascii=False), key))
+        # 再次 ingest 无新证据 → 短路，哨兵字段保留
+        self.fast.ingest([row])
+        after = self.fast._query("SELECT candidate_json FROM onchain_fast_jobs WHERE key=?", (key,))[0]
+        self.assertEqual(json.loads(after["candidate_json"]).get("__sentinel__"), "KEEP_ME")
+
+    def test_screened_old_candidate_rewrites_when_new_evidence_arrives(self):
+        # 反向保障：有新叙事证据时，即使仍是 screened，也必须走完整 UPSERT 重写 candidate_json。
+        row = {"network": "bsc", "contractAddress": "0x" + "d" * 40, "symbol": "WEAK2",
+               "name": "WEAK2", "firstSeenAt": NOW, "poolCreatedAt": NOW - 20_000,
+               "observedAt": NOW, "providers": ["geckoterminal"], "dexId": "test",
+               "metrics": {"liquidityUsd": 500, "volumeH1Usd": 100, "transactionsH1": 1,
+                           "buysH1": 1, "sellsH1": 0}}
+        self.fast.ingest([row])
+        key = candidate_key(row)
+        self.fast._write("UPDATE onchain_fast_jobs SET first_seen_at=? WHERE key=?", (NOW - 30 * 86400_000, key))
+        before = self.fast._query("SELECT candidate_json FROM onchain_fast_jobs WHERE key=?", (key,))[0]["candidate_json"]
+        # 注入新叙事证据 → digest 变化 → 必须重写
+        row_with_evidence = {**row, "researchEvidence": {"identityStatus": "news-contract-explicit", "content": "官方给出 CA"}}
+        self.fast.ingest([row_with_evidence])
+        after = self.fast._query("SELECT candidate_json FROM onchain_fast_jobs WHERE key=?", (key,))[0]["candidate_json"]
+        self.assertNotEqual(before, after)
+        self.assertIn("researchEvidence", json.loads(after))
+
     def test_rapid_candidate_state_keeps_only_compact_decision_facts(self):
         state = rapid_candidate_state({
             **candidate("RAPID"),

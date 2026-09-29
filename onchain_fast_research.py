@@ -645,13 +645,12 @@ class FastResearch:
         self._batch_ingest_max_size = int(os.getenv("BATCH_INGEST_MAX_SIZE", "50"))
         self._batch_ingest_flush_interval_s = int(os.getenv("BATCH_INGEST_FLUSH_INTERVAL_S", "5"))
 
-        # Batch ingest buffer to reduce write lock contention
-        self._ingest_buffer: deque[dict[str, Any]] = deque()
-        self._ingest_buffer_lock = threading.Lock()
-        self._ingest_flush_event = threading.Event()
-        self._batch_ingest_enabled = bool(os.getenv("BATCH_INGEST_ENABLED", "1") == "1")
-        self._batch_ingest_max_size = int(os.getenv("BATCH_INGEST_MAX_SIZE", "50"))
-        self._batch_ingest_flush_interval_s = int(os.getenv("BATCH_INGEST_FLUSH_INTERVAL_S", "5"))
+        # Screened 老币候选重写短路：已判定「不值得投研」且超过阈值的候选，若无
+        # 新叙事证据，则跳过重写 candidate_json（只轻量更新 updated_at/quote_due_at），
+        # 从源头阻止 onchain_fast_jobs 僵尸数据累积（DB 膨胀根因，2026-09-29 治本）。
+        self._screened_skip_rewrite_enabled = bool(os.getenv("SCREENED_SKIP_REWRITE_ENABLED", "1") == "1")
+        self._screened_skip_rewrite_age_ms = int(os.getenv(
+            "SCREENED_SKIP_REWRITE_AGE_MS", str(7 * 24 * 60 * 60 * 1000)))
 
     def run_gmgn_local_batch(self):
         """Run GMGN-skill local analysis channel: scan pending trench jobs -> gmgn-cli data -> AI analyze -> write back -> emit alerts.
@@ -1496,6 +1495,24 @@ class FastResearch:
                     quote_due = now + (15_000 if now - first < 180_000 else 60_000 if now - first < 15 * 60_000 else 300_000)
                     if now - first >= 24 * 60 * 60_000:
                         quote_due = 0
+                    # 治本短路：已判定「不值得投研」的 screened 老币，若无新叙事证据，
+                    # 跳过重写 candidate_json（只轻量刷新 updated_at/quote_due_at/symbol/name），
+                    # 从源头阻止 onchain_fast_jobs 僵尸数据累积导致的 DB 膨胀。
+                    # 条件严格：old 且本次均 screened、首见超阈值、证据 digest 未变、
+                    # 无 board 升级/无新闻共振。任何新证据或状态跃迁都走完整 UPSERT。
+                    if (self._screened_skip_rewrite_enabled
+                            and old
+                            and old["status"] == "screened"
+                            and status == "screened"
+                            and not new_evidence
+                            and not row.get("newsResonance")
+                            and not board_membership_upgrade
+                            and now - first >= self._screened_skip_rewrite_age_ms):
+                        conn.execute(
+                            "UPDATE onchain_fast_jobs SET symbol=?,name=?,quote_due_at=?,updated_at=? WHERE key=?",
+                            (str(row.get("symbol") or "")[:80], str(row.get("name") or "")[:180], quote_due, now, key),
+                        )
+                        continue
                     conn.execute("""
                         INSERT INTO onchain_fast_jobs
                           (key,network,contract,symbol,name,candidate_json,first_seen_at,screened_at,status,next_due_at,quote_due_at,updated_at)
