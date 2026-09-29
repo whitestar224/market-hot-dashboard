@@ -42398,6 +42398,12 @@ def rank_monitor_event(board: str, current: dict[str, Any], reason: str) -> dict
         binance_wallet_token_url(current.get("chain"), current.get("contractAddress"))
         if is_binance_wallet else ""
     )
+    gmgn_wallet_url = ""
+    if is_gmgn_hot_search:
+        chain = str(current.get("chain") or "").strip().casefold()
+        chain_meta = BINANCE_WALLET_KLINE_CHAINS.get(chain)
+        chain_id = chain_meta[0] if chain_meta else ""
+        gmgn_wallet_url = binance_wallet_token_url(chain_id, current.get("contractAddress"))
     reason_label = {
         "new": "新进",
         "rank": "排名更新",
@@ -42438,7 +42444,9 @@ def rank_monitor_event(board: str, current: dict[str, Any], reason: str) -> dict
         "title": f"{board_label}{reason_label}：{symbol}",
         "body": body,
         "url": (
-            wallet_url
+            gmgn_wallet_url
+            if is_gmgn_hot_search and "/token/" in gmgn_wallet_url
+            else wallet_url
             if is_binance_wallet and "/token/" in wallet_url
             else current.get("url")
             if (is_binance_wallet or is_ave) and current.get("url")
