@@ -1789,6 +1789,9 @@ def init_auth_db() -> None:
                 binance_wallet_hot_first_seen_at INTEGER NOT NULL DEFAULT 0,
                 binance_wallet_hot_last_seen_at INTEGER NOT NULL DEFAULT 0,
                 binance_wallet_hot_rank INTEGER NOT NULL DEFAULT 0,
+                gmgn_hot_search_first_seen_at INTEGER NOT NULL DEFAULT 0,
+                gmgn_hot_search_last_seen_at INTEGER NOT NULL DEFAULT 0,
+                gmgn_hot_search_rank INTEGER NOT NULL DEFAULT 0,
                 gainers_first_seen_at INTEGER NOT NULL DEFAULT 0,
                 binance_gainers_last_seen_at INTEGER NOT NULL DEFAULT 0,
                 binance_gainers_rank INTEGER NOT NULL DEFAULT 0,
@@ -1878,6 +1881,9 @@ def init_auth_db() -> None:
             "binance_wallet_hot_first_seen_at": "binance_wallet_hot_first_seen_at INTEGER NOT NULL DEFAULT 0",
             "binance_wallet_hot_last_seen_at": "binance_wallet_hot_last_seen_at INTEGER NOT NULL DEFAULT 0",
             "binance_wallet_hot_rank": "binance_wallet_hot_rank INTEGER NOT NULL DEFAULT 0",
+            "gmgn_hot_search_first_seen_at": "gmgn_hot_search_first_seen_at INTEGER NOT NULL DEFAULT 0",
+            "gmgn_hot_search_last_seen_at": "gmgn_hot_search_last_seen_at INTEGER NOT NULL DEFAULT 0",
+            "gmgn_hot_search_rank": "gmgn_hot_search_rank INTEGER NOT NULL DEFAULT 0",
             "gainers_first_seen_at": "gainers_first_seen_at INTEGER NOT NULL DEFAULT 0",
             "binance_gainers_last_seen_at": "binance_gainers_last_seen_at INTEGER NOT NULL DEFAULT 0",
             "binance_gainers_rank": "binance_gainers_rank INTEGER NOT NULL DEFAULT 0",
@@ -23900,7 +23906,7 @@ def price_watch_manual_asset_resolution(value: Any) -> dict[str, Any]:
             return
         identity_fields = (
             "onchain_contract_address", "new_contract_source", "aicoin_last_seen_at",
-            "binance_wallet_hot_last_seen_at", "binance_gainers_last_seen_at",
+            "binance_wallet_hot_last_seen_at", "gmgn_hot_search_last_seen_at", "binance_gainers_last_seen_at",
             "binance_futures_gainers_last_seen_at",
             "okx_gainers_last_seen_at", "opportunity_first_seen_at", "personal_x_mentioned_at",
         )
@@ -24981,6 +24987,7 @@ def sync_price_watch_aicoin_candidates() -> int:
             SELECT symbol, name, pair_hint, opportunity_first_seen_at,
                    personal_x_mentioned_at, new_contract_listed_at,
                    binance_wallet_hot_last_seen_at, ave_hot_last_seen_at,
+                   gmgn_hot_search_last_seen_at,
                    gainers_first_seen_at
             FROM price_watch_assets
             WHERE manual_pinned = 0
@@ -24998,6 +25005,8 @@ def sync_price_watch_aicoin_candidates() -> int:
                     >= now_ms - NEW_CONTRACT_MONITOR_RETENTION_SECONDS * 1000
                     or int(existing_auto["binance_wallet_hot_last_seen_at"] or 0)
                     >= now_ms - BINANCE_WALLET_4H_STRUCTURE_RETENTION_SECONDS * 1000
+                    or int(existing_auto["gmgn_hot_search_last_seen_at"] or 0)
+                    >= now_ms - PRICE_MONITOR_SOURCE_GRACE_SECONDS["gmgn-hot-search-5m"] * 1000
                     or int(existing_auto["ave_hot_last_seen_at"] or 0)
                     >= now_ms - PRICE_WATCH_RETENTION_SECONDS * 1000
                     # Keep the first gainer admission as a durable 72h clock.
@@ -25101,6 +25110,8 @@ def sync_price_watch_ave_candidates(
               AND aicoin_last_seen_at = 0
               AND binance_wallet_hot_first_seen_at = 0
               AND binance_wallet_hot_last_seen_at = 0
+              AND gmgn_hot_search_first_seen_at = 0
+              AND gmgn_hot_search_last_seen_at = 0
               AND gainers_first_seen_at = 0
               AND binance_gainers_last_seen_at = 0
               AND binance_futures_gainers_last_seen_at = 0
@@ -25327,6 +25338,97 @@ def sync_price_watch_binance_wallet_candidates(
                         excluded.binance_wallet_hot_last_seen_at
                     ),
                     binance_wallet_hot_rank = excluded.binance_wallet_hot_rank,
+                    onchain_chain = CASE WHEN excluded.onchain_chain != '' THEN excluded.onchain_chain ELSE price_watch_assets.onchain_chain END,
+                    onchain_chain_label = CASE WHEN excluded.onchain_chain_label != '' THEN excluded.onchain_chain_label ELSE price_watch_assets.onchain_chain_label END,
+                    onchain_contract_address = CASE WHEN excluded.onchain_contract_address != '' THEN excluded.onchain_contract_address ELSE price_watch_assets.onchain_contract_address END,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    item["symbol"], item["name"], item["icon"], item["pairHint"],
+                    item["firstSeenAt"], item["lastSeenAt"], item["rank"],
+                    item["chain"], item["chainLabel"], item["contractAddress"],
+                    now_value, now_value,
+                ),
+            )
+        restore_confirmed_price_structure_reentries_db(
+            conn,
+            {item["symbol"] for item in candidates},
+            now_value,
+        )
+    with PRICE_STRUCTURE_CACHE_LOCK:
+        PRICE_STRUCTURE_CACHE.clear()
+    return len(candidates)
+
+
+def sync_price_watch_gmgn_hot_search_candidates(
+    rows: list[dict[str, Any]] | None = None,
+    *,
+    now_ms: int | None = None,
+) -> int:
+    """Put GMGN 5m hot-search new entries into prior-high + structure monitoring.
+
+    A token newly entering the GMGN 5-minute hot-search window is a fast-moving
+    on-chain signal, so it joins the same ``price_watch_assets`` pool that the
+    Binance Wallet 4h hot ranking feeds.  Its chain/contract identity is stored
+    so on-chain-only tokens keep working with the shared GeckoTerminal fallback,
+    and the pool entry time (today) enables the one-minute structure cycle for
+    the entry day via ``price_structure_1m_state``.
+    """
+    now_value = int(now_ms or time.time() * 1000)
+    source_rows = rows if isinstance(rows, list) else []
+    candidates: list[dict[str, Any]] = []
+    for raw_row in source_rows:
+        if not isinstance(raw_row, dict):
+            continue
+        symbol = price_structure_monitor_symbol(raw_row.get("symbol") or raw_row.get("name"))
+        contract = clean_feed_text(raw_row.get("contractAddress"), 180)
+        chain = clean_feed_text(raw_row.get("chain"), 40)
+        if not symbol or not contract or not chain:
+            continue
+        if is_excluded_crypto_asset(symbol) or symbol in {"USDT", "USDC", "BUSD", "FDUSD", "DAI", "TUSD", "USDE", "USDD"}:
+            continue
+        candidates.append({
+            "symbol": symbol,
+            "name": clean_feed_text(raw_row.get("name") or raw_row.get("symbol") or symbol, 100),
+            "icon": clean_feed_text(raw_row.get("icon"), 600),
+            "pairHint": clean_feed_text(
+                " ".join(part for part in (raw_row.get("chainLabel") or chain, contract) if part),
+                220,
+            ),
+            "firstSeenAt": now_value,
+            "lastSeenAt": now_value,
+            "rank": int(safe_float(raw_row.get("rank"), 0)),
+            "chain": chain,
+            "chainLabel": clean_feed_text(raw_row.get("chainLabel"), 40),
+            "contractAddress": contract,
+        })
+    if not candidates:
+        return 0
+    with AUTH_DB_LOCK, auth_db() as conn:
+        for item in candidates:
+            conn.execute(
+                """
+                INSERT INTO price_watch_assets (
+                    symbol, name, icon, pair_hint, manual_pinned,
+                    gmgn_hot_search_first_seen_at, gmgn_hot_search_last_seen_at,
+                    gmgn_hot_search_rank,
+                    onchain_chain, onchain_chain_label, onchain_contract_address,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    name = CASE WHEN excluded.name != '' THEN excluded.name ELSE price_watch_assets.name END,
+                    icon = CASE WHEN excluded.icon != '' THEN excluded.icon ELSE price_watch_assets.icon END,
+                    pair_hint = CASE WHEN excluded.pair_hint != '' THEN excluded.pair_hint ELSE price_watch_assets.pair_hint END,
+                    gmgn_hot_search_first_seen_at = CASE
+                        WHEN price_watch_assets.gmgn_hot_search_first_seen_at > 0
+                        THEN MIN(price_watch_assets.gmgn_hot_search_first_seen_at, excluded.gmgn_hot_search_first_seen_at)
+                        ELSE excluded.gmgn_hot_search_first_seen_at
+                    END,
+                    gmgn_hot_search_last_seen_at = MAX(
+                        price_watch_assets.gmgn_hot_search_last_seen_at,
+                        excluded.gmgn_hot_search_last_seen_at
+                    ),
+                    gmgn_hot_search_rank = excluded.gmgn_hot_search_rank,
                     onchain_chain = CASE WHEN excluded.onchain_chain != '' THEN excluded.onchain_chain ELSE price_watch_assets.onchain_chain END,
                     onchain_chain_label = CASE WHEN excluded.onchain_chain_label != '' THEN excluded.onchain_chain_label ELSE price_watch_assets.onchain_chain_label END,
                     onchain_contract_address = CASE WHEN excluded.onchain_contract_address != '' THEN excluded.onchain_contract_address ELSE price_watch_assets.onchain_contract_address END,
@@ -25672,6 +25774,8 @@ def price_monitor_latest_source_at(row: sqlite3.Row | dict[str, Any] | None) -> 
         int(safe_float(item.get("aveHotLastSeenAt"), 0)),
         int(safe_float(item.get("binance_wallet_hot_last_seen_at"), 0)),
         int(safe_float(item.get("binanceWalletHotLastSeenAt"), 0)),
+        int(safe_float(item.get("gmgn_hot_search_last_seen_at"), 0)),
+        int(safe_float(item.get("gmgnHotSearchLastSeenAt"), 0)),
         int(safe_float(item.get("binance_gainers_last_seen_at"), 0)),
         int(safe_float(item.get("binanceGainersLastSeenAt"), 0)),
         int(safe_float(item.get("binance_futures_gainers_last_seen_at"), 0)),
@@ -25704,6 +25808,11 @@ def price_monitor_retention_source_observations(
             item.get("binance_wallet_hot_last_seen_at")
             or item.get("binanceWalletHotLastSeenAt")
             or item.get("wallet4hLastSeenAt"),
+            0,
+        ))),
+        ("gmgn-hot-search-5m", int(safe_float(
+            item.get("gmgn_hot_search_last_seen_at")
+            or item.get("gmgnHotSearchLastSeenAt"),
             0,
         ))),
         ("gainers", max(
@@ -26419,6 +26528,7 @@ def price_watch_active_rows(
                 OR assets.manual_pinned = 1
                 OR (assets.aicoin_last_seen_at >= ? AND assets.dismissed_until < ?)
                 OR (assets.binance_wallet_hot_last_seen_at >= ? AND assets.dismissed_until < ?)
+                OR (assets.gmgn_hot_search_last_seen_at >= ? AND assets.dismissed_until < ?)
                 OR (
                      assets.gainers_first_seen_at >= ?
                      AND (
@@ -26446,12 +26556,14 @@ def price_watch_active_rows(
                 assets.opportunity_last_seen_at DESC,
                 assets.gainers_first_seen_at DESC,
                 assets.binance_wallet_hot_last_seen_at DESC,
+                assets.gmgn_hot_search_last_seen_at DESC,
                 assets.ave_hot_last_seen_at DESC,
                 assets.aicoin_last_seen_at DESC,
                 assets.created_at DESC
             """,
             (
                 cutoff_ms, cutoff_ms,
+                cutoff_ms, now_ms,
                 cutoff_ms, now_ms,
                 cutoff_ms, now_ms,
                 gainers_cutoff_ms, now_ms,
@@ -26495,7 +26607,12 @@ def price_watch_prior_high_source_enabled(row: sqlite3.Row | dict[str, Any] | No
         >= current_ms - BINANCE_WALLET_4H_STRUCTURE_RETENTION_SECONDS * 1000
         and int(item.get("dismissed_until") or 0) < current_ms
     )
-    return approved_new_contract_active or personal_x_active or aicoin_active or binance_wallet_active or price_watch_gainers_active(
+    gmgn_hot_search_active = bool(
+        int(item.get("gmgn_hot_search_last_seen_at") or 0)
+        >= current_ms - PRICE_MONITOR_SOURCE_GRACE_SECONDS["gmgn-hot-search-5m"] * 1000
+        and int(item.get("dismissed_until") or 0) < current_ms
+    )
+    return approved_new_contract_active or personal_x_active or aicoin_active or binance_wallet_active or gmgn_hot_search_active or price_watch_gainers_active(
         item,
         now_ms=current_ms,
     )
@@ -26552,6 +26669,12 @@ def price_watch_public_item(row: dict[str, Any]) -> dict[str, Any]:
     binance_wallet_active = bool(
         binance_wallet_last_seen_at
         >= now_ms - BINANCE_WALLET_4H_STRUCTURE_RETENTION_SECONDS * 1000
+    )
+    gmgn_hot_search_first_seen_at = int(row.get("gmgn_hot_search_first_seen_at") or 0)
+    gmgn_hot_search_last_seen_at = int(row.get("gmgn_hot_search_last_seen_at") or 0)
+    gmgn_hot_search_active = bool(
+        gmgn_hot_search_last_seen_at
+        >= now_ms - PRICE_MONITOR_SOURCE_GRACE_SECONDS["gmgn-hot-search-5m"] * 1000
     )
     gainers_first_seen_at = int(row.get("gainers_first_seen_at") or 0)
     binance_gainers_last_seen_at = int(row.get("binance_gainers_last_seen_at") or 0)
@@ -26635,9 +26758,11 @@ def price_watch_public_item(row: dict[str, Any]) -> dict[str, Any]:
             else "opportunity"
             if opportunity_active or opportunity_first_seen_at
             else "binance-wallet"
-            if binance_wallet_active and binance_wallet_last_seen_at >= max(last_seen_at, ave_hot_last_seen_at)
+            if binance_wallet_active and binance_wallet_last_seen_at >= max(last_seen_at, ave_hot_last_seen_at, gmgn_hot_search_last_seen_at)
+            else "gmgn-hot-search"
+            if gmgn_hot_search_active and gmgn_hot_search_last_seen_at >= max(last_seen_at, ave_hot_last_seen_at, binance_wallet_last_seen_at)
             else "ave"
-            if ave_hot_active and ave_hot_last_seen_at >= max(last_seen_at, binance_wallet_last_seen_at)
+            if ave_hot_active and ave_hot_last_seen_at >= max(last_seen_at, binance_wallet_last_seen_at, gmgn_hot_search_last_seen_at)
             else "aicoin"
             if aicoin_active
             else "binance-futures-gainers"
@@ -26665,6 +26790,10 @@ def price_watch_public_item(row: dict[str, Any]) -> dict[str, Any]:
         "binanceWalletHotFirstSeenAt": binance_wallet_first_seen_at,
         "binanceWalletHotLastSeenAt": binance_wallet_last_seen_at,
         "binanceWalletHotRank": int(row.get("binance_wallet_hot_rank") or 0),
+        "gmgnHotSearch": gmgn_hot_search_active,
+        "gmgnHotSearchFirstSeenAt": gmgn_hot_search_first_seen_at,
+        "gmgnHotSearchLastSeenAt": gmgn_hot_search_last_seen_at,
+        "gmgnHotSearchRank": int(row.get("gmgn_hot_search_rank") or 0),
         "aveHot": ave_hot_active,
         "aveHotFirstSeenAt": ave_hot_first_seen_at,
         "aveHotLastSeenAt": ave_hot_last_seen_at,
@@ -27337,6 +27466,7 @@ def add_price_watch_symbol(value: Any, name: Any = "") -> dict[str, Any]:
             ).fetchone()
             source_fields = (
                 "aicoin_first_seen_at", "ave_hot_first_seen_at", "binance_wallet_hot_first_seen_at",
+                "gmgn_hot_search_first_seen_at",
                 "gainers_first_seen_at", "personal_x_mentioned_at", "new_contract_listed_at",
                 "opportunity_first_seen_at", "onchain_contract_address",
             )
@@ -29155,6 +29285,10 @@ def price_structure_monitor_pool_entered_at(item: dict[str, Any]) -> int:
             item.get("wallet4hFirstSeenAt") or item.get("binance_wallet_hot_first_seen_at"),
             0,
         )),
+        int(safe_float(
+            item.get("gmgnHotSearchFirstSeenAt") or item.get("gmgn_hot_search_first_seen_at"),
+            0,
+        )),
         int(safe_float(item.get("gainersFirstSeenAt") or item.get("gainers_first_seen_at"), 0)),
         int(safe_float(item.get("personalXMentionedAt") or item.get("personal_x_mentioned_at"), 0)),
     ]
@@ -29493,6 +29627,10 @@ def price_structure_watch_rows_uncached() -> list[dict[str, Any]]:
         aicoin_last_seen_at = int(merged.get("aicoin_last_seen_at") or 0)
         personal_x_mentioned_at = int(merged.get("personal_x_mentioned_at") or 0)
         wallet_last_seen_at = int(safe_float(wallet_row.get("lastSeenAt"), 0))
+        gmgn_last_seen_at = int(merged.get("gmgn_hot_search_last_seen_at") or 0)
+        gmgn_first_seen_at = int(
+            merged.get("gmgn_hot_search_first_seen_at") or persisted_row.get("gmgn_hot_search_first_seen_at") or 0
+        )
         gainers_first_seen_at = int(merged.get("gainers_first_seen_at") or 0)
         gainers_active = bool(
             gainers_first_seen_at >= gainers_cutoff
@@ -29507,6 +29645,7 @@ def price_structure_watch_rows_uncached() -> list[dict[str, Any]]:
             or aicoin_last_seen_at >= priority_cutoff
             or personal_x_mentioned_at >= priority_cutoff
             or wallet_last_seen_at >= priority_cutoff
+            or gmgn_last_seen_at >= priority_cutoff
             or gainers_active
         ):
             return False
@@ -29528,6 +29667,8 @@ def price_structure_watch_rows_uncached() -> list[dict[str, Any]]:
             membership_sources.append("个人X")
         if wallet_last_seen_at >= priority_cutoff:
             membership_sources.append("币安钱包4H")
+        if gmgn_last_seen_at >= priority_cutoff:
+            membership_sources.append("GMGN热搜5M")
         if gainers_active and int(merged.get("binance_gainers_last_seen_at") or 0) > 0:
             membership_sources.append("Binance涨幅榜")
         if gainers_active and int(merged.get("binance_futures_gainers_last_seen_at") or 0) > 0:
@@ -29554,6 +29695,8 @@ def price_structure_watch_rows_uncached() -> list[dict[str, Any]]:
                     now_ms,
                 )
             ))
+        if gmgn_last_seen_at >= priority_cutoff:
+            monitor_pool_entry_times.append(gmgn_first_seen_at or now_ms)
         if gainers_active:
             monitor_pool_entry_times.append(gainers_first_seen_at)
         monitor_pool_entered_at = min(
@@ -29591,6 +29734,9 @@ def price_structure_watch_rows_uncached() -> list[dict[str, Any]]:
             "wallet4hFirstSeenAt": int(safe_float(wallet_row.get("firstSeenAt"), 0)),
             "wallet4hLastSeenAt": wallet_last_seen_at,
             "walletHotRank": int(safe_float(wallet_row.get("walletHotRank"), 0)),
+            "gmgnHotSearchFirstSeenAt": gmgn_first_seen_at,
+            "gmgnHotSearchLastSeenAt": gmgn_last_seen_at,
+            "gmgnHotSearchRank": int(merged.get("gmgn_hot_search_rank") or 0),
             "adaptiveContext": adaptive_context,
             "personalXPriority": int(merged.get("personal_x_mentioned_at") or 0) >= priority_cutoff,
             "personalXMentionedAt": int(merged.get("personal_x_mentioned_at") or 0),
@@ -42678,6 +42824,7 @@ def sync_gmgn_hot_search_alert_feed(source: dict[str, Any] | None = None) -> lis
     now = time.time()
     current_membership = {str(row["key"]) for row in snapshots}
     events: list[dict[str, Any]] = []
+    new_entry_rows: list[dict[str, Any]] = []
     with GMGN_HOT_SEARCH_ALERT_LOCK:
         state = read_json_cache(GMGN_HOT_SEARCH_ALERT_STATE_PATH)
         ready = (
@@ -42710,6 +42857,7 @@ def sync_gmgn_hot_search_alert_feed(source: dict[str, Any] | None = None) -> lis
                 if now - safe_float(last_alerts.get(alert_key)) < RANK_MONITOR_COOLDOWN_SECONDS:
                     continue
                 events.append(rank_monitor_event("hot", row, "new"))
+                new_entry_rows.append(row)
                 last_alerts[alert_key] = now
         for key in current_membership:
             seen[key] = now
@@ -42728,6 +42876,13 @@ def sync_gmgn_hot_search_alert_feed(source: dict[str, Any] | None = None) -> lis
                 "reentryWindowSeconds": GMGN_HOT_SEARCH_REENTRY_SECONDS,
             },
         )
+    # New 5m hot-search entries join the prior-high + structure monitoring pool
+    # (outside the alert lock so the DB write never blocks the broadcast loop).
+    if new_entry_rows:
+        try:
+            sync_price_watch_gmgn_hot_search_candidates(new_entry_rows, now_ms=int(now * 1000))
+        except Exception as exc:
+            print(f"GMGN hot-search pool ingest failed: {safe_error_text(str(exc))}", file=sys.stderr)
     return events
 
 

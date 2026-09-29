@@ -1150,6 +1150,7 @@ PRICE_MONITOR_SOURCE_GRACE_SECONDS = {
     "aicoin": 24 * 60 * 60,
     "ave": 2 * 60 * 60,
     "binance-wallet-4h": 6 * 60 * 60,
+    "gmgn-hot-search-5m": 6 * 60 * 60,
     "gainers": 12 * 60 * 60,
     "personal-x": 3 * 24 * 60 * 60,
     "new-contract": 3 * 24 * 60 * 60,
