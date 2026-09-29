@@ -514,9 +514,26 @@ state.py 且是同一对象，直接 `from app.core.state import`。
 ### 后续批次顺序（据此更新）
 
 1. ~~批次 1 核心层~~ 2. ~~批次 2 seo~~ 3. ~~批次 3 共享状态区~~ 4. ~~批次 4 ops_health~~
-5. **`auth_config`**（3 函数、0 重绑定、最干净）→ ~~`smart_money`~~（本批已完成）
-   → `binance` → `alert` → `onchain` → `dragon_wave` / `strategy` / `market`
-   → `news` / `wechat` / `price_watch` / `price_structure` / `social_x` → `misc`（最后）
+5. ~~`smart_money`~~（批次 5）6. ~~`dragon_wave`~~（批次 6，`auth_config` 因散布 7 处放弃）
+   → `binance`（20 函数）→ `alert`（22）→ `onchain`（25）→ `strategy`（44）→ `market`（36）
+   → `news`（68）/ `wechat`（51）/ `price_watch`（59）/ `price_structure`（77）/ `social_x`（101）
+   → `misc`（824，最后）。另有两个小簇 `logging`（1 函数、自包含）/ `persistence`（12）可随时插入。
+
+### 批次 6：dragon_wave 反馈域（app/api/dragon_wave.py）✅ 已完成并验证
+
+**内容**：把 6 个 `dragon_wave_feedback_*` 函数 + `DRAGON_WAVE_FEEDBACK_INDEX_SIGNAL_FIELDS`
+常量（原 5980-6228，249 行）搬到 `src/app/api/dragon_wave.py`。`server.py` 53739 → 53490。
+
+**候选调整**：`auth_config`（split-plan 标 3 函数）实际散布在 7 处且 `init_auth_db` 带大迁移
+闭包，不是干净连续块，故改选 `dragon_wave`（6 函数连续、0 重绑定）。`dragon_wave_monitor_node_binary`
+（29138 行）是离群点留在 server.py；`merge_dragon_wave_feedback`（夹在中间的 9 行 helper）随块搬走。
+
+**依赖**：`safe_float`/`normalize_dragon_wave_feedback`/`load_user_payload` 走 `_server()`
+懒加载（`normalize_dragon_wave_feedback` 仍定义在 server.py 5901 行）；`USER_SCOPE_DRAGON_WAVE_FEEDBACK`
+从 `app.core.state` import。
+
+**验收**：verify_split 6 名再导出零泄漏零残留；静态 19/19；API A/B 40/40 0 回归；
+`test_dragon_wave_feedback.py` 18/18 通过（该文件测 quiet_http_server，非本块）。
 
 ### 批次 5：smart_money / 全网热点域（app/api/smart_money.py）✅ 已完成并验证
 
