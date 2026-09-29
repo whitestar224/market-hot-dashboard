@@ -19,6 +19,7 @@ python -m PyInstaller `
   --clean `
   --noconfirm `
   --name xingyunshe-server `
+  --paths src `
   --distpath $DistDir `
   --workpath $BuildDir `
   --specpath $BuildDir `

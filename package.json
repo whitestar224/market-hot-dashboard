@@ -79,6 +79,7 @@
           "configure_binance_web3.py",
           "desktop_alert_bridge.py",
           "requirements.txt",
+          "src/**",
           "assets/**",
           "docs/**",
           "go/prior-high-monitor/**",

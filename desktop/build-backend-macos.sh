@@ -15,6 +15,7 @@ python3 -m PyInstaller \
   --clean \
   --noconfirm \
   --name xingyunshe-server \
+  --paths src \
   --distpath "$DIST_DIR" \
   --workpath "$BUILD_DIR" \
   --specpath "$BUILD_DIR" \
