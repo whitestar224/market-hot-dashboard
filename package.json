@@ -7,6 +7,8 @@
   "author": "Xingyun Society",
   "license": "SEE LICENSE IN LICENSE",
   "scripts": {
+    "test": "python tools/run_tests.py",
+    "test:py": "python tools/run_tests.py --exclude \"test_ten_critical_signals,contract_identity,test_acceleration,test_port_binding,test_worker_discards_queued_ths\" --watchdog 600",
     "monitor:build-buy": "esbuild tools/monitor-buy-executor-entry.js --bundle --format=esm --platform=browser --target=es2022 --minify --outfile=assets/monitor-buy-executor.js",
     "desktop:dev": "electron .",
     "desktop:prepare-config": "powershell -NoProfile -ExecutionPolicy Bypass -File desktop/prepare-desktop-config.ps1",
