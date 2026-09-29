@@ -1,0 +1,67 @@
+# requirements.lock —— 精确锁定版本（可复现部署）
+#
+# 生成方式：在【生产运行环境】C:/Python314 下 `pip freeze` 后筛选出
+# requirements.txt 声明依赖的完整传递闭包。
+#
+# 用途：
+#   1. 部署/回滚时用 `pip install -r requirements.lock` 精确复现已验证的版本组合。
+#   2. 排查「升级某库后行为改变」时作为基线对照。
+#
+# 与 requirements.txt 的关系：requirements.txt 是【约束声明】（版本区间），
+# 本文件是【冻结快照】（精确版本）。日常开发以 requirements.txt 为准，
+# 上线/回滚以本文件为准。两者定期同步。
+#
+# 注意：
+#   - 本机为 Windows + Python 3.14，uiautomation / rapidocr 是 Windows-only
+#     可选依赖（OCR 桌面识别），Linux 部署时跳过。
+#   - 已知无害告警：requests 2.32.5 会对 chardet 7.x 报 RequestsDependencyWarning
+#     （requests 内部版本校验不认识极新的 chardet），不影响功能，勿动。
+#
+# 快照时间：2026-09-29
+# 环境：CPython 3.14.3 (Windows)
+
+# ---- 直接依赖（对应 requirements.txt）----
+requests==2.32.5
+httpx==0.28.1
+beautifulsoup4==4.14.3
+lxml==6.0.2
+urllib3==2.6.3
+websocket-client==1.9.0
+cryptography==45.0.7
+eth-account==0.13.7
+Pillow==12.1.1
+uiautomation==2.0.29 ; platform_system == "Windows"
+rapidocr-onnxruntime==1.2.3 ; platform_system == "Windows"
+
+# ---- 传递依赖（requests / httpx）----
+certifi==2026.2.25
+charset-normalizer==3.4.5
+idna==3.11
+httpcore==1.0.9
+
+# ---- 传递依赖（beautifulsoup4 / lxml）----
+bs4==0.0.2
+soupsieve==2.8.3
+
+# ---- 传递依赖（cryptography / eth-account）----
+cffi==2.0.0
+pycparser==3.0
+pycryptodome==3.23.0
+eth-typing==6.0.0
+typing-extensions==4.15.0
+eth-utils==6.0.0
+eth-keys==0.8.0
+eth-rlp==3.0.0
+eth-hash==0.8.0
+eth-abi==6.0.0
+rlp==5.0.0
+hexbytes==2.0.0
+ckzg==2.1.8
+cytoolz==1.1.0
+toolz==1.1.0
+bitarray==3.11.0
+protobuf==7.34.1
+
+# ---- 传递依赖（rapidocr-onnxruntime，Windows-only）----
+numpy==2.4.3
+pandas==3.0.1
