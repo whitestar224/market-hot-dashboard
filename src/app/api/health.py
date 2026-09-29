@@ -108,9 +108,13 @@ def health_payload() -> dict[str, Any]:
 
     try:
         PERSIST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        # Verify writability by overwriting a stable probe file in place, without
+        # deleting it. Deleting (unlink) here trips the sandbox file-safety
+        # interceptor (sitecustomize._safe_path_unlink -> broker trash) and hangs
+        # the liveness probe; a plain overwrite is enough to prove the dir is
+        # writable and leaves no delete for an interceptor to stall on.
         probe = PERSIST_CACHE_DIR / ".healthcheck"
         probe.write_text(str(time.time()), encoding="utf-8")
-        probe.unlink(missing_ok=True)
         checks["runtimeCache"] = {"ok": True, "path": str(PERSIST_CACHE_DIR)}
     except Exception as exc:
         ok = False
