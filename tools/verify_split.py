@@ -80,6 +80,10 @@ EXTRACTED = {
         ],
         "internal": [],
     },
+    "app.api.login_rate": {
+        "reexported": ["clear_login_failures", "login_rate_limited", "record_login_failure"],
+        "internal": [],
+    },
     "app.core.state": {
         # check_all_identity：把模块导出的全部公开名字逐个与 server 命名空间做
         # `is` 同一性比对。这对锁/缓存是生死线 —— 若出现「两把不同的锁」，

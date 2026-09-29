@@ -211,6 +211,9 @@ from app.api.dragon_wave import (
     merge_dragon_wave_feedback,
 )
 
+# ---- 批次 7：登录限流域抽出至 app/api/login_rate.py
+from app.api.login_rate import clear_login_failures, login_rate_limited, record_login_failure
+
 # ---- 由 tools/extract_module.py 区间抽取至 app/core/state.py ----
 from app.core.state import (
     AICOIN_CDP_RELAUNCH_LOCK,
@@ -3041,25 +3044,6 @@ def delete_session(token: str) -> None:
         conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash(token),))
 
 
-def login_rate_limited(key: str) -> bool:
-    now = time.time()
-    with AUTH_LOGIN_LOCK:
-        attempts = [item for item in AUTH_LOGIN_ATTEMPTS.get(key, []) if now - item < 300]
-        AUTH_LOGIN_ATTEMPTS[key] = attempts
-        return len(attempts) >= 8
-
-
-def record_login_failure(key: str) -> None:
-    now = time.time()
-    with AUTH_LOGIN_LOCK:
-        attempts = [item for item in AUTH_LOGIN_ATTEMPTS.get(key, []) if now - item < 300]
-        attempts.append(now)
-        AUTH_LOGIN_ATTEMPTS[key] = attempts
-
-
-def clear_login_failures(key: str) -> None:
-    with AUTH_LOGIN_LOCK:
-        AUTH_LOGIN_ATTEMPTS.pop(key, None)
 
 
 def issue_phone_code(phone: str, client_key: str) -> dict[str, Any]:
