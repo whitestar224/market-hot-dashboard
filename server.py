@@ -370,6 +370,12 @@ from app.core.state import (
     GMGN_HOT_CHAINS,
     GMGN_HOT_DEFAULT_PERIOD,
     GMGN_HOT_PERIODS,
+    GMGN_HOT_SEARCH_ALERT_INTERVAL_SECONDS,
+    GMGN_HOT_SEARCH_ALERT_LOCK,
+    GMGN_HOT_SEARCH_ALERT_PERIOD,
+    GMGN_HOT_SEARCH_ALERT_STATE_PATH,
+    GMGN_HOT_SEARCH_ALERT_STATE_VERSION,
+    GMGN_HOT_SEARCH_REENTRY_SECONDS,
     GMGN_OPENAPI_BASE,
     GMGN_TRENCH_BOARD_REFRESH_SECONDS,
     GMGN_TRENCH_HISTORY_LOCK,
@@ -900,6 +906,7 @@ SITE_ALERT_MONITOR_STARTED_AT = 0
 DISCORD_NEWSFLASH_BRIDGE_PROCESS: subprocess.Popen | None = None
 BINANCE_WALLET_HOT_ALERT_MONITOR_ACTIVE = False
 AVE_HOT_ALERT_MONITOR_ACTIVE = False
+GMGN_HOT_SEARCH_ALERT_MONITOR_ACTIVE = False
 GLOBAL_HOTSPOT_MONITOR_ACTIVE = False
 ONCHAIN_RESEARCH_INGEST_THREAD: threading.Thread | None = None
 TRENCH_PERSON_REPLAY_PENDING: list[dict[str, Any]] | None = None
@@ -18155,11 +18162,11 @@ def market_payload() -> dict[str, Any]:
         ("gmgn-trenches", fetch_gmgn_trenches_hot_board),
         ("aicoin", fetch_aicoin),
         ("binance", fetch_binance),
-        ("okx", fetch_okx),
+        ("gmgn-hot-search", fetch_gmgn_hot_search),
         ("bitget", fetch_bitget),
         ("futu-hk", lambda: fetch_futu_hot("hk")),
         ("ave", fetch_ave_hot),
-        ("gmgn-hot-search", fetch_gmgn_hot_search),
+        ("okx", fetch_okx),
         ("okx-dex", fetch_okx_dex_hot),
         ("ths", fetch_ths_hot),
         ("futu-us", lambda: fetch_futu_hot("us")),
@@ -22780,6 +22787,15 @@ def desktop_alert_source_is_muted(item: dict[str, Any]) -> bool:
     kind = str(item.get("kind") or "")
     title = str(item.get("title") or "")
     body = str(item.get("body") or "")
+    # GMGN 5-minute hot-search "new entry" events are the one GMGN hot-board
+    # signal the user opted into surfacing (popup + voice).  Let them through
+    # before the generic GMGN hot-board mute below.
+    if (
+        source_id == "gmgn-hot-search"
+        and str(item.get("alertPeriod") or "") == GMGN_HOT_SEARCH_ALERT_PERIOD
+        and re.search(r"(?:新进|new\s+entry)", f"{kind} {title}", re.I)
+    ):
+        return False
     # Keep the exact GMGN source fully quiet for compatibility with already
     # queued legacy events. Alias sources are muted for hot-board entries below.
     if source_id in RANK_BROADCAST_MUTED_SOURCE_IDS or gmgn_hot_rank_source(item):
@@ -42093,14 +42109,14 @@ def parse_site_gainers_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
 def rank_monitor_asset_key(source: dict[str, Any], row: dict[str, Any]) -> str:
     group = str(source.get("group") or row.get("group") or "").lower()
     raw_symbol = str(row.get("symbol") or row.get("asset") or row.get("name") or "").strip()
-    if str(source.get("id") or "") in {"binance-wallet-hot", "ave"}:
+    if str(source.get("id") or "") in {"binance-wallet-hot", "ave", "gmgn-hot-search"}:
         chain = clean_feed_text(row.get("chain") or row.get("chainId") or "unknown", 40).casefold()
         contract = clean_feed_text(row.get("contractAddress"), 180).casefold()
         if contract:
-            prefix = "WALLET" if str(source.get("id") or "") == "binance-wallet-hot" else "AVE"
+            prefix = "WALLET" if str(source.get("id") or "") == "binance-wallet-hot" else "AVE" if str(source.get("id") or "") == "ave" else "GMGN"
             return f"{prefix}:{chain}:{contract}"
         unicode_symbol = re.sub(r"[^0-9A-Za-z\u3400-\u9fff]", "", raw_symbol).casefold()
-        prefix = "WALLET" if str(source.get("id") or "") == "binance-wallet-hot" else "AVE"
+        prefix = "WALLET" if str(source.get("id") or "") == "binance-wallet-hot" else "AVE" if str(source.get("id") or "") == "ave" else "GMGN"
         return f"{prefix}:{chain}:{unicode_symbol}" if unicode_symbol else ""
     if group == "hk":
         code = re.sub(r"\D", "", raw_symbol).zfill(5)[-5:]
@@ -42375,6 +42391,9 @@ def rank_monitor_event(board: str, current: dict[str, Any], reason: str) -> dict
     board_label = rank_monitor_board_label(board, current)
     is_binance_wallet = str(current.get("sourceId") or "") == "binance-wallet-hot"
     is_ave = str(current.get("sourceId") or "") == "ave"
+    is_gmgn_hot_search = str(current.get("sourceId") or "") == "gmgn-hot-search"
+    if is_gmgn_hot_search and str(current.get("period") or "") == GMGN_HOT_SEARCH_ALERT_PERIOD:
+        board_label = "GMGN 5 分钟热搜榜"
     wallet_url = (
         binance_wallet_token_url(current.get("chain"), current.get("contractAddress"))
         if is_binance_wallet else ""
@@ -42457,6 +42476,8 @@ def rank_monitor_event(board: str, current: dict[str, Any], reason: str) -> dict
         event["speech"] = (
             f"币安钱包热门榜新进，{symbol} 新进入{clean_feed_text(current.get('periodLabel') or '24 小时', 24).replace(' ', '')}热门榜前十。"
             if is_binance_wallet
+            else f"GMGN 热搜榜新进，{symbol} 新进入 5 分钟热搜榜前十。"
+            if is_gmgn_hot_search
             else f"榜单新进，{symbol} 新进入{board_label}前十。"
         )
     return event
@@ -42594,6 +42615,131 @@ def sync_ave_hot_alert_feed(source: dict[str, Any] | None = None) -> list[dict[s
             },
         )
     return []
+
+
+def gmgn_hot_search_5m_alert_rows(source: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the GMGN hot-search 5-minute aggregate board as snapshot rows.
+
+    The GMGN hot-search source only surfaces the default 1h window as its
+    ``rows``; the 5m membership lives inside ``periodBoards``.  This helper
+    extracts the 5m ``综合`` (all-chain) board so the dedicated 5m alert feed
+    can observe new entries without touching the generic rank monitor (which
+    deliberately keeps every GMGN hot-search window quiet).
+    """
+    if str(source.get("id") or "") != "gmgn-hot-search":
+        return []
+    boards = source.get("periodBoards") if isinstance(source.get("periodBoards"), list) else []
+    board = next(
+        (
+            item
+            for item in boards
+            if isinstance(item, dict)
+            and str(item.get("chain") or "") == "all"
+            and normalize_gmgn_hot_period(item.get("period")) == GMGN_HOT_SEARCH_ALERT_PERIOD
+        ),
+        None,
+    )
+    if not board or str(board.get("status") or "") == "unavailable":
+        return []
+    rows = board.get("rows") if isinstance(board.get("rows"), list) else []
+    snapshots: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        snapshot = rank_monitor_snapshot(source, row, index, "hot")
+        snapshot["period"] = GMGN_HOT_SEARCH_ALERT_PERIOD
+        snapshot["periodLabel"] = "5 分钟"
+        if snapshot.get("key"):
+            snapshots.append(snapshot)
+    return snapshots
+
+
+def sync_gmgn_hot_search_alert_feed(source: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Observe GMGN hot-search 5m entries for popup + voice broadcast.
+
+    Unlike the 1h/6h/24h windows, a token newly entering the 5-minute window is
+    a fast-moving signal worth surfacing.  This feed is intentionally separate
+    from ``sync_rank_monitor_feed`` so it can deliver these events while the
+    generic rank monitor keeps the GMGN hot-search source silent.
+    """
+    gmgn_source = source if isinstance(source, dict) else cached("gmgn-hot-search", fetch_gmgn_hot_search)
+    snapshots = gmgn_hot_search_5m_alert_rows(gmgn_source)
+    if not snapshots:
+        return []
+
+    now = time.time()
+    current_membership = {str(row["key"]) for row in snapshots}
+    events: list[dict[str, Any]] = []
+    with GMGN_HOT_SEARCH_ALERT_LOCK:
+        state = read_json_cache(GMGN_HOT_SEARCH_ALERT_STATE_PATH)
+        ready = (
+            bool(state.get("ready"))
+            and str(state.get("period")) == GMGN_HOT_SEARCH_ALERT_PERIOD
+            and int(safe_float(state.get("version"))) == GMGN_HOT_SEARCH_ALERT_STATE_VERSION
+        )
+        previous_membership = set(state.get("membership") or [])
+        last_alerts = state.get("lastAlerts") if isinstance(state.get("lastAlerts"), dict) else {}
+        seen = state.get("lastSeen") if isinstance(state.get("lastSeen"), dict) else {}
+        seen = {
+            key: safe_float(stamp)
+            for key, stamp in seen.items()
+            if safe_float(stamp) > now - GMGN_HOT_SEARCH_REENTRY_SECONDS
+        }
+        for alert_key, stamp in last_alerts.items():
+            if alert_key.startswith("5m:new:") and safe_float(stamp) > now - GMGN_HOT_SEARCH_REENTRY_SECONDS:
+                key = alert_key[len("5m:new:"):]
+                seen[key] = max(seen.get(key, 0), safe_float(stamp))
+        for key in previous_membership:
+            stamp = safe_float(state.get("updatedAt")) / 1000
+            if stamp > now - GMGN_HOT_SEARCH_REENTRY_SECONDS:
+                seen[key] = max(seen.get(key, 0), stamp)
+        if ready:
+            for row in snapshots:
+                key = str(row.get("key") or "")
+                if not key or key in previous_membership or key in seen:
+                    continue
+                alert_key = f"5m:new:{key}"
+                if now - safe_float(last_alerts.get(alert_key)) < RANK_MONITOR_COOLDOWN_SECONDS:
+                    continue
+                events.append(rank_monitor_event("hot", row, "new"))
+                last_alerts[alert_key] = now
+        for key in current_membership:
+            seen[key] = now
+        last_alerts = dict(sorted(last_alerts.items(), key=lambda item: safe_float(item[1]))[-1000:])
+        persist_alert_events(events)
+        write_json_cache(
+            GMGN_HOT_SEARCH_ALERT_STATE_PATH,
+            {
+                "version": GMGN_HOT_SEARCH_ALERT_STATE_VERSION,
+                "ready": True,
+                "period": GMGN_HOT_SEARCH_ALERT_PERIOD,
+                "updatedAt": int(now * 1000),
+                "membership": sorted(current_membership),
+                "lastAlerts": last_alerts,
+                "lastSeen": seen,
+                "reentryWindowSeconds": GMGN_HOT_SEARCH_REENTRY_SECONDS,
+            },
+        )
+    return events
+
+
+def gmgn_hot_search_alert_monitor_loop() -> None:
+    while not SERVER_SHUTDOWN_EVENT.is_set():
+        try:
+            source = cached("gmgn-hot-search", fetch_gmgn_hot_search)
+            sync_gmgn_hot_search_alert_feed(source)
+        except Exception as exc:
+            print(f"GMGN hot-search alert monitor failed: {safe_error_text(str(exc))}", file=sys.stderr)
+        if SERVER_SHUTDOWN_EVENT.wait(GMGN_HOT_SEARCH_ALERT_INTERVAL_SECONDS):
+            return
+
+
+def start_gmgn_hot_search_alert_monitor() -> None:
+    global GMGN_HOT_SEARCH_ALERT_MONITOR_ACTIVE
+    if GMGN_HOT_SEARCH_ALERT_MONITOR_ACTIVE:
+        return
+    GMGN_HOT_SEARCH_ALERT_MONITOR_ACTIVE = True
+    threading.Thread(target=gmgn_hot_search_alert_monitor_loop, daemon=True).start()
 
 
 def binance_wallet_hot_alert_monitor_loop() -> None:
@@ -53549,6 +53695,7 @@ def main():
         start_x_kol_priority_monitor()
         start_binance_wallet_hot_alert_monitor()
         start_ave_hot_alert_monitor()
+        start_gmgn_hot_search_alert_monitor()
         start_global_hotspot_monitor()
         start_self_optimization_monitor()
         start_onchain_research_bridge()
