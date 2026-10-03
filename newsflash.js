@@ -211,4 +211,8 @@ updateClock();
 setInterval(updateClock, 1000);
 hydrateFlashCache();
 loadFlash();
-setInterval(loadFlash, 60_000);
+// The panel previously refreshed once a minute, and the backend cache adds its
+// own TTL on top — together that let a flash sit unseen for up to ~2 minutes.
+// Poll on a short clock; the backend serves stale-while-revalidate so this never
+// blocks on a slow upstream fetch.
+setInterval(loadFlash, 15_000);

@@ -636,6 +636,10 @@ class FastResearch:
         self._gmgn_local_last_run_ms = 0
         self._gmgn_local_interval_s = int(os.getenv("GMGN_LOCAL_INTERVAL_SECONDS", "25"))
         self._gmgn_local_batch_size = int(os.getenv("GMGN_LOCAL_BATCH_SIZE", "3"))
+        # A new GMGN trench-board snapshot can wake this lane immediately;
+        # the scheduler remains the single owner of execution so refreshes do
+        # not spawn overlapping AI/SQLite workers.
+        self._gmgn_local_wake = threading.Event()
 
         # Batch ingest buffer to reduce write lock contention
         self._ingest_buffer: deque[dict[str, Any]] = deque()
@@ -652,6 +656,11 @@ class FastResearch:
         self._screened_skip_rewrite_age_ms = int(os.getenv(
             "SCREENED_SKIP_REWRITE_AGE_MS", str(7 * 24 * 60 * 60 * 1000)))
 
+    def wake_gmgn_local(self):
+        """Wake the GMGN local research lane after a new trench-board snapshot."""
+        if self._gmgn_local_enabled:
+            self._gmgn_local_wake.set()
+
     def run_gmgn_local_batch(self):
         """Run GMGN-skill local analysis channel: scan pending trench jobs -> gmgn-cli data -> AI analyze -> write back -> emit alerts.
 
@@ -663,8 +672,10 @@ class FastResearch:
         if not self._gmgn_local_enabled:
             return {"status": "disabled"}
         now_ms = _now_ms()
-        if now_ms - self._gmgn_local_last_run_ms < self._gmgn_local_interval_s * 1000:
+        woke_by_board_refresh = self._gmgn_local_wake.is_set()
+        if now_ms - self._gmgn_local_last_run_ms < self._gmgn_local_interval_s * 1000 and not woke_by_board_refresh:
             return {"status": "cooldown"}
+        self._gmgn_local_wake.clear()
         import gmgn_local_trench_analyzer as _mod  # noqa: PLC0415
         try:
             print(f"[GMGN-Local] Starting batch analysis, last_run={self._gmgn_local_last_run_ms}", flush=True)

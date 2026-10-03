@@ -5,6 +5,7 @@ import html
 import json
 import os
 import re
+import threading
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -305,6 +306,28 @@ def _fetch_feed(source: dict[str, Any], headers: dict[str, str], timeout: float)
     return parse_feed_xml(response.text, source)
 
 
+def fetch_configured_feed_items(
+    feed_id: str,
+    *,
+    headers: dict[str, str] | None = None,
+    timeout: float = 10.0,
+) -> list[dict[str, Any]]:
+    """Fetch one configured public feed by id, exactly like the aggregator would.
+
+    The desktop-alert pipeline mirrors 方程式新闻 (``bwenews``) through this
+    helper so its popups use the same parser and route-racing as the aggregated
+    page feed, while staying an independent fetch: a broken 律动 route can no
+    longer silence 方程式, and vice versa.
+    """
+    wanted = str(feed_id or "").strip()
+    source = next((row for row in configured_feed_sources() if str(row.get("id")) == wanted), None)
+    if source is None:
+        return []
+    request_headers = dict(headers or {"User-Agent": "XingyunSocietyNewsflash/1.0"})
+    wait = max(3.0, min(float(timeout or 8.0), 20.0))
+    return _fetch_feed(source, request_headers, wait)
+
+
 def _normalized_source_name(value: Any) -> str:
     """Normalize decorative publisher names without changing visible labels."""
     text = unicodedata.normalize("NFKC", str(value or "")).casefold()
@@ -461,6 +484,54 @@ def _fingerprints_match(
 
 def stories_match(left: dict[str, Any], right: dict[str, Any], window_seconds: int = 18 * 3600) -> bool:
     return _fingerprints_match(_story_fingerprint(left), _story_fingerprint(right), window_seconds)
+
+
+class StoryIndex:
+    """Bounded, thread-safe index of story fingerprints.
+
+    Keeps one story from producing two desktop popups when the same wire item
+    arrives from two publishers (律动 and 方程式新闻 both carry the same crypto
+    news).  Fingerprints are built once per retained row and once per lookup, so
+    a few hundred entries stay cheap on a 12-second poll — unlike calling
+    :func:`stories_match` pair-by-pair, which would rebuild every fingerprint on
+    every comparison.
+    """
+
+    def __init__(self, *, window_seconds: int = 6 * 3600, limit: int = 400) -> None:
+        self._lock = threading.Lock()
+        self._window_seconds = max(60, int(window_seconds))
+        self._limit = max(1, int(limit))
+        self._rows: list[tuple[float, _StoryFingerprint]] = []
+
+    def clear(self) -> None:
+        with self._lock:
+            self._rows.clear()
+
+    def add(self, item: dict[str, Any]) -> None:
+        if not isinstance(item, dict):
+            return
+        fingerprint = _story_fingerprint(item)
+        if not fingerprint.text and not fingerprint.url:
+            return
+        now = time.time()
+        cutoff = now - self._window_seconds
+        with self._lock:
+            self._rows = [row for row in self._rows if row[0] >= cutoff]
+            self._rows.append((now, fingerprint))
+            if len(self._rows) > self._limit:
+                del self._rows[: len(self._rows) - self._limit]
+
+    def contains(self, item: dict[str, Any]) -> bool:
+        if not isinstance(item, dict):
+            return False
+        fingerprint = _story_fingerprint(item)
+        cutoff = time.time() - self._window_seconds
+        with self._lock:
+            rows = [row_fingerprint for stamp, row_fingerprint in self._rows if stamp >= cutoff]
+        return any(
+            _fingerprints_match(row_fingerprint, fingerprint, self._window_seconds)
+            for row_fingerprint in rows
+        )
 
 
 def _source_record(item: dict[str, Any]) -> dict[str, str]:

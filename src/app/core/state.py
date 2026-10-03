@@ -1095,6 +1095,20 @@ PRICE_WATCH_RETENTION_SECONDS = 30 * 24 * 60 * 60
 BINANCE_WALLET_4H_STRUCTURE_RETENTION_SECONDS = PRICE_WATCH_RETENTION_SECONDS
 
 
+# GMGN's 5-minute hot search is a fast discovery board: a token surfacing there
+# is worth watching right away, but the board churns and most entries never
+# graduate.  A GMGN-only discovery therefore keeps its monitor slot for a short
+# probation window, and the clock follows the *latest* GMGN appearance -- a token
+# that keeps re-entering the board keeps refreshing its slot, while one that
+# falls off can still return later.  The only way to outlive the probation is to
+# graduate to a stronger feed: the Binance Wallet 4h hot ranking keeps its own
+# 30-day lifecycle (BINANCE_WALLET_4H_STRUCTURE_RETENTION_SECONDS).
+GMGN_HOT_SEARCH_POOL_RETENTION_SECONDS = max(
+    24 * 60 * 60,
+    int(float(os.getenv("GMGN_HOT_SEARCH_POOL_RETENTION_DAYS", "3") or "3")) * 24 * 60 * 60,
+)
+
+
 BINANCE_WALLET_4H_STRUCTURE_SYNC_SECONDS = 5 * 60
 
 
@@ -1150,7 +1164,7 @@ PRICE_MONITOR_SOURCE_GRACE_SECONDS = {
     "aicoin": 24 * 60 * 60,
     "ave": 2 * 60 * 60,
     "binance-wallet-4h": 6 * 60 * 60,
-    "gmgn-hot-search-5m": 6 * 60 * 60,
+    "gmgn-hot-search-5m": GMGN_HOT_SEARCH_POOL_RETENTION_SECONDS,
     "gainers": 12 * 60 * 60,
     "personal-x": 3 * 24 * 60 * 60,
     "new-contract": 3 * 24 * 60 * 60,
@@ -1994,6 +2008,14 @@ RUNTIME_QR_MAX_FILES = 8
 
 
 RUNTIME_TEMP_MAX_AGE_SECONDS = 60 * 60
+
+
+# 磁盘上 api_*.json / source-cache/*.json 缓存键的长尾淘汰阈值（秒）。
+# 一个缓存键若超过该时长未被任何源刷新，说明它对应的数据源已下线/改名，
+# 属于废弃残留，运行期后台清理会将其从磁盘删除，避免永久累积。
+# 活跃源每 10–300s 就会刷新一次，24h 远大于任何活跃源的最长刷新周期，
+# 因此该阈值不会误删仍在使用中的缓存。
+STALE_API_CACHE_FILE_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
 DESKTOP_ALERT_LOG_PATH = PERSIST_CACHE_DIR / "desktop_alert.log"

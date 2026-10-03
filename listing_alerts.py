@@ -24,6 +24,11 @@ INVENTORY_SOURCES = frozenset({
 # 过早的时间戳（min(entries) 取到早鸟时间）和 seen 永久静默，导致主所上新弹窗消失。
 NON_OWNER_SOURCES = frozenset({"binance-alpha-new"})
 
+# 按所独立的新合约提醒（用户指定：币安 + OKX）的事件 key 前缀。调用方必须把该前缀
+# 纳入投递期静默白名单（server.desktop_alert_source_is_muted），否则会被
+# "newboard:/listing:/first-listing:" 那条上新策略直接静默掉。
+VENUE_LISTING_KEY_PREFIX = "venue-listing"
+
 
 def asset_key(value):
     text = str(value or "").strip().upper()
@@ -93,5 +98,46 @@ def observe_listings(state, sources, *, now_ms, historical=()):
         # 否则冷启动轮或早鸟抢先会把主所上新永久吞掉。
         if covered and any(source_id in INVENTORY_SOURCES for _, source_id in entries):
             seen.setdefault(key, now_ms)
-    return {"version": 1, "ready": covered, "updatedAt": now_ms,
+    # Extra keys (e.g. venueProofs written by observe_venue_listings) must survive
+    # this rebuild, otherwise the per-venue proofs are dropped on every cycle.
+    return {**state, "version": 1, "ready": covered, "updatedAt": now_ms,
             "coverage": sorted(complete), "seen": seen, "proofs": proofs}, proofs
+
+
+def observe_venue_listings(state, sources, *, venue_ids, now_ms, fresh_ms=FRESH_MS):
+    """Per-venue new-contract proofs that ignore the cross-venue inventory check.
+
+    A main venue's own new-board is authoritative *for that venue*: a contract whose
+    own listing stamp is fresh pops even if the asset already trades elsewhere. This
+    exists because the global first-listing policy is intentionally blind to any asset
+    already present in one of the six spot/futures inventories — and five of those
+    carry no date at all, so `min(owner_entries)` collapses to 0 and main-venue
+    listings could never produce a proof (measured: Binance 0 popups, OKX 1, ever).
+
+    No permanent seen-set is kept: the proof key embeds the listing stamp, so it is
+    stable across cycles and the caller's site-alert layer dedupes delivery by key.
+    """
+    wanted = {str(value) for value in venue_ids}
+    proofs = {key: dict(value) for key, value in (state.get("venueProofs") or {}).items()
+              if isinstance(value, dict) and now_ms < number(value.get("expiresAt"))}
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        venue = str(source.get("id") or "")
+        if venue not in wanted or source.get("status") != "ok":
+            continue
+        for row in source.get("listingInventory") or source.get("rows") or []:
+            if not isinstance(row, dict):
+                continue
+            key = asset_key(row.get("asset") or row.get("symbol"))
+            stamp = number(row.get("listedAt", row.get("date")))
+            # Future stamps are clock skew, not a listing; stale stamps can never
+            # alert again, so they are simply skipped instead of being remembered.
+            if not key or not stamp or now_ms < stamp or now_ms - stamp > fresh_ms:
+                continue
+            proofs[f"{venue}:{key}"] = {
+                "venue": venue, "sourceId": venue, "asset": key, "listedAt": stamp,
+                "key": f"{VENUE_LISTING_KEY_PREFIX}:{venue}:{key}:{stamp}",
+                "expiresAt": stamp + fresh_ms,
+            }
+    return {**state, "venueProofs": proofs}, proofs

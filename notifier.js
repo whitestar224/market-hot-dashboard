@@ -393,17 +393,22 @@
 
   function parseNewsflashEvents(payload) {
     const items = Array.isArray(payload?.items) ? payload.items : [];
-    return items.map((item) => ({
-      key: stableKey("flash", item.id, item.title, item.add_time),
-      kind: "律动快讯",
-      source: "BlockBeats",
-      sourceLabel: "BB",
-      title: item.title || "市场快讯",
-      body: item.content || "",
-      url: item.url || "https://www.theblockbeats.info/newsflash",
-      time: item.add_time,
-      priority: "市场信息"
-    }));
+    return items.map((item) => {
+      // /api/newsflash 是聚合源：律动与方程式新闻共用这条解析，来源必须逐条取自
+      // 条目本身，否则方程式快讯会顶着 "BlockBeats / BB" 弹出来。
+      const source = pickFirst(item, ["source", "sourceName"]) || "BlockBeats 律动";
+      return {
+        key: stableKey("flash", item.id, item.title, item.add_time),
+        kind: "聚合快讯",
+        source,
+        sourceLabel: pickFirst(item, ["sourceLabel"]) || source.slice(0, 2).toUpperCase(),
+        title: item.title || "市场快讯",
+        body: item.content || "",
+        url: item.url || "https://www.theblockbeats.info/newsflash",
+        time: item.add_time,
+        priority: "市场信息"
+      };
+    });
   }
 
   function parseSignedNumber(value) {

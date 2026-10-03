@@ -49,6 +49,7 @@ from bs4 import BeautifulSoup
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import quiet_http_server as dragon_wave_local
 from network_proxy import (
+    collect_proxy_candidates,
     local_proxy_candidates,
     network_proxy_generation,
     network_proxy_status,
@@ -80,9 +81,16 @@ from alert_delivery import AlertDeliveryStore
 from monitor_exclusion_db import persist_global_monitor_exclusion
 from prior_high_monitor import analyze_prior_high
 from news_trade_explanations import ExplanationService, context_for as explanation_context, research_key as explanation_key
-from newsflash_sources import aggregate_newsflash, http_get_race, source_family
+from newsflash_sources import (
+    StoryIndex,
+    aggregate_newsflash,
+    fetch_configured_feed_items,
+    http_get_race,
+    source_family,
+)
 from event_flow_window import attention_evidence, attention_window, STAGES as ATTENTION_STAGES
-from listing_alerts import attach_inventory as attach_listing_inventory, observe_listings, asset_key as listing_asset_key
+from listing_alerts import (attach_inventory as attach_listing_inventory, observe_listings,
+                            observe_venue_listings, asset_key as listing_asset_key)
 from opennews_client import opennews_feed_payload
 from opentwitter_client import twitter_watch_feed_payload
 from pump_claim_monitor import pump_claim_feed_payload
@@ -375,6 +383,7 @@ from app.core.state import (
     GMGN_HOT_SEARCH_ALERT_PERIOD,
     GMGN_HOT_SEARCH_ALERT_STATE_PATH,
     GMGN_HOT_SEARCH_ALERT_STATE_VERSION,
+    GMGN_HOT_SEARCH_POOL_RETENTION_SECONDS,
     GMGN_HOT_SEARCH_REENTRY_SECONDS,
     GMGN_OPENAPI_BASE,
     GMGN_TRENCH_BOARD_REFRESH_SECONDS,
@@ -650,6 +659,7 @@ from app.core.state import (
     RUNTIME_QR_MAX_AGE_SECONDS,
     RUNTIME_QR_MAX_FILES,
     RUNTIME_TEMP_MAX_AGE_SECONDS,
+    STALE_API_CACHE_FILE_MAX_AGE_SECONDS,
     SECONDARY_RANK_LEADER_ALLOWED_SOURCE_IDS,
     SECURITY_AUDIT_RETENTION_DAYS,
     SECURITY_RATE_BUCKETS,
@@ -1506,12 +1516,85 @@ def cleanup_runtime_ephemeral_files(
     return removed
 
 
+def prune_stale_api_cache_files(
+    cache_dir: Path | None = None,
+    *,
+    now: float | None = None,
+    max_age_seconds: float | None = None,
+) -> dict[str, int]:
+    """Delete disk cache keys whose data source has been retired or renamed.
+
+    Every ``api_*.json`` and ``source-cache/*.json`` file written by
+    ``refresh_api_cache_now`` carries an ``_cache.updatedAt`` timestamp.  An
+    active source refreshes every 10–300s, so any key untouched for
+    *max_age_seconds* (default 24h) belongs to a source that no longer exists
+    and would otherwise accumulate forever on disk.  This only walks the cache
+    roots and never descends into non-cache trees (venv, vendor, logs, …), so
+    it cannot touch runtime dependencies or live state files.
+    """
+    root = (cache_dir or PERSIST_CACHE_DIR).resolve()
+    current = time.time() if now is None else now
+    if max_age_seconds is None:
+        max_age_seconds = float(STALE_API_CACHE_FILE_MAX_AGE_SECONDS)
+    candidates: list[Path] = [p for p in root.glob("api_*.json") if p.is_file()]
+    source_dir = root / "source-cache"
+    if source_dir.is_dir():
+        candidates.extend(p for p in source_dir.glob("*.json") if p.is_file())
+    removed = 0
+    freed = 0
+    for path in candidates:
+        try:
+            if current - path.stat().st_mtime <= max_age_seconds:
+                continue
+            # Double-check the embedded timestamp rather than trusting mtime
+            # alone: a file could be rewritten in place without the cache
+            # clock moving.  Treat unparseable content as stale (delete) so a
+            # corrupt orphan cannot linger forever.
+            payload = read_json_cache(path)
+            cached_at = payload_cache_time(payload) if payload else 0.0
+            if cached_at > 0.0 and current - cached_at <= max_age_seconds:
+                continue
+            size = path.stat().st_size
+            path.unlink(missing_ok=True)
+            removed += 1
+            freed += size
+        except OSError:
+            continue
+    return {"removed": removed, "freed_bytes": freed}
+
+
 def auth_db() -> sqlite3.Connection:
     conn = sqlite3.connect(AUTH_DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+# Columns added to price_watch_assets after the original schema.  Kept in one
+# place so both ``init_auth_db`` and the live ingestion writers can converge the
+# schema idempotently; tests import ``server`` without running ``init_auth_db``.
+PRICE_WATCH_ASSET_ADDED_COLUMNS: dict[str, str] = {
+    "launchpad_platform": "launchpad_platform TEXT NOT NULL DEFAULT ''",
+    "launchpad_platform_observed_at": "launchpad_platform_observed_at INTEGER NOT NULL DEFAULT 0",
+}
+
+
+def ensure_price_watch_asset_columns(conn: sqlite3.Connection) -> None:
+    """Add any missing late-era price_watch_assets columns (idempotent)."""
+    try:
+        existing = {
+            row["name"] if isinstance(row, sqlite3.Row) else row[1]
+            for row in conn.execute("PRAGMA table_info(price_watch_assets)").fetchall()
+        }
+    except sqlite3.Error:
+        return
+    for column, ddl in PRICE_WATCH_ASSET_ADDED_COLUMNS.items():
+        if column not in existing:
+            try:
+                conn.execute(f"ALTER TABLE price_watch_assets ADD COLUMN {ddl}")
+            except sqlite3.Error:
+                pass
 
 
 def secure_field_for_migration(value: Any, normalizer) -> tuple[str, str]:
@@ -1902,6 +1985,10 @@ def init_auth_db() -> None:
             "new_contract_pair": "new_contract_pair TEXT NOT NULL DEFAULT ''",
             "structure_1m_override": "structure_1m_override INTEGER NOT NULL DEFAULT -1",
             "structure_interval_overrides_json": "structure_interval_overrides_json TEXT NOT NULL DEFAULT '{}'",
+            # Native GMGN launch platform id (e.g. fourmeme / pumpfun).  A
+            # non-empty value means the token graduated off a launch platform,
+            # which must be surfaced as a red priority alert on every board.
+            **PRICE_WATCH_ASSET_ADDED_COLUMNS,
         }.items():
             if column not in price_watch_asset_columns:
                 conn.execute(f"ALTER TABLE price_watch_assets ADD COLUMN {ddl}")
@@ -13457,6 +13544,13 @@ def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
                 research_candidates,
                 match_recent_news=True,
             )
+            # 新榜快照出现新 CA 后，立即唤醒 V4.9 战壕投研通道；实际执行仍由
+            # onchain-fast scheduler 串行调度，避免刷新线程直接启动 AI/SQLite 工作。
+            if research_ingested:
+                try:
+                    fast_research.wake_gmgn_local()
+                except Exception:
+                    pass
     source_status = live_payload.get("sourceStatus") if isinstance(live_payload.get("sourceStatus"), dict) else {}
     online_count = sum(1 for value in source_status.values() if value == "ok")
     capped_rows = rows[:GMGN_TRENCH_RESPONSE_MAX_ROWS]
@@ -14036,7 +14130,9 @@ def fetch_gmgn_trenches_hot_board(*, force_refresh: bool = False, attach_overlay
     )
     if not attach_overlays:
         return source
-    return attach_trench_person_signals(attach_v44_research_marks_to_gmgn_trenches(source))
+    return attach_counterfeit_platform_labels(
+        attach_trench_person_signals(attach_v44_research_marks_to_gmgn_trenches(source))
+    )
 
 
 def ave_hot_all_rows(source: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -16471,6 +16567,48 @@ def js_object_field(block: str, field: str, var_map: dict[str, Any]) -> Any:
     return decode_js_literal(match.group(1).strip(), var_map)
 
 
+def extract_nuxt_object_blocks(script: str) -> list[str]:
+    """Return every ``{id:...,article_id:...,...}`` newsflash card in a Nuxt payload.
+
+    The legacy matcher keyed off the ``isSup`` field. The publisher no longer
+    stamps that flag on every card: only the newest ~10 entries carry it, so
+    older entries — and anything published during a fetch outage that has since
+    rolled out of the flagged set — were silently dropped on every pass. Scan
+    balanced braces instead, skipping string literals, so each card is recovered
+    regardless of which optional flags it happens to carry.
+    """
+
+    blocks: list[str] = []
+    for match in re.finditer(r"\{id:(?:\d+|[A-Za-z_$][\w$]*),article_id:", script):
+        start = match.start()
+        depth = 0
+        index = start
+        quote = ""
+        escaped = False
+        length = len(script)
+        while index < length:
+            char = script[index]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = ""
+            else:
+                if char in "\"'":
+                    quote = char
+                elif char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+            index += 1
+        blocks.append(script[start:index + 1])
+    return blocks
+
+
 def clean_html(value: str) -> str:
     return BeautifulSoup(value, "lxml").get_text(" ", strip=True)
 
@@ -16535,7 +16673,12 @@ def fetch_blockbeats_flash() -> dict[str, Any]:
     start = html_text.find("window.__NUXT__=")
     script = html_text[start:] if start >= 0 else html_text
     var_map = extract_nuxt_var_map(script)
-    blocks = re.findall(r"\{id:(?:\d+|[A-Za-z_$][\w$]*),article_id:.*?isSup:[^}]+\}", script, flags=re.S)
+    # Prefer the balanced-brace scan: it recovers every card, whereas the old
+    # `isSup`-anchored regex kept only the newest ~10 flagged entries and lost
+    # the rest (the main reason fast-published flash items went missing).
+    blocks = extract_nuxt_object_blocks(script)
+    if not blocks:
+        blocks = re.findall(r"\{id:(?:\d+|[A-Za-z_$][\w$]*),article_id:.*?isSup:[^}]+\}", script, flags=re.S)
     items = []
     seen = set()
     for block in blocks:
@@ -16565,6 +16708,33 @@ def fetch_blockbeats_flash() -> dict[str, Any]:
     items = sorted(items, key=lambda item: item.get("add_time") or 0, reverse=True)[:60]
     spawn_background_news_ingest(items)
     return {"updatedAt": int(time.time() * 1000), "items": items}
+
+
+BLOCKBEATS_FLASH_MEMO_LOCK = threading.Lock()
+BLOCKBEATS_FLASH_MEMO: dict[str, Any] = {"updatedAt": 0, "items": [], "fetchedAt": 0.0}
+BLOCKBEATS_FLASH_MEMO_SECONDS = 15.0
+
+
+def fetch_blockbeats_flash_shared() -> dict[str, Any]:
+    """BlockBeats flashes with a one-tick memo.
+
+    The 律动 popup feed and the 方程式新闻 cross-source duplicate check both need
+    the same list inside the same poll tick. Sharing one short memo keeps the
+    page scrape from running twice per cycle without delaying either feed.
+    """
+    now = time.time()
+    with BLOCKBEATS_FLASH_MEMO_LOCK:
+        memo = dict(BLOCKBEATS_FLASH_MEMO)
+    if memo["items"] and now - float(memo.get("fetchedAt") or 0.0) <= BLOCKBEATS_FLASH_MEMO_SECONDS:
+        return {"updatedAt": memo["updatedAt"], "items": memo["items"]}
+    payload = fetch_blockbeats_flash()
+    items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    updated_at = payload.get("updatedAt") or int(time.time() * 1000)
+    with BLOCKBEATS_FLASH_MEMO_LOCK:
+        BLOCKBEATS_FLASH_MEMO["updatedAt"] = updated_at
+        BLOCKBEATS_FLASH_MEMO["items"] = items
+        BLOCKBEATS_FLASH_MEMO["fetchedAt"] = now
+    return {"updatedAt": updated_at, "items": items}
 
 
 def newsflash_semantic_text(item: dict[str, Any]) -> str:
@@ -16906,6 +17076,401 @@ def fetch_aggregated_newsflash() -> dict[str, Any]:
     payload["deduplicatedCount"] = int(safe_float(payload.get("deduplicatedCount"), 0)) + semantic_removed
     spawn_background_news_ingest(payload.get("items"))
     return payload
+
+
+NEWSFLASH_ALERT_MAX_AGE_MS = 6 * 60 * 60 * 1000
+# 方程式新闻的公开 RSS（rss-public.bwe-ws.com）是低频镜像：实测只回 10 条、
+# 条目间隔 3–43 小时不等，最新一条常常已是十几小时前。沿用律动的 6 小时窗口会
+# 让它长期一条都不弹。放宽到 24 小时；首次基线（feed 未 ready）只登记不弹窗，
+# 所以放宽窗口不会造成补弹洪水。
+NEWSFLASH_FORMULA_ALERT_MAX_AGE_MS = 24 * 60 * 60 * 1000
+NEWSFLASH_ALERT_STORY_WINDOW_SECONDS = NEWSFLASH_FORMULA_ALERT_MAX_AGE_MS // 1000
+
+
+def blockbeats_story_index() -> StoryIndex:
+    """Fingerprints of every story 律动 currently carries.
+
+    ``/api/newsflash`` merges 律动 and 方程式新闻 into one row per story. The
+    方程式 popup feed is a separate fetch, so it consults this index to drop a
+    story that 律动 already owns instead of popping the same news twice. The
+    window matches 方程式's wider freshness window so a late-surfacing mirror
+    item still gets deduplicated against 律动.
+    """
+    index = StoryIndex(window_seconds=NEWSFLASH_ALERT_STORY_WINDOW_SECONDS)
+    for row in fetch_blockbeats_flash_shared().get("items") or []:
+        if isinstance(row, dict):
+            index.add(row)
+    return index
+
+
+# ---------------------------------------------------------------------------
+# 方程式新闻实时流（BWE 官方 WebSocket）
+#
+# rss-public.bwe-ws.com 是低频镜像（实测只回 10 条、最新一条常是十几小时前），
+# 拿不到 α。官方 WebSocket 推送的是 BWE 自家报道，帧格式（官方文档）：
+#   {"source_name":"BWENEWS","news_title":"...","coins_included":["BTC","ETH"],
+#    "url":"https://...","timestamp":1745770800}
+# 心跳是**应用层纯文本**：发 "ping"、收 "pong"（不是协议级 ping 帧）。
+# 交易所公告不在 WS 里、只在 RSS 里，所以两者互补：WS 抢实时，RSS 兜公告。
+#
+# 网络铁律：禁止固化直连或固定代理。连接时读 NETWORK_PROXY_ADAPTER 当前选中的
+# 线路（它每 60s 重新探测并把结果写回环境变量），每次重连都重新读；适配器换线路
+# 时 generation 自增，这里据此主动断开重连。
+# ---------------------------------------------------------------------------
+
+BWE_NEWS_WS_URL = env_value("XINGYUN_BWE_WS_URL", "wss://bwenews-api.bwe-ws.com/ws") or "wss://bwenews-api.bwe-ws.com/ws"
+BWE_NEWS_WS_PING_SECONDS = 25.0
+BWE_NEWS_WS_IDLE_TIMEOUT_SECONDS = 150.0
+BWE_NEWS_WS_CONNECT_TIMEOUT_SECONDS = 12.0
+BWE_NEWS_WS_RECONNECT_MIN_SECONDS = 3.0
+BWE_NEWS_WS_RECONNECT_MAX_SECONDS = 60.0
+BWE_NEWS_WS_BUFFER_LIMIT = 200
+BWE_NEWS_WS_BUFFER_PATH = PERSIST_CACHE_DIR / "bwenews_ws_buffer.json"
+BWE_NEWS_WS_RSS_MEMO_SECONDS = 90.0
+
+BWE_NEWS_WS_LOCK = threading.Lock()
+BWE_NEWS_WS_ITEMS: list[dict[str, Any]] = []
+BWE_NEWS_WS_LOADED = False
+BWE_NEWS_WS_THREAD: threading.Thread | None = None
+BWE_NEWS_WS_STATE: dict[str, Any] = {
+    "enabled": True,
+    "connected": False,
+    "route": "direct",
+    "connectedAt": 0,
+    "lastFrameAt": 0,
+    "received": 0,
+    "reconnects": 0,
+    "lastError": "",
+}
+
+BWE_RSS_MEMO_LOCK = threading.Lock()
+BWE_RSS_MEMO: dict[str, Any] = {"fetchedAt": 0.0, "items": []}
+
+
+def _websocket_module():
+    """懒加载 websocket-client；缺失时整条实时流优雅降级为只跑 RSS。"""
+    try:
+        import websocket  # noqa: PLC0415 - 可选依赖，必须允许缺失
+    except Exception:
+        return None
+    return websocket
+
+
+def bwe_news_ws_enabled() -> bool:
+    return env_flag("XINGYUN_BWE_WS_ENABLED", default=True)
+
+
+def bwe_news_ws_item(raw: Any) -> dict[str, Any] | None:
+    """把一帧官方推送规范化成与 RSS 同构的快讯条目。"""
+    if not isinstance(raw, dict):
+        return None
+    source_name = clean_feed_text(raw.get("source_name"), 32).casefold()
+    # 官方只转发自家报道；出现别的 source_name 说明不是 BWE 原创内容，别冒充。
+    if source_name not in {"", "bwenews"}:
+        return None
+    title = clean_feed_text(raw.get("news_title") or raw.get("title"), 500)
+    if not title:
+        return None
+    url = clean_feed_text(raw.get("url"), 700)
+    published = int(safe_float(raw.get("timestamp"))) or int(time.time())
+    if published > 10_000_000_000:
+        published //= 1000
+    coins: list[str] = []
+    for coin in raw.get("coins_included") if isinstance(raw.get("coins_included"), list) else []:
+        label = clean_feed_text(coin, 24)
+        if label and label not in coins:
+            coins.append(label)
+    digest = hashlib.sha1(f"bwenews-ws\n{url}\n{title}".encode("utf-8")).hexdigest()[:20]
+    return {
+        "id": f"bwenews-ws:{digest}",
+        "title": title,
+        "content": ("相关代币：" + " / ".join(coins)) if coins else "",
+        "url": url,
+        "image": "",
+        "links": [url] if url else [],
+        "add_time": published,
+        "sourceId": "bwenews",
+        "source": "方程式新闻",
+        "sourceLabel": "BWE",
+        "sourcePriority": 80,
+        "sourceChannel": "websocket",
+    }
+
+
+def bwe_news_ws_load() -> None:
+    global BWE_NEWS_WS_LOADED, BWE_NEWS_WS_ITEMS
+    with BWE_NEWS_WS_LOCK:
+        if BWE_NEWS_WS_LOADED:
+            return
+        BWE_NEWS_WS_LOADED = True
+        payload = read_json_cache(BWE_NEWS_WS_BUFFER_PATH)
+        rows = payload.get("items") if isinstance(payload.get("items"), list) else []
+        BWE_NEWS_WS_ITEMS = [row for row in rows if isinstance(row, dict)][:BWE_NEWS_WS_BUFFER_LIMIT]
+
+
+def bwe_news_ws_persist_locked() -> None:
+    write_json_cache(BWE_NEWS_WS_BUFFER_PATH, {"version": 1, "items": BWE_NEWS_WS_ITEMS})
+
+
+def bwe_news_ws_recent_items(max_age_ms: int) -> list[dict[str, Any]]:
+    """窗口内的实时流条目（新到旧）。聚合页/弹窗每小时都会多次调用，只读内存。"""
+    bwe_news_ws_load()
+    cutoff = int(time.time() * 1000) - max(0, int(max_age_ms))
+    with BWE_NEWS_WS_LOCK:
+        return [
+            dict(row)
+            for row in BWE_NEWS_WS_ITEMS
+            if alert_event_ms(row.get("add_time")) >= cutoff
+        ]
+
+
+def bwe_news_ws_store(rows: list[dict[str, Any]]) -> int:
+    """存入实时流缓冲：按 id 去重、新条在前、有界、落盘。返回新增条数。"""
+    global BWE_NEWS_WS_ITEMS
+    accepted = [row for row in rows if isinstance(row, dict) and row.get("id")]
+    if not accepted:
+        return 0
+    bwe_news_ws_load()
+    with BWE_NEWS_WS_LOCK:
+        known = {str(row.get("id")) for row in BWE_NEWS_WS_ITEMS}
+        added = [row for row in accepted if str(row.get("id")) not in known]
+        if not added:
+            return 0
+        BWE_NEWS_WS_ITEMS = (added + BWE_NEWS_WS_ITEMS)[:BWE_NEWS_WS_BUFFER_LIMIT]
+        try:
+            bwe_news_ws_persist_locked()
+        except Exception as exc:
+            print(f"BWE stream buffer persist failed: {safe_error_text(str(exc))[:160]}", file=sys.stderr)
+    return len(added)
+
+
+def bwe_news_ws_ingest_text(text: str) -> int:
+    """解析一帧文本：JSON 快讯入库；"pong" 只算心跳。"""
+    raw = str(text or "").strip()
+    if not raw:
+        return 0
+    with BWE_NEWS_WS_LOCK:
+        BWE_NEWS_WS_STATE["lastFrameAt"] = int(time.time() * 1000)
+    if raw.casefold() == "pong":
+        return 0
+    try:
+        decoded = json.loads(raw)
+    except (ValueError, TypeError):
+        return 0
+    frames = decoded if isinstance(decoded, list) else [decoded]
+    rows = [item for item in (bwe_news_ws_item(frame) for frame in frames) if item]
+    added = bwe_news_ws_store(rows)
+    if added:
+        with BWE_NEWS_WS_LOCK:
+            BWE_NEWS_WS_STATE["received"] = int(BWE_NEWS_WS_STATE.get("received") or 0) + added
+        print(f"BWE stream: +{added} realtime item(s): {rows[0]['title'][:60]}", flush=True)
+    return added
+
+
+def bwe_news_ws_routes() -> list[str]:
+    """候选线路：适配器当前选中线路 → 其余候选 → 直连（空串）。"""
+    routes: list[str] = []
+    for value in (network_proxy_url(), *collect_proxy_candidates(os.environ)):
+        normalized = str(value or "").strip()
+        if normalized not in routes:
+            routes.append(normalized)
+    if "" not in routes:
+        routes.append("")
+    return routes
+
+
+def bwe_news_ws_connect(websocket_module, proxy_url: str):
+    kwargs: dict[str, Any] = {
+        "timeout": BWE_NEWS_WS_CONNECT_TIMEOUT_SECONDS,
+        "enable_multithread": True,
+    }
+    if proxy_url:
+        parsed = urlparse(proxy_url)
+        if parsed.hostname and parsed.port:
+            kwargs.update(
+                http_proxy_host=parsed.hostname,
+                http_proxy_port=parsed.port,
+                proxy_type="http",
+            )
+    return websocket_module.create_connection(BWE_NEWS_WS_URL, **kwargs)
+
+
+def bwe_news_ws_pump(websocket_module, connection) -> None:
+    """读帧 + 按时发应用层 ping，直到断开、超时或服务停止。"""
+    connection.settimeout(1.0)
+    timeout_error = getattr(websocket_module, "WebSocketTimeoutException", TimeoutError)
+    connected_generation = network_proxy_generation()
+    last_ping = time.time()
+    last_frame = time.time()
+    while not SERVER_SHUTDOWN_EVENT.is_set():
+        try:
+            frame = connection.recv()
+        except timeout_error:
+            frame = None
+        except Exception:
+            raise
+        if frame:
+            last_frame = time.time()
+            if isinstance(frame, bytes):
+                frame = frame.decode("utf-8", "replace")
+            bwe_news_ws_ingest_text(str(frame))
+        now = time.time()
+        if now - last_ping >= BWE_NEWS_WS_PING_SECONDS:
+            connection.send("ping")
+            last_ping = now
+        if now - last_frame > BWE_NEWS_WS_IDLE_TIMEOUT_SECONDS:
+            raise TimeoutError("BWE websocket silent beyond idle timeout")
+        if network_proxy_generation() != connected_generation:
+            # 网络线路已被适配器切换（本地代理换端口等）→ 主动重连走新线路。
+            raise ConnectionAbortedError("network route changed")
+
+
+def bwe_news_ws_client_loop() -> None:
+    websocket_module = _websocket_module()
+    if websocket_module is None:
+        print("BWE stream: websocket-client 不可用，实时流停用（仅保留 RSS 弹窗）。", file=sys.stderr)
+        with BWE_NEWS_WS_LOCK:
+            BWE_NEWS_WS_STATE.update({"enabled": False, "connected": False, "lastError": "websocket-client missing"})
+        return
+    backoff = BWE_NEWS_WS_RECONNECT_MIN_SECONDS
+    while not SERVER_SHUTDOWN_EVENT.is_set():
+        if not bwe_news_ws_enabled():
+            SERVER_SHUTDOWN_EVENT.wait(30)
+            continue
+        with BWE_NEWS_WS_LOCK:
+            BWE_NEWS_WS_STATE["enabled"] = True
+        connected = False
+        last_error = ""
+        for route in bwe_news_ws_routes():
+            if SERVER_SHUTDOWN_EVENT.is_set():
+                return
+            label = route or "direct"
+            try:
+                connection = bwe_news_ws_connect(websocket_module, route)
+            except Exception as exc:
+                last_error = f"{label}: {type(exc).__name__}: {exc}"
+                continue
+            connected = True
+            backoff = BWE_NEWS_WS_RECONNECT_MIN_SECONDS
+            with BWE_NEWS_WS_LOCK:
+                BWE_NEWS_WS_STATE.update({
+                    "connected": True,
+                    "route": label,
+                    "connectedAt": int(time.time() * 1000),
+                    "lastError": "",
+                })
+            print(f"BWE stream: connected via {label}", flush=True)
+            try:
+                bwe_news_ws_pump(websocket_module, connection)
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            finally:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+                with BWE_NEWS_WS_LOCK:
+                    BWE_NEWS_WS_STATE["connected"] = False
+            break
+        if not connected:
+            # 所有线路都不通：退避后重试，并重新读线路（代理端口可能已变）。
+            last_error = last_error or "no route available"
+        with BWE_NEWS_WS_LOCK:
+            BWE_NEWS_WS_STATE.update({
+                "reconnects": int(BWE_NEWS_WS_STATE.get("reconnects") or 0) + 1,
+                "lastError": last_error[:200],
+            })
+        if last_error:
+            print(f"BWE stream: {last_error} (retry in {backoff:.0f}s)", file=sys.stderr)
+        if SERVER_SHUTDOWN_EVENT.wait(backoff):
+            return
+        backoff = min(BWE_NEWS_WS_RECONNECT_MAX_SECONDS, backoff * 2)
+
+
+def bwe_news_ws_status() -> dict[str, Any]:
+    with BWE_NEWS_WS_LOCK:
+        state = dict(BWE_NEWS_WS_STATE)
+        buffered = len(BWE_NEWS_WS_ITEMS)
+    state.update({
+        "url": BWE_NEWS_WS_URL,
+        "buffered": buffered,
+        "recent6h": len(bwe_news_ws_recent_items(NEWSFLASH_ALERT_MAX_AGE_MS)),
+        "websocketAvailable": _websocket_module() is not None,
+    })
+    return state
+
+
+def start_bwe_news_stream() -> bool:
+    global BWE_NEWS_WS_THREAD
+    if not bwe_news_ws_enabled():
+        print("BWE stream: disabled by XINGYUN_BWE_WS_ENABLED")
+        return False
+    with BWE_NEWS_WS_LOCK:
+        if BWE_NEWS_WS_THREAD and BWE_NEWS_WS_THREAD.is_alive():
+            return True
+        BWE_NEWS_WS_THREAD = threading.Thread(
+            target=bwe_news_ws_client_loop, daemon=True, name="bwe-news-stream",
+        )
+        BWE_NEWS_WS_THREAD.start()
+    return True
+
+
+def ensure_bwe_news_stream() -> None:
+    """常驻自愈：线程意外退出时在维护 tick 里补起来。"""
+    if not bwe_news_ws_enabled():
+        return
+    thread = BWE_NEWS_WS_THREAD
+    if thread is None or not thread.is_alive():
+        start_bwe_news_stream()
+
+
+def fetch_formula_news_rss_items() -> list[dict[str, Any]]:
+    """BWE 公开 RSS（含交易所公告）低配抓取：90s 记忆，避免高频轮询镜像。"""
+    now = time.time()
+    with BWE_RSS_MEMO_LOCK:
+        memo = dict(BWE_RSS_MEMO)
+    if memo["items"] and now - float(memo.get("fetchedAt") or 0.0) <= BWE_NEWS_WS_RSS_MEMO_SECONDS:
+        return memo["items"]
+    items = fetch_configured_feed_items("bwenews", headers=HEADERS, timeout=20)
+    with BWE_RSS_MEMO_LOCK:
+        BWE_RSS_MEMO["fetchedAt"] = now
+        BWE_RSS_MEMO["items"] = items
+    return items
+
+
+def merge_formula_news_items(
+    stream_items: list[dict[str, Any]], rss_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """实时流优先：同一条故事只保留实时流那一份。
+
+    否则同一条新闻会先由 WS 弹一次、稍后 RSS 再弹一次（两边 key 不同）。WS 条目
+    在缓冲里保留整个窗口，所以窗口内稳定只出现 WS 那一份 key。
+    """
+    index = StoryIndex(window_seconds=NEWSFLASH_ALERT_STORY_WINDOW_SECONDS)
+    merged: list[dict[str, Any]] = []
+    for row in list(stream_items) + list(rss_items):
+        if not isinstance(row, dict) or index.contains(row):
+            continue
+        index.add(row)
+        merged.append(row)
+    return merged
+
+
+def fetch_formula_news_flash() -> dict[str, Any]:
+    """方程式新闻（BWE）快讯，供桌面弹窗事件流使用。
+
+    实时流（官方 WebSocket）+ 公开 RSS（含交易所公告）合并；同题只留一份；再剔除
+    律动已经覆盖的故事，避免双份弹窗与双份语音。两条抓取各自独立，任一路故障都
+    不会让另一条静默。
+    """
+    stream_items = bwe_news_ws_recent_items(NEWSFLASH_FORMULA_ALERT_MAX_AGE_MS)
+    rss_items = fetch_formula_news_rss_items()
+    merged = merge_formula_news_items(stream_items, rss_items)
+    if not merged:
+        return {"updatedAt": int(time.time() * 1000), "items": []}
+    index = blockbeats_story_index()
+    fresh = [row for row in merged if not index.contains(row)]
+    return {"updatedAt": int(time.time() * 1000), "items": fresh}
 
 
 def parse_date_ms(value: str) -> int | None:
@@ -22756,6 +23321,17 @@ def normalize_desktop_alert(payload: dict[str, Any]) -> dict[str, Any]:
         "authorHandle": alert_text(payload.get("authorHandle"), 80),
         "sourceId": alert_text(payload.get("sourceId"), 120),
         "alertPeriod": alert_text(payload.get("alertPeriod"), 12),
+        "launchpadPlatform": alert_text(payload.get("launchpadPlatform"), 80),
+        # Must survive normalization or the delivery-time mute bypass silently
+        # stops working (learned the hard way with launchpadPlatform).
+        "platformOwnToken": bool(payload.get("platformOwnToken")),
+        # Marks a popup as a ``project`` (vs meme) finding.  Purely a label —
+        # it does not affect delivery or mute policy.
+        "projectCandidate": bool(payload.get("projectCandidate")),
+        # Names the launch platform a knock-off is impersonating.  Label only —
+        # it must never change tone, priority or mute policy.
+        "counterfeitPlatformClaim": alert_text(payload.get("counterfeitPlatformClaim"), 80),
+        "counterfeitPlatformLabel": alert_text(payload.get("counterfeitPlatformLabel"), 120),
         "binanceAiNarrative": alert_text(payload.get("binanceAiNarrative") or payload.get("exchangeAiNarrative"), 1600),
         "binanceAiNarrativeSource": alert_text(
             payload.get("binanceAiNarrativeSource") or payload.get("exchangeAiNarrativeSource"), 80
@@ -22773,6 +23349,695 @@ def normalize_desktop_alert(payload: dict[str, Any]) -> dict[str, Any]:
             and source == "News Trade 监控"
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Platform-own token ("台子币") recognition.
+#
+# Distinct from the launchpad detector below!  That one answers "which platform
+# did this coin graduate FROM"; this one answers "IS THIS COIN THE PLATFORM
+# ITSELF" (pump.fun -> PUMP, Virtuals -> VIRTUAL, sapling.cash -> SAPLING ...).
+#
+# Every launchpad ends up minting its own platform token, and those tokens get
+# spammed into the trenches right next to the coins they launch, surrounded by
+# copycats using the same ticker.  The ONLY reliable tell is the contract
+# address, so an authoritative allow-list comes first; a description that
+# self-declares ("...是Solana上的代币发射台..." / "the pad's own coin") is the
+# second signal for brand-new pads that are not in the list yet.
+#
+# A same-symbol token whose address is NOT on the list and whose description
+# does NOT self-declare is treated as a knock-off and stays silent.
+# ---------------------------------------------------------------------------
+PLATFORM_OWN_TOKEN_RAW: tuple[tuple[str, str, str], ...] = (
+    # (canonical address as published, platform label, ticker)
+    # Solana mints are base58 (case-sensitive); EVM addresses are hex.
+    ("pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn", "pump.fun", "PUMP"),
+    ("CDBdbNqmrLu1PcgjrFG52yxg71QnFhBZcUE6PSFdbonk", "LetsBonk", "LetsBONK"),
+    ("3iQL8BFS2vE7mww4ehAqQHAsbmRNCrPxizWAT2Zfyr9y", "Virtuals", "VIRTUAL"),
+    ("0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b", "Virtuals", "VIRTUAL"),
+    ("0x44ff8620b8cA30902395A7bD3F2407e1A091BF73", "Virtuals", "VIRTUAL"),
+    ("0xc6911796042b15d7Fa4F6CDe69e245DdCd3d9c31", "Virtuals", "VIRTUAL"),
+    ("DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", "BONK", "BONK"),
+    ("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN", "Jupiter", "JUP"),
+    ("4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R", "Raydium", "RAY"),
+    ("boopkpWqe68MSxLqBGogs8ZbUDN4GXaLhFwNP7mpP1i", "boop.fun", "BOOP"),
+    ("BAGSB9tFCx3edD8TdjNgq6JCQYFyL6tDv6m2RSHpump", "Bags", "BAGS"),
+    ("7B7wJbWfKPXqzmmaMC1CwqS5BmRwUHY8H6XQZmnJpump", "Clanker", "CLANKER"),
+    ("moonshot1B5AmDwTr5fKMNW1Pg1UvpMZKtsFy4S8TBkCEq", "Moonshot", "MOONSHOT"),
+    ("believeyqL6vxVfXQxMeBFVMFGFPqrcTKw6arjVCUhsMfe", "Believe", "LAUNCHCOIN"),
+    # Newly verified pads (2026-10-02) — the two the user reported.
+    ("BZFYNPeQAEW3HWQ4DNsTVahC1n4ZjTgn6jB2nnBbB96W", "sapling.cash", "SAPLING"),
+    ("C1mBfBoDkwWfd6uTFZp62ARHLjeVp3bDpCDMfMZtPngE", "Hoookedpad", "HOOKED"),
+    # Newly verified pads (2026-10-02 audit) — surfaced by scanning the
+    # candidates DB for high-scoring rows that were silently filtered.
+    # Each address was cross-checked against the pad's own docs/site because
+    # every one of these has same-ticker copycats (see HOOKR below).
+    ("0x18E674231A58c239Dc7DaeDcffE15Ec3A24cff5c", "Hookr.fun", "HOOKR"),
+    ("0x39dBED3a2bd333467115dE45665cC57F813C4571", "Pons", "PONS"),
+    ("0xeCe5cA8bf9220718E5727754026757512212cb3c", "Argus", "ARGUS"),
+    ("0x44B453D355835Ce1269fc11D3FA4161c0DcC0087", "lift.fun", "LIFT"),
+    ("0x22aF33FE49fD1Fa80c7149773dDe5890D3c76F3b", "Bankr", "BNKR"),
+    ("0x178E54df3D091EE4D0B2534742eF9e3692b76526", "Bankr", "BNKR"),
+)
+
+# Lookup index built at import time so a hand-typed address cannot silently die
+# on a case mismatch (this bit us twice — SAPLING and JUP).
+PLATFORM_OWN_TOKEN_ADDRESSES: dict[str, tuple[str, str]] = {
+    address.casefold(): (platform, ticker)
+    for address, platform, ticker in PLATFORM_OWN_TOKEN_RAW
+}
+assert len(PLATFORM_OWN_TOKEN_ADDRESSES) == len(PLATFORM_OWN_TOKEN_RAW), (
+    "PLATFORM_OWN_TOKEN_RAW has addresses that collide once casefolded"
+)
+
+# Description self-declaration markers.  A match only counts when the token's
+# own name/ticker echoes the platform, so "发射台" inside an unrelated blurb
+# does not light up.  Kept narrow on purpose.
+PLATFORM_OWN_TOKEN_DECLARATIONS: tuple[str, ...] = (
+    "代币发射台", "代币发射平台", "发行平台", "启动平台", "发射平台",
+    "发币平台", "平台币", "平台代币", "本平台代币",
+    "platform token", "our token", "the pad's own coin", "launchpad token",
+    "native token of", "buyback and burn", "回购与销毁", "回购并销毁",
+)
+
+PLATFORM_OWN_TOKEN_SPEECH_PREFIX = "重点提醒，台子币，发射平台"
+
+
+# ---------------------------------------------------------------------------
+# Launch-platform OFFICIAL X ACCOUNTS — the trust anchor that makes a pad's
+# token detectable the moment it launches.
+#
+# Why an address-only allow-list is not enough: it can only name tokens that
+# already exist, so a pad's *next* token is invisible until somebody types its
+# address in by hand.  A pad's official account is different — it is stable,
+# there are few of them, and the pad announces its own token there
+# (``solana:BZFY…``).  Watch the account and every token that pad will ever
+# print is discovered automatically, at announcement time.
+#
+# How an account earns a row here: it must have ALREADY published the address
+# we independently verified in ``PLATFORM_OWN_TOKEN_RAW``.  Never guess a
+# handle — a wrong anchor is worse than no anchor, because it promotes an
+# attacker's address to "official".  Re-run
+# ``tools/verify_platform_official_handles.py`` (33 candidates were checked on
+# 2026-10-03; only the four below published the real mint) before adding one.
+# ---------------------------------------------------------------------------
+PLATFORM_OFFICIAL_X_ACCOUNTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    # (platform label — matches PLATFORM_OWN_TOKEN_RAW, verified handle,
+    #  extra brand strings that also count as this pad's own ticker)
+    ("BONK", "bonk_inu", ()),
+    ("sapling.cash", "saplingdotcash", ()),
+    ("Hoookedpad", "Hoookedpad", ()),
+    ("Hookr.fun", "HookrFun", ()),
+)
+
+PLATFORM_OFFICIAL_ACCOUNT_INDEX: dict[str, str] = {
+    handle.casefold(): platform for platform, handle, _extra in PLATFORM_OFFICIAL_X_ACCOUNTS
+}
+PLATFORM_OFFICIAL_ACCOUNT_HANDLES: tuple[str, ...] = tuple(
+    handle for _platform, handle, _extra in PLATFORM_OFFICIAL_X_ACCOUNTS
+)
+
+# address(casefold) -> {platform, handle, statusId, url, text, firstSeenAt, ...}
+PLATFORM_ANNOUNCED_TOKENS: dict[str, dict[str, Any]] = {}
+PLATFORM_ANNOUNCED_TOKENS_LOCK = threading.RLock()
+PLATFORM_ANNOUNCED_TOKENS_LOADED = False
+
+
+def _platform_brand_key(value: Any) -> str:
+    """casefold + strip everything that is not a letter or digit."""
+    return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+
+def platform_brand_tokens(platform: str) -> frozenset[str]:
+    """Every normalized string that counts as ``platform``'s own ticker.
+
+    Built from the verified allow-list (which knows the real ticker even when
+    it differs from the brand, e.g. Believe -> LAUNCHCOIN), the label stem
+    ("sapling.cash" -> "sapling"), and any explicit extra stems.
+    """
+    label = str(platform or "").strip()
+    if not label:
+        return frozenset()
+    keys: set[str] = set()
+    stem = _platform_brand_key(label.split(".")[0])
+    if stem:
+        keys.add(stem)
+    for _address, row_platform, ticker in PLATFORM_OWN_TOKEN_RAW:
+        if row_platform.casefold() == label.casefold():
+            key = _platform_brand_key(ticker)
+            if key:
+                keys.add(key)
+    for row_platform, _handle, extra in PLATFORM_OFFICIAL_X_ACCOUNTS:
+        if row_platform.casefold() == label.casefold():
+            for item in extra:
+                key = _platform_brand_key(item)
+                if key:
+                    keys.add(key)
+    return frozenset(keys)
+
+
+def platform_brand_claim_for_symbol(value: Any) -> str:
+    """Which launch platform's own ticker this symbol is impersonating.
+
+    Exact match after normalization — ``SAPLING`` hits sapling.cash, while
+    ``SAPLINGINU`` does not.  Used only to *label* a knock-off, never to
+    trigger anything.
+    """
+    key = _platform_brand_key(value)
+    if not key:
+        return ""
+    platforms = {label for _a, label, _t in PLATFORM_OWN_TOKEN_RAW}
+    platforms.update(platform for platform, _h, _e in PLATFORM_OFFICIAL_X_ACCOUNTS)
+    for label in sorted(platforms):
+        if key in platform_brand_tokens(label):
+            return label
+    return ""
+
+
+def load_platform_announced_tokens() -> dict[str, dict[str, Any]]:
+    """Hydrate the announced-token index from disk (once per process)."""
+    global PLATFORM_ANNOUNCED_TOKENS_LOADED
+    if PLATFORM_ANNOUNCED_TOKENS_LOADED:
+        return PLATFORM_ANNOUNCED_TOKENS
+    with PLATFORM_ANNOUNCED_TOKENS_LOCK:
+        if PLATFORM_ANNOUNCED_TOKENS_LOADED:
+            return PLATFORM_ANNOUNCED_TOKENS
+        stored = read_json_cache(api_cache_path("platform-announced-tokens"))
+        tokens = stored.get("tokens") if isinstance(stored, dict) else None
+        if isinstance(tokens, dict):
+            for address, meta in tokens.items():
+                key = str(address or "").strip().casefold()
+                if key and isinstance(meta, dict):
+                    PLATFORM_ANNOUNCED_TOKENS[key] = dict(meta)
+        PLATFORM_ANNOUNCED_TOKENS_LOADED = True
+    return PLATFORM_ANNOUNCED_TOKENS
+
+
+def persist_platform_announced_tokens() -> None:
+    with PLATFORM_ANNOUNCED_TOKENS_LOCK:
+        payload = {
+            "version": 1,
+            "updatedAt": int(time.time() * 1000),
+            "tokens": {address: dict(meta) for address, meta in PLATFORM_ANNOUNCED_TOKENS.items()},
+        }
+    write_json_cache(api_cache_path("platform-announced-tokens"), payload)
+
+
+def platform_announced_token_record(
+    address: Any,
+    platform: str,
+    *,
+    handle: str = "",
+    status_id: Any = "",
+    url: str = "",
+    text: str = "",
+) -> bool:
+    """Store one address a verified official account published. True when new."""
+    key = str(address or "").strip().casefold()
+    label = clean_feed_text(platform, 80)
+    if not key or not label:
+        return False
+    load_platform_announced_tokens()
+    now_ms = int(time.time() * 1000)
+    with PLATFORM_ANNOUNCED_TOKENS_LOCK:
+        existing = PLATFORM_ANNOUNCED_TOKENS.get(key)
+        if isinstance(existing, dict):
+            # First publisher wins.  Re-announcing the same mint (by the same
+            # account or another verified one) must not create a second entry,
+            # re-announce it, or re-attribute it to a different platform.
+            existing["lastSeenAt"] = now_ms
+            if text and not existing.get("text"):
+                existing["text"] = clean_feed_text(text, 400)
+            return False
+        PLATFORM_ANNOUNCED_TOKENS[key] = {
+            "platform": label,
+            "handle": clean_feed_text(handle, 60),
+            "statusId": clean_feed_text(status_id, 40),
+            "url": clean_feed_text(url, 600),
+            "text": clean_feed_text(text, 400),
+            "firstSeenAt": now_ms,
+            "lastSeenAt": now_ms,
+        }
+    persist_platform_announced_tokens()
+    return True
+
+
+def platform_announced_addresses_in_text(text: str) -> list[str]:
+    """Contract addresses stated in one announcement, with duplicates removed."""
+    found: list[str] = []
+    seen: set[str] = set()
+    identity = personal_x_onchain_identity_from_text(text)
+    address = str(identity.get("contractAddress") or "").strip()
+    if address:
+        found.append(address)
+        seen.add(address.casefold())
+    for candidate in chat_opportunity_contract_candidates(text):
+        item = str(candidate.get("contractAddress") or "").strip()
+        if item and item.casefold() not in seen:
+            found.append(item)
+            seen.add(item.casefold())
+    return found
+
+
+def platform_announced_token_match(row: dict[str, Any]) -> tuple[str, str]:
+    """``(platform, ticker)`` when a pad itself published this row's address.
+
+    The second gate is the row's OWN symbol: a verified account also tweets
+    about partner and user tokens, so an announced address only counts as the
+    pad's own coin when the symbol is that pad's brand ticker.
+    """
+    if not isinstance(row, dict):
+        return "", ""
+    address = _platform_own_token_address(row)
+    if not address:
+        return "", ""
+    announced = load_platform_announced_tokens().get(address)
+    if not isinstance(announced, dict):
+        return "", ""
+    platform = clean_feed_text(announced.get("platform"), 80)
+    if not platform:
+        return "", ""
+    symbol = clean_feed_text(row.get("symbol") or row.get("name"), 40)
+    if _platform_brand_key(symbol) not in platform_brand_tokens(platform):
+        return "", ""
+    return platform, symbol.upper() or platform
+
+
+def counterfeit_platform_claim_for_row(row: dict[str, Any]) -> str:
+    """The platform a row *impersonates* — empty when the claim is legitimate.
+
+    Fires on a same-ticker knock-off: it wears a pad's ticker but its address
+    is neither the verified mint nor one the pad itself announced.  Label only;
+    callers must never let this change tone, priority or mute policy.
+    """
+    if not isinstance(row, dict):
+        return ""
+    address = _platform_own_token_address(row)
+    if address and address in PLATFORM_OWN_TOKEN_ADDRESSES:
+        return ""
+    if platform_announced_token_match(row)[0]:
+        return ""
+    return platform_brand_claim_for_symbol(row.get("symbol") or row.get("name"))
+
+
+def apply_counterfeit_platform_claim(row: dict[str, Any]) -> dict[str, Any]:
+    """Annotate a board row that impersonates a launch platform. Silent."""
+    if not isinstance(row, dict):
+        return row
+    claimed = counterfeit_platform_claim_for_row(row)
+    if claimed:
+        row["counterfeitPlatformClaim"] = claimed
+        row["counterfeitPlatformLabel"] = f"仿盘·冒充{claimed}"
+    else:
+        row.pop("counterfeitPlatformClaim", None)
+        row.pop("counterfeitPlatformLabel", None)
+    return row
+
+
+def sync_platform_official_announcements(*, per_account_limit: int = 20) -> dict[str, Any]:
+    """Poll each verified official account and record the mints it publishes.
+
+    Run from the site-alert monitor loop.  Every account here already proved it
+    publishes its own pad's mint, so anything it states is authoritative; the
+    per-row symbol gate in ``platform_announced_token_match`` still guards the
+    popup path against partner/user tokens.
+    """
+    load_platform_announced_tokens()
+    discovered: list[dict[str, Any]] = []
+    errors: list[str] = []
+    checked = 0
+    for platform, handle, _extra in PLATFORM_OFFICIAL_X_ACCOUNTS:
+        source = normalize_x_source(
+            {"handle": handle, "displayName": handle, "category": "project_official"}
+        )
+        if not source:
+            errors.append(f"{handle}: source rejected")
+            continue
+        try:
+            payload = x_kol_fetch_fxtwitter_timeline(source)
+        except Exception as exc:  # noqa: BLE001 - a dead mirror must not kill the loop
+            errors.append(f"{handle}: {type(exc).__name__}")
+            continue
+        items = payload.get("items") if isinstance(payload.get("items"), list) else []
+        checked += 1
+        for item in items[: max(1, int(per_account_limit or 20))]:
+            if not isinstance(item, dict):
+                continue
+            text = f"{item.get('text') or ''} {item.get('fullText') or ''}".strip()
+            if not text:
+                continue
+            for address in platform_announced_addresses_in_text(text):
+                is_new = platform_announced_token_record(
+                    address,
+                    platform,
+                    handle=handle,
+                    status_id=item.get("tweetId") or item.get("statusId") or "",
+                    url=item.get("url") or "",
+                    text=text,
+                )
+                if is_new:
+                    discovered.append(
+                        {
+                            "platform": platform,
+                            "handle": handle,
+                            "address": address,
+                            "statusId": item.get("tweetId") or "",
+                            "url": item.get("url") or "",
+                        }
+                    )
+    return {
+        "ok": checked > 0,
+        "accounts": len(PLATFORM_OFFICIAL_X_ACCOUNTS),
+        "accountsChecked": checked,
+        "known": len(PLATFORM_ANNOUNCED_TOKENS),
+        "discovered": discovered,
+        "errors": errors,
+    }
+
+
+def attach_counterfeit_platform_labels(payload: dict[str, Any]) -> dict[str, Any]:
+    """Overlay the knock-off label on board rows without mutating caches.
+
+    Label only.  It deliberately does not touch ``platformOwnToken``: the red
+    popup is decided at the alert entry points, and a list overlay must never
+    be able to un-mute an alert.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    load_platform_announced_tokens()
+    result = dict(payload)
+    for field in ("items", "rows", "summaryRows"):
+        original = payload.get(field)
+        if not isinstance(original, list):
+            continue
+        annotated: list[dict[str, Any]] = []
+        for raw in original:
+            if not isinstance(raw, dict):
+                continue
+            row = dict(raw)
+            apply_counterfeit_platform_claim(row)
+            annotated.append(row)
+        result[field] = annotated
+    return result
+
+
+PLATFORM_ANNOUNCEMENT_SYNC_INTERVAL_SECONDS = max(
+    60.0, float(os.getenv("PLATFORM_ANNOUNCEMENT_SYNC_INTERVAL_SECONDS", "600") or 600)
+)
+PLATFORM_ANNOUNCEMENT_SYNC_LOCK = threading.Lock()
+PLATFORM_ANNOUNCEMENT_SYNC_LAST: dict[str, float] = {"at": 0.0}
+
+
+def ensure_platform_official_announcements(*, force: bool = False) -> dict[str, Any]:
+    """Throttled poll of the verified official accounts (call from maintenance).
+
+    One poll per ``PLATFORM_ANNOUNCEMENT_SYNC_INTERVAL_SECONDS``; a slow mirror
+    can never make this overlap, and a failure is swallowed so the 24/7 monitor
+    keeps running.
+    """
+    now = time.monotonic()
+    elapsed = now - float(PLATFORM_ANNOUNCEMENT_SYNC_LAST.get("at") or 0.0)
+    if not force and elapsed < PLATFORM_ANNOUNCEMENT_SYNC_INTERVAL_SECONDS:
+        return {"ok": True, "skipped": True, "known": len(PLATFORM_ANNOUNCED_TOKENS)}
+    if not PLATFORM_ANNOUNCEMENT_SYNC_LOCK.acquire(blocking=False):
+        return {"ok": True, "skipped": True, "reason": "in-flight"}
+    try:
+        result = sync_platform_official_announcements()
+        PLATFORM_ANNOUNCEMENT_SYNC_LAST["at"] = time.monotonic()
+        for item in result.get("discovered") or []:
+            print(
+                f"Platform announcement auto-registered: {item.get('platform')} "
+                f"{item.get('address')} via @{item.get('handle')}",
+                file=sys.stderr,
+            )
+        return result
+    except Exception as exc:  # noqa: BLE001 - maintenance must never die
+        PLATFORM_ANNOUNCEMENT_SYNC_LAST["at"] = time.monotonic()
+        print(
+            f"Platform announcement sync failed: {safe_error_text(str(exc))}",
+            file=sys.stderr,
+        )
+        return {"ok": False, "error": str(exc)}
+    finally:
+        PLATFORM_ANNOUNCEMENT_SYNC_LOCK.release()
+
+
+def _platform_own_token_address(row: dict[str, Any]) -> str:
+    """Pull the contract address from any of the shapes a row may use."""
+    if not isinstance(row, dict):
+        return ""
+    for key in ("contractAddress", "contract", "address", "tokenAddress", "mint"):
+        text = str(row.get(key) or "").strip()
+        if text:
+            return text.casefold()
+    for key in ("launchFacts", "token"):
+        value = row.get(key)
+        if isinstance(value, dict):
+            text = str(value.get("contractAddress") or value.get("address") or "").strip()
+            if text:
+                return text.casefold()
+    return ""
+
+
+def platform_own_token_for_row(row: dict[str, Any]) -> tuple[str, str]:
+    """Return ``(platform, ticker)`` when the row IS a launchpad's own token.
+
+    Returns ``("", "")`` for ordinary coins *and* for copycats that merely reuse
+    a platform's ticker.  Address allow-list wins; then an address the pad's own
+    verified account announced; a self-declaring description is the last resort
+    for pads not yet listed.
+    """
+    if not isinstance(row, dict):
+        return "", ""
+    address = _platform_own_token_address(row)
+    if address in PLATFORM_OWN_TOKEN_ADDRESSES:
+        return PLATFORM_OWN_TOKEN_ADDRESSES[address]
+
+    # Second hop: an address a *verified* official account published itself.
+    # A brand-new pad token therefore lands here the moment it appears on any
+    # board — no human has to type its address in first.  The row's own symbol
+    # must match the pad's brand ticker, so a partner token the pad also tweets
+    # about cannot ride along.
+    announced_platform, announced_ticker = platform_announced_token_match(row)
+    if announced_platform:
+        return announced_platform, announced_ticker
+
+    # Fallback: the description explicitly says this coin *is* a launch platform
+    # token.  Require both a declaration marker and some platform-ish noun so a
+    # plain memecoin blurb cannot trip it.
+    haystack = row_free_text_haystack(row)
+    if not haystack:
+        return "", ""
+    for marker in PLATFORM_OWN_TOKEN_DECLARATIONS:
+        if marker.casefold() in haystack:
+            ticker = clean_feed_text(row.get("symbol") or row.get("name"), 24).upper()
+            return ("自述平台币", ticker or "PLATFORM")
+    return "", ""
+
+
+def apply_platform_own_token_tone(event: dict[str, Any], platform: str, ticker: str) -> dict[str, Any]:
+    """Red priority popup for a platform's own token ("台子币")."""
+    if not isinstance(event, dict) or not platform:
+        return event
+    event["platformOwnToken"] = True
+    event["launchpadPlatform"] = platform
+    event["alertTone"] = "red"
+    event["queuePriority"] = max(
+        int(safe_float(event.get("queuePriority"), 0)), DESKTOP_ALERT_CRITICAL_PRIORITY + 40
+    )
+    title = clean_feed_text(event.get("title"), 200)
+    if title and not title.startswith("台子币"):
+        event["title"] = f"台子币｜{title}"
+    event["priority"] = f"台子币重点（{platform}）"
+    kind = clean_feed_text(event.get("kind"), 60)
+    if kind and "台子币" not in kind:
+        event["kind"] = f"{kind}·台子币"
+    symbol = clean_feed_text(event.get("symbol") or ticker, 24)
+    speech = (
+        f"{PLATFORM_OWN_TOKEN_SPEECH_PREFIX} {platform} 的平台币 "
+        f"{symbol or ticker} 出现，注意这是发射台本家币。"
+    )
+    opening = clean_feed_text(event.get("speech"), 120)
+    event["speech"] = f"{speech}{opening}" if opening else speech
+    event["sound"] = True
+    return event
+
+
+# ---------------------------------------------------------------------------
+# "project" candidate marker.
+#
+# Distinct from the launchpad detectors above: those answer "is this token a
+# launch platform / did it launch FROM a platform".  This one answers a simpler
+# question the user asked for — *is this a project (a real team/platform) rather
+# than a plain meme?* — and only tags the popup, it never changes whether the
+# popup fires.  A project that lands on the Binance-wallet 4h hot board or the
+# GMGN 5-minute hot-search board keeps its original trigger; it just carries a
+# 「项目｜」 prefix and a project priority label so the user can tell at a glance.
+#
+# The signal is the upstream ``candidateType`` field, whose only two values in
+# the local dataset are ``project`` and ``meme``.
+# ---------------------------------------------------------------------------
+PROJECT_CANDIDATE_TYPE = "project"
+PROJECT_TITLE_PREFIX = "项目｜"
+
+
+def project_candidate_for_row(row: dict[str, Any]) -> bool:
+    """True when the row is classified as a ``project`` candidate.
+
+    Reads ``candidateType`` / ``candidate_type`` from the row itself, from a
+    nested ``launchFacts`` / ``token`` dict, or from a few common aliases.
+    Anything that is not exactly ``project`` (e.g. ``meme``, empty) is False.
+    """
+    if not isinstance(row, dict):
+        return False
+    for key in ("candidateType", "candidate_type"):
+        value = clean_feed_text(row.get(key), 30).casefold()
+        if value:
+            return value == PROJECT_CANDIDATE_TYPE
+    for key in ("launchFacts", "token"):
+        value = row.get(key)
+        if isinstance(value, dict):
+            nested = clean_feed_text(value.get("candidateType") or value.get("candidate_type"), 30).casefold()
+            if nested:
+                return nested == PROJECT_CANDIDATE_TYPE
+    return False
+
+
+def apply_project_candidate_tone(event: dict[str, Any]) -> dict[str, Any]:
+    """Tag an existing popup as a ``project`` finding — never changes the trigger.
+
+    Only prefixes the title and sets a project priority label; the popup's
+    alertTone, queuePriority and speech are left exactly as they were, so this
+    never upgrades (or downgrades) an existing alert.
+    """
+    if not isinstance(event, dict):
+        return event
+    event["projectCandidate"] = True
+    title = clean_feed_text(event.get("title"), 200)
+    if title and not title.startswith(PROJECT_TITLE_PREFIX.rstrip("｜")):
+        event["title"] = f"{PROJECT_TITLE_PREFIX}{title}"
+    priority = clean_feed_text(event.get("priority"), 40)
+    if "项目" not in priority:
+        event["priority"] = f"项目重点（{priority}）" if priority else "项目重点"
+    return event
+
+
+
+# Launchpad / token-launch-platform recognition.
+#
+# The ONLY accepted signal is the native GMGN ``launchpad`` field (raw
+# ``launchpad_platform``): a lowercase platform id such as ``fourmeme`` /
+# ``pumpfun`` / ``argus``.  A non-empty value means the token graduated off that
+# launch platform — an exact upstream fact.
+#
+# A free-text fallback used to scan the symbol/name/description for a platform
+# brand, for boards that omit ``launchpad`` (e.g. the GMGN 5-minute hot-search
+# board).  It was removed (2026-10-03) because it was pure noise: every launch
+# alert it ever produced was a false positive.  Memecoins routinely name-drop a
+# platform ("PUMPFUN ARMY", "LIBRARY"), so a brand word in a token's name or
+# blurb is a narrative choice, never proof of provenance.  A launch platform is
+# a *fact* about where a token was issued, and only a structured field can state
+# it.  Keep this rule strict: guessing here paints ordinary memecoins red.
+
+
+def row_free_text_haystack(row: dict[str, Any]) -> str:
+    """Lowercased free-text blob for *self-declaration* checks only.
+
+    Used by ``platform_own_token_for_row`` to catch a pad's own token that
+    explicitly says so in its blurb.  It must never be used to infer launch
+    provenance — see the note above.
+    """
+    if not isinstance(row, dict):
+        return ""
+    parts: list[str] = []
+    for key in ("symbol", "name", "description", "summary", "note", "source", "sourceTitle"):
+        value = row.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+    for key in ("tags", "narrativeLabels", "providers"):
+        value = row.get(key)
+        if isinstance(value, list):
+            parts.extend(str(item) for item in value if item)
+        elif isinstance(value, str):
+            parts.append(value)
+    for key in ("launchFacts", "narrativeContext", "filterSignals"):
+        value = row.get(key)
+        if isinstance(value, dict):
+            parts.extend(str(item) for item in value.values() if isinstance(item, (str, int, float)))
+    return " ".join(parts).casefold()
+
+
+def launchpad_platform_label(value: Any) -> str:
+    """Normalize a raw platform id/name into a display label."""
+    text = clean_feed_text(value, 80)
+    if not text:
+        return ""
+    compact = re.sub(r"[\s_\-]+", "", text).casefold()
+    display = {
+        "pumpfun": "pump.fun",
+        "fourmeme": "four.meme",
+        "bonkfun": "bonk.fun",
+        "letsbonk": "LetsBonk",
+        "believe": "Believe",
+        "bags": "Bags",
+        "jupstudio": "Jupiter Studio",
+        "moonshot": "Moonshot",
+        "meteoradammv2": "Meteora DAMM",
+        "meteoradamm": "Meteora DAMM",
+        "meteoravirtualcurve": "Meteora 虚拟曲线",
+        "raylaunchpad": "Raydium Launchpad",
+        "virtuals": "Virtuals",
+        "longxyz": "long.xyz",
+        "bankr": "Bankr",
+        "argus": "Argus",
+        "pons": "Pons",
+        "flap": "Flap",
+        "heaven": "Heaven",
+        "boop": "Boop",
+        "clanker": "Clanker",
+    }.get(compact)
+    return display or text
+
+
+def launchpad_platform_for_row(row: dict[str, Any]) -> str:
+    """Detect the launch platform a token graduated from, using exact facts only.
+
+    Returns a display label such as ``four.meme`` when the row carries a native
+    GMGN ``launchpad`` value (or the equivalent inside ``launchFacts``), and an
+    empty string otherwise.  Free text is deliberately *not* consulted: a token
+    whose name mentions a platform is still just a memecoin.
+    """
+    if not isinstance(row, dict):
+        return ""
+    for key in ("launchpad", "launchpadPlatform", "launchpad_platform", "launchPlatform"):
+        label = launchpad_platform_label(row.get(key))
+        if label:
+            return label
+    facts = row.get("launchFacts")
+    if isinstance(facts, dict):
+        label = launchpad_platform_label(facts.get("launchpad") or facts.get("launchpadPlatform"))
+        if label:
+            return label
+    return ""
+
+
+def launchpad_platform_for_snapshot(row: dict[str, Any]) -> str:
+    """Detect a launch platform on a rank-monitor snapshot row.
+
+    Only the snapshot's structured fields are trusted.  Rank snapshots carry the
+    native GMGN ``launchpad`` value when the board provides it; the hot-search
+    board does not, and the symbol/name/summary must NOT be re-scanned for a
+    platform brand (that is how "PUMPFUN ARMY" got painted red).
+    """
+    if not isinstance(row, dict):
+        return ""
+    return launchpad_platform_for_row(row)
+
+
+# ``apply_launchpad_alert_tone`` was removed (2026-10-03): the "发射台项目"
+# red alert is gone.  A coin coming off a launchpad is the norm, not news —
+# the only red launchpad-related alert left is the pad's OWN token ("台子币"),
+# applied by ``apply_platform_own_token_tone``.
 
 
 def gmgn_hot_rank_source(item: dict[str, Any]) -> bool:
@@ -22811,6 +24076,13 @@ def desktop_alert_source_is_muted(item: dict[str, Any]) -> bool:
         and re.search(r"(?:新进|new\s+entry)", f"{kind} {title}", re.I)
     ):
         return False
+    # A platform's OWN token ("台子币") is the strongest red reminder we emit;
+    # never let any board-level mute swallow it.
+    if item.get("platformOwnToken"):
+        return False
+    # NOTE: the old "发射台项目" (alertTone==red + launchpadPlatform) bypass was
+    # removed on 2026-10-03 together with that alert.  ``launchpadPlatform`` may
+    # still ride along as plain data, so it must never re-open a mute on its own.
     # Keep the exact GMGN source fully quiet for compatibility with already
     # queued legacy events. Alias sources are muted for hot-board entries below.
     if source_id in RANK_BROADCAST_MUTED_SOURCE_IDS or gmgn_hot_rank_source(item):
@@ -22887,7 +24159,7 @@ def desktop_alert_source_is_muted(item: dict[str, Any]) -> bool:
                     and not (latest.get("window") or {}).get("eligible")):
                 return True
         return False
-    if (key.startswith(("newboard:", "listing:", "aster-contract:", "first-listing:"))
+    if (key.startswith(("newboard:", "listing:", "aster-contract:", "first-listing:", "venue-listing:"))
             and ("新币" in kind or "交易所上新" in kind or key.startswith("aster-contract:"))):
         return (item.get("listingPolicyVersion") != 1
                 or safe_float(item.get("expiresAt")) <= time.time() * 1000)
@@ -24334,10 +25606,18 @@ def personal_x_onchain_identity_from_text(value: Any) -> dict[str, str]:
     """Extract an explicit chain/contract identity without guessing from a ticker."""
     text = str(value or "")
     lower = text.casefold()
-    evm_match = re.search(r"0x[0-9a-fA-F]{40}", text)
+    # The trailing guard matters: a 64-hex transaction hash starts with
+    # "0x" and contains a 40-hex prefix, so without it the prefix of every
+    # tx hash was being read back as a contract address.
+    evm_match = re.search(r"(?<![0-9a-fA-F])0x[0-9a-fA-F]{40}(?![0-9a-fA-F])", text)
     solana_match = re.search(
         r"(?:pump\.fun/(?:coin/)?|gmgn\.ai/(?:sol|solana)/token/|"
-        r"dexscreener\.com/(?:solana|sol)/|(?:\bca\b|合约地址|contract(?:\s+address)?)[：:\s]+)"
+        r"dexscreener\.com/(?:solana|sol)/|"
+        # Chain-prefixed notation, e.g. "solana:<mint>" / "SOL: <mint>".
+        # Launch platforms publish their own token this way ("solana:BZFY…"),
+        # and it is the single most explicit form there is, so accept it.
+        r"(?<![0-9a-z])(?:sol|solana)\s*[:：]\s*|"
+        r"(?:\bca\b|合约地址|contract(?:\s+address)?)[：:\s]+)"
         r"([1-9A-HJ-NP-Za-km-z]{32,64})",
         text,
         flags=re.I,
@@ -25050,6 +26330,7 @@ def sync_price_watch_aicoin_candidates() -> int:
               AND ave_hot_last_seen_at < ?
               AND gainers_first_seen_at = 0
               AND aicoin_last_seen_at < ?
+              AND gmgn_hot_search_last_seen_at < ?
             """,
             (
                 now_ms - PERSONAL_X_MONITOR_RETENTION_SECONDS * 1000,
@@ -25057,6 +26338,7 @@ def sync_price_watch_aicoin_candidates() -> int:
                 now_ms - BINANCE_WALLET_4H_STRUCTURE_RETENTION_SECONDS * 1000,
                 now_ms - PRICE_WATCH_RETENTION_SECONDS * 1000,
                 now_ms - PRICE_WATCH_RETENTION_SECONDS * 1000,
+                now_ms - GMGN_HOT_SEARCH_POOL_RETENTION_SECONDS * 1000,
             ),
         )
         conn.execute(
@@ -25318,11 +26600,13 @@ def sync_price_watch_binance_wallet_candidates(
             "chain": clean_feed_text(raw_row.get("chain"), 40),
             "chainLabel": clean_feed_text(raw_row.get("chainLabel"), 40),
             "contractAddress": clean_feed_text(raw_row.get("contractAddress"), 180),
+            "launchpadPlatform": launchpad_platform_for_snapshot(raw_row),
         })
     candidates = list(price_structure_wallet_rows_by_symbol(candidates).values())
     if not candidates:
         return 0
     with AUTH_DB_LOCK, auth_db() as conn:
+        ensure_price_watch_asset_columns(conn)
         for item in candidates:
             conn.execute(
                 """
@@ -25331,8 +26615,9 @@ def sync_price_watch_binance_wallet_candidates(
                     binance_wallet_hot_first_seen_at, binance_wallet_hot_last_seen_at,
                     binance_wallet_hot_rank,
                     onchain_chain, onchain_chain_label, onchain_contract_address,
+                    launchpad_platform, launchpad_platform_observed_at,
                     status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                 ON CONFLICT(symbol) DO UPDATE SET
                     name = CASE WHEN excluded.name != '' THEN excluded.name ELSE price_watch_assets.name END,
                     icon = CASE WHEN excluded.icon != '' THEN excluded.icon ELSE price_watch_assets.icon END,
@@ -25350,12 +26635,16 @@ def sync_price_watch_binance_wallet_candidates(
                     onchain_chain = CASE WHEN excluded.onchain_chain != '' THEN excluded.onchain_chain ELSE price_watch_assets.onchain_chain END,
                     onchain_chain_label = CASE WHEN excluded.onchain_chain_label != '' THEN excluded.onchain_chain_label ELSE price_watch_assets.onchain_chain_label END,
                     onchain_contract_address = CASE WHEN excluded.onchain_contract_address != '' THEN excluded.onchain_contract_address ELSE price_watch_assets.onchain_contract_address END,
+                    launchpad_platform = CASE WHEN excluded.launchpad_platform != '' THEN excluded.launchpad_platform ELSE price_watch_assets.launchpad_platform END,
+                    launchpad_platform_observed_at = CASE WHEN excluded.launchpad_platform != '' THEN excluded.launchpad_platform_observed_at ELSE price_watch_assets.launchpad_platform_observed_at END,
                     updated_at = excluded.updated_at
                 """,
                 (
                     item["symbol"], item["name"], item["icon"], item["pairHint"],
                     item["firstSeenAt"], item["lastSeenAt"], item["rank"],
                     item["chain"], item["chainLabel"], item["contractAddress"],
+                    item.get("launchpadPlatform") or "",
+                    now_value if item.get("launchpadPlatform") else 0,
                     now_value, now_value,
                 ),
             )
@@ -25410,10 +26699,12 @@ def sync_price_watch_gmgn_hot_search_candidates(
             "chain": chain,
             "chainLabel": clean_feed_text(raw_row.get("chainLabel"), 40),
             "contractAddress": contract,
+            "launchpadPlatform": launchpad_platform_for_snapshot(raw_row),
         })
     if not candidates:
         return 0
     with AUTH_DB_LOCK, auth_db() as conn:
+        ensure_price_watch_asset_columns(conn)
         for item in candidates:
             conn.execute(
                 """
@@ -25422,8 +26713,9 @@ def sync_price_watch_gmgn_hot_search_candidates(
                     gmgn_hot_search_first_seen_at, gmgn_hot_search_last_seen_at,
                     gmgn_hot_search_rank,
                     onchain_chain, onchain_chain_label, onchain_contract_address,
+                    launchpad_platform, launchpad_platform_observed_at,
                     status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                 ON CONFLICT(symbol) DO UPDATE SET
                     name = CASE WHEN excluded.name != '' THEN excluded.name ELSE price_watch_assets.name END,
                     icon = CASE WHEN excluded.icon != '' THEN excluded.icon ELSE price_watch_assets.icon END,
@@ -25441,12 +26733,16 @@ def sync_price_watch_gmgn_hot_search_candidates(
                     onchain_chain = CASE WHEN excluded.onchain_chain != '' THEN excluded.onchain_chain ELSE price_watch_assets.onchain_chain END,
                     onchain_chain_label = CASE WHEN excluded.onchain_chain_label != '' THEN excluded.onchain_chain_label ELSE price_watch_assets.onchain_chain_label END,
                     onchain_contract_address = CASE WHEN excluded.onchain_contract_address != '' THEN excluded.onchain_contract_address ELSE price_watch_assets.onchain_contract_address END,
+                    launchpad_platform = CASE WHEN excluded.launchpad_platform != '' THEN excluded.launchpad_platform ELSE price_watch_assets.launchpad_platform END,
+                    launchpad_platform_observed_at = CASE WHEN excluded.launchpad_platform != '' THEN excluded.launchpad_platform_observed_at ELSE price_watch_assets.launchpad_platform_observed_at END,
                     updated_at = excluded.updated_at
                 """,
                 (
                     item["symbol"], item["name"], item["icon"], item["pairHint"],
                     item["firstSeenAt"], item["lastSeenAt"], item["rank"],
                     item["chain"], item["chainLabel"], item["contractAddress"],
+                    item.get("launchpadPlatform") or "",
+                    now_value if item.get("launchpadPlatform") else 0,
                     now_value, now_value,
                 ),
             )
@@ -26501,6 +27797,13 @@ def price_watch_active_rows(
     now_ms = int(time.time() * 1000)
     cutoff_ms = now_ms - PRICE_WATCH_RETENTION_SECONDS * 1000
     gainers_cutoff_ms = now_ms - GAINERS_MONITOR_PROMOTION_SECONDS * 1000
+    # A GMGN 5m hot-search entry is a short probation, not 30-day membership: it
+    # earns a lasting slot only by graduating to a stronger feed (the Binance
+    # Wallet 4h hot ranking keeps its own 30-day window via ``cutoff_ms``), so
+    # this clause uses the shorter window.  The clock follows the latest GMGN
+    # appearance, so re-entering the board refreshes it and a dropped token can
+    # come back.
+    gmgn_cutoff_ms = now_ms - GMGN_HOT_SEARCH_POOL_RETENTION_SECONDS * 1000
     # The live quote loop is latency-sensitive. SQLite already coordinates its
     # read with writers, so it must not sit behind unrelated application work
     # waiting for the broad in-process auth/database mutex.
@@ -26574,7 +27877,7 @@ def price_watch_active_rows(
                 cutoff_ms, cutoff_ms,
                 cutoff_ms, now_ms,
                 cutoff_ms, now_ms,
-                cutoff_ms, now_ms,
+                gmgn_cutoff_ms, now_ms,
                 gainers_cutoff_ms, now_ms,
                 cutoff_ms, cutoff_ms,
             ),
@@ -30748,6 +32051,7 @@ def fetch_price_structure_item(
                 "name": row.get("name") or symbol,
                 "icon": row.get("icon") or crypto_icon_url(symbol),
                 "monitorPool": row.get("monitorPool") or "",
+                "launchpadPlatform": clean_feed_text(row.get("launchpad_platform"), 80),
                 "monitorPoolEnteredAt": int(safe_float(row.get("monitorPoolEnteredAt"), 0)),
                 "structureMembershipSources": row.get("structureMembershipSources") if isinstance(row.get("structureMembershipSources"), list) else [],
                 "marketActivity": row.get("marketActivity") if isinstance(row.get("marketActivity"), dict) else {},
@@ -31505,6 +32809,9 @@ def price_structure_prearm_candidates(now_ms: int | None = None) -> list[dict[st
                 "chain": clean_feed_text(item.get("chain"), 40),
                 "contractAddress": clean_feed_text(item.get("contractAddress"), 180),
                 "monitorPool": item.get("monitorPool") or "",
+                "launchpadPlatform": clean_feed_text(
+                    item.get("launchpadPlatform") or launchpad_platform_for_row(item), 80
+                ),
                 "structureMembershipSources": item.get("structureMembershipSources") if isinstance(item.get("structureMembershipSources"), list) else [],
                 "newCoinSource": item.get("newCoinSource") or "",
                 "newCoinSources": item.get("newCoinSources") if isinstance(item.get("newCoinSources"), list) else [],
@@ -31790,7 +33097,7 @@ def launch_price_structure_prearm_alert(
         candidate,
         quote.get("provider") or candidate.get("provider"),
     )
-    return launch_desktop_alert({
+    event = {
         "key": (
             f"price-watch:dragon-wave-secondary-prearm:{symbol}:{candidate.get('id')}"
             if secondary_prearm
@@ -31827,7 +33134,20 @@ def launch_price_structure_prearm_alert(
         ),
         "sound": "urgent",
         "queuePriority": DESKTOP_ALERT_TRADING_PREARM_PRIORITY,
-    })
+    }
+    # 台子币（发射平台本家代币）报红：这是真正稀有的信号，命中即报红并直接返回。
+    #
+    # 「发射台」（币从哪个发射台发出来）**不再报红**（2026-10-03 用户拍板）：
+    # 战壕榜 300/300 行都带原生 launchpad，报红等于「每个新币都红」，零区分度。
+    own_platform, own_ticker = platform_own_token_for_row(candidate)
+    if own_platform:
+        apply_platform_own_token_tone(event, own_platform, own_ticker)
+        return launch_desktop_alert(event)
+    if project_candidate_for_row(candidate):
+        # A project in the pre-arm path keeps its trading-prearm trigger but is
+        # tagged so it reads differently from a plain meme setup.
+        apply_project_candidate_tone(event)
+    return launch_desktop_alert(event)
 
 
 def price_structure_prearm_monitor_once() -> dict[str, Any]:
@@ -37054,7 +38374,11 @@ def chat_opportunity_contract_candidates(value: Any) -> list[dict[str, str]]:
             addresses.append(address)
     solana_pattern = re.compile(
         r"(?:pump\.fun/(?:coin/)?|gmgn\.ai/(?:sol|solana)/token/|"
-        r"dexscreener\.com/(?:solana|sol)/|(?:\bca\b|合约地址|contract(?:\s+address)?)[：:\s#-]+)"
+        r"dexscreener\.com/(?:solana|sol)/|"
+        # Chain-prefixed notation, e.g. "solana:<mint>" / "SOL: <mint>".
+        # Launch platforms publish their own token this way ("solana:BZFY…").
+        r"(?<![0-9a-z])(?:sol|solana)\s*[:：]\s*|"
+        r"(?:\bca\b|合约地址|contract(?:\s+address)?)[：:\s#-]+)"
         r"([1-9A-HJ-NP-Za-km-z]{32,64})",
         flags=re.I,
     )
@@ -42104,6 +43428,18 @@ def first_listing_additional_inventories() -> list[dict[str, Any]]:
     return [future.result() for future in futures]
 
 
+# 按所独立的新合约提醒（用户指定：币安 + OKX）。这些所自家新币榜对它自己就是权威：
+# 只要榜上出现近期上架的新合约就弹窗，不参与跨市场"全球首发"判定
+# （全球首发判定要求该币在所有已接入现货/合约市场都查不到，见 listing_alerts.py）。
+VENUE_LISTING_SOURCES = ("binance-new", "okx-new")
+VENUE_LISTING_LABELS = {"binance-new": "币安", "okx-new": "OKX"}
+
+
+def venue_listing_prefix(venue_name: str) -> str:
+    """中英混排时在拉丁字母与「新合约」之间补一个空格（OKX 新合约 / 币安新合约）。"""
+    return f"{venue_name} " if venue_name and venue_name.isascii() else venue_name
+
+
 def parse_site_newboard_events(payload: dict[str, Any], *, track_listings: bool = False) -> list[dict[str, Any]]:
     sections = payload.get("sections") if isinstance(payload.get("sections"), list) else []
     now_ms = int(safe_float(payload.get("updatedAt"))) or int(time.time() * 1000)
@@ -42113,9 +43449,14 @@ def parse_site_newboard_events(payload: dict[str, Any], *, track_listings: bool 
         if track_listings:
             state, proofs = observe_listings(state, [*sections, *extra_sources], now_ms=now_ms,
                 historical=read_json_cache(NEW_COIN_LOW_LISTING_HISTORY_PATH).get("items") or [])
+            # Run after observe_listings: that call rebuilds the state dict and now
+            # preserves unknown keys, so the per-venue proofs survive the round trip.
+            state, venue_proofs = observe_venue_listings(
+                state, sections, venue_ids=VENUE_LISTING_SOURCES, now_ms=now_ms)
             write_json_cache(FIRST_LISTING_ALERT_STATE_PATH, state)
         else:
             proofs = state.get("proofs") or {}
+            venue_proofs = state.get("venueProofs") or {}
     events: list[dict[str, Any]] = []
     for section in sections:
         rows = section.get("rows") if isinstance(section.get("rows"), list) else []
@@ -42124,11 +43465,21 @@ def parse_site_newboard_events(payload: dict[str, Any], *, track_listings: bool 
             heat = site_heat_info(row, rank)
             symbol = row.get("symbol") or row.get("asset") or row.get("title") or row.get("name") or "新标的"
             section_title = section.get("title") or "新币新股"
+            section_id = str(section.get("id") or "")
             section_text = f"{section.get('id') or ''} {section.get('title') or ''} {section.get('group') or ''}".lower()
             is_stock = any(keyword in section_text for keyword in ("stock", "ipo", "新股", "港股", "美股", "a股"))
-            proof = proofs.get(listing_asset_key(row.get("asset") or row.get("symbol"))) or {}
+            asset_key_text = listing_asset_key(row.get("asset") or row.get("symbol"))
+            global_proof = proofs.get(asset_key_text) or {}
+            venue_proof = (venue_proofs.get(f"{section_id}:{asset_key_text}")
+                           if section_id in VENUE_LISTING_SOURCES else None)
+            # 本所自己持有 global proof 时沿用它（key 与语义都不变）；否则币安/OKX 走
+            # 按所独立的 venue proof —— 关键是绝不能让「别所持有的 global proof」把
+            # 币安/OKX 的弹窗重新压掉，那正是本次要根除的失效模式。
+            proof = (global_proof if global_proof.get("sourceId") == section_id
+                     else venue_proof or global_proof)
+            venue_label = VENUE_LISTING_LABELS.get(section_id, "") if section_id in VENUE_LISTING_SOURCES else ""
             if not is_stock and (row.get("assetType") == "tradfi" or not proof
-                    or proof.get("sourceId") != section.get("id") or now_ms >= proof.get("expiresAt", 0)):
+                    or proof.get("sourceId") != section_id or now_ms >= proof.get("expiresAt", 0)):
                 continue
             speech_subject = "新股上市" if is_stock else "新币上新"
             body_parts = [
@@ -42137,24 +43488,41 @@ def parse_site_newboard_events(payload: dict[str, Any], *, track_listings: bool 
                 row.get("turnover") or row.get("metric"),
                 f"综合热度 {heat['score']}" if heat.get("high") else "",
             ]
-            events.append(
-                {
-                    "key": proof.get("key") if not is_stock else js_stable_key("newboard", section.get("id"), row.get("id"), symbol, row.get("date"), row.get("url")),
-                    "listingPolicyVersion": 1 if not is_stock else 0,
-                    "expiresAt": proof.get("expiresAt", 0) if not is_stock else 0,
-                    "sourceScope": clean_feed_text(section.get("id"), 60),
-                    "kind": "新币新股高热" if heat.get("high") else ("新股上市" if is_stock else "新币上新"),
-                    "source": row.get("source") or section.get("sourceName") or section.get("title") or "新币新股榜",
-                    "sourceLabel": row.get("sourceLabel") or section.get("sourceLabel") or "NEW",
-                    "title": f"高热提醒：{section.get('title') or '新币新股'} {symbol}" if heat.get("high") else f"{section.get('title') or '新币新股'} {symbol}",
-                    "body": alert_body_join(*body_parts),
-                    "url": row.get("url") or "./newboards.html",
-                    "time": row.get("date") or payload.get("updatedAt") or int(time.time() * 1000),
-                    "priority": "高热重点" if heat.get("high") else ("新股上市" if is_stock else "新币上新"),
-                    "speech": f"{speech_subject}提醒，{symbol}。{section_title}。",
-                    "queuePriority": 90 if heat.get("high") else 80,
-                }
-            )
+            event = {
+                "key": proof.get("key") if not is_stock else js_stable_key("newboard", section.get("id"), row.get("id"), symbol, row.get("date"), row.get("url")),
+                "listingPolicyVersion": 1 if not is_stock else 0,
+                "expiresAt": proof.get("expiresAt", 0) if not is_stock else 0,
+                "sourceScope": clean_feed_text(section.get("id"), 60),
+                "kind": "新币新股高热" if heat.get("high") else ("新股上市" if is_stock else "新币上新"),
+                "source": row.get("source") or section.get("sourceName") or section.get("title") or "新币新股榜",
+                "sourceLabel": row.get("sourceLabel") or section.get("sourceLabel") or "NEW",
+                "title": f"高热提醒：{section.get('title') or '新币新股'} {symbol}" if heat.get("high") else f"{section.get('title') or '新币新股'} {symbol}",
+                "body": alert_body_join(*body_parts),
+                "url": row.get("url") or "./newboards.html",
+                "time": row.get("date") or payload.get("updatedAt") or int(time.time() * 1000),
+                "priority": "高热重点" if heat.get("high") else ("新股上市" if is_stock else "新币上新"),
+                "speech": f"{speech_subject}提醒，{symbol}。{section_title}。",
+                "queuePriority": 90 if heat.get("high") else 80,
+            }
+            if venue_label:
+                # 文案区分为"某所新合约"，避免与"全球首发"混为一谈。
+                venue_asset = clean_feed_text(row.get("asset") or symbol, 24)
+                prefix = venue_listing_prefix(venue_label)
+                venue_title = f"{prefix}新合约｜{venue_asset}"
+                event["title"] = f"高热提醒：{venue_title}" if heat.get("high") else venue_title
+                event["speech"] = f"{prefix}新合约提醒，{venue_asset}。{section_title}。"
+                event["venueListing"] = venue_label
+            # 新币榜上的台子币（发射平台本家代币）报红——这是真正稀有的信号。
+            # 「发射台」（币从哪个发射台发出来）不再报红：新币榜上几乎每一行都带
+            # 原生 launchpad，报红等于把整张榜涂红（2026-10-03 用户拍板取消）。
+            own_platform, own_ticker = platform_own_token_for_row(row)
+            if own_platform and not is_stock:
+                apply_platform_own_token_tone(event, own_platform, own_ticker)
+                events.append(event)
+                continue
+            if not is_stock and (project_candidate_for_row(row) or project_candidate_for_row(section)):
+                apply_project_candidate_tone(event)
+            events.append(event)
     return events
 
 
@@ -42164,15 +43532,22 @@ def parse_site_newsflash_events(payload: dict[str, Any]) -> list[dict[str, Any]]
     for item in items:
         if not isinstance(item, dict):
             continue
+        # 律动与方程式新闻共用这条解析：来源身份必须跟着条目本身走，否则方程式
+        # 快讯会顶着 "BlockBeats / BB" 弹窗（也曾经让投研入口判断错误）。
+        source_id = clean_feed_text(item.get("sourceId") or "blockbeats", 40).casefold()
+        is_formula = source_id == "bwenews"
         event = {
             "key": js_stable_key("flash", item.get("id"), item.get("title"), item.get("add_time")),
             "kind": "聚合快讯",
             "sourceType": "newsflash",
-            "source": item.get("source") or "BlockBeats 律动",
-            "sourceLabel": item.get("sourceLabel") or "BB",
+            "sourceId": source_id,
+            "source": item.get("source") or ("方程式新闻" if is_formula else "BlockBeats 律动"),
+            "sourceLabel": item.get("sourceLabel") or ("BWE" if is_formula else "BB"),
             "title": item.get("title") or "市场快讯",
             "body": item.get("content") or "",
-            "url": item.get("url") or "https://www.theblockbeats.info/newsflash",
+            "url": item.get("url") or (
+                "https://rss-public.bwe-ws.com" if is_formula else "https://www.theblockbeats.info/newsflash"
+            ),
             "time": item.get("add_time") or int(time.time() * 1000),
             "priority": "市场信息",
         }
@@ -42342,6 +43717,13 @@ def rank_monitor_snapshot(source: dict[str, Any], row: dict[str, Any], index: in
         ),
         "narrativeLabel": row.get("narrativeLabel") or "",
         "narrativeLabels": row.get("narrativeLabels") if isinstance(row.get("narrativeLabels"), list) else [],
+        # Keep the native launch platform so a launch-pad token can be reported
+        # red no matter which board surfaced it (hot-search rows omit the field,
+        # so this stays empty there and the text-marker fallback takes over).
+        "launchpad": clean_feed_text(row.get("launchpad") or row.get("launchpadPlatform"), 80),
+        # Keep the upstream candidate classification so a ``project`` row can be
+        # labelled on any board (meme rows / boards without the field stay empty).
+        "candidateType": clean_feed_text(row.get("candidateType") or row.get("candidate_type"), 30),
         "binanceAiNarrative": row.get("binanceAiNarrative") or "",
         "binanceAiNarrativeSource": row.get("binanceAiNarrativeSource") or "",
         "icon": row.get("icon") or "",
@@ -42643,6 +44025,21 @@ def rank_monitor_event(board: str, current: dict[str, Any], reason: str) -> dict
             if is_gmgn_hot_search
             else f"榜单新进，{symbol} 新进入{board_label}前十。"
         )
+    # A launchpad's OWN token ("台子币") is the rare, real signal: the platform
+    # itself is trading.  Checked first and returns immediately so nothing can
+    # overwrite its tone/speech.
+    #
+    # "Graduated off a launchpad" is deliberately NOT alerted (2026-10-03 用户拍板):
+    # almost every new memecoin comes off some launchpad, so it carried zero
+    # information — the red skin just painted every new coin red.
+    own_platform, own_ticker = platform_own_token_for_row(current)
+    if own_platform:
+        apply_platform_own_token_tone(event, own_platform, own_ticker)
+        return event
+    if project_candidate_for_row(current):
+        # A ``project`` candidate on any rank board keeps its normal trigger but
+        # gets a 「项目｜」 prefix so it reads differently from a meme entry.
+        apply_project_candidate_tone(event)
     return event
 
 
@@ -49339,12 +50736,16 @@ def send_fast_onchain_alert(row: dict[str, Any], analysis: dict[str, Any], job: 
     elapsed = max(0, int(job["analyzed_at"] - job["first_seen_at"]) // 1000)
     is_chatgpt_route = analysis.get("researchRoute") == CHATGPT_RESEARCH_ROUTE
     decision = golden_leader_alert_decision(row, analysis)
-    if is_chatgpt_route:
-        if not chatgpt_positive_alert_decision(analysis):
-            return {"ok": False, "suppressed": True,
-                    "reason": analysis.get("alertReason") or "仅弹正向且值得看的标的"}
-    elif not decision["popupEligible"]:
-        return {"ok": False, "suppressed": True, "reason": decision["reason"]}
+    # 台子币（发射平台本家代币）不受投研等级/正向筛选约束：扫链一旦识别到就
+    # 立即报红，否则会被下面的 suppressed 分支吃掉，导致台子币永远不弹窗。
+    own_platform, own_ticker = platform_own_token_for_row(row)
+    if not own_platform:
+        if is_chatgpt_route:
+            if not chatgpt_positive_alert_decision(analysis):
+                return {"ok": False, "suppressed": True,
+                        "reason": analysis.get("alertReason") or "仅弹正向且值得看的标的"}
+        elif not decision["popupEligible"]:
+            return {"ok": False, "suppressed": True, "reason": decision["reason"]}
     framework = analysis.get("frameworkAssessment") or {}
     permission = decision["executionPermission"]
     execution_note = "执行许可" if permission == "ALLOW" else "仅研究，不可直接执行" if permission == "BLOCK" else "需补审后再决定"
@@ -49365,7 +50766,7 @@ def send_fast_onchain_alert(row: dict[str, Any], analysis: dict[str, Any], job: 
 
     chat_popup_title = symbol_first_popup_text(analysis.get("popupTitle"), title=True)
     chat_popup_body = symbol_first_popup_text(analysis.get("popupBody"))
-    return launch_desktop_alert({
+    event = {
         "key": (f"onchain-chatgpt-research:{job['key']}" if is_chatgpt_route
                 else f"onchain-v48-potential:{job['key']}:{decision['potentialTier']}"),
         "eventFlowKey": (f"onchain-chatgpt-research:{job['key']}" if is_chatgpt_route
@@ -49388,7 +50789,19 @@ def send_fast_onchain_alert(row: dict[str, Any], analysis: dict[str, Any], job: 
         "speech": ("" if is_chatgpt_route or not decision["speechEligible"]
                    else f"链上投研发现{decision['gradeLabel']}，{decision['label']}，{symbol}。{execution_note}。{framework.get('primaryDriver') or analysis.get('summary') or ''}"),
         "sound": (False if is_chatgpt_route else decision["speechEligible"]),
-    })
+    }
+    # 台子币（平台本家代币）直接报红并返回——这是唯一还会走红色重点的发射台相关信号。
+    #
+    # 「发射台项目」（币从哪个发射台发出来）**已于 2026-10-03 取消报红**：
+    # 战壕榜/新币榜几乎每一行都带原生 launchpad（实测 300/300），报红等于
+    # 「每个新币都红」，把真正的台子币信号淹没掉。
+    if own_platform:
+        apply_platform_own_token_tone(event, own_platform, own_ticker)
+        return launch_desktop_alert(event)
+    if project_candidate_for_row(row) or project_candidate_for_row(analysis):
+        # A project finding keeps its normal research trigger, just tagged.
+        apply_project_candidate_tone(event)
+    return launch_desktop_alert(event)
 
 
 def send_fast_onchain_news_resonance_alert(
@@ -51057,7 +52470,12 @@ def parse_site_rotation_map_events(
 
 def site_alert_feeds() -> list[dict[str, Any]]:
     return [
-        {"name": "newsflash", "interval": 12, "maxAgeMs": 6 * 60 * 60 * 1000, "fetch": fetch_blockbeats_flash, "parse": parse_site_newsflash_events},
+        {"name": "newsflash", "interval": 12, "maxAgeMs": NEWSFLASH_ALERT_MAX_AGE_MS, "fetch": fetch_blockbeats_flash_shared, "parse": parse_site_newsflash_events},
+        # 方程式新闻走独立的弹窗源：抓取线路与律动分开（一路故障不再互相拖累），
+        # 同题新闻由 fetch_formula_news_flash 去重，避免同一事件弹两次。
+        # 间隔取 5 秒：实时流条目在内存里，轮询只是搬运；公开 RSS 另有 90 秒记忆，
+        # 不会因为轮询变快而反复打这个低频镜像。
+        {"name": "bwenews", "interval": 5, "maxAgeMs": NEWSFLASH_FORMULA_ALERT_MAX_AGE_MS, "fetch": fetch_formula_news_flash, "parse": parse_site_newsflash_events},
         {"name": "listings", "interval": 18, "maxAgeMs": 24 * 60 * 60 * 1000, "fetch": listing_events_payload, "parse": parse_site_listing_events},
         {"name": "aster-contracts", "interval": 12, "maxAgeMs": 48 * 60 * 60 * 1000, "fetch": aster_contracts_payload, "parse": parse_site_aster_contract_events},
         {"name": "newboards", "interval": 18, "maxAgeMs": 15 * 60 * 1000, "fetch": new_coin_rankings_payload, "parse": lambda payload: parse_site_newboard_events(payload, track_listings=True)},
@@ -51195,7 +52613,27 @@ def site_alert_monitor_loop() -> None:
     for feed in feeds:
         threading.Thread(target=run_source, args=(feed['name'], lambda f=feed: sync_site_alert_feed(f), float(feed.get('interval') or 30)), daemon=True, name=f"alert-feed-{feed['name']}").start()
     threading.Thread(target=run_source, args=('rank', sync_rank_monitor_feed, RANK_MONITOR_INTERVAL), daemon=True, name='alert-feed-rank').start()
-    run_source('maintenance', lambda: (maintain_runtime_memory(time.time()), ensure_desktop_alert_worker()), 60)
+    def run_maintenance() -> None:
+        # Bound in-memory caches, reap expired login QR images + orphaned
+        # atomic-write .tmp files, retire disk cache keys whose source has
+        # been removed, and keep the desktop-alert worker alive — all on one
+        # low-frequency tick so the 24/7 monitor never accumulates junk.
+        maintain_runtime_memory(time.time())
+        try:
+            cleanup_runtime_ephemeral_files()
+        except Exception as exc:
+            print(f"Runtime ephemeral cleanup failed: {safe_error_text(str(exc))}", file=sys.stderr)
+        try:
+            prune_stale_api_cache_files()
+        except Exception as exc:
+            print(f"Stale API cache prune failed: {safe_error_text(str(exc))}", file=sys.stderr)
+        ensure_desktop_alert_worker()
+        ensure_bwe_news_stream()
+        # Read each verified launch-platform official account and auto-register
+        # the mints it announces, so a pad's brand-new token is recognised the
+        # moment it shows up instead of waiting for a human to add its address.
+        ensure_platform_official_announcements()
+    run_source('maintenance', run_maintenance, 60)
 
 
 def news_trade_alert_monitor_loop() -> None:
@@ -52426,7 +53864,11 @@ class Handler(SimpleHTTPRequestHandler):
                         research_candidates,
                         match_recent_news=True,
                     )
-                self.send_json(attach_trench_person_signals(attach_gmgn_native_trench_narrative(trench_payload)))
+                self.send_json(
+                    attach_counterfeit_platform_labels(
+                        attach_trench_person_signals(attach_gmgn_native_trench_narrative(trench_payload))
+                    )
+                )
             except (TypeError, ValueError) as exc:
                 self.send_json({"ok": False, "items": [], "error": str(exc)}, status=400)
             except Exception as exc:
@@ -52636,12 +54078,15 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if parsed.path == "/api/newsflash":
             try:
+                # Short TTL so the panel tracks new flashes closely; the cache is
+                # stale-while-revalidate, so a slow upstream never blocks a read.
+                newsflash_ttl = max(10, int(safe_float(env_value("NEWSFLASH_API_CACHE_SECONDS", "25"), 25)))
                 if force_refresh and read_json_cache(api_cache_path("newsflash")):
                     trigger_api_refresh("newsflash", fetch_aggregated_newsflash)
-                    payload = cached_api_payload("newsflash", fetch_aggregated_newsflash, 60)
+                    payload = cached_api_payload("newsflash", fetch_aggregated_newsflash, newsflash_ttl)
                     payload.setdefault("_cache", {})["refreshing"] = True
                 else:
-                    payload = cached_api_payload("newsflash", fetch_aggregated_newsflash, 60)
+                    payload = cached_api_payload("newsflash", fetch_aggregated_newsflash, newsflash_ttl)
                 if isinstance(payload.get("items"), list):
                     payload["items"] = [enrich_newsflash_explanation_item(item) for item in payload["items"]]
                 self.send_json(payload)
@@ -52742,6 +54187,12 @@ class Handler(SimpleHTTPRequestHandler):
                     "startedAt": SITE_ALERT_MONITOR_STARTED_AT,
                 }
             )
+            return
+        if parsed.path == "/api/newsflash-stream-status":
+            if not self.request_is_local_or_admin():
+                self.send_json({"ok": False, "error": "仅限本机或管理员查看"}, status=403)
+                return
+            self.send_json({"ok": True, **bwe_news_ws_status()})
             return
         if parsed.path == "/api/self-optimization-status":
             if not self.request_is_local_or_admin():
@@ -53871,6 +55322,9 @@ def main():
         start_global_hotspot_monitor()
         start_self_optimization_monitor()
         start_onchain_research_bridge()
+        # 方程式新闻实时流（BWE 官方 WebSocket）：抢 α 的通道，越早连越好；
+        # 它只是桌面弹窗的一条来源，挂掉也不影响任何主链路。
+        start_bwe_news_stream()
         start_wechat_auth_monitor()
         start_qq_onebot_bridge()
         start_wechat_group_monitor()

@@ -644,6 +644,17 @@ def show_popup(payload: dict, slot: int) -> int:
     title_text = limited_lines(soft_wrap_text(title, 24), 2)
     body_text = soft_wrap_text(body, 42)
 
+    # Number of buttons sharing the header row with the brand.  Only used to
+    # decide whether the fit-to-width shrink pass can be skipped entirely.
+    action_count = sum((
+        1 if contract_address and chain and source_id else 0,
+        1 if url else 0,
+        1 if contract_address else 0,
+        1 if can_explain else 0,
+        1 if can_translate else 0,
+        1 if can_confirm else 0,
+    ))
+
     root = tk.Tk()
     root.title("星云社快讯")
     root.overrideredirect(True)
@@ -704,7 +715,12 @@ def show_popup(payload: dict, slot: int) -> int:
         receipts.send('read' if read else 'closed', visible_timer.milliseconds)
         root.destroy()
 
+    view_btn = None
+    explanation_button = None
     copy_btn = None
+    # The CA copy button restores its own label after a copy; the header may
+    # have collapsed that label to fit, so keep the current text in one place.
+    copy_label = {"text": "复制CA"}
 
     def copy_contract() -> bool:
         copied = copy_text_to_clipboard(root, contract_address)
@@ -715,7 +731,7 @@ def show_popup(payload: dict, slot: int) -> int:
             )
             root.after(
                 1400,
-                lambda: copy_btn.configure(text="复制CA", fg="#9f1d18" if is_red else "#075669"),
+                lambda: copy_btn.configure(text=copy_label["text"], fg="#9f1d18" if is_red else "#075669"),
             )
         return copied
 
@@ -1163,10 +1179,43 @@ def show_popup(payload: dict, slot: int) -> int:
         tk.Label(footer, text=priority, bg='#ffffff', fg='#c91e1e' if is_hot else '#7b8790',
                  font=('Microsoft YaHei UI', 9)).pack(side='right', padx=18, pady=12)
 
-    if can_explain or contract_address:
+    if can_explain or contract_address or action_count:
         # Keep the compact header action beside View, including under DPI
-        # scaling, without clipping the brand, action or footer.
+        # scaling, without clipping the brand, action or footer.  The card keeps
+        # its base size: a crowded header ("解释推文 / 复制CA / 查看 / ✦ / x") is
+        # made to fit by shrinking the buttons, never by stretching the card.
+        header_buttons = [b for b in (ai_btn, view_btn, copy_btn, explanation_button,
+                                      translate_btn, confirm_btn) if b is not None]
         root.update_idletasks()
+        if top.winfo_reqwidth() + 2 > width:
+            # 1. Tighten the gaps between the header actions.
+            for button in header_buttons:
+                button.pack_configure(padx=(2, 0))
+            close_btn.pack_configure(padx=(2, 12))
+            root.update_idletasks()
+        if top.winfo_reqwidth() + 2 > width:
+            # 2. Collapse every action to its natural width, shortening the
+            #    long labels to two characters first so nothing can clip.
+            for button in header_buttons:
+                label = str(button.cget("text"))
+                if len(label) > 2:
+                    if button is copy_btn:
+                        copy_label["text"] = label[:2]
+                    button.configure(text=label[:2])
+                button.configure(width=0)
+            root.update_idletasks()
+        if top.winfo_reqwidth() + 2 > width:
+            # 3. Fall back to the footer's compact 8pt font.
+            for button in header_buttons:
+                button.configure(font=("Microsoft YaHei UI", 8, "bold"))
+            root.update_idletasks()
+        if top.winfo_reqwidth() + 2 > width:
+            # 4. Last resort: the brand is the only elastic text left.
+            for candidate in (f"星云社快讯  {alert_time}", "星云社快讯", ""):
+                brand.configure(text=candidate)
+                root.update_idletasks()
+                if top.winfo_reqwidth() + 2 <= width:
+                    break
         width = max(width, top.winfo_reqwidth()+2)
         height = max(height, outer.winfo_reqheight())
         x, y = popup_position(work_area(root), width, height, slot)

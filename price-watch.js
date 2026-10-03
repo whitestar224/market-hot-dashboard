@@ -9,6 +9,21 @@
   const headingLabel = document.querySelector("#watchHeadingLabel");
   const headingTitle = document.querySelector("#watchHeadingTitle");
   const headingDescription = document.querySelector("#watchHeadingDescription");
+  // Map a monitor asset's backend ``origin`` to its display label. Every
+  // backend origin value must appear here: an unmapped origin silently falls
+  // back to the AICoin label, which previously mislabelled GMGN 5m hot-search
+  // entries as "AICoin 新进".
+  const PRICE_WATCH_ORIGIN_LABELS = {
+    "manual": "手动",
+    "binance-wallet": "币安钱包 4H 热门",
+    "gmgn-hot-search": "GMGN 5 分钟热搜新进",
+    "ave": "AVE.ai 热门榜新进",
+    "binance-gainers": "Binance 涨幅榜",
+    "binance-futures-gainers": "Binance 合约涨幅榜",
+    "okx-gainers": "OKX 涨幅榜",
+    "opportunity": "机会发现",
+    "aicoin": "AICoin 新进",
+  };
   function renderGrid(html) {
     const openedResearch = new Set([...grid.querySelectorAll("details[data-research-detail][open]")].map((node) => node.dataset.researchDetail));
     if (window.XingyunLiveDom?.render) {
@@ -2330,17 +2345,7 @@
       ? (item.newContractSource || "交易所新合约")
       : item.personalXPriority
         ? "个人 X 提及"
-        : item.manual
-          ? "手动"
-          : item.origin === "binance-wallet"
-            ? "币安钱包 4H 热门"
-            : item.origin === "ave"
-              ? "AVE.ai 热门榜新进"
-              : item.origin === "binance-gainers"
-                ? "Binance 涨幅榜"
-                : item.origin === "okx-gainers"
-                  ? "OKX 涨幅榜"
-            : "AICoin 新进";
+        : (PRICE_WATCH_ORIGIN_LABELS[item.origin] || "AICoin 新进");
     const icon = item.icon
       ? `<img src="${escapeHtml(item.icon)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.closest('.price-watch-icon').classList.add('is-fallback');this.remove()" />`
       : "";
@@ -2412,17 +2417,7 @@
       ? (item.newContractSource || "交易所新合约")
       : item.personalXPriority
         ? "个人 X 提及"
-        : item.manual
-          ? "手动"
-          : item.origin === "binance-wallet"
-            ? "币安钱包 4H 热门"
-            : item.origin === "ave"
-              ? "AVE.ai 热门榜新进"
-              : item.origin === "binance-gainers"
-                ? "Binance 涨幅榜"
-                : item.origin === "okx-gainers"
-                  ? "OKX 涨幅榜"
-            : "AICoin 新进";
+        : (PRICE_WATCH_ORIGIN_LABELS[item.origin] || "AICoin 新进");
     const icon = item.icon
       ? `<img src="${escapeHtml(item.icon)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.closest('.price-watch-icon').classList.add('is-fallback');this.remove()" />`
       : "";
