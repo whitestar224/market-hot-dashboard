@@ -2075,6 +2075,12 @@ GMGN_HOT_SEARCH_ALERT_LOCK = threading.Lock()
 GMGN_HOT_SEARCH_ALERT_STATE_PATH = PERSIST_CACHE_DIR / "gmgn_hot_search_alert_state.json"
 
 
+# 进程启动标记：同一进程内恒定，重启后必变。榜单类「新进」告警用它区分
+# 「本次启动的第一次轮询」（只重建基线，不补弹停机期间积压的历史新进）与
+# 正常运行中的轮询（照常弹窗）。见 sync_gmgn_hot_search_alert_feed。
+SERVER_BOOT_AT_MS = int(time.time() * 1000)
+
+
 GLOBAL_HOTSPOT_STATE_PATH = PERSIST_CACHE_DIR / "global_hotspot_monitor.json"
 
 

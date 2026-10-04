@@ -669,6 +669,7 @@ from app.core.state import (
     SELF_OPTIMIZATION_STATE_LOCK,
     SELF_OPTIMIZATION_STATE_PATH,
     SELF_OPTIMIZATION_WORK_ROOT,
+    SERVER_BOOT_AT_MS,
     SERVER_SHUTDOWN_EVENT,
     SHARED_EXECUTORS,
     SITE_ALERT_FUTURE_TOLERANCE_MS,
@@ -44236,7 +44237,7 @@ def sync_gmgn_hot_search_alert_feed(source: dict[str, Any] | None = None) -> lis
     now = time.time()
     current_membership = {str(row["key"]) for row in snapshots}
     events: list[dict[str, Any]] = []
-    new_entry_rows: list[dict[str, Any]] = []
+    pool_rows: list[dict[str, Any]] = []
     with GMGN_HOT_SEARCH_ALERT_LOCK:
         state = read_json_cache(GMGN_HOT_SEARCH_ALERT_STATE_PATH)
         ready = (
@@ -44244,6 +44245,10 @@ def sync_gmgn_hot_search_alert_feed(source: dict[str, Any] | None = None) -> lis
             and str(state.get("period")) == GMGN_HOT_SEARCH_ALERT_PERIOD
             and int(safe_float(state.get("version"))) == GMGN_HOT_SEARCH_ALERT_STATE_VERSION
         )
+        # 本次启动的第一次轮询 = 只重建基线：服务停止期间积压进来的「新进」不补弹，
+        # 否则每次启动都会把停机这段时间的历史新进一次性冲屏。基线内的行照常入监控池，
+        # 运行中真正的新进（下一次轮询起出现）仍照常弹窗。
+        boot_warmup = str(state.get("bootId") or "") != str(SERVER_BOOT_AT_MS)
         previous_membership = set(state.get("membership") or [])
         last_alerts = state.get("lastAlerts") if isinstance(state.get("lastAlerts"), dict) else {}
         seen = state.get("lastSeen") if isinstance(state.get("lastSeen"), dict) else {}
@@ -44260,7 +44265,9 @@ def sync_gmgn_hot_search_alert_feed(source: dict[str, Any] | None = None) -> lis
             stamp = safe_float(state.get("updatedAt")) / 1000
             if stamp > now - GMGN_HOT_SEARCH_REENTRY_SECONDS:
                 seen[key] = max(seen.get(key, 0), stamp)
-        if ready:
+        if boot_warmup:
+            pool_rows.extend(snapshots)
+        elif ready:
             for row in snapshots:
                 key = str(row.get("key") or "")
                 if not key or key in previous_membership or key in seen:
@@ -44269,7 +44276,7 @@ def sync_gmgn_hot_search_alert_feed(source: dict[str, Any] | None = None) -> lis
                 if now - safe_float(last_alerts.get(alert_key)) < RANK_MONITOR_COOLDOWN_SECONDS:
                     continue
                 events.append(rank_monitor_event("hot", row, "new"))
-                new_entry_rows.append(row)
+                pool_rows.append(row)
                 last_alerts[alert_key] = now
         for key in current_membership:
             seen[key] = now
@@ -44281,6 +44288,7 @@ def sync_gmgn_hot_search_alert_feed(source: dict[str, Any] | None = None) -> lis
                 "version": GMGN_HOT_SEARCH_ALERT_STATE_VERSION,
                 "ready": True,
                 "period": GMGN_HOT_SEARCH_ALERT_PERIOD,
+                "bootId": str(SERVER_BOOT_AT_MS),
                 "updatedAt": int(now * 1000),
                 "membership": sorted(current_membership),
                 "lastAlerts": last_alerts,
@@ -44288,11 +44296,16 @@ def sync_gmgn_hot_search_alert_feed(source: dict[str, Any] | None = None) -> lis
                 "reentryWindowSeconds": GMGN_HOT_SEARCH_REENTRY_SECONDS,
             },
         )
-    # New 5m hot-search entries join the prior-high + structure monitoring pool
-    # (outside the alert lock so the DB write never blocks the broadcast loop).
-    if new_entry_rows:
+    if boot_warmup:
+        print(
+            f"GMGN hot-search alert warm-up: {len(snapshots)} rows seeded without popups",
+            file=sys.stderr,
+        )
+    # 本次启动的基线行 + 运行中真新进的行都进 prior-high / 结构监控池
+    # （在告警锁之外写库，避免 DB 写入阻塞广播循环）。
+    if pool_rows:
         try:
-            sync_price_watch_gmgn_hot_search_candidates(new_entry_rows, now_ms=int(now * 1000))
+            sync_price_watch_gmgn_hot_search_candidates(pool_rows, now_ms=int(now * 1000))
         except Exception as exc:
             print(f"GMGN hot-search pool ingest failed: {safe_error_text(str(exc))}", file=sys.stderr)
     return events
