@@ -122,5 +122,47 @@ class PriceWatchTradeUrlTests(unittest.TestCase):
         self.assertNotIn("/futures/", payload["url"])
 
 
+    def test_onchain_asset_with_secondary_binance_provider_never_opens_futures_page(self):
+        """链上代币即使被中心化行情源覆盖，也不许跳到币安二级合约页。"""
+        url = server.price_watch_trade_url(
+            "PUMP",
+            "Binance Futures",
+            chain_id="CT_501",
+            contract_address="pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn",
+        )
+        self.assertIn("/token/sol/pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn", url)
+        self.assertNotIn("/futures/", url)
+
+    def test_onchain_asset_with_unknown_chain_falls_back_instead_of_futures(self):
+        """链上入参即使用不出链上代币页（链未知/地址残缺），也不许退化到交易所合约页。"""
+        for contract in ("0x56910d4409f3a0c78c64dd8d0545ff0705389870", "0xabc7777"):
+            with self.subTest(contract=contract):
+                url = server.price_watch_trade_url(
+                    "SOMECOIN",
+                    "Binance Futures",
+                    chain_id="",
+                    contract_address=contract,
+                )
+                self.assertEqual(url, "./price-watch.html")
+                self.assertNotIn("/futures/", url)
+
+    def test_onchain_price_alert_with_binance_provider_view_stays_onchain(self):
+        event = {
+            "symbol": "ZEC",
+            "distancePct": 2.4,
+            "currentPrice": 41.2,
+            "weekHigh": 42.0,
+            "episode": 1,
+            "provider": "Binance Futures",
+            "chain": "CT_501",
+            "contractAddress": "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS",
+        }
+        with patch.object(server, "launch_desktop_alert", side_effect=lambda payload: payload):
+            payload = server.launch_price_watch_alert(event)
+
+        self.assertIn("/token/sol/A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS", payload["url"])
+        self.assertNotIn("/futures/", payload["url"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -19113,13 +19113,22 @@ def price_watch_trade_url(
     contract_address: Any = "",
     prefer_wallet: bool = False,
 ) -> str:
-    """Open the source-native market; Wallet-origin assets keep their Wallet route."""
+    """Open the source-native market; on-chain assets keep their on-chain route.
+
+    A row carrying a contract address is an on-chain asset, and the same ticker on a
+    centralized exchange is a different instrument (Binance's PUMP perpetual is not the
+    Solana PUMP token, its ZEC perpetual is not a Solana ZEC). Those rows therefore never
+    open a CEX contract page — otherwise 「查看」 sends the user to a perpetual contract
+    for a token they never clicked. Wallet-origin assets keep their Wallet route too.
+    """
     asset = price_watch_symbol_without_quote(symbol)
     provider_name = str(provider or "").strip().lower()
     contract = clean_feed_text(contract_address, 180)
     wallet_url = binance_wallet_token_url(chain_id, contract) if contract else ""
-    if prefer_wallet and "/token/" in wallet_url:
-        return wallet_url
+    if contract or prefer_wallet:
+        # 带合约地址或币安钱包来源 = 链上资产：只走链上代币页，链未知时回落监控页，
+        # 绝不退化成同 ticker 的中心化合约页。
+        return wallet_url if "/token/" in wallet_url else fallback
     exchange = (
         "Binance Futures" if "binance" in provider_name
         else "OKX SWAP" if "okx" in provider_name
@@ -19130,9 +19139,6 @@ def price_watch_trade_url(
         exchange_url = rotation_trade_url({"symbol": asset, "exchange": exchange})
         if exchange_url:
             return exchange_url
-    if contract:
-        if "/token/" in wallet_url:
-            return wallet_url
     if not asset:
         return fallback
     return fallback
