@@ -2493,7 +2493,7 @@
     if (newLow) {
       headingLabel.textContent = "NEW COIN / LOW POSITION / STRUCTURE";
       headingTitle.textContent = "近一年新币低位结构";
-      headingDescription.innerHTML = `按跨交易所<b>首次上架</b>计算近 365 天币龄 · 仅监控 <b>1小时 / 4小时</b> · 24H 全网合约成交额低于 <b>1000 万美元</b>自动剔除，恢复后自动加回`;
+      headingDescription.innerHTML = `按跨交易所<b>首次上架</b>计算近 365 天币龄 · 仅监控 <b>1小时 / 4小时</b> · 已剔除股票 / 指数 / 商品等 TradFi 合约 · <b>币安 / OKX</b> 新上合约始终纳入监控池，其余合约 24H 成交额低于 <b>1000 万美元</b>自动剔除，恢复后自动加回`;
       return;
     }
     if (mapping) {
@@ -2906,7 +2906,7 @@
       const signalCount = Number(payload.summary?.signals) || 0;
       if (["structure", "newlow"].includes(currentMode)) {
         statusNode.textContent = newLow
-          ? `活跃新币 ${Number(payload.summary?.inventory) || 0} 个 · 已剔除不活跃 ${Number(payload.summary?.inactiveExcluded) || 0} 个 · 已轮询 ${Number(payload.summary?.scanned) || 0} 个 · 低位候选 ${Number(payload.summary?.candidates) || 0} 个`
+          ? `活跃新币 ${Number(payload.summary?.inventory) || 0} 个 · 已剔除 TradFi ${Number(payload.summary?.tradfiExcluded) || 0} 个 · 已剔除不活跃 ${Number(payload.summary?.inactiveExcluded) || 0} 个 · 已轮询 ${Number(payload.summary?.scanned) || 0} 个 · 低位候选 ${Number(payload.summary?.candidates) || 0} 个`
           : (refresh
             ? `六个周期的龙头策略已重新扫描 · 当前 ${signalCount} 个起爆信号`
             : `后台并发监控 · 已剔除低成交额 ${Number(payload.summary?.inactiveExcluded) || 0} 个 · 当前 ${signalCount} 个起爆信号`);

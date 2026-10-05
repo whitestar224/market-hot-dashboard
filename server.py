@@ -14666,6 +14666,75 @@ def fetch_okx_dex_gainers() -> dict[str, Any]:
     return source
 
 
+# ---------------------------------------------------------------------------
+# Venue-native TradFi contract classification
+#
+# Every admission venue now lists crypto perpetuals and TradFi instruments
+# (equities, indices, commodities, FX, pre-IPO) behind the *same* endpoint, so
+# the venue's own contract metadata is the only reliable discriminator:
+#   * Binance: contractType == "TRADIFI_PERPETUAL".  underlyingType alone is not
+#     usable: DEFIUSDT / BTCDOMUSDT / ALLUSDT are crypto index products that also
+#     report underlyingType == "INDEX".
+#   * OKX: instCategory 3 (tokenised equities) and 4 (commodities / indices).
+#   * Gate: contract_type in stocks / indices / index / tradfi / metals /
+#     commodities / forex.
+#   * HTX: tradfi_labels present.
+# A bare ticker can be TradFi on one venue and a genuine crypto asset on
+# another (BB, ON, PAXG, QNT, USDC, XAUT), so callers must let a venue-reported
+# crypto listing win over another venue's TradFi listing for the same symbol.
+# ---------------------------------------------------------------------------
+TRADFI_GATE_CONTRACT_TYPES = frozenset({
+    "stocks", "indices", "index", "tradfi", "metals", "commodities", "forex",
+})
+TRADFI_OKX_INST_CATEGORIES = frozenset({"3", "4"})
+TRADFI_BINANCE_SUBTYPES = frozenset({"tradfi", "pre-ipo"})
+TRADFI_HTX_LABELS = frozenset({
+    "stock", "stocks", "tradfi", "equity", "index", "indices",
+    "metal", "metals", "commodity", "commodities", "forex", "preipo", "pre-ipo",
+})
+
+
+def binance_contract_is_tradfi(item: Any) -> bool:
+    """Binance flags stock / commodity / FX perpetuals with a dedicated contract type."""
+    if not isinstance(item, dict):
+        return False
+    if "TRADIFI" in str(item.get("contractType") or "").upper():
+        return True
+    subtypes = {
+        str(value or "").strip().lower()
+        for value in (item.get("underlyingSubType") or [])
+    }
+    return bool(subtypes & TRADFI_BINANCE_SUBTYPES)
+
+
+def okx_contract_is_tradfi(item: Any) -> bool:
+    """OKX instCategory 3 = tokenised equity, 4 = commodity / index."""
+    if not isinstance(item, dict):
+        return False
+    return str(item.get("instCategory") or "").strip() in TRADFI_OKX_INST_CATEGORIES
+
+
+def gate_contract_is_tradfi(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    return str(item.get("contract_type") or "").strip().lower() in TRADFI_GATE_CONTRACT_TYPES
+
+
+def htx_contract_is_tradfi(item: Any) -> bool:
+    """HTX flags a TradFi contract through tradfi_labels, or through its labels array.
+
+    tradfi_labels is incomplete: newer stock listings (NKE, BYD, CVNA, BAC ...)
+    ship an empty tradfi_labels while still carrying a "stock" / "indices"
+    label, so both fields have to be consulted.
+    """
+    if not isinstance(item, dict):
+        return False
+    if item.get("tradfi_labels"):
+        return True
+    labels = {str(value or "").strip().lower() for value in (item.get("labels") or [])}
+    return bool(labels & TRADFI_HTX_LABELS)
+
+
 def fetch_binance_new_coins() -> dict[str, Any]:
     exchange_payload = requests.get(
         "https://fapi.binance.com/fapi/v1/exchangeInfo",
@@ -14683,8 +14752,7 @@ def fetch_binance_new_coins() -> dict[str, Any]:
         for item in exchange_payload.get("symbols", [])
         if item.get("status") == "TRADING"
         and item.get("quoteAsset") == "USDT"
-        and "TRADIFI" not in str(item.get("contractType") or "").upper()
-        and "TRADFI" not in {str(value or "").upper() for value in item.get("underlyingSubType", [])}
+        and not binance_contract_is_tradfi(item)
         and not is_excluded_crypto_asset(item.get("baseAsset"))
     ]
     symbols.sort(key=lambda item: safe_float(item.get("onboardDate")), reverse=True)
@@ -14698,7 +14766,7 @@ def fetch_binance_new_coins() -> dict[str, Any]:
         last = safe_float(ticker.get("lastPrice"))
         quote_volume = safe_float(ticker.get("quoteVolume"))
         onboard_ms = int(safe_float(item.get("onboardDate")))
-        is_tradfi = "TRADIFI" in str(item.get("contractType") or "").upper()
+        is_tradfi = binance_contract_is_tradfi(item)
         rows.append(
             {
                 "rank": len(rows) + 1,
@@ -14756,7 +14824,7 @@ def fetch_okx_new_coins() -> dict[str, Any]:
         item
         for item in instruments_payload.get("data", [])
         if item.get("state") == "live" and str(item.get("instId") or "").endswith("-USDT-SWAP")
-        and str(item.get("instCategory") or "").strip() != "3"
+        and not okx_contract_is_tradfi(item)
     ]
     instruments.sort(key=lambda item: safe_float(item.get("listTime")), reverse=True)
     rows = []
@@ -14771,7 +14839,7 @@ def fetch_okx_new_coins() -> dict[str, Any]:
         turnover = last * base_volume if last and base_volume else 0
         list_ms = int(safe_float(item.get("listTime")))
         pair = inst_id.replace("-", "").replace("SWAP", "")
-        is_tradfi = str(item.get("instCategory") or "").strip() == "3"
+        is_tradfi = okx_contract_is_tradfi(item)
         rows.append(
             {
                 "rank": len(rows) + 1,
@@ -26190,7 +26258,11 @@ def sync_price_watch_new_contract_candidates(
             }.get(source_id, "交易所新合约"),
             80,
         )
-        allow_tradfi = source_id in {"gate-new", "htx-new"} or bool(source.get("allowTradfi"))
+        # Gate and HTX publish a TradFi contract on their "new contract" board
+        # next to real coins.  Those rows are equities / indices / commodities /
+        # FX, so they must never enter a coin monitor pool; `allowTradfi` stays
+        # as an explicit opt-in for a future feed that genuinely needs them.
+        allow_tradfi = bool(source.get("allowTradfi"))
         rows = source.get("rows") if isinstance(source.get("rows"), list) else []
         for row in rows:
             if not isinstance(row, dict):
@@ -31383,6 +31455,9 @@ def price_structure_broadcast_eligibility(
 
 
 NEW_COIN_LOW_ADMISSION_SOURCES = frozenset({"binance", "okx", "gate", "htx"})
+# Admission venues whose new listings are monitored regardless of turnover.
+# See new_coin_low_admission_venue_priority.
+NEW_COIN_LOW_PRIORITY_ADMISSION_SOURCES = frozenset({"binance", "okx"})
 NEW_COIN_LOW_HISTORY_SOURCES = frozenset({
     "binance", "okx", "bitget", "gate", "htx", "aster"
 })
@@ -31609,6 +31684,46 @@ def new_coin_low_row_admitted(item: dict[str, Any] | None) -> bool:
         for source in sources
         if source
     )
+
+
+def new_coin_low_admission_venue_priority(item: dict[str, Any] | None) -> bool:
+    """Binance / OKX listings are monitored even before they build up turnover.
+
+    Which venue listed a contract is a far stronger signal than a 24h turnover
+    snapshot: a fresh Binance or OKX listing may be hours old and still carry
+    negligible turnover, yet it is exactly the new coin this pool exists to
+    watch.  Gate / HTX listings keep the turnover gate because those venues
+    list a long tail of illiquid contracts.
+    """
+    if not isinstance(item, dict):
+        return False
+    sources = [
+        *(item.get("newCoinSources") if isinstance(item.get("newCoinSources"), list) else []),
+        item.get("newCoinSource"),
+    ]
+    return any(
+        clean_feed_text(source, 40).casefold() in NEW_COIN_LOW_PRIORITY_ADMISSION_SOURCES
+        for source in sources
+        if source
+    )
+
+
+def new_coin_low_symbol_excluded_as_tradfi(
+    symbol: Any,
+    tradfi_assets: set[str],
+    crypto_contract_assets: set[str],
+) -> bool:
+    """A TradFi listing removes a symbol only when no admission venue lists it as crypto.
+
+    Tickers overlap between asset classes (OKX lists BB / ON / QNT as tokenised
+    equities while Binance lists the same tickers as crypto perpetuals), so a
+    venue-reported crypto contract always wins over another venue's TradFi
+    contract for the same bare symbol.
+    """
+    key = clean_price_watch_symbol(symbol)
+    if not key or key not in tradfi_assets:
+        return False
+    return key not in crypto_contract_assets
 
 
 def price_structure_membership_sources(item: dict[str, Any] | None) -> list[str]:
@@ -33580,6 +33695,19 @@ def new_coin_low_activity_state(
             "turnover24hUsd": safe_float((market or {}).get("turnover24hUsd"), 0) if market else None,
             "source": clean_feed_text((market or {}).get("source"), 30),
         }
+    if new_coin_low_admission_venue_priority(row):
+        # Binance / OKX admissions are never dropped for thin turnover.
+        return {
+            "active": True,
+            "status": "active",
+            "reason": "admission-venue-priority",
+            "ageDays": round(age_days, 1),
+            "turnover24hUsd": (
+                round(safe_float(market.get("turnover24hUsd"), 0), 2) if market else None
+            ),
+            "source": clean_feed_text((market or {}).get("source"), 30),
+            "thresholdUsd": NEW_COIN_LOW_MIN_TURNOVER_24H_USD,
+        }
     if not market:
         if age_days > NEW_COIN_LOW_UNAVAILABLE_MAX_AGE_DAYS:
             return {
@@ -33953,6 +34081,14 @@ def new_coin_low_inventory_rows(
     candidates: dict[str, dict[str, Any]] = {}
     candidates_lock = threading.Lock()
     tradfi_assets: set[str] = set()
+    # TradFi symbols listed inside the pool's age window.  The counter the page
+    # surfaces must not include stock contracts that are already too old to be
+    # a "new coin" in the first place.
+    tradfi_recent_assets: set[str] = set()
+    # Symbols an admission venue reported as a real crypto contract in this
+    # build.  Used to let a crypto listing win over another venue's TradFi
+    # listing for the same bare ticker.
+    crypto_contract_assets: set[str] = set()
 
     listing_history = read_json_cache(NEW_COIN_LOW_LISTING_HISTORY_PATH)
     for history_row in listing_history.get("items") if isinstance(listing_history.get("items"), list) else []:
@@ -33988,6 +34124,25 @@ def new_coin_low_inventory_rows(
                 now_ms=now_ms,
             )
 
+    def mark_tradfi(asset_value: Any, listed_at_value: Any = 0) -> None:
+        asset = clean_price_watch_symbol(asset_value)
+        if not asset:
+            return
+        listed_at = int(safe_float(listed_at_value, 0))
+        recent = listed_at > 0 and new_coin_low_row_within_age(
+            {"newCoinListedAt": listed_at}, now_ms=now_ms
+        )
+        with candidates_lock:
+            tradfi_assets.add(asset)
+            if recent:
+                tradfi_recent_assets.add(asset)
+
+    def mark_crypto_contract(asset_value: Any) -> None:
+        asset = clean_price_watch_symbol(asset_value)
+        if asset:
+            with candidates_lock:
+                crypto_contract_assets.add(asset)
+
     def binance_inventory() -> None:
         payload = requests.get(
             "https://fapi.binance.com/fapi/v1/exchangeInfo", headers=HEADERS, timeout=18
@@ -33995,6 +34150,11 @@ def new_coin_low_inventory_rows(
         for item in payload.get("symbols", []) if isinstance(payload, dict) else []:
             if not isinstance(item, dict) or item.get("quoteAsset") != "USDT":
                 continue
+            if binance_contract_is_tradfi(item):
+                # Stock / index / commodity / FX perpetuals are not new coins.
+                mark_tradfi(item.get("baseAsset"), item.get("onboardDate"))
+                continue
+            mark_crypto_contract(item.get("baseAsset"))
             add(item.get("baseAsset"), item.get("onboardDate"), "Binance", item.get("symbol") or "")
 
     def okx_inventory() -> None:
@@ -34004,9 +34164,15 @@ def new_coin_low_inventory_rows(
         ).json()
         for item in payload.get("data", []) if isinstance(payload, dict) else []:
             inst_id = str(item.get("instId") or "") if isinstance(item, dict) else ""
-            if not inst_id.endswith("-USDT-SWAP") or str(item.get("instCategory") or "") == "3":
+            if not inst_id.endswith("-USDT-SWAP"):
                 continue
-            add(inst_id.split("-")[0], item.get("listTime"), "OKX", inst_id)
+            asset = inst_id.split("-")[0]
+            if okx_contract_is_tradfi(item):
+                # instCategory 3 = tokenised equities, 4 = commodities / indices.
+                mark_tradfi(asset, item.get("listTime"))
+                continue
+            mark_crypto_contract(asset)
+            add(asset, item.get("listTime"), "OKX", inst_id)
 
     def gate_inventory() -> None:
         response = requests.get(
@@ -34019,13 +34185,10 @@ def new_coin_low_inventory_rows(
                 continue
             contract = str(item.get("name") or "").upper()
             asset = clean_price_watch_symbol(contract.removesuffix("_USDT"))
-            if str(item.get("contract_type") or "").lower() in {
-                "stocks", "indices", "index", "tradfi", "metals", "commodities", "forex"
-            }:
-                if asset:
-                    with candidates_lock:
-                        tradfi_assets.add(asset)
+            if gate_contract_is_tradfi(item):
+                mark_tradfi(asset, safe_float(item.get("launch_time") or item.get("create_time")) * 1000)
                 continue
+            mark_crypto_contract(asset)
             add(asset, safe_float(item.get("launch_time") or item.get("create_time")) * 1000, "Gate", contract)
 
     def htx_inventory() -> None:
@@ -34038,11 +34201,15 @@ def new_coin_low_inventory_rows(
             if not isinstance(item, dict):
                 continue
             asset = clean_price_watch_symbol(item.get("symbol"))
-            if item.get("tradfi_labels"):
-                if asset:
-                    with candidates_lock:
-                        tradfi_assets.add(asset)
+            if htx_contract_is_tradfi(item):
+                mark_tradfi(asset, htx_contract_date_ms(item.get("create_date")))
                 continue
+            # HTX deliberately does not vouch for a crypto contract here: it
+            # tags an unlabelled contract with labels == ["common"], which is
+            # what its FX pairs (EURUSD / GBPUSD / USDBRL) carry too. Letting
+            # HTX claim crypto would let those TradFi pairs survive the filter
+            # below, and no genuine crypto symbol depends on HTX for that
+            # claim (Binance / OKX / Gate already cover them).
             add(asset, htx_contract_date_ms(item.get("create_date")), "HTX", item.get("contract_code") or "")
 
     def bitget_history_inventory() -> None:
@@ -34090,11 +34257,23 @@ def new_coin_low_inventory_rows(
         "updatedAt": now_ms,
         "items": history_rows,
     })
+    crypto_candidates = {
+        symbol: row for symbol, row in candidates.items()
+        if not new_coin_low_symbol_excluded_as_tradfi(
+            symbol, tradfi_assets, crypto_contract_assets
+        )
+    }
+    # Report every TradFi contract the pool refuses.  TradFi contracts never
+    # reach `candidates` (the fetchers skip them), so the count has to come from
+    # the classification sets rather than from the candidate diff.
+    tradfi_excluded = len([
+        symbol for symbol in tradfi_recent_assets
+        if symbol not in crypto_contract_assets
+    ])
     base_rows = [
-        row for symbol, row in candidates.items()
+        row for symbol, row in crypto_candidates.items()
         if (
-            symbol not in tradfi_assets
-            and new_coin_low_row_admitted(row)
+            new_coin_low_row_admitted(row)
             and new_coin_low_row_within_age(row, now_ms=now_ms)
         )
     ]
@@ -34133,6 +34312,7 @@ def new_coin_low_inventory_rows(
         "thresholdUsd": NEW_COIN_LOW_MIN_TURNOVER_24H_USD,
         "graceDays": NEW_COIN_LOW_ACTIVITY_GRACE_DAYS,
         "checked": len(base_rows),
+        "tradfiExcluded": tradfi_excluded,
     }
     NEW_COIN_LOW_INVENTORY_CACHE = (time.time(), [dict(row) for row in rows])
     with PRICE_STRUCTURE_RECENT_LISTING_INDEX_LOCK:
@@ -34283,6 +34463,7 @@ def new_coin_low_structure_payload(*, force_refresh: bool = False) -> dict[str, 
             "candidates": len(candidates),
             "monitorMode": "parallel-new-coin-low",
             "inactiveExcluded": int(safe_float(NEW_COIN_LOW_ACTIVITY_SUMMARY.get("excluded"), 0)),
+            "tradfiExcluded": int(safe_float(NEW_COIN_LOW_ACTIVITY_SUMMARY.get("tradfiExcluded"), 0)),
             "activityUnavailable": int(safe_float(NEW_COIN_LOW_ACTIVITY_SUMMARY.get("unavailable"), 0)),
             "activityUnavailableExcluded": int(safe_float(
                 NEW_COIN_LOW_ACTIVITY_SUMMARY.get("unavailableExcluded"), 0
