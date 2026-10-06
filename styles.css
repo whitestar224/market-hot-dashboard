@@ -1821,6 +1821,27 @@ select option {
   background: rgba(255, 197, 70, 0.1);
 }
 
+/* 跨源补录：GMGN 短窗口漏采、由外部线索补齐的条目。用冷色和「补录」二字
+   与 GMGN 原生条目区分，避免被误读为战壕接口自己的采集结果。 */
+.gmgn-trench-backfill-badge {
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  border: 1px solid rgba(112, 205, 255, 0.55);
+  border-radius: 999px;
+  color: #9fd8ff;
+  font-size: 8px;
+  font-style: normal;
+  font-weight: 950;
+  line-height: 1.35;
+  white-space: nowrap;
+  cursor: help;
+  background: rgba(112, 205, 255, 0.12);
+}
+
+.gmgn-trench-history-strip .gmgn-trench-backfill-summary {
+  color: #9fd8ff;
+}
+
 .gmgn-trench-name span {
   color: rgba(241, 234, 215, 0.46);
   font-size: 10px;

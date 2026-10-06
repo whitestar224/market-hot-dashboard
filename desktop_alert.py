@@ -109,6 +109,24 @@ def clamp_text(value: object, limit: int) -> str:
     return text[: limit - 3] + "..."
 
 
+def ai_narrative_looks_english(value: object) -> bool:
+    """Detect the English upstream narrative; keep the popup tooltip Chinese."""
+    return looks_english(value)
+
+
+def chinese_ai_narrative(value: object, limit: int = 1600) -> str:
+    """Return the tooltip text only when it is Chinese.
+
+    The desktop popup is the last stop before a user reads the narrative, so an
+    English value coming from the payload, a source cache or a mismatched
+    upstream call is withheld here instead of being displayed.
+    """
+    text = clamp_text(value, limit)
+    if not text or ai_narrative_looks_english(text):
+        return ""
+    return text
+
+
 def load_payload(encoded: str) -> dict:
     try:
         raw = base64.b64decode(encoded.encode("ascii"))
@@ -607,7 +625,7 @@ def show_popup(payload: dict, slot: int) -> int:
     contract_address = str(payload.get("contractAddress") or payload.get("contract") or "").strip()
     chain = str(payload.get("chain") or "").strip()
     source_id = str(payload.get("sourceId") or "").strip()
-    ai_narrative = clamp_text(payload.get("binanceAiNarrative") or "", 1600)
+    ai_narrative = chinese_ai_narrative(payload.get("binanceAiNarrative") or "", 1600)
     ai_narrative_port = int(payload.get("explanationPort") or os.getenv("XYS_ALERT_PORT") or 8765)
     translation_text = clamp_text(payload.get("translationText") or "", 1800)
     translate_endpoint = str(payload.get("translateEndpoint") or "").strip()
@@ -813,7 +831,7 @@ def show_popup(payload: dict, slot: int) -> int:
                 result = fetch_binance_ai_narrative(
                     ai_narrative_port, source_id, chain, contract_address, payload.get("key") or ""
                 )
-                text_value = clamp_text(
+                text_value = chinese_ai_narrative(
                     result.get("exchangeAiNarrative") or result.get("binanceAiNarrative") or "", 1600
                 )
                 if text_value and root.winfo_exists():

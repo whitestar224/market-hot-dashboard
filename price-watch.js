@@ -123,6 +123,16 @@
   let lastOnchainTrenchesLoadAt = 0;
   let selectedTrenchNetwork = initialResearchParams.get("trenchChain") || "";
   let selectedTrenchPage = Math.max(1, Number(initialResearchParams.get("trenchPage")) || 1);
+  // GMGN's trenches response carries no narrative of its own (verified: 114
+  // fields, none of them a story), so the board asks Binance's AI narrative
+  // endpoint for the rows it is actually showing. Narratives are cached per
+  // contract for the session so paging, re-rendering and hover never re-request.
+  const TRENCH_AI_ITEMS_MAX = 24;
+  const TRENCH_AI_RETRY_MS = 600_000;
+  const trenchAiNarratives = new Map();
+  const trenchAiPending = new Set();
+  let trenchAiRequestedAt = 0;
+  let trenchAiSignature = "";
   const CHAIN_SUBMODES = ["today", "scan", "trenches", "ecosystem", "history", "system"];
   const requestedChainSubMode = new URLSearchParams(window.location.search).get("chainView") || "today";
   let chainSubMode = CHAIN_SUBMODES.includes(requestedChainSubMode) ? requestedChainSubMode : "today";
@@ -1949,16 +1959,152 @@
     </span>`;
   }
 
+  function trenchAiKey(row) {
+    const contract = String(row?.contractAddress || "").trim();
+    if (!contract) return "";
+    const network = String(row?.network || row?.chain || "").trim().toLowerCase();
+    return `${network}:${contract}`;
+  }
+
+  function trenchAiNarrativeFor(row) {
+    const key = trenchAiKey(row);
+    return key ? trenchAiNarratives.get(key) || null : null;
+  }
+
+  function trenchAiNarrativeText(row) {
+    return gmgnChineseNarrativeText(trenchAiNarrativeFor(row)?.exchangeAiNarrative);
+  }
+
   function trenchNarrativeHoverTemplate(row) {
-    const narrative = String(row?.gmgnNarrative || "").trim();
+    // Second line of defence behind the server-side language gate: the AI
+    // narrative tooltip stays Chinese, so an English value in a stale payload
+    // is withheld and the card explains that no Chinese narrative came back.
+    const entry = trenchAiNarrativeFor(row);
+    const narrative = gmgnChineseNarrativeText(entry?.exchangeAiNarrative);
+    const key = trenchAiKey(row);
+    const pending = Boolean(key) && trenchAiPending.has(key);
+    const providerKey = String(entry?.exchangeAiNarrativeProvider || "").toLowerCase();
+    const sourceLabel = providerKey === "binance" ? "币安 AI" : providerKey === "bitget" ? "Bitget AI" : "AI";
+    const body = narrative
+      ? escapeHtml(narrative)
+      : pending
+        ? "正在向币安 AI 叙事接口请求这一条的中文叙事，返回后自动显示。"
+        : "币安 AI 叙事接口本次未返回该币的中文叙事，新币刚开盘时很常见；换页或点“刷新战壕”会重新请求。";
     return `<span class="onchain-trench-social-tool is-ai ${narrative ? "has-native" : "is-unavailable"}" tabindex="0">
-      <button type="button" class="onchain-trench-social-button" aria-label="查看 GMGN AI 叙事">${trenchSocialGlyph("AI")}</button>
+      <button type="button" class="onchain-trench-social-button" aria-label="查看 ${escapeHtml(sourceLabel)}叙事">${trenchSocialGlyph("AI")}</button>
       <span class="onchain-trench-hover-card is-ai-card" role="tooltip">
-        <b>GMGN AI 叙事</b>
-        <p>${narrative ? escapeHtml(narrative) : "GMGN 战壕接口本次未随主数据返回原生叙事。为避免 IP 限频，系统不会按币逐个补请求，也不会用其他模型冒充 GMGN。"}</p>
-        <small>${narrative ? "内容由 GMGN 随本次战壕数据返回；" : ""}悬停不发起新请求。AI 内容未经人工审核，请独立核实，不构成投资建议。</small>
+        <b>${escapeHtml(sourceLabel)}叙事</b>
+        <p>${body}</p>
+        <small>${narrative ? `内容由${escapeHtml(sourceLabel)}接口生成；` : ""}AI 内容未经人工审核，请独立核实，不构成投资建议。</small>
       </span>
     </span>`;
+  }
+
+  // Ask Binance's AI narrative endpoint for the rows currently on screen. The
+  // request is bounded to one page and cached per contract, so hovering a card
+  // stays a pure local lookup.
+  async function requestOnchainTrenchAi({ force = false } = {}) {
+    const items = Array.isArray(onchainTrenchesPayload?.items) ? onchainTrenchesPayload.items : [];
+    if (!items.length) return;
+    if (force) {
+      items.forEach((row) => {
+        const key = trenchAiKey(row);
+        const cached = key ? trenchAiNarratives.get(key) : null;
+        if (cached && !cached.exchangeAiNarrative) trenchAiNarratives.delete(key);
+      });
+    }
+    const targets = [];
+    const seen = new Set();
+    items.forEach((row) => {
+      const key = trenchAiKey(row);
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      if (trenchAiPending.has(key) || trenchAiNarratives.has(key)) return;
+      targets.push(row);
+    });
+    const bounded = targets.slice(0, TRENCH_AI_ITEMS_MAX);
+    if (!bounded.length) return;
+
+    const keys = bounded.map(trenchAiKey);
+    const signature = keys.join("|");
+    const now = Date.now();
+    if (signature === trenchAiSignature && now - trenchAiRequestedAt < TRENCH_AI_RETRY_MS) return;
+    trenchAiSignature = signature;
+    trenchAiRequestedAt = now;
+    keys.forEach((key) => trenchAiPending.add(key));
+    if (currentMode === "chains" && chainSubMode === "trenches") renderChainEcosystem();
+
+    try {
+      const response = await fetch("/api/exchange-ai-narratives", {
+        method: "POST",
+        cache: "no-store",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          items: bounded.map((row) => ({
+            key: trenchAiKey(row),
+            sourceId: "gmgn-trenches",
+            chain: String(row?.network || row?.chain || ""),
+            contractAddress: String(row?.contractAddress || ""),
+            symbol: String(row?.symbol || row?.name || "")
+          }))
+        })
+      });
+      const payload = await response.json().catch(() => ({}));
+      const updates = Array.isArray(payload?.items) ? payload.items : [];
+      updates.forEach((update) => {
+        const key = String(update?.key || "");
+        if (!key) return;
+        trenchAiNarratives.set(key, {
+          exchangeAiNarrative: String(update?.exchangeAiNarrative || ""),
+          exchangeAiNarrativeStatus: String(update?.exchangeAiNarrativeStatus || ""),
+          exchangeAiNarrativeProvider: String(update?.exchangeAiNarrativeProvider || ""),
+          exchangeAiNarrativeSource: String(update?.exchangeAiNarrativeSource || ""),
+          exchangeAiNarrativeUrl: String(update?.exchangeAiNarrativeUrl || "")
+        });
+      });
+      applyOnchainTrenchAiNarratives();
+    } catch (_) {
+      // The board stays usable; the next refresh retries the missing rows.
+    } finally {
+      keys.forEach((key) => trenchAiPending.delete(key));
+      if (currentMode === "chains" && chainSubMode === "trenches") {
+        const rows = Array.isArray(onchainTrenchesPayload?.items) ? onchainTrenchesPayload.items : [];
+        const ready = rows.filter((row) => trenchAiNarrativeText(row)).length;
+        if (statusNode && !onchainTrenchesLoading) {
+          statusNode.textContent = `GMGN 实时战壕已更新 · 本页币安 AI 叙事 ${ready}/${rows.length} · 悬停不请求接口`;
+        }
+        renderChainEcosystem();
+      }
+    }
+  }
+
+  function applyOnchainTrenchAiNarratives() {
+    const items = Array.isArray(onchainTrenchesPayload?.items) ? onchainTrenchesPayload.items : [];
+    items.forEach((row) => {
+      const entry = trenchAiNarrativeFor(row);
+      if (!entry) return;
+      const narrative = gmgnChineseNarrativeText(entry.exchangeAiNarrative);
+      row.aiAnalysisProvider = entry.exchangeAiNarrativeProvider || "binance";
+      row.aiAnalysisSource = entry.exchangeAiNarrativeSource || "Binance AI";
+      row.aiAnalysisStatus = narrative ? "ready" : "not-returned";
+      row.exchangeAiNarrative = narrative;
+    });
+  }
+
+  // Latin alphabet must clearly dominate to be rejected, so short Chinese
+  // summaries that embed tickers still render.
+  function gmgnNarrativeLooksEnglish(value) {
+    const text = String(value || "").trim();
+    if (text.length < 12) return false;
+    const latin = (text.match(/[A-Za-z]/g) || []).length;
+    const cjk = (text.match(/[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/g) || []).length;
+    return latin >= 18 && latin >= Math.max(12, cjk * 4);
+  }
+
+  function gmgnChineseNarrativeText(value) {
+    const text = String(value || "").trim();
+    if (!text || gmgnNarrativeLooksEnglish(text)) return "";
+    return text;
   }
 
   function onchainTrenchSocialsTemplate(row) {
@@ -2016,6 +2162,11 @@
     const coolingDown = cooldownUntil > Date.now() || Boolean(payload?.rateLimited && retryAfter);
     const apiConfigured = Boolean(payload?.gmgnApi?.personalKeyUsed);
     const aiCoverage = payload?.aiCoverage || {};
+    const aiReadyCount = items.filter((row) => trenchAiNarrativeText(row)).length;
+    const aiPendingCount = items.filter((row) => {
+      const key = trenchAiKey(row);
+      return Boolean(key) && trenchAiPending.has(key);
+    }).length;
     const page = Number(payload?.page) || selectedTrenchPage;
     const pages = Number(payload?.pages) || 1;
     const total = Number(payload?.total) || 0;
@@ -2035,11 +2186,11 @@
             <span><b>${total}</b><em>实时结果</em></span>
             <span><b>${Number(counts.gmgn) || 0}</b><em>GMGN</em></span>
             <span><b>${sourceTotal ? `${healthySources}/${sourceTotal}` : "等待"}</b><em>链已返回</em></span>
-            <span><b>${Number(aiCoverage.ready) || 0}/${Number(aiCoverage.total) || items.length || 0}</b><em>GMGN 原生叙事</em></span>
+            <span><b>${aiReadyCount}/${items.length || Number(aiCoverage.total) || 0}</b><em>币安 AI 叙事${aiPendingCount ? ` · ${aiPendingCount} 生成中` : ""}</em></span>
           </div>
         </header>
         <aside class="onchain-trenches-preset-note">
-          <span><b>GMGN API 只读${apiConfigured ? " · 已接入个人 Key" : ""}</b><em>同一请求 90 秒合并复用，各链错峰读取；叙事只使用 GMGN 主响应附带内容，图标悬停零请求。429 冷却期间停止访问，不拿旧数据冒充实时。</em>${unsupportedSources.length ? `<small>${escapeHtml(unsupportedSources.map(onchainResearchNetworkLabel).join("、"))} 当前未获 GMGN 战壕接口支持</small>` : failedSources.length ? `<small>${escapeHtml(failedSources.map(onchainResearchNetworkLabel).join("、"))} 正在自动恢复${retryAfter ? `，约 ${retryAfter} 秒后可重试` : ""}</small>` : ""}</span>
+          <span><b>GMGN API 只读${apiConfigured ? " · 已接入个人 Key" : ""}</b><em>同一请求 90 秒合并复用，各链错峰读取；GMGN 战壕接口本身不返回叙事，榜单按当前页向币安 AI 叙事接口取中文叙事并逐合约缓存，图标悬停零请求。429 冷却期间停止访问，不拿旧数据冒充实时。</em>${unsupportedSources.length ? `<small>${escapeHtml(unsupportedSources.map(onchainResearchNetworkLabel).join("、"))} 当前未获 GMGN 战壕接口支持</small>` : failedSources.length ? `<small>${escapeHtml(failedSources.map(onchainResearchNetworkLabel).join("、"))} 正在自动恢复${retryAfter ? `，约 ${retryAfter} 秒后可重试` : ""}</small>` : ""}</span>
           <i>${escapeHtml(relativeTime(payload?.updatedAt))}</i>
         </aside>
         <div class="onchain-trenches-filterbar">
@@ -3139,12 +3290,13 @@
       onchainTrenchesLoaded = true;
       lastOnchainTrenchesLoadAt = Date.now();
       selectedTrenchPage = Math.max(1, Number(payload.page) || selectedTrenchPage);
+      applyOnchainTrenchAiNarratives();
       if (!quiet) {
-        const coverage = payload.aiCoverage || {};
         statusNode.textContent = payload.rateLimited
           ? `GMGN 请求已暂停，防止 IP 继续受限 · 约 ${Number(payload.retryAfterSeconds) || 60} 秒后自动恢复`
-          : `GMGN 实时战壕已更新 · ${Number(payload.counts?.gmgn) || 0} 条 · 原生叙事 ${Number(coverage.ready) || 0}/${Number(coverage.total) || 0} · 悬停不请求接口`;
+          : `GMGN 实时战壕已更新 · ${Number(payload.counts?.gmgn) || 0} 条 · 正在向币安 AI 叙事接口补齐本页叙事`;
       }
+      void requestOnchainTrenchAi({ force: refresh });
       if (payload.rateLimited) {
         const retryMs = Math.max(10_000, (Number(payload.retryAfterSeconds) || 60) * 1_000 + 1_500);
         onchainTrenchRetryTimer = window.setTimeout(() => {

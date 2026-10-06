@@ -25,6 +25,27 @@ const gmgnTrenchXPostRetryAt = new Map();
 const gmgnTrenchXPostQueue = [];
 let gmgnTrenchXPostRequestActive = false;
 
+// Second line of defence behind the server-side language gate: the AI narrative
+// tooltip stays Chinese even if an English value arrives from a stale payload
+// or a cached response. Latin alphabet must clearly dominate to be rejected,
+// so short Chinese summaries that embed tickers still render.
+const EXCHANGE_AI_LATIN_PATTERN = /[A-Za-z]/g;
+const EXCHANGE_AI_CJK_PATTERN = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/g;
+
+function exchangeAiNarrativeLooksEnglish(value) {
+  const text = String(value || "").trim();
+  if (text.length < 12) return false;
+  const latin = (text.match(EXCHANGE_AI_LATIN_PATTERN) || []).length;
+  const cjk = (text.match(EXCHANGE_AI_CJK_PATTERN) || []).length;
+  return latin >= 18 && latin >= Math.max(12, cjk * 4);
+}
+
+function exchangeAiChineseNarrative(value) {
+  const text = String(value || "").trim();
+  if (!text || exchangeAiNarrativeLooksEnglish(text)) return "";
+  return text;
+}
+
 function readLocalPreference(key, fallback) {
   try {
     return localStorage.getItem(key) || fallback;
@@ -874,6 +895,14 @@ function renderGmgnTrenchRow(row, source, index) {
   const personBadge = personSignal
     ? `<i class="gmgn-trench-person-badge" title="${escapeHtml(`${personName} ${personAction}`)}">人物${escapeHtml(personAction)}</i>`
     : "";
+  // 跨源补录条目：GMGN 的 completed 上游只保留约 19 分钟，轮询空档里的新币
+  // 永远补不回来。这些条目来自 Ave 热搜 / 币安钱包热门榜 / 个人 X 监控等常驻
+  // 线索通道，必须显式标注来源，不能被误读成战壕接口自己采到的。
+  const backfillSources = Array.isArray(row?.originLabels) ? row.originLabels.filter(Boolean) : [];
+  const backfillLabel = String(row?.originLabel || backfillSources[0] || "外部线索").trim();
+  const backfillBadge = row?.backfilled
+    ? `<i class="gmgn-trench-backfill-badge" title="外部线索补录 · ${escapeHtml(backfillSources.length ? backfillSources.join(" / ") : backfillLabel)}：该币在榜窗口内开盘，但 GMGN 战壕接口的短窗口没有采到，因此由外部线索通道补录展示">补录</i>`
+    : "";
   const aiCopy = narrative
     || (!binanceAiSupported
       ? "币安 AI 叙事接口当前不支持这条链，因此不会发送无效请求。"
@@ -927,6 +956,7 @@ function renderGmgnTrenchRow(row, source, index) {
               : `<span class="gmgn-trench-token-link is-static"><strong>${escapeHtml(symbol)}</strong><span>${escapeHtml(name)}</span></span>`}
             ${researchBadge}
             ${personBadge}
+            ${backfillBadge}
             ${filterWarningBadge}
           </div>
           <div class="gmgn-trench-subline">
@@ -966,6 +996,10 @@ function renderGmgnTrenchBoard(source) {
       : "实时源暂时断开 · 正在展示已接收历史";
   if (!rows.length) return `<div class="rows">${renderEmpty(source)}</div>`;
   const totalPagesToShow = totalPages <= 1 ? "" : `· <b>${totalPages}</b> 页`;
+  const backfilledCount = Number(source?.backfilledCount || 0);
+  const backfillSummary = backfilledCount > 0
+    ? ` · <span class="gmgn-trench-backfill-summary">含 ${backfilledCount} 条外部线索补录</span>`
+    : "";
   const paginationButtons = totalPages > 1 ? `
     <div class="total-pagination">
       <button type="button" class="total-page-button total-page-nav" data-role="trench-page" data-page="${page - 1}" ${page <= 1 ? "disabled" : ""}>上一页</button>
@@ -979,7 +1013,7 @@ function renderGmgnTrenchBoard(source) {
   return `
     <div class="gmgn-trench-history-strip">
       <span><b>${escapeHtml(source.historyCount || cappedRows.length)}</b> 个已接收新币</span>
-      <small>${escapeHtml(liveState)}${totalPagesToShow} · 严格按开盘时间倒序</small>
+      <small>${escapeHtml(liveState)}${totalPagesToShow} · 严格按开盘时间倒序${backfillSummary}</small>
     </div>
     <div class="gmgn-trench-hot-scroll" role="list" aria-label="GMGN 战壕新币接收历史">
       ${rows.map((row, index) => renderGmgnTrenchRow(row, source, startIdx + index + 1)).join("")}
@@ -1298,7 +1332,7 @@ function exchangeAiIdentity(row, source) {
 function exchangeAiResult(row, source) {
   const cached = exchangeAiNarrativeCache.get(exchangeAiIdentity(row, source)) || {};
   return {
-    narrative: String(row?.exchangeAiNarrative || row?.binanceAiNarrative || cached.exchangeAiNarrative || "").trim(),
+    narrative: exchangeAiChineseNarrative(row?.exchangeAiNarrative || row?.binanceAiNarrative || cached.exchangeAiNarrative || ""),
     source: String(row?.exchangeAiNarrativeSource || row?.binanceAiNarrativeSource || cached.exchangeAiNarrativeSource || "Binance AI").trim(),
     provider: String(row?.exchangeAiNarrativeProvider || cached.exchangeAiNarrativeProvider || "binance").trim(),
     status: String(row?.exchangeAiNarrativeStatus || row?.binanceAiNarrativeStatus || cached.exchangeAiNarrativeStatus || "").trim().toUpperCase()

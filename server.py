@@ -386,6 +386,9 @@ from app.core.state import (
     GMGN_HOT_SEARCH_POOL_RETENTION_SECONDS,
     GMGN_HOT_SEARCH_REENTRY_SECONDS,
     GMGN_OPENAPI_BASE,
+    GMGN_TRENCH_BACKFILL_MAX_ROWS,
+    GMGN_TRENCH_BACKFILL_ORIGIN_LABELS,
+    GMGN_TRENCH_BACKFILL_PROVIDERS,
     GMGN_TRENCH_BOARD_REFRESH_SECONDS,
     GMGN_TRENCH_HISTORY_LOCK,
     GMGN_TRENCH_HISTORY_MAX_ROWS,
@@ -6543,8 +6546,8 @@ def ensure_local_translation_service(wait_seconds: int = 0) -> bool:
     return local_translation_service_ready()
 
 
-def libretranslate_translate(text: str) -> str:
-    ensure_local_translation_service(wait_seconds=45)
+def libretranslate_translate(text: str, *, wait_seconds: int = 45) -> str:
+    ensure_local_translation_service(wait_seconds=wait_seconds)
     base_url = env_value("LIBRETRANSLATE_URL") or "http://127.0.0.1:5000"
     endpoint = f"{base_url.rstrip('/')}/translate"
     body: dict[str, Any] = {
@@ -9503,6 +9506,93 @@ BINANCE_WALLET_AI_NARRATIVE_NEGATIVE_TTL_SECONDS = max(
 BINANCE_WALLET_AI_NARRATIVE_CACHE_MAX_ENTRIES = 512
 BINANCE_WALLET_AI_NARRATIVE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 BINANCE_WALLET_AI_NARRATIVE_CACHE_LOCK = threading.Lock()
+# Binance localizes the AI narrative strictly through the ``Lang`` request
+# header: ``zh-CN`` returns the Chinese text, anything else (or a missing
+# header) returns the English one.  Every narrative that reaches a popup,
+# tooltip or card therefore has to pass one shared language gate instead of
+# trusting each upstream to behave.
+EXCHANGE_AI_NARRATIVE_LANGUAGE = "zh-CN"
+EXCHANGE_AI_NARRATIVE_LOCALIZED_KEYS = (
+    "cn", "zh-cn", "zh_cn", "zh", "cnText", "cn_text",
+    "narrativeCn", "narrativeCN", "narrative_cn", "summaryCn", "summary_cn",
+)
+EXCHANGE_AI_NARRATIVE_FALLBACK_KEYS = (
+    "text", "content", "summary", "narrative", "en", "enText", "description",
+)
+NARRATIVE_LATIN_PATTERN = re.compile(r"[A-Za-z]")
+NARRATIVE_CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+
+
+def narrative_text_looks_english(value: Any) -> bool:
+    """Detect an English narrative without punishing short Chinese summaries.
+
+    A narrative stays acceptable when it merely embeds tickers or product
+    names (``GMGN 原生 AI 叙事``); it is only rejected when the Latin alphabet
+    clearly dominates the prose, which is what the English upstream returns.
+    """
+    text = clean_feed_text(value, 4000)
+    if len(text) < 12:
+        return False
+    latin = len(NARRATIVE_LATIN_PATTERN.findall(text))
+    cjk = len(NARRATIVE_CJK_PATTERN.findall(text))
+    return latin >= 18 and latin >= max(12, cjk * 4)
+
+
+def narrative_text_is_chinese(value: Any) -> bool:
+    """Return True only for narrative text that is safe to show in Chinese UI."""
+    text = clean_feed_text(value, 4000)
+    if not text:
+        return False
+    return not narrative_text_looks_english(text)
+
+
+def localized_narrative_text(value: Any, limit: int = 1600) -> str:
+    """Read one localized narrative payload, preferring its Chinese member."""
+    if isinstance(value, str):
+        return clean_feed_text(value, limit)
+    if not isinstance(value, dict):
+        return ""
+    for key in EXCHANGE_AI_NARRATIVE_LOCALIZED_KEYS:
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return clean_feed_text(candidate, limit)
+    for key in EXCHANGE_AI_NARRATIVE_FALLBACK_KEYS:
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return clean_feed_text(candidate, limit)
+    return ""
+
+
+def translate_narrative_to_chinese(value: Any, limit: int = 1600) -> str:
+    """Translate an English narrative locally; empty when that is unavailable.
+
+    The local engine is reused on purpose: keeping the popup Chinese must not
+    depend on a second, paid upstream.  ``wait_seconds=0`` keeps the popup
+    request fast instead of blocking on a cold autostart.
+    """
+    source = clean_feed_text(value, limit)
+    if not source or not narrative_text_looks_english(source):
+        return ""
+    if not env_flag("EXCHANGE_AI_NARRATIVE_TRANSLATE_FALLBACK", default=True):
+        return ""
+    if not env_flag("LIBRETRANSLATE_ENABLED", default=True):
+        return ""
+    try:
+        translated = libretranslate_translate(source, wait_seconds=0)
+    except Exception:
+        return ""
+    translated = clean_feed_text(translated, limit)
+    return translated if narrative_text_is_chinese(translated) else ""
+
+
+def narrative_chinese_or_unavailable(value: Any, limit: int = 1600) -> str:
+    """Return Chinese narrative text, translating English, never leaking it."""
+    text = clean_feed_text(value, limit)
+    if not text:
+        return ""
+    if narrative_text_is_chinese(text):
+        return text
+    return translate_narrative_to_chinese(text, limit)
 EXCHANGE_AI_NARRATIVE_MAX_ITEMS = 24
 EXCHANGE_AI_NARRATIVE_ALLOWED_SOURCES = {
     "binance",
@@ -9635,17 +9725,56 @@ def binance_wallet_ai_narrative_from_payload(
         return {}
     if expected_contract and response_contract and response_contract.casefold() != expected_contract.casefold():
         return {}
-    narrative = clean_feed_text(data.get("narrative"), 1600)
+    narrative = (
+        localized_narrative_text(data.get("narrative"), 1600)
+        if isinstance(data.get("narrative"), (dict, list))
+        else clean_feed_text(data.get("narrative"), 1600)
+    )
     status = clean_feed_text(data.get("status"), 40).upper()
     if not narrative or (status and status != "GENERATED"):
         return {
             "binanceAiNarrativeStatus": status or "UNAVAILABLE",
             "binanceAiNarrativeSource": "Binance AI",
         }
+    if narrative_text_looks_english(narrative):
+        # The widget localizes purely from the request header, so English text
+        # means this response lost the zh-CN language.  Keep it under a private
+        # key so the caller can translate it instead of showing it in a popup.
+        return {
+            "binanceAiNarrativeEnglishOnly": narrative,
+            "binanceAiNarrativeStatus": "LANGUAGE_MISMATCH",
+            "binanceAiNarrativeSource": "Binance AI",
+            "binanceAiNarrativeLanguage": "en",
+        }
     return {
         "binanceAiNarrative": narrative,
         "binanceAiNarrativeStatus": status or "GENERATED",
         "binanceAiNarrativeSource": "Binance AI",
+        "binanceAiNarrativeLanguage": EXCHANGE_AI_NARRATIVE_LANGUAGE,
+    }
+
+
+def binance_ai_narrative_chinese_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep only Chinese Binance narrative text, translating the English one."""
+    if not isinstance(result, dict):
+        return {}
+    english_only = clean_feed_text(result.get("binanceAiNarrativeEnglishOnly"), 1600)
+    if not english_only:
+        return dict(result)
+    translated = translate_narrative_to_chinese(english_only)
+    if not translated:
+        # Better to show “暂无中文叙事” than to answer a Chinese popup in English.
+        return {
+            "binanceAiNarrativeStatus": "UNAVAILABLE",
+            "binanceAiNarrativeSource": "Binance AI",
+            "binanceAiNarrativeLanguage": "en",
+        }
+    return {
+        "binanceAiNarrative": translated,
+        "binanceAiNarrativeStatus": "GENERATED",
+        "binanceAiNarrativeSource": "Binance AI",
+        "binanceAiNarrativeLanguage": EXCHANGE_AI_NARRATIVE_LANGUAGE,
+        "binanceAiNarrativeTranslated": True,
     }
 
 
@@ -9660,13 +9789,21 @@ def fetch_binance_wallet_ai_narrative(chain_id: Any, contract_address: Any) -> d
         cached = BINANCE_WALLET_AI_NARRATIVE_CACHE.get(cache_key)
         if cached:
             cached_at, cached_value = cached
-            ttl = (
-                BINANCE_WALLET_AI_NARRATIVE_CACHE_TTL_SECONDS
-                if cached_value.get("binanceAiNarrative")
-                else BINANCE_WALLET_AI_NARRATIVE_NEGATIVE_TTL_SECONDS
-            )
-            if now - cached_at < ttl:
-                return dict(cached_value)
+            if (
+                cached_value.get("binanceAiNarrative")
+                and not narrative_text_is_chinese(cached_value.get("binanceAiNarrative"))
+            ):
+                # Older builds cached English rows; drop them instead of
+                # serving the English text again.
+                BINANCE_WALLET_AI_NARRATIVE_CACHE.pop(cache_key, None)
+            else:
+                ttl = (
+                    BINANCE_WALLET_AI_NARRATIVE_CACHE_TTL_SECONDS
+                    if cached_value.get("binanceAiNarrative")
+                    else BINANCE_WALLET_AI_NARRATIVE_NEGATIVE_TTL_SECONDS
+                )
+                if now - cached_at < ttl:
+                    return dict(cached_value)
 
     headers = {
         **HEADERS,
@@ -9674,7 +9811,10 @@ def fetch_binance_wallet_ai_narrative(chain_id: Any, contract_address: Any) -> d
         "Accept-Encoding": "identity",
         "Content-Type": "application/json",
         "Clienttype": "web",
+        # Must stay a literal: ``Lang`` is the only switch that makes the widget
+        # answer in Chinese, and the regression test greps this exact pair.
         "Lang": "zh-CN",
+        "Accept-Language": "zh-CN,zh;q=0.9",
         "Origin": "https://web3.binance.com",
         "Referer": "https://web3.binance.com/zh-CN/markets/trending?period=4h",
     }
@@ -9694,10 +9834,12 @@ def fetch_binance_wallet_ai_narrative(chain_id: Any, contract_address: Any) -> d
                     (payload or {}).get("message") or (payload or {}).get("msg") or "invalid response",
                     160,
                 ))
-            result = binance_wallet_ai_narrative_from_payload(
-                payload,
-                chain_id=chain,
-                contract_address=contract,
+            result = binance_ai_narrative_chinese_result(
+                binance_wallet_ai_narrative_from_payload(
+                    payload,
+                    chain_id=chain,
+                    contract_address=contract,
+                )
             )
             with BINANCE_WALLET_AI_NARRATIVE_CACHE_LOCK:
                 BINANCE_WALLET_AI_NARRATIVE_CACHE[cache_key] = (time.time(), dict(result))
@@ -9740,7 +9882,7 @@ def enrich_binance_wallet_ai_narratives(source: dict[str, Any]) -> dict[str, Any
         except Exception:
             continue
         if result:
-            futures[future].update(result)
+            futures[future].update(binance_ai_narrative_chinese_result(result))
     return source
 
 
@@ -9750,7 +9892,7 @@ def normalize_exchange_ai_binance_chain(value: Any) -> str:
 
 
 def exchange_ai_result_from_binance(result: dict[str, Any]) -> dict[str, Any]:
-    narrative = clean_feed_text(result.get("binanceAiNarrative"), 1600)
+    narrative = narrative_chinese_or_unavailable(result.get("binanceAiNarrative"), 1600)
     status = clean_feed_text(result.get("binanceAiNarrativeStatus"), 40).upper()
     if not narrative:
         return {
@@ -9931,7 +10073,7 @@ def bitget_exchange_ai_from_html(
 
     report = details.get("priceAnalysisReport") if isinstance(details.get("priceAnalysisReport"), dict) else {}
     raw_narrative = report.get("coinPriceSummary") or report.get("marketSummary")
-    narrative = clean_feed_text(
+    narrative = narrative_chinese_or_unavailable(
         BeautifulSoup(html.unescape(str(raw_narrative or "")), "html.parser").get_text(" ", strip=True),
         1600,
     )
@@ -10080,6 +10222,44 @@ def exchange_ai_narrative_for_item(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def exchange_ai_narrative_sanitize_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Single exit gate: no AI narrative leaves the API in English.
+
+    Provider responses, persisted source caches and rows enriched by an older
+    build all pass through here, so a stale English value can never reach a
+    popup, tooltip or card again.
+    """
+    if not isinstance(item, dict):
+        return {}
+    raw = clean_feed_text(
+        item.get("exchangeAiNarrative") or item.get("binanceAiNarrative"), 1600
+    )
+    if not raw:
+        sanitized = dict(item)
+        sanitized.pop("exchangeAiNarrative", None)
+        sanitized.pop("binanceAiNarrative", None)
+        sanitized.pop("exchangeAiNarrativeAvailable", None)
+        if not clean_feed_text(sanitized.get("exchangeAiNarrativeStatus"), 40):
+            sanitized["exchangeAiNarrativeStatus"] = "UNAVAILABLE"
+        return sanitized
+    if narrative_text_is_chinese(raw):
+        return item
+    translated = translate_narrative_to_chinese(raw)
+    sanitized = dict(item)
+    sanitized.pop("binanceAiNarrative", None)
+    if not translated:
+        sanitized.pop("exchangeAiNarrative", None)
+        sanitized.pop("exchangeAiNarrativeAvailable", None)
+        sanitized["exchangeAiNarrativeStatus"] = "UNAVAILABLE"
+        sanitized["exchangeAiNarrativeLanguage"] = "en"
+        return sanitized
+    sanitized["exchangeAiNarrative"] = translated
+    sanitized["exchangeAiNarrativeStatus"] = "GENERATED"
+    sanitized["exchangeAiNarrativeLanguage"] = EXCHANGE_AI_NARRATIVE_LANGUAGE
+    sanitized["exchangeAiNarrativeTranslated"] = True
+    return sanitized
+
+
 def exchange_ai_narratives_payload(payload: dict[str, Any]) -> dict[str, Any]:
     raw_items = payload.get("items") if isinstance(payload, dict) else []
     items = [item for item in (raw_items or []) if isinstance(item, dict)][:EXCHANGE_AI_NARRATIVE_MAX_ITEMS]
@@ -10109,7 +10289,14 @@ def exchange_ai_narratives_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "key": clean_feed_text(items[index].get("key"), 260),
                 "exchangeAiNarrativeStatus": "UNAVAILABLE",
             }
-    return {"ok": True, "items": [item for item in results if isinstance(item, dict)]}
+    return {
+        "ok": True,
+        "items": [
+            exchange_ai_narrative_sanitize_item(item)
+            for item in results
+            if isinstance(item, dict)
+        ],
+    }
 
 
 def binance_wallet_hot_source_from_payload(payload: dict[str, Any], period: Any = "24h") -> dict[str, Any]:
@@ -12083,19 +12270,24 @@ def merge_gmgn_trench_history(
     return rows[:GMGN_TRENCH_HISTORY_MAX_ROWS]
 
 
+# Chain badge labels shared by the GMGN trench board and its cross-source
+# backfill rows, so both render the same short chain tag.
+GMGN_TRENCH_CHAIN_LABELS: dict[str, str] = {
+    "eth": "ETH",
+    "solana": "SOL",
+    "robinhood": "HOOD",
+    "arc": "ARC",
+    "base": "BASE",
+    "bsc": "BSC",
+}
+
+
 def gmgn_trench_board_rows(
     history_rows: list[dict[str, Any]],
     *,
     current_rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    chain_labels = {
-        "eth": "ETH",
-        "solana": "SOL",
-        "robinhood": "HOOD",
-        "arc": "ARC",
-        "base": "BASE",
-        "bsc": "BSC",
-    }
+    chain_labels = GMGN_TRENCH_CHAIN_LABELS
     filtered_history = [
         raw for raw in history_rows
         if clean_feed_text(raw.get("network") or raw.get("chain"), 40).lower()
@@ -12186,6 +12378,207 @@ def gmgn_trench_board_rows(
         })
         rows.append(row)
     return rows
+
+
+def gmgn_trench_backfill_origin(providers: list[str]) -> tuple[list[str], list[str]]:
+    """Return (clue providers, Chinese labels) for one cross-source backfill row.
+
+    Provider order follows ``GMGN_TRENCH_BACKFILL_PROVIDERS`` so that a row
+    carrying both an Ave heat signal and a Binance-wallet placement is
+    labelled with the stronger, wallet-confirmed source first.
+    """
+    present = {text for text in providers if text}
+    used = [name for name in GMGN_TRENCH_BACKFILL_PROVIDERS if name in present]
+    labels = [GMGN_TRENCH_BACKFILL_ORIGIN_LABELS[name] for name in used if name in GMGN_TRENCH_BACKFILL_ORIGIN_LABELS]
+    return used, labels
+
+
+def gmgn_trench_external_backfill_rows(
+    *,
+    window_start_ms: int,
+    window_end_ms: int,
+    known_identities: set[str],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Surface coins the trenches tape never captured, using external clues.
+
+    GMGN's ``trenches/completed`` upstream only ever holds roughly the last
+    19 minutes of migrations, so any polling gap permanently loses whatever
+    opened inside it — the board can never back-fill from GMGN itself.  The
+    same coins, however, usually still reach the research store through the
+    always-on clue channels (Ave.ai heat search, Binance Wallet hot list,
+    personal-X monitor).  This turns those rows into board-shaped entries so
+    the tape stops depending on a single, very short upstream window.
+
+    Only rows inside the *current* board window are eligible: the board must
+    stay "the newest N coins by real open time", not "newest N plus a pile of
+    old leftovers".
+    """
+    if limit <= 0 or window_start_ms <= 0 or window_end_ms <= window_start_ms:
+        return []
+    try:
+        conn = CHAIN_ECOSYSTEM_MONITOR.store._connect()
+    except Exception:
+        return []
+    try:
+        # Read-only SELECT: keep it lock-free exactly like load_v44_research_marks.
+        records = conn.execute(
+            "SELECT network,contract_address,pool_address,dex_id,symbol,name,"
+            "candidate_type,decision,selected_score,confidence,first_seen_at,"
+            "pool_created_at,last_seen_at,trade_url,providers_json,metrics_json,"
+            "reasons_json,risks_json "
+            "FROM onchain_research_candidates "
+            "WHERE pool_created_at >= ? AND pool_created_at <= ? "
+            "ORDER BY pool_created_at DESC LIMIT 4000",
+            (int(window_start_ms), int(window_end_ms)),
+        ).fetchall()
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+    rows: list[dict[str, Any]] = []
+    seen_identities: set[str] = set()
+    for record in records:
+        network = clean_feed_text(record["network"], 40).lower()
+        if network == "sol":
+            network = "solana"
+        contract = clean_feed_text(record["contract_address"], 180)
+        if not contract or network not in ONCHAIN_RESEARCH_DEFAULT_NETWORKS:
+            continue
+        identity = gmgn_trench_history_identity({"network": network, "contractAddress": contract})
+        if not identity or identity in known_identities or identity in seen_identities:
+            continue
+        try:
+            providers = json.loads(record["providers_json"] or "[]")
+        except Exception:
+            providers = []
+        if not isinstance(providers, list):
+            providers = []
+        providers = [
+            text for text in (clean_feed_text(value, 80) for value in providers) if text
+        ]
+        # A row the trenches endpoint already delivered is a normal board
+        # member, not a backfill.
+        if "gmgn-trenches" in providers:
+            continue
+        clue_providers, origin_labels = gmgn_trench_backfill_origin(providers)
+        if not origin_labels:
+            continue
+        try:
+            metrics = json.loads(record["metrics_json"] or "{}")
+        except Exception:
+            metrics = {}
+        if not isinstance(metrics, dict):
+            metrics = {}
+        # The board advertises "MC > $10K" per chain; a backfill entry must
+        # honour the same floor or it would silently change the contract.
+        profile = GMGN_TRENCH_CHAIN_FILTERS.get(network) or {}
+        min_market_cap = safe_float(profile.get("minMarketCapUsd"), 0)
+        market_cap = safe_float(metrics.get("marketCapUsd") or metrics.get("fdvUsd"))
+        if min_market_cap and market_cap <= min_market_cap:
+            continue
+        try:
+            reasons = json.loads(record["reasons_json"] or "[]")
+        except Exception:
+            reasons = []
+        if not isinstance(reasons, list):
+            reasons = []
+        try:
+            risks = json.loads(record["risks_json"] or "[]")
+        except Exception:
+            risks = []
+        if not isinstance(risks, list):
+            risks = []
+        seen_identities.add(identity)
+        pool_created_at = int(safe_float(record["pool_created_at"], 0))
+        first_seen_at = int(safe_float(record["first_seen_at"], pool_created_at)) or pool_created_at
+        chain_label = GMGN_TRENCH_CHAIN_LABELS.get(network, network.upper())
+        volume_h24 = safe_float(metrics.get("volumeH24Usd"))
+        rows.append({
+            "network": network,
+            "provider": "external-backfill",
+            "backfilled": True,
+            "originLabel": origin_labels[0],
+            "backfillProviders": clue_providers,
+            "originLabels": origin_labels,
+            "contractAddress": contract,
+            "poolAddress": clean_feed_text(record["pool_address"], 180),
+            "dexId": clean_feed_text(record["dex_id"], 80),
+            "launchpad": "",
+            "launchStage": "observed",
+            "symbol": clean_feed_text(record["symbol"], 60),
+            "name": clean_feed_text(record["name"], 180),
+            "decision": clean_feed_text(record["decision"], 30),
+            "selectedScore": safe_float(record["selected_score"]),
+            "confidence": safe_float(record["confidence"]),
+            "candidateType": clean_feed_text(record["candidate_type"], 30),
+            "ageMinutes": max(0.0, (window_end_ms - pool_created_at) / 60000.0),
+            "firstSeenAt": first_seen_at,
+            "observedAt": int(safe_float(record["last_seen_at"], first_seen_at)) or first_seen_at,
+            "receivedAt": first_seen_at,
+            "providers": providers,
+            "reasons": list(dict.fromkeys([
+                f"外部线索补录：{' / '.join(origin_labels)}已捕捉，但 GMGN 战壕接口的短窗口没采到，"
+                f"因此不依赖单一上游展示",
+                *[clean_feed_text(value, 240) for value in reasons if clean_feed_text(value, 240)],
+            ]))[:6],
+            "risks": [clean_feed_text(value, 240) for value in risks if clean_feed_text(value, 240)][:6],
+            "filterWarnings": [],
+            "imageUrl": "",
+            "poolCreatedAt": pool_created_at,
+            "tradeUrl": clean_feed_text(record["trade_url"], 900),
+            "gmgnNarrative": "",
+            "gmgnSourceIndex": 9999,
+            "metrics": metrics,
+            "rank": 0,
+            "chain": network,
+            "chainLabel": chain_label,
+            "icon": "",
+            "url": clean_feed_text(record["trade_url"], 900),
+            "binanceWalletUrl": binance_wallet_contract_url(network, contract),
+            "price": price_usd(metrics.get("priceUsd")),
+            "turnover": f"24H {money_usd(volume_h24)}",
+            "amount": volume_h24,
+            "change": pct(safe_float(metrics.get("priceChangeH1"))),
+            "heat": 0,
+            "transactions": int(safe_float(metrics.get("transactionsH24"))),
+            "marketCapUsd": market_cap,
+            "liquidityUsd": safe_float(metrics.get("liquidityUsd")),
+            "isCurrent": False,
+            "note": f"{chain_label} · 外部线索补录（{origin_labels[0]}）",
+        })
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def gmgn_trench_merge_backfill_rows(
+    board_rows: list[dict[str, Any]],
+    backfill_rows: list[dict[str, Any]],
+    *,
+    cap: int,
+) -> list[dict[str, Any]]:
+    """Chronologically merge backfill entries into the tape and re-rank.
+
+    Backfilled rows must interleave by real open time — appending them after
+    the board would break the "strictly newest-open-first" promise the header
+    makes.  The merged tape is re-capped so the board keeps its size contract;
+    the oldest entries (whichever source they came from) fall off.
+    """
+    if not backfill_rows:
+        return board_rows
+    merged = gmgn_trench_unique_rows([*board_rows, *backfill_rows])
+    merged = [dict(row) for row in merged]
+    merged.sort(key=lambda row: (
+        int(safe_float(row.get("poolCreatedAt"), 0)),
+        int(safe_float(row.get("receivedAt"), 0)),
+        -int(safe_float(row.get("gmgnSourceIndex"), 9999)),
+    ), reverse=True)
+    merged = merged[:cap] if cap > 0 else merged
+    for index, row in enumerate(merged, start=1):
+        row["rank"] = index
+    return merged
 
 
 def trench_person_semantic_cache_key(signal: dict[str, Any]) -> str:
@@ -13554,12 +13947,39 @@ def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
                     pass
     source_status = live_payload.get("sourceStatus") if isinstance(live_payload.get("sourceStatus"), dict) else {}
     online_count = sum(1 for value in source_status.values() if value == "ok")
-    capped_rows = rows[:GMGN_TRENCH_RESPONSE_MAX_ROWS]
+    # Cross-source backfill runs AFTER the research ingest above, so the
+    # gmgn-trench research stream keeps its exact previous membership (these
+    # coins already live in the research store under their clue providers).
+    board_window = rows[:GMGN_TRENCH_RESPONSE_MAX_ROWS]
+    window_start_ms = min(
+        (int(safe_float(row.get("poolCreatedAt"), 0)) for row in board_window if isinstance(row, dict)),
+        default=0,
+    )
+    known_trench_identities = {
+        identity
+        for source_rows in (rows, history_rows)
+        for raw in source_rows
+        if isinstance(raw, dict)
+        and (identity := gmgn_trench_history_identity(raw))
+    }
+    backfill_rows = gmgn_trench_external_backfill_rows(
+        window_start_ms=window_start_ms,
+        window_end_ms=observed_at,
+        known_identities=known_trench_identities,
+        limit=GMGN_TRENCH_BACKFILL_MAX_ROWS,
+    )
+    rows = gmgn_trench_merge_backfill_rows(
+        rows,
+        backfill_rows,
+        cap=GMGN_TRENCH_RESPONSE_MAX_ROWS,
+    )
+    capped_rows = rows
+    backfilled_count = sum(1 for row in capped_rows if isinstance(row, dict) and row.get("backfilled"))
     source = source_template(
         id="gmgn-trenches",
         group="crypto",
         title="GMGN 战壕新币榜",
-        subtitle="五链按真实开盘时间倒序 · MC > $10K · 至少一个社交媒体",
+        subtitle="五链按真实开盘时间倒序 · MC > $10K · 至少一个社交媒体 · 漏采缺口按外部线索标注补录",
         accent="#9cff57",
         source_label="GMGN",
         source_name="GMGN Agent API · trenches/completed",
@@ -13574,6 +13994,7 @@ def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
         "scrollableHistory": True,
         "visibleRows": 10,
         "historyCount": len(capped_rows),
+        "backfilledCount": backfilled_count,
         "currentCount": len(current_display_rows),
         "currentRawCount": len(live_rows),
         "currentFetchedCount": int(safe_float(live_payload.get("unfilteredTotal"), len(raw_live_rows))),
@@ -30533,6 +30954,116 @@ def price_structure_symbol_excluded(
     return bool(row)
 
 
+PRICE_STRUCTURE_MONITOR_VISIBILITY_CACHE: (
+    tuple[float, tuple[frozenset[str], frozenset[str]]] | None
+) = None
+PRICE_STRUCTURE_MONITOR_VISIBILITY_LOCK = threading.Lock()
+PRICE_STRUCTURE_MONITOR_VISIBILITY_SECONDS = max(
+    5.0,
+    float(os.getenv("PRICE_STRUCTURE_MONITOR_VISIBILITY_SECONDS", "30") or "30"),
+)
+
+
+def price_structure_monitor_visibility(
+    *,
+    now_ms: int | None = None,
+) -> tuple[frozenset[str], frozenset[str]] | None:
+    """Return ``(every persisted monitor identity, the ones the page shows now)``.
+
+    The structure scanner admits a deliberately wider roster than the page: live
+    AiCoin hot-list rows, Binance-Wallet 4h rows and personal-X contexts all
+    enter the structure pool, and the pool keeps a 30-day window.  The page adds
+    two gates the scanner never had -- the turnover/activity gate and a usable
+    quote (``status != "unavailable"``) -- so a symbol can keep producing
+    structure popups long after its card disappeared from the monitor pool.  The
+    operator cannot act on a popup whose coin is not on the page, so every
+    structure alert is gated on the *visible* roster.
+
+    The two sets are returned together because the gate only applies to symbols
+    the monitor system already knew about (see
+    ``price_structure_item_in_visible_monitor``).  ``None`` means the roster
+    could not be established: callers must keep their previous behaviour rather
+    than silently muting the whole pool.
+    """
+    global PRICE_STRUCTURE_MONITOR_VISIBILITY_CACHE
+    now_value = int(now_ms or time.time() * 1000)
+    with PRICE_STRUCTURE_MONITOR_VISIBILITY_LOCK:
+        cached = PRICE_STRUCTURE_MONITOR_VISIBILITY_CACHE
+        if cached and time.time() - cached[0] < PRICE_STRUCTURE_MONITOR_VISIBILITY_SECONDS:
+            # The cached pair is already immutable, so it is shared as-is: the
+            # three-second structure loop asks for this on every pass.
+            return cached[1]
+    try:
+        # Pure reads.  SQLite (WAL) coordinates them with writers and the
+        # structure loop must not queue behind the broad application mutex.
+        with auth_db() as conn:
+            tracked = {
+                price_structure_monitor_symbol(row["symbol"])
+                for row in conn.execute("SELECT symbol FROM price_watch_assets")
+            } - {""}
+        rows = price_watch_active_rows(
+            bypass_process_lock=True,
+            persist_retention_transitions=False,
+        )
+        rows = filter_price_monitor_cold_archives(
+            rows,
+            now_ms=now_value,
+            persist_retention_transitions=False,
+        )
+        rows = filter_price_monitor_rows_by_activity(
+            rows,
+            allow_refresh=False,
+            persist_retention_transitions=False,
+            update_summary=False,
+        )
+    except Exception as exc:
+        print(
+            "Structure monitor visibility roster failed: "
+            + safe_error_text(str(exc))[:160],
+            file=sys.stderr,
+        )
+        return None
+    visible = {
+        price_structure_monitor_symbol(row.get("symbol"))
+        for row in rows
+        if clean_feed_text(row.get("status"), 40) != "unavailable"
+    } - {""}
+    with PRICE_STRUCTURE_MONITOR_VISIBILITY_LOCK:
+        PRICE_STRUCTURE_MONITOR_VISIBILITY_CACHE = (
+            time.time(),
+            (frozenset(tracked), frozenset(visible)),
+        )
+    return PRICE_STRUCTURE_MONITOR_VISIBILITY_CACHE[1]
+
+
+def price_structure_item_in_visible_monitor(
+    item: dict[str, Any] | None,
+    *,
+    visibility: tuple[frozenset[str], frozenset[str]] | None = None,
+) -> bool:
+    """Whether a structure popup still owns a card on the price-monitor page.
+
+    ``new-coin-low`` is exempt: it is a separate pool with its own page
+    (``/api/new-coin-low-structures``) as the operator surface for those
+    symbols, so it is never gated on the price-monitor roster.  A symbol that
+    never reached ``price_watch_assets`` is a live discovery row (AiCoin hot
+    list / Binance Wallet 4h) rather than a card the operator lost track of, so
+    it also keeps the previous behaviour.
+    """
+    if not isinstance(item, dict):
+        return False
+    if clean_feed_text(item.get("monitorPool"), 40) == "new-coin-low":
+        return True
+    symbol = price_structure_monitor_symbol(item.get("symbol"))
+    if not symbol:
+        return False
+    roster = visibility if visibility is not None else price_structure_monitor_visibility()
+    if roster is None:
+        return True
+    tracked, visible = roster
+    return symbol not in tracked or symbol in visible
+
+
 def price_structure_payload_without_symbols(
     payload: dict[str, Any],
     excluded_symbols: set[str],
@@ -30952,6 +31483,11 @@ def price_structure_watch_rows_uncached() -> list[dict[str, Any]]:
     now_ms = int(time.time() * 1000)
     priority_cutoff = now_ms - PRICE_WATCH_RETENTION_SECONDS * 1000
     gainers_cutoff = now_ms - GAINERS_MONITOR_PROMOTION_SECONDS * 1000
+    # A GMGN 5m hot-search entry is a short probation, not 30-day membership:
+    # ``price_watch_active_rows`` and ``price_watch_public_item`` both expire it
+    # on GMGN_HOT_SEARCH_POOL_RETENTION_SECONDS.  Using the 30-day window here
+    # kept the two pools out of sync for up to a month.
+    gmgn_cutoff = now_ms - GMGN_HOT_SEARCH_POOL_RETENTION_SECONDS * 1000
     # AiCoin's saved source may contain historical rows without contract fields.
     # Resolve those symbols through their current persisted identity once, then
     # prevent an archived contract from bypassing retention through that cache.
@@ -31036,7 +31572,7 @@ def price_structure_watch_rows_uncached() -> list[dict[str, Any]]:
             or aicoin_last_seen_at >= priority_cutoff
             or personal_x_mentioned_at >= priority_cutoff
             or wallet_last_seen_at >= priority_cutoff
-            or gmgn_last_seen_at >= priority_cutoff
+            or gmgn_last_seen_at >= gmgn_cutoff
             or gainers_active
         ):
             return False
@@ -31058,7 +31594,7 @@ def price_structure_watch_rows_uncached() -> list[dict[str, Any]]:
             membership_sources.append("个人X")
         if wallet_last_seen_at >= priority_cutoff:
             membership_sources.append("币安钱包4H")
-        if gmgn_last_seen_at >= priority_cutoff:
+        if gmgn_last_seen_at >= gmgn_cutoff:
             membership_sources.append("GMGN热搜5M")
         if gainers_active and int(merged.get("binance_gainers_last_seen_at") or 0) > 0:
             membership_sources.append("Binance涨幅榜")
@@ -31086,7 +31622,7 @@ def price_structure_watch_rows_uncached() -> list[dict[str, Any]]:
                     now_ms,
                 )
             ))
-        if gmgn_last_seen_at >= priority_cutoff:
+        if gmgn_last_seen_at >= gmgn_cutoff:
             monitor_pool_entry_times.append(gmgn_first_seen_at or now_ms)
         if gainers_active:
             monitor_pool_entry_times.append(gainers_first_seen_at)
@@ -32502,6 +33038,7 @@ def launch_price_structure_strategy_alerts(
         or (not signals and not alert_hints)
         or price_structure_symbol_excluded(symbol, bypass_process_lock=True)
         or price_monitor_row_has_cold_archive(item)
+        or not price_structure_item_in_visible_monitor(item)
     ):
         return 0
     child_ids = {
@@ -32717,6 +33254,7 @@ def launch_price_structure_first_observation_alerts(
         not symbol
         or price_structure_symbol_excluded(symbol, bypass_process_lock=True)
         or price_monitor_row_has_cold_archive(item)
+        or not price_structure_item_in_visible_monitor(item)
     ):
         return 0
     previous_frames = {
@@ -32861,6 +33399,9 @@ def price_structure_prearm_candidates(now_ms: int | None = None) -> list[dict[st
     candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
     excluded_symbols = price_structure_excluded_symbols()
+    # Resolved once per pass: the roster itself is a short-TTL read, but every
+    # item in the payload would otherwise ask for it again.
+    visibility = price_structure_monitor_visibility()
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -32869,7 +33410,11 @@ def price_structure_prearm_candidates(now_ms: int | None = None) -> list[dict[st
             continue
         symbol = price_structure_monitor_symbol(item.get("symbol"))
         frames = item.get("frames") if isinstance(item.get("frames"), list) else []
-        if not symbol or symbol in excluded_symbols:
+        if (
+            not symbol
+            or symbol in excluded_symbols
+            or not price_structure_item_in_visible_monitor(item, visibility=visibility)
+        ):
             continue
         for frame in frames:
             if not price_structure_frame_is_prearm_watchable(frame):
@@ -33141,6 +33686,8 @@ def launch_price_structure_prearm_alert(
         or price_monitor_row_has_cold_archive(candidate)
     ):
         return {"ok": True, "skipped": True, "reason": "structure monitor excluded"}
+    if not price_structure_item_in_visible_monitor(candidate):
+        return {"ok": True, "skipped": True, "reason": "symbol left the price monitor pool"}
     secondary_prearm = bool(candidate.get("secondaryBreakoutPrearm"))
     replay_kind = "secondary-prearm" if secondary_prearm else "prearm"
     if price_structure_replay_alert_is_suppressed(
@@ -33829,6 +34376,7 @@ def filter_price_monitor_rows_by_activity(
     *,
     allow_refresh: bool = True,
     persist_retention_transitions: bool = True,
+    update_summary: bool = True,
 ) -> list[dict[str, Any]]:
     """Apply the $10m gate to CEX contracts, never as an on-chain CA hard floor."""
     global PRICE_MONITOR_ACTIVITY_SUMMARY, PRICE_MONITOR_ACTIVITY_STATES
@@ -34015,14 +34563,17 @@ def filter_price_monitor_rows_by_activity(
             excluded += 1
             continue
         filtered.append({**row, "marketActivity": state})
-    PRICE_MONITOR_ACTIVITY_SUMMARY = {
-        "excluded": excluded,
-        "unavailable": unavailable,
-        "thresholdUsd": NEW_COIN_LOW_MIN_TURNOVER_24H_USD,
-        "thresholdScope": "secondary-contract-only",
-        "onchainHardThresholdUsd": None,
-        "checked": len(rows),
-    }
+    if update_summary:
+        # Read-only callers (the structure monitor's visibility roster) must not
+        # overwrite the counters the price-monitor payload reports.
+        PRICE_MONITOR_ACTIVITY_SUMMARY = {
+            "excluded": excluded,
+            "unavailable": unavailable,
+            "thresholdUsd": NEW_COIN_LOW_MIN_TURNOVER_24H_USD,
+            "thresholdScope": "secondary-contract-only",
+            "onchainHardThresholdUsd": None,
+            "checked": len(rows),
+        }
     if len(PRICE_MONITOR_ACTIVITY_STATES) > 10_000:
         PRICE_MONITOR_ACTIVITY_STATES = dict(list(PRICE_MONITOR_ACTIVITY_STATES.items())[-8_000:])
     if allow_refresh and retention_rows:
@@ -55431,6 +55982,27 @@ def market_worker_loop(interval: float) -> int:
     return 0
 
 
+def start_trench_overlay() -> None:
+    """把 Alt+Q 战壕悬浮窗作为独立进程拉起来。
+
+    悬浮窗与 server.py 是两个进程，重启本服务并不会自动带上它，所以由这里负责拉起，
+    这样 service_guard、直接 `python server.py`、打包版都走同一条路。
+    纯附加功能：任何异常只写日志，绝不影响服务启动。
+    """
+    if os.name != "nt":
+        return
+    try:
+        import trench_overlay
+
+        result = trench_overlay.spawn_detached()
+        if result.get("started"):
+            print(f"Trench overlay spawned (pid {result.get('pid')}); hold Alt+Q to show it.", flush=True)
+        else:
+            print(f"Trench overlay not started: {result.get('reason')}", file=sys.stderr, flush=True)
+    except Exception as exc:
+        print(f"Trench overlay launch failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+
+
 def main():
     global SERVER_RUNTIME_ACTIVE
     parser = argparse.ArgumentParser()
@@ -55505,6 +56077,10 @@ def main():
     def bootstrap_noncritical_monitors() -> None:
         """Restore slower feeds without delaying HTTP or real-time price alerts."""
 
+        # Alt+Q trench overlay lives in its own GUI process, so whoever starts the
+        # server has to spawn it - restarting the service otherwise looks like it
+        # does nothing. Fire-and-forget; it can never delay or break startup.
+        start_trench_overlay()
         # The outbound webhook bridge is independent of the slower market-cache
         # warmup below. Start it first so push delivery is not delayed by remote
         # feeds, while keeping all inbound Discord monitoring permanently absent.

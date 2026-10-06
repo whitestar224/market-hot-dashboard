@@ -1077,6 +1077,29 @@ GMGN_TRENCH_RESPONSE_MAX_ROWS = max(
 )
 
 
+# 跨源补录：把「外部线索」（Ave 热搜 / 币安钱包热门 / GMGN 热搜）已抓到、
+# 但 GMGN completed 战壕接口因上游窗口极短而漏采的同期新币，标来源并入榜。
+# 0 = 关闭补录。
+GMGN_TRENCH_BACKFILL_MAX_ROWS = max(
+    0,
+    min(200, int(float(os.getenv("GMGN_TRENCH_BACKFILL_MAX_ROWS", "60") or "60"))),
+)
+
+# 只有这些 provider 才算「外部线索」。gmgn-trenches 自身不算，含它的行说明
+# GMGN 战壕接口本来就采到了，不需要补录。
+GMGN_TRENCH_BACKFILL_PROVIDERS: tuple[str, ...] = (
+    "binance-wallet-hot",
+    "ave-hot",
+    "x-monitor",
+)
+
+GMGN_TRENCH_BACKFILL_ORIGIN_LABELS: dict[str, str] = {
+    "binance-wallet-hot": "币安钱包热门榜",
+    "ave-hot": "Ave.ai 热搜",
+    "x-monitor": "个人 X 监控",
+}
+
+
 MARKET_PRIORITY_WINDOWS = {"1h": 60 * 60, "6h": 6 * 60 * 60, "24h": 24 * 60 * 60}
 
 

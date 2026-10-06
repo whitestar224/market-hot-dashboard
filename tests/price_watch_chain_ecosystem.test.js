@@ -47,7 +47,7 @@ test("research shows full narrative and server pagination without truncating can
   assert.match(js, /群聊交叉验证/);
   assert.match(js, /news-triggered/);
   assert.match(js, /function binanceWalletTokenUrl\(row\)/);
-  assert.match(js, /https:\/\/web3\.binance\.com\/en\/token/);
+  assert.match(js, /https:\/\/web3\.binance\.com\/zh-CN\/token/);
   assert.match(js, /const href = binanceWalletTokenUrl\(row\)/);
   assert.match(js, /在币安钱包打开当前链与 CA/);
   assert.match(js, /新闻触发 · CA明确/);
@@ -107,12 +107,19 @@ test("price watch exposes chain ecosystem mode and API", () => {
   assert.match(js, /sniperHoldingPercent/);
   assert.match(js, /bundlerHoldingPercent/);
   assert.match(js, /smartMoneyHolders/);
-  assert.match(js, /GMGN AI 叙事/);
+  assert.match(js, /币安 AI 叙事/);
   assert.match(js, /function trenchPersonSignalTemplate/);
   assert.match(js, /已进入 V4\.9 快速投研/);
-  assert.match(js, /悬停不发起新请求/);
+  assert.match(js, /图标悬停零请求/);
   assert.match(js, /打开原 X/);
   assert.match(js, /在 GMGN 搜索/);
+  // GMGN's trenches payload has no narrative field, so the board asks Binance
+  // AI for the visible page and caches the answer per contract.
+  assert.match(js, /fetch\("\/api\/exchange-ai-narratives"/);
+  assert.match(js, /sourceId: "gmgn-trenches"/);
+  assert.match(js, /const trenchAiNarratives = new Map\(\)/);
+  assert.doesNotMatch(js, /gmgnChineseNarrativeText\(row\?\.gmgnNarrative\)/);
+  assert.match(js, /void requestOnchainTrenchAi\(\{ force: refresh \}\);/);
   assert.doesNotMatch(js, /\/api\/onchain-trenches\/ai/);
   assert.doesNotMatch(js, /scheduleOnchainTrenchAiPoll/);
   assert.match(js, /data-trench-network/);

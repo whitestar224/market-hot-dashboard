@@ -13,6 +13,7 @@ import re
 import threading
 import time
 import uuid
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlsplit
@@ -210,6 +211,98 @@ def _gmgn_api_key() -> str:
     return personal_key
 
 
+# --- Clock skew guard -------------------------------------------------------
+# GMGN's OpenAPI rejects any request whose ``timestamp`` query parameter drifts
+# past its own tolerance with 401 / AUTH_TIMESTAMP_EXPIRED.  A host clock that
+# is only a handful of seconds off therefore takes the *entire* read-only
+# pipeline down while the API key itself stays perfectly valid, so the skew is
+# measured from GMGN's own ``Date`` response header and applied to every
+# request instead of trusting the local wall clock.
+_GMGN_CLOCK_LOCK = threading.Lock()
+_GMGN_CLOCK_OFFSET = 0.0
+_GMGN_CLOCK_SYNCED_AT = 0.0
+_GMGN_CLOCK_MAX_OFFSET = 3600.0
+
+
+def gmgn_clock_status() -> dict[str, Any]:
+    synced_at = float(_GMGN_CLOCK_SYNCED_AT)
+    return {
+        "clockOffsetSeconds": round(float(_GMGN_CLOCK_OFFSET), 2),
+        "clockSyncedAt": int(synced_at) if synced_at else 0,
+        "clockSyncAgeSeconds": max(0, int(time.time() - synced_at)) if synced_at else None,
+    }
+
+
+def _measure_gmgn_clock_offset(session: Any = None) -> float:
+    """Return ``GMGN server time - local time`` using the response Date header.
+
+    The header has one-second granularity, so the local timestamp is taken at
+    the midpoint of the round trip to absorb network latency (which can be a
+    few seconds when requests ride a shared system proxy).
+    """
+    client = session or _GMGN_HTTP_SESSION
+    request_kwargs: dict[str, Any] = {"timeout": (6, 20)}
+    proxy_url = _gmgn_proxy_url()
+    if proxy_url:
+        request_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+    started = time.time()
+    response = client.get(GMGN_OPENAPI_BASE + "/", **request_kwargs)
+    finished = time.time()
+    try:
+        raw = str(response.headers.get("Date") or "")
+    except (AttributeError, TypeError):
+        raw = ""
+    if not raw:
+        raise RuntimeError("GMGN 响应缺少 Date 头，无法校准本机时钟")
+    server_at = parsedate_to_datetime(raw).timestamp()
+    offset = server_at - (started + finished) / 2.0
+    if math.isnan(offset) or abs(offset) > _GMGN_CLOCK_MAX_OFFSET:
+        raise RuntimeError(f"GMGN 时钟校准结果异常（{offset:.1f}s），已忽略")
+    return offset
+
+
+def _gmgn_clock_offset(session: Any = None, *, force: bool = False) -> float:
+    """Cached local-vs-GMGN clock skew, refreshed at most every ``TTL`` seconds.
+
+    A failed calibration keeps the last known offset (starting at zero) rather
+    than discarding it, and the request path replays once with a fresh reading
+    when GMGN still reports an expired timestamp.
+    """
+    global _GMGN_CLOCK_OFFSET, _GMGN_CLOCK_SYNCED_AT
+    try:
+        ttl = max(30.0, float(os.getenv("GMGN_CLOCK_SYNC_SECONDS", "600") or 600))
+    except (TypeError, ValueError):
+        ttl = 600.0
+    if not force and _GMGN_CLOCK_SYNCED_AT and time.time() - _GMGN_CLOCK_SYNCED_AT <= ttl:
+        return float(_GMGN_CLOCK_OFFSET)
+    with _GMGN_CLOCK_LOCK:
+        if not force and _GMGN_CLOCK_SYNCED_AT and time.time() - _GMGN_CLOCK_SYNCED_AT <= ttl:
+            return float(_GMGN_CLOCK_OFFSET)
+        try:
+            offset = _measure_gmgn_clock_offset(session)
+        except Exception:
+            return float(_GMGN_CLOCK_OFFSET)
+        _GMGN_CLOCK_OFFSET = offset
+        _GMGN_CLOCK_SYNCED_AT = time.time()
+        return offset
+
+
+def _gmgn_clock_error(payload: Any) -> bool:
+    """True when GMGN rejected the request purely because of clock drift."""
+    if not isinstance(payload, Mapping):
+        return False
+    marker = " ".join(
+        str(payload.get(field) or "") for field in ("error", "message", "reason")
+    ).upper()
+    # GMGN renders the marker as both ``AUTH_TIMESTAMP_EXPIRED`` and
+    # ``Timestamp Invalid``, so compare against a punctuation-free form.
+    compact = re.sub(r"[^A-Z0-9]", "", marker)
+    return any(
+        token in compact
+        for token in ("TIMESTAMPEXPIRED", "TIMESTAMPINVALID", "TIMESTAMPMISMATCH")
+    )
+
+
 def _env_enabled(name: str, default: bool) -> bool:
     value = str(os.getenv(name) or "").strip().casefold()
     if not value:
@@ -289,6 +382,7 @@ def _persist_rate_state() -> None:
 def reset_gmgn_runtime_state(*, clear_persistent: bool = False) -> None:
     """Reset cache and cooldown; primarily used by deterministic tests."""
     global _GMGN_NEXT_REQUEST_AT, _GMGN_COOLDOWN_UNTIL, _GMGN_RATE_LIMIT_STREAK, _GMGN_RATE_STATE_LOADED
+    global _GMGN_CLOCK_OFFSET, _GMGN_CLOCK_SYNCED_AT
     with _GMGN_CACHE_LOCK:
         _GMGN_RESPONSE_CACHE.clear()
     with _GMGN_RATE_LOCK:
@@ -296,6 +390,11 @@ def reset_gmgn_runtime_state(*, clear_persistent: bool = False) -> None:
         _GMGN_COOLDOWN_UNTIL = 0.0
         _GMGN_RATE_LIMIT_STREAK = 0
         _GMGN_RATE_STATE_LOADED = True
+    # Deterministic tests pin the calibrated skew to zero so request stamps
+    # match the local wall clock and no calibration round trip is issued.
+    with _GMGN_CLOCK_LOCK:
+        _GMGN_CLOCK_OFFSET = 0.0
+        _GMGN_CLOCK_SYNCED_AT = time.time()
     if clear_persistent:
         for path in [_GMGN_RATE_STATE_PATH, *list(_GMGN_PERSIST_DIR.glob("*.json"))]:
             try:
@@ -667,19 +766,63 @@ def _localized_text(value: Any, limit: int = 1800) -> str:
     return ""
 
 
+GMGN_NARRATIVE_CHINESE_KEYS = (
+    "cn", "zh_cn", "zh-CN", "zh", "aiSummaryCn", "summary_cn",
+    "content_cn", "text_cn", "narrativeCn", "narrative_cn",
+)
+GMGN_NARRATIVE_OTHER_KEYS = (
+    "content", "text", "summary", "narrative", "en", "enText", "description",
+)
+
+
+def _narrative_looks_english(value: Any) -> bool:
+    """Detect an English narrative without punishing tickers or brand names.
+
+    Mirrors ``server.narrative_text_looks_english`` so this standalone module
+    can reject the English text the GMGN payload falls back to when it has no
+    Chinese member.
+    """
+    text = str(value or "")
+    if len(text) < 12:
+        return False
+    latin = len(re.findall(r"[A-Za-z]", text))
+    cjk = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", text))
+    return latin >= 18 and latin >= max(12, cjk * 4)
+
+
+def _localized_chinese_text(value: Any, limit: int = 1800) -> str:
+    """Read one localized GMGN field in Chinese; English is never returned."""
+    if isinstance(value, str):
+        text = _text(value, limit).strip()
+        return "" if _narrative_looks_english(text) else text
+    if not isinstance(value, Mapping):
+        return ""
+    for key in (*GMGN_NARRATIVE_CHINESE_KEYS, *GMGN_NARRATIVE_OTHER_KEYS):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            text = _text(candidate, limit).strip()
+            if not _narrative_looks_english(text):
+                return text
+    return ""
+
+
 def _gmgn_native_narrative(raw: Mapping[str, Any]) -> str:
     """Return only an explicitly named GMGN AI narrative field.
 
     The regular project description is intentionally excluded: presenting a
     deployer-written description as GMGN AI would be misleading.  Some GMGN
     API tiers use camelCase while others use snake_case, so both are accepted.
+
+    A narrative that only exists in English is dropped instead of being shown
+    in the Chinese board: the card then states that this response carried no
+    native Chinese narrative.
     """
     keys = (
         "ai_narrative", "aiNarrative", "ai_narrative_text", "aiNarrativeText",
         "ai_summary", "aiSummary", "gmgn_ai_narrative", "gmgnAiNarrative",
     )
     for key in keys:
-        narrative = _localized_text(raw.get(key))
+        narrative = _localized_chinese_text(raw.get(key))
         if narrative:
             return narrative
     for container_key in ("meta_info", "metaInfo", "ai_info", "aiInfo"):
@@ -687,7 +830,7 @@ def _gmgn_native_narrative(raw: Mapping[str, Any]) -> str:
         if not isinstance(container, Mapping):
             continue
         for key in keys:
-            narrative = _localized_text(container.get(key))
+            narrative = _localized_chinese_text(container.get(key))
             if narrative:
                 return narrative
     return ""
@@ -789,6 +932,7 @@ def _payload_with_meta(
     result["_gmgnMeta"] = {
         **gmgn_api_key_status(),
         **gmgn_cooldown_status(),
+        **gmgn_clock_status(),
         "cached": cached,
         "stale": stale,
         "updatedAt": int(updated_at * 1000),
@@ -887,64 +1031,76 @@ def gmgn_readonly_post(
             raise GmgnRateLimitError(cooldown["retryAfterSeconds"])
 
         try:
-            _wait_for_readonly_slot()
-            client = session or _GMGN_HTTP_SESSION
-            request_params = dict(params or {})
-            request_params.update({
-                "timestamp": int(time.time()),
-                "client_id": str(uuid.uuid4()),
-            })
-            request_kwargs: dict[str, Any] = {
-                "params": request_params,
-                "headers": {**GMGN_READONLY_HEADERS, "X-APIKEY": _gmgn_api_key()},
-                "timeout": (6, 30),
-            }
             method = str(_method or "POST").strip().upper()
-            if method == "POST":
-                request_kwargs["json"] = dict(body)
-            elif method != "GET":
+            if method not in {"GET", "POST"}:
                 raise ValueError(f"Unsupported GMGN read-only method: {method}")
+            client = session or _GMGN_HTTP_SESSION
+            api_key = _gmgn_api_key()
             proxy_url = _gmgn_proxy_url()
-            if proxy_url:
-                request_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
-            response = (
-                client.get(GMGN_OPENAPI_BASE + path, **request_kwargs)
-                if method == "GET"
-                else client.post(GMGN_OPENAPI_BASE + path, **request_kwargs)
-            )
-            try:
-                payload = response.json()
-            except Exception as exc:
-                raise RuntimeError("GMGN 返回了无法解析的数据") from exc
-            code = payload.get("code") if isinstance(payload, Mapping) else None
-            if _response_status(response) == 429 or str(code) == "429":
-                retry_after = _record_rate_limit(response)
-                stale = usable_cached(fresh_only=False)
-                if stale is not None:
-                    return _payload_with_meta(
-                        stale,
-                        cached=True,
-                        stale=True,
-                        updated_at=float(stale.get("_gmgnMeta", {}).get("updatedAt", 0)) / 1000 or time.time(),
-                        error=f"rate limited; retry in {retry_after}s",
-                    )
-                raise GmgnRateLimitError(retry_after)
-            response.raise_for_status()
-            if not isinstance(payload, Mapping):
-                raise RuntimeError("GMGN 返回格式无效")
-            result = dict(payload)
-            if code in (0, "0", None):
-                result.pop("_gmgnMeta", None)
-                updated_at = time.time()
-                _store_cache_entry(
-                    cache_key,
-                    result,
-                    updated_at,
-                    allow_persistent=persist_cache,
+            clock_retry_used = False
+            while True:
+                _wait_for_readonly_slot()
+                request_params = dict(params or {})
+                request_params.update({
+                    # GMGN validates this against its own clock, so apply the
+                    # measured skew instead of trusting the local wall clock.
+                    "timestamp": int(time.time() + _gmgn_clock_offset(session)),
+                    "client_id": str(uuid.uuid4()),
+                })
+                request_kwargs: dict[str, Any] = {
+                    "params": request_params,
+                    "headers": {**GMGN_READONLY_HEADERS, "X-APIKEY": api_key},
+                    "timeout": (6, 30),
+                }
+                if method == "POST":
+                    request_kwargs["json"] = dict(body)
+                if proxy_url:
+                    request_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+                response = (
+                    client.get(GMGN_OPENAPI_BASE + path, **request_kwargs)
+                    if method == "GET"
+                    else client.post(GMGN_OPENAPI_BASE + path, **request_kwargs)
                 )
-                _clear_rate_limit()
-                return _payload_with_meta(result, cached=False, stale=False, updated_at=updated_at)
-            return result
+                try:
+                    payload = response.json()
+                except Exception as exc:
+                    raise RuntimeError("GMGN 返回了无法解析的数据") from exc
+                status = _response_status(response)
+                code = payload.get("code") if isinstance(payload, Mapping) else None
+                if status == 429 or str(code) == "429":
+                    retry_after = _record_rate_limit(response)
+                    stale = usable_cached(fresh_only=False)
+                    if stale is not None:
+                        return _payload_with_meta(
+                            stale,
+                            cached=True,
+                            stale=True,
+                            updated_at=float(stale.get("_gmgnMeta", {}).get("updatedAt", 0)) / 1000 or time.time(),
+                            error=f"rate limited; retry in {retry_after}s",
+                        )
+                    raise GmgnRateLimitError(retry_after)
+                if not clock_retry_used and status == 401 and _gmgn_clock_error(payload):
+                    # The host clock drifted past GMGN's tolerance: re-measure
+                    # the skew once and replay the request with a fresh stamp.
+                    clock_retry_used = True
+                    _gmgn_clock_offset(session, force=True)
+                    continue
+                response.raise_for_status()
+                if not isinstance(payload, Mapping):
+                    raise RuntimeError("GMGN 返回格式无效")
+                result = dict(payload)
+                if code in (0, "0", None):
+                    result.pop("_gmgnMeta", None)
+                    updated_at = time.time()
+                    _store_cache_entry(
+                        cache_key,
+                        result,
+                        updated_at,
+                        allow_persistent=persist_cache,
+                    )
+                    _clear_rate_limit()
+                    return _payload_with_meta(result, cached=False, stale=False, updated_at=updated_at)
+                return result
         except GmgnRateLimitError:
             raise
         except Exception as exc:
