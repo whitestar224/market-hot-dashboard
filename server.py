@@ -562,6 +562,11 @@ from app.core.state import (
     PRICE_STRUCTURE_TIMEFRAMES,
     PRICE_STRUCTURE_TIMEFRAME_POOL,
     PRICE_STRUCTURE_UNAVAILABLE_RETRY_SECONDS,
+    PRICE_WATCH_BOARD_DEFAULTS,
+    PRICE_WATCH_BOARD_IDS,
+    PRICE_WATCH_BOARD_LABELS,
+    PRICE_WATCH_BOARD_SHORTS,
+    PRICE_WATCH_BOARDS,
     PRICE_WATCH_CONSOLIDATION_BARS,
     PRICE_WATCH_CONSOLIDATION_NET_PCT,
     PRICE_WATCH_CONSOLIDATION_RANGE_PCT,
@@ -2074,6 +2079,18 @@ def init_auth_db() -> None:
                 absent_at INTEGER NOT NULL DEFAULT 0,
                 absent_confirmations INTEGER NOT NULL DEFAULT 0,
                 last_absent_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        # Per-board runtime switches for the monitor page.  A missing row means
+        # "both switches on", so an untouched install behaves exactly as before.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_watch_board_toggles (
+                board TEXT PRIMARY KEY,
+                intake_enabled INTEGER NOT NULL DEFAULT 1,
+                alert_enabled INTEGER NOT NULL DEFAULT 1,
                 updated_at INTEGER NOT NULL
             )
             """
@@ -17139,8 +17156,9 @@ def spawn_background_news_ingest(items: Any) -> None:
 
     def ingest_worker(batch: list[dict[str, Any]]) -> None:
         try:
-            for item in batch:
-                ONCHAIN_FAST_RESEARCH.ingest_news(item)
+            if price_watch_board_intake_enabled("chains"):
+                for item in batch:
+                    ONCHAIN_FAST_RESEARCH.ingest_news(item)
         except Exception as exc:
             print(f"Newsflash research ingest deferred: {safe_monitor_error(exc)}", file=sys.stderr)
         finally:
@@ -23808,6 +23826,10 @@ def normalize_desktop_alert(payload: dict[str, Any]) -> dict[str, Any]:
         "autoCloseMs": max(0, int(safe_float(payload.get("autoCloseMs"), 0))),
         "queuePriority": int(safe_float(payload.get("queuePriority"), 0)),
         "sourceType": alert_text(payload.get("sourceType"), 40),
+        # Which monitor board this popup belongs to.  It drives the per-board
+        # alert switch; callers that cannot be inferred from ``key`` set it
+        # explicitly (notably the shared structure/newlow launchers).
+        "board": alert_text(payload.get("board"), 24),
         "xCategory": x_category,
         "xCategoryLabel": alert_text(
             payload.get("xCategoryLabel") or (x_kol_category_label(x_category) if x_category else ""),
@@ -25182,6 +25204,20 @@ def desktop_alert_delivery_tick() -> None:
             DESKTOP_ALERT_GENERAL_PROCESSES.pop(active['slot'], None)
             record_event_flow_popup(row['payload'], 'skipped', 'GMGN 热搜/战壕榜播报已关闭')
             continue
+        # A per-board alert switch flipped after this popup was admitted.  Only
+        # an unshown startup is recycled — a mapped window keeps its lifecycle.
+        muted_board = price_watch_alert_board_muted(row['payload'])
+        if muted_board and not row['shown']:
+            reason = f'该榜单弹窗已关闭（{muted_board}）'
+            ALERT_DELIVERY_STORE.suppress(identity, reason)
+            if running:
+                process.terminate()
+                continue
+            DESKTOP_ALERT_DELIVERIES.pop(identity, None)
+            DESKTOP_ALERT_STRUCTURE_PROCESSES.pop(active['slot'], None)
+            DESKTOP_ALERT_GENERAL_PROCESSES.pop(active['slot'], None)
+            record_event_flow_popup(row['payload'], 'skipped', reason)
+            continue
         # Suppression is checked before launch. Once a popup is visible it owns
         # its lifecycle: quote refreshes, source expiry, or a new popup may not
         # terminate it. Its own close/exclude callback records the final state.
@@ -25224,10 +25260,16 @@ def desktop_alert_delivery_tick() -> None:
         suppression_reason = desktop_alert_runtime_suppression_reason(
             normalized, pending=True, now=now
         )
+        muted_board = price_watch_alert_board_muted(normalized)
         if ((symbol and price_structure_symbol_excluded(symbol))
                 or (symbol and price_monitor_row_has_cold_archive(normalized))
-                or desktop_alert_source_is_muted(normalized) or suppression_reason):
-            reason = suppression_reason or '来源已静音或标的已被移出监控'
+                or desktop_alert_source_is_muted(normalized) or muted_board
+                or suppression_reason):
+            reason = (
+                suppression_reason
+                or (f'该榜单弹窗已关闭（{muted_board}）' if muted_board else '')
+                or '来源已静音或标的已被移出监控'
+            )
             ALERT_DELIVERY_STORE.suppress(row['id'], reason)
             record_event_flow_popup(normalized, 'skipped', reason)
             continue
@@ -25398,6 +25440,15 @@ def launch_desktop_alert(payload: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "skipped": True, "reason": "symbol excluded from monitor system"}
     if desktop_alert_source_is_muted(normalized):
         return {"ok": True, "skipped": True, "reason": "source alerts disabled", "category": "muted-source"}
+    muted_board = price_watch_alert_board_muted(normalized)
+    if muted_board:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": f"board alerts disabled: {muted_board}",
+            "category": "muted-board",
+            "board": muted_board,
+        }
     suppression_reason = desktop_alert_political_military_reason(normalized)
     if suppression_reason:
         return {
@@ -26391,6 +26442,8 @@ def record_personal_x_future_event(text: str, handle: str, observed_at: int, now
     event = detect_future_event(text, now_ms=now_ms)
     if not event:
         return None
+    if not price_watch_board_intake_enabled("personalx"):
+        return None
     dedupe_key = event_dedupe_key(event["title"], event["source_text"])
     with FUTURE_EVENT_LOCK:
         if dedupe_key in FUTURE_EVENT_SEEN:
@@ -26427,6 +26480,7 @@ def record_personal_x_future_event(text: str, handle: str, observed_at: int, now
     try:
         launch_desktop_alert({
             "key": dedupe_key,
+            "board": "personalx",
             "kind": "X未来事件",
             "source": f"@{handle}",
             "sourceLabel": "X",
@@ -26706,6 +26760,11 @@ def sync_price_watch_new_contract_candidates(
 
 
 def sync_price_watch_aicoin_candidates() -> int:
+    # Single choke point for this board's pool intake: the 榜单页 switch for
+    # 「AIcoin 热门榜」 gates here, so every caller (payload build, monitor sync)
+    # honours it.  Turning it off never removes what is already in the pool.
+    if not price_watch_board_intake_enabled("aicoin"):
+        return 0
     source = price_watch_aicoin_source()
     rows = source.get("rows") if isinstance(source.get("rows"), list) else []
     now_ms = int(time.time() * 1000)
@@ -27066,6 +27125,9 @@ def sync_price_watch_binance_wallet_candidates(
     now_ms: int | None = None,
 ) -> int:
     """Put retained Binance Wallet 4h hot members into prior-high monitoring."""
+    # Single choke point for this board's pool intake (「币安钱包热门榜」 switch).
+    if not price_watch_board_intake_enabled("binance-wallet-hot"):
+        return 0
     now_value = int(now_ms or time.time() * 1000)
     cutoff_ms = now_value - BINANCE_WALLET_4H_STRUCTURE_RETENTION_SECONDS * 1000
     source_rows = rows if isinstance(rows, list) else binance_wallet_4h_structure_rows(now_ms=now_value)
@@ -27172,6 +27234,10 @@ def sync_price_watch_gmgn_hot_search_candidates(
     and the pool entry time (today) enables the one-minute structure cycle for
     the entry day via ``price_structure_1m_state``.
     """
+    # Single choke point for this board's pool intake (「GMGN 热搜榜」 switch).
+    # The popup side is suppressed separately by ``price_watch_alert_board_muted``.
+    if not price_watch_board_intake_enabled("gmgn-hot-search"):
+        return 0
     now_value = int(now_ms or time.time() * 1000)
     source_rows = rows if isinstance(rows, list) else []
     candidates: list[dict[str, Any]] = []
@@ -28289,6 +28355,240 @@ def temporarily_exclude_monitor_symbol(value: Any, *, source_pool: str = "price-
     }
 
 
+PRICE_WATCH_BOARD_TOGGLE_CACHE: (
+    tuple[float, dict[str, dict[str, bool]]] | None
+) = None
+PRICE_WATCH_BOARD_TOGGLE_LOCK = threading.Lock()
+PRICE_WATCH_BOARD_TOGGLE_SECONDS = max(
+    1.0,
+    float(os.getenv("PRICE_WATCH_BOARD_TOGGLE_SECONDS", "5") or "5"),
+)
+
+
+def price_watch_board_toggles(*, force: bool = False) -> dict[str, dict[str, bool]]:
+    """Return ``{board: {"intake": bool, "alert": bool}}`` for every board.
+
+    A board without a stored row keeps both switches on, so an untouched
+    install behaves exactly as before.  Any read failure fails open: a broken
+    roster must never mute every popup on the box.
+    """
+
+    global PRICE_WATCH_BOARD_TOGGLE_CACHE
+    state = {
+        board: dict(PRICE_WATCH_BOARD_DEFAULTS.get(board) or {"intake": True, "alert": True})
+        for board in PRICE_WATCH_BOARD_IDS
+    }
+    now = time.time()
+    cached = PRICE_WATCH_BOARD_TOGGLE_CACHE
+    if not force and cached and now - cached[0] < PRICE_WATCH_BOARD_TOGGLE_SECONDS:
+        return cached[1]
+    try:
+        # Pure read: never take AUTH_DB_LOCK here.  Callers such as
+        # ``launch_price_watch_alert(persist_only=True)`` already hold the price
+        # DB transaction, and re-entering the process mutex would invert the
+        # lock order.
+        with auth_db() as conn:
+            rows = conn.execute(
+                "SELECT board, intake_enabled, alert_enabled FROM price_watch_board_toggles"
+            ).fetchall()
+    except Exception as exc:
+        print(
+            "Board toggle state read failed: " + safe_error_text(str(exc))[:160],
+            file=sys.stderr,
+        )
+        return state
+    for row in rows:
+        board = clean_feed_text(row["board"], 40)
+        if board in state:
+            state[board] = {
+                "intake": bool(row["intake_enabled"]),
+                "alert": bool(row["alert_enabled"]),
+            }
+    with PRICE_WATCH_BOARD_TOGGLE_LOCK:
+        PRICE_WATCH_BOARD_TOGGLE_CACHE = (now, state)
+    return state
+
+
+def price_watch_board_enabled(board: Any, kind: str) -> bool:
+    """Whether ``board`` still runs its ``intake`` / ``alert`` rule."""
+
+    board_id = clean_feed_text(board, 40)
+    if not board_id:
+        return True
+    try:
+        entry = price_watch_board_toggles().get(board_id)
+    except Exception:
+        return True
+    if not entry:
+        return True
+    return bool(entry.get(kind, True))
+
+
+def price_watch_board_intake_enabled(board: Any) -> bool:
+    """Whether ``board`` may still take NEW items in.
+
+    Turning this off never removes what is already on the board; it only stops
+    new discoveries from being added.
+    """
+
+    return price_watch_board_enabled(board, "intake")
+
+
+def price_watch_board_alert_enabled(board: Any) -> bool:
+    """Whether ``board`` may still pop desktop alerts."""
+
+    return price_watch_board_enabled(board, "alert")
+
+
+def price_watch_board_payload(
+    toggles: dict[str, dict[str, bool]] | None = None,
+) -> list[dict[str, Any]]:
+    """Serialise every board plus its current switch state for the client."""
+
+    state = toggles if toggles is not None else price_watch_board_toggles()
+    return [
+        {
+            "id": board["id"],
+            "label": board["label"],
+            "short": PRICE_WATCH_BOARD_SHORTS.get(board["id"], board["label"]),
+            "description": board["description"],
+            # False for a board that never admits into the crypto monitor pool
+            # (stock boards): its intake switch is rendered but inert.
+            "intakeApplies": bool(board.get("intakeApplies", True)),
+            "intake": bool((state.get(board["id"]) or {}).get("intake", True)),
+            "alert": bool((state.get(board["id"]) or {}).get("alert", True)),
+        }
+        for board in PRICE_WATCH_BOARDS
+    ]
+
+
+def set_price_watch_board_toggle(board: Any, kind: Any, enabled: Any) -> dict[str, Any]:
+    board_id = clean_feed_text(board, 40)
+    if board_id not in PRICE_WATCH_BOARD_IDS:
+        raise ValueError("榜单无效")
+    kind_id = str(kind or "").strip().lower()
+    if kind_id not in {"intake", "alert"}:
+        raise ValueError("开关类型无效")
+    enabled_value = bool_value(enabled, True)
+    now_ms = int(time.time() * 1000)
+    with AUTH_DB_LOCK, auth_db() as conn:
+        row = conn.execute(
+            "SELECT intake_enabled, alert_enabled FROM price_watch_board_toggles WHERE board = ?",
+            (board_id,),
+        ).fetchone()
+        intake = int(row["intake_enabled"]) if row else 1
+        alert = int(row["alert_enabled"]) if row else 1
+        if kind_id == "intake":
+            intake = 1 if enabled_value else 0
+        else:
+            alert = 1 if enabled_value else 0
+        conn.execute(
+            """
+            INSERT INTO price_watch_board_toggles (
+                board, intake_enabled, alert_enabled, updated_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(board) DO UPDATE SET
+                intake_enabled = excluded.intake_enabled,
+                alert_enabled = excluded.alert_enabled,
+                updated_at = excluded.updated_at
+            """,
+            (board_id, intake, alert, now_ms),
+        )
+    toggles = price_watch_board_toggles(force=True)
+    label = PRICE_WATCH_BOARD_LABELS.get(board_id, board_id)
+    kind_label = "入池" if kind_id == "intake" else "弹窗"
+    return {
+        "ok": True,
+        "board": board_id,
+        "kind": kind_id,
+        "enabled": enabled_value,
+        "boards": price_watch_board_payload(toggles),
+        "message": f"{label} · {kind_label}已{'开启' if enabled_value else '关闭'}",
+    }
+
+
+# ``key`` prefixes that identify which board a desktop alert came from.  The
+# order matters: the specific structure/oversold keys must be tested before the
+# generic ``price-watch:`` catch-all.  Keep in sync with the payloads emitted by
+# ``launch_price_watch_alert`` / ``launch_price_structure_*``.
+PRICE_WATCH_ALERT_BOARD_KEY_PREFIXES = (
+    ("price-watch:fib:", "oversold"),
+    ("price-watch:oversold:", "oversold"),
+    ("price-watch:dragon-wave-secondary-prearm:", "structure"),
+    ("price-watch:dragon-wave-prearm:", "structure"),
+    ("price-watch:dragon-wave-secondary:", "structure"),
+    ("price-watch:dragon-wave:", "structure"),
+    ("price-watch:structure-first:", "structure"),
+    ("price-watch:", "prior"),
+    ("x-tweet-analysis:", "personalx"),
+    ("smart-money-buy:", "smartmoney"),
+    ("chain-ecosystem:", "chains"),
+    ("chat-new-ca:", "wechat"),
+    ("chat-opportunity:", "wechat"),
+    ("chat-ca-hourly:", "wechat"),
+    ("news-trade-", "news"),
+    ("rotation-new-leader:", "mapping"),
+    ("rotation-map-change:", "mapping"),
+    ("aster-contract:", "aster"),
+)
+PRICE_WATCH_ALERT_BOARD_SOURCE_TYPES = {
+    "smart-money-buy": "smartmoney",
+    "x-tweet-analysis": "personalx",
+    "trench-person-signal": "chains",
+    "onchain-chatgpt-research": "chains",
+    "onchain-v48-potential": "chains",
+    "news-ca-resonance": "news",
+}
+PRICE_WATCH_ALERT_PRIOR_KEY_PATTERN = re.compile(r"^price-watch:[^:]+:episode:\d+$")
+
+
+# Site-alert feeds that feed a monitor board.  Their intake switch short-circuits
+# the whole feed poll, so the board stops taking new items in.
+PRICE_WATCH_SITE_FEED_BOARDS = {
+    "rotation-map": "mapping",
+    "aster-contracts": "aster",
+    "x-kol": "personalx",
+    "event-monitor": "news",
+}
+
+
+def price_watch_alert_board(item: dict[str, Any] | None) -> str:
+    """Best-effort mapping from a desktop-alert payload to its board id."""
+
+    if not isinstance(item, dict):
+        return ""
+    board = clean_feed_text(item.get("board"), 24)
+    if board in PRICE_WATCH_BOARD_IDS:
+        return board
+    # Rank-monitor popups carry the market source id verbatim, and the board
+    # roster is keyed by that same id — so this one test covers every 榜单页
+    # board (币安钱包热门榜 / GMGN 热搜榜 / Ave / AIcoin / 战壕榜 / OKX DEX …).
+    source_id = str(item.get("sourceId") or "").strip().casefold()
+    if source_id in PRICE_WATCH_BOARD_IDS:
+        return source_id
+    key = str(item.get("key") or "")
+    if PRICE_WATCH_ALERT_PRIOR_KEY_PATTERN.match(key):
+        return "prior"
+    for prefix, board_id in PRICE_WATCH_ALERT_BOARD_KEY_PREFIXES:
+        if key.startswith(prefix):
+            return board_id
+    source_type = str(item.get("sourceType") or "").strip().casefold()
+    if source_type in PRICE_WATCH_ALERT_BOARD_SOURCE_TYPES:
+        return PRICE_WATCH_ALERT_BOARD_SOURCE_TYPES[source_type]
+    if str(item.get("sourceId") or "").strip().casefold() == "rotation-map":
+        return "mapping"
+    return ""
+
+
+def price_watch_alert_board_muted(item: dict[str, Any] | None) -> str:
+    """Return the board id when that board's alert switch is off."""
+
+    board = price_watch_alert_board(item)
+    if not board:
+        return ""
+    return "" if price_watch_board_enabled(board, "alert") else board
+
+
 def price_watch_active_rows(
     *,
     bypass_process_lock: bool = False,
@@ -28723,6 +29023,9 @@ def price_watch_payload(
     persist_retention_transitions: bool = True,
 ) -> dict[str, Any]:
     if sync_candidates:
+        # Each source's 「入池」 switch lives INSIDE its own sync function (single
+        # choke point), so it cannot be bypassed by another caller.  Sources with
+        # no 榜单页 card yet (新合约 / 涨幅榜) stay ungated.
         sync_price_watch_new_contract_candidates()
         sync_price_watch_gainers_candidates()
         sync_price_watch_aicoin_candidates()
@@ -33020,6 +33323,7 @@ def launch_price_structure_strategy_alerts(
     item: dict[str, Any],
     *,
     gap_recovery_previous: dict[str, Any] | None = None,
+    board: str = "structure",
 ) -> int:
     """Broadcast a live trigger only as a fallback when pre-arm did not catch it.
 
@@ -33051,7 +33355,7 @@ def launch_price_structure_strategy_alerts(
     alert_url = price_watch_trade_url(
         symbol,
         item.get("provider"),
-        f"http://127.0.0.1:{local_port}/price-watch.html?mode=structure",
+        f"http://127.0.0.1:{local_port}/price-watch.html?mode={board}",
         chain_id=item.get("chain"),
         contract_address=item.get("contractAddress"),
         prefer_wallet=price_watch_prefers_binance_wallet(item),
@@ -33087,6 +33391,7 @@ def launch_price_structure_strategy_alerts(
         )
         result = launch_desktop_alert({
             "key": f"price-watch:dragon-wave:{symbol}:{interval}:{decision_time}",
+            "board": board,
             "kind": "价格监控",
             "source": "币种价格监控",
             "sourceLabel": "B",
@@ -33140,6 +33445,7 @@ def launch_price_structure_strategy_alerts(
         )
         result = launch_desktop_alert({
             "key": f"price-watch:dragon-wave-secondary:{symbol}:{interval}:{decision_time}",
+            "board": board,
             "kind": "价格监控",
             "source": "币种价格监控",
             "sourceLabel": "B!",
@@ -33247,6 +33553,8 @@ def release_price_structure_observation_alert(symbol_value: Any, claimed_at: int
 def launch_price_structure_first_observation_alerts(
     item: dict[str, Any],
     previous_item: dict[str, Any] | None,
+    *,
+    board: str = "structure",
 ) -> int:
     """Speak only the transition from no structure to the first observed setup."""
     symbol = price_structure_monitor_symbol(item.get("symbol"))
@@ -33270,7 +33578,7 @@ def launch_price_structure_first_observation_alerts(
     alert_url = price_watch_trade_url(
         symbol,
         item.get("provider"),
-        f"http://127.0.0.1:{local_port}/price-watch.html?mode=structure",
+        f"http://127.0.0.1:{local_port}/price-watch.html?mode={board}",
         chain_id=item.get("chain"),
         contract_address=item.get("contractAddress"),
         prefer_wallet=price_watch_prefers_binance_wallet(item),
@@ -33316,6 +33624,7 @@ def launch_price_structure_first_observation_alerts(
         )
         result = launch_desktop_alert({
             "key": f"price-watch:structure-first:{symbol}:{interval}:{identity}",
+            "board": board,
             "kind": "价格监控",
             "source": "币种价格监控",
             "sourceLabel": "S",
@@ -34896,6 +35205,14 @@ def hydrate_new_coin_low_snapshot() -> None:
 
 def refresh_new_coin_low_structure_item(row: dict[str, Any]) -> dict[str, Any]:
     symbol = clean_price_watch_symbol(row.get("symbol"))
+    if not price_watch_board_intake_enabled("newlow"):
+        return {
+            "symbol": symbol,
+            "monitorPool": "new-coin-low",
+            "skipped": True,
+            "skipReason": "新币低位结构入池已关闭",
+            "alerts": 0,
+        }
     if not new_coin_low_row_admitted(row):
         return {
             "symbol": symbol,
@@ -34914,8 +35231,8 @@ def refresh_new_coin_low_structure_item(row: dict[str, Any]) -> dict[str, Any]:
         replay_baseline = price_structure_replay_baseline_item(previous, fresh)
         suppress_price_structure_replay_alerts(replay_baseline)
     alert_count = (
-        launch_price_structure_first_observation_alerts(fresh, previous)
-        + launch_price_structure_strategy_alerts(fresh, gap_recovery_previous=previous)
+        launch_price_structure_first_observation_alerts(fresh, previous, board="newlow")
+        + launch_price_structure_strategy_alerts(fresh, gap_recovery_previous=previous, board="newlow")
     )
     with NEW_COIN_LOW_LOCK:
         if price_structure_symbol_excluded(symbol):
@@ -35096,6 +35413,13 @@ def refresh_price_structure_strategy_monitor_item(
     rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Fetch one leader concurrently, then serialize only the snapshot commit."""
+    if not price_watch_board_intake_enabled("structure"):
+        return {
+            "symbol": price_structure_monitor_symbol(row.get("symbol")),
+            "skipped": True,
+            "skipReason": "多周期结构入池已关闭",
+            "alerts": 0,
+        }
     fresh_item = fetch_price_structure_item(row, fast_provider_probe=True)
     with PRICE_STRUCTURE_REFRESH_LOCK:
         excluded_symbols = price_structure_excluded_symbols(bypass_process_lock=True)
@@ -37179,6 +37503,12 @@ def update_price_watch_snapshot(result: dict[str, Any], *, persist_alerts: bool 
             if oversold_distance_pct >= PRICE_WATCH_OVERSOLD_REARM_PCT and oversold_cooldown_ready:
                 oversold_armed = True
 
+        if oversold_should_alert and not price_watch_board_intake_enabled("oversold"):
+            # Board intake off: never open a NEW oversold episode.  The state is
+            # rolled back to where it stood so re-enabling resumes cleanly.
+            oversold_should_alert = False
+            oversold_in_zone = oversold_was_in_zone
+            oversold_armed = oversold_was_armed
         if oversold_should_alert:
             oversold_episode += 1
         conn.execute(
@@ -37338,6 +37668,8 @@ def update_price_watch_snapshot(result: dict[str, Any], *, persist_alerts: bool 
                     and fib_signal
                     and not fib_alert_emitted
                 )
+                if fib_should_alert and not price_watch_board_intake_enabled("oversold"):
+                    fib_should_alert = False
 
                 fib_in_zone = fib_was_in_zone
                 if not fib_candidate or target_price <= 0:
@@ -37570,6 +37902,7 @@ def launch_price_watch_alert(event: dict[str, Any], *, persist_only: bool = Fals
         return dispatch(
             {
                 "key": f"price-watch:fib:{symbol}:{fib_level}:episode:{int(event.get('episode') or 1)}",
+                "board": "oversold",
                 "kind": "超跌反弹 · 日线主升浪",
                 "source": "币种价格监控",
                 "sourceLabel": "PW",
@@ -37603,6 +37936,7 @@ def launch_price_watch_alert(event: dict[str, Any], *, persist_only: bool = Fals
         return dispatch(
             {
                 "key": f"price-watch:oversold:{symbol}:episode:{int(event.get('episode') or 1)}",
+                "board": "oversold",
                 "kind": "超跌反弹",
                 "source": "币种价格监控",
                 "sourceLabel": "PW",
@@ -37636,6 +37970,7 @@ def launch_price_watch_alert(event: dict[str, Any], *, persist_only: bool = Fals
     return dispatch(
         {
             "key": f"price-watch:{symbol}:episode:{int(event.get('episode') or 1)}",
+            "board": "prior",
             "kind": "价格监控",
             "source": "币种价格监控",
             "sourceLabel": "PW",
@@ -38591,6 +38926,7 @@ def sync_price_watch_monitor(*, symbols: list[str] | None = None) -> dict[str, A
     if not PRICE_WATCH_LOCK.acquire(blocking=False):
         return price_watch_payload(sync_candidates=False)
     try:
+        # Each source's 「入池」 switch lives inside its own sync function.
         sync_price_watch_new_contract_candidates()
         sync_price_watch_gainers_candidates()
         sync_price_watch_aicoin_candidates()
@@ -39743,16 +40079,17 @@ def backfill_recent_chat_group_signal_mentions(hours: int = 24, limit: int = 120
         group_name = normalize_group_name(row.get("group_name")) or "群聊"
         content = str(row.get("content") or "")
         captured_at = int(row.get("captured_at") or 0)
-        ONCHAIN_FAST_RESEARCH.ingest_chat_context(
-            content,
-            group_name,
-            platform=platform,
-            sender=row.get("sender") or "群成员",
-            observed_at=captured_at,
-            message_id=row.get("message_hash") or "",
-            contracts=signal.get("contracts") or [],
-            symbols=signal.get("symbols") or [],
-        )
+        if price_watch_board_intake_enabled("chains"):
+            ONCHAIN_FAST_RESEARCH.ingest_chat_context(
+                content,
+                group_name,
+                platform=platform,
+                sender=row.get("sender") or "群成员",
+                observed_at=captured_at,
+                message_id=row.get("message_hash") or "",
+                contracts=signal.get("contracts") or [],
+                symbols=signal.get("symbols") or [],
+            )
     return inserted
 
 
@@ -41460,6 +41797,8 @@ def enqueue_recent_wechat_group_ai_backfill(limit: int = 10) -> int:
 
 
 def poll_wechat_group_monitors_once(user_id: int | None = None) -> dict[str, Any]:
+    if not price_watch_board_intake_enabled("wechat"):
+        return {"ok": True, "groups": 0, "newMessages": 0, "queued": 0, "skipped": "群聊机会入池已关闭"}
     monitors = wechat_group_monitor_rows(user_id=user_id, enabled_only=True)
     if not monitors:
         return {"ok": True, "groups": 0, "newMessages": 0, "queued": 0}
@@ -41575,16 +41914,17 @@ def poll_wechat_group_monitors_once(user_id: int | None = None) -> dict[str, Any
                 source_kind="qq" if platform == "qq" else "wechat",
                 observed_at=(int(safe_float(message.get("capturedAt"), 0)) or now) * 1000,
             )
-            ONCHAIN_FAST_RESEARCH.ingest_chat_context(
-                message.get("content"),
-                group_name,
-                platform=platform,
-                sender=message.get("sender") or "群成员",
-                observed_at=int(safe_float(message.get("capturedAt"), 0)) or now,
-                message_id=message.get("hash") or "",
-                contracts=signal_profile.get("contracts") or [],
-                symbols=signal_profile.get("symbols") or [],
-            )
+            if price_watch_board_intake_enabled("chains"):
+                ONCHAIN_FAST_RESEARCH.ingest_chat_context(
+                    message.get("content"),
+                    group_name,
+                    platform=platform,
+                    sender=message.get("sender") or "群成员",
+                    observed_at=int(safe_float(message.get("capturedAt"), 0)) or now,
+                    message_id=message.get("hash") or "",
+                    contracts=signal_profile.get("contracts") or [],
+                    symbols=signal_profile.get("symbols") or [],
+                )
             update_strategy_adaptive_context_from_text(
                 message.get("content"),
                 source_kind="qq" if platform == "qq" else "wechat",
@@ -42167,7 +42507,8 @@ def persist_x_kol_realtime_payload(user: dict[str, Any] | None, payload: dict[st
         if 0 < published < 100_000_000_000:
             published *= 1000
         if published and 0 <= now_ms - published <= 5 * 60_000:
-            ONCHAIN_FAST_RESEARCH.ingest_text(row.get("text") or row.get("title"), "x-monitor")
+            if price_watch_board_intake_enabled("chains"):
+                ONCHAIN_FAST_RESEARCH.ingest_text(row.get("text") or row.get("title"), "x-monitor")
     write_json_cache(x_kol_realtime_snapshot_path(user), {
         "savedAt": int(time.time() * 1000),
         "payload": payload,
@@ -42886,8 +43227,9 @@ def x_kol_realtime_worker(user: dict[str, Any] | None) -> None:
     wake_event = X_KOL_REALTIME_WAKE_EVENTS.setdefault(key, threading.Event())
     while not SERVER_SHUTDOWN_EVENT.is_set():
         try:
-            published = publish_x_kol_realtime_payload(user, x_kol_feed_payload(user))
-            persist_x_kol_realtime_payload(user, published)
+            if price_watch_board_intake_enabled("personalx"):
+                published = publish_x_kol_realtime_payload(user, x_kol_feed_payload(user))
+                persist_x_kol_realtime_payload(user, published)
         except Exception as exc:
             with X_KOL_REALTIME_CONDITION:
                 previous = X_KOL_REALTIME_SNAPSHOTS.get(key) or {}
@@ -45013,6 +45355,11 @@ def sync_gmgn_hot_search_alert_feed(source: dict[str, Any] | None = None) -> lis
         for key in current_membership:
             seen[key] = now
         last_alerts = dict(sorted(last_alerts.items(), key=lambda item: safe_float(item[1]))[-1000:])
+        # NO board-level gate here: ``persist_alert_events`` funnels every event
+        # through ``launch_desktop_alert``, which applies ``price_watch_alert_board_muted``
+        # centrally.  Keeping the suppression in one place means this feed still
+        # records membership / seen / lastAlerts, so re-enabling a board's popup
+        # switch never bursts a backlog of stale "new" entries.
         persist_alert_events(events)
         write_json_cache(
             GMGN_HOT_SEARCH_ALERT_STATE_PATH,
@@ -45067,7 +45414,7 @@ def binance_wallet_hot_alert_monitor_loop() -> None:
         try:
             wallet_source = binance_wallet_hot_source("4h")
             rows = binance_wallet_hot_research_rows(wallet_source)
-            if rows:
+            if rows and price_watch_board_intake_enabled("chains"):
                 ONCHAIN_FAST_RESEARCH.buffer_ingest(rows)
             sync_binance_wallet_hot_alert_feed(wallet_source)
         except Exception as exc:
@@ -45091,7 +45438,7 @@ def ave_hot_alert_monitor_loop() -> None:
             source = cached("ave", fetch_ave_hot)
             sync_price_watch_ave_candidates(source)
             rows = ave_hot_research_rows(source)
-            if rows:
+            if rows and price_watch_board_intake_enabled("chains"):
                 ONCHAIN_FAST_RESEARCH.buffer_ingest(rows)
             sync_ave_hot_alert_feed(source)
         except Exception as exc:
@@ -53246,6 +53593,9 @@ def site_alert_feeds() -> list[dict[str, Any]]:
 
 
 def sync_site_alert_feed(feed: dict[str, Any]) -> None:
+    feed_board = PRICE_WATCH_SITE_FEED_BOARDS.get(str(feed.get("name") or ""))
+    if feed_board and not price_watch_board_intake_enabled(feed_board):
+        return
     state = load_site_alert_state()
     try:
         payload = feed["fetch"]()
@@ -53391,8 +53741,9 @@ def news_trade_alert_monitor_loop() -> None:
     """Independent from slow ranking/X sources; persisted AI transitions dedupe restarts."""
     while not SERVER_SHUTDOWN_EVENT.is_set():
         try:
-            payload = event_monitor_payload()
-            parse_site_event_monitor_events({**payload, "updatedAt": int(time.time() * 1000)}, admit_alerts=True)
+            if price_watch_board_intake_enabled("news"):
+                payload = event_monitor_payload()
+                parse_site_event_monitor_events({**payload, "updatedAt": int(time.time() * 1000)}, admit_alerts=True)
         except Exception as exc:
             print(f"News Trade monitor failed: {safe_error_text(str(exc))}", file=sys.stderr)
         # 60s 粒度足够 (AI transition 弹窗通知)。此前 15s 一轮, 在 300s 级的
@@ -54529,6 +54880,14 @@ class Handler(SimpleHTTPRequestHandler):
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=404)
             return
+        if parsed.path == "/api/price-watch/boards":
+            # Kept out of the cached watch snapshot so a switch flip shows up on
+            # the very next poll instead of waiting for a payload rebuild.
+            try:
+                self.send_json({"ok": True, "boards": price_watch_board_payload()})
+            except Exception as exc:
+                self.send_json({"ok": False, "boards": [], "error": str(exc)}, status=502)
+            return
         if parsed.path == "/api/price-watch":
             try:
                 # Admission sources and price snapshots are maintained by the
@@ -55649,6 +56008,10 @@ class Handler(SimpleHTTPRequestHandler):
                     result = temporarily_exclude_monitor_symbol(
                         payload.get("symbol"), source_pool="price-watch"
                     )
+                elif action in {"set_board_toggle", "toggle_board"}:
+                    result = set_price_watch_board_toggle(
+                        payload.get("board"), payload.get("kind"), payload.get("enabled", True)
+                    )
                 elif action == "refresh":
                     self.send_json(sync_price_watch_monitor())
                     return
@@ -56071,6 +56434,8 @@ def main():
     start_price_watch_monitor(enable_workers=args.port == primary_monitor_port)
     start_chat_hourly_summary_monitor()
     SMART_MONEY_MONITOR.set_alert_callback(send_smart_money_buy_desktop_alert)
+    # The smart-money board's intake switch stops new buys at the poll layer.
+    SMART_MONEY_MONITOR.set_intake_guard(lambda: price_watch_board_intake_enabled("smartmoney"))
     if args.port == primary_monitor_port:
         SMART_MONEY_MONITOR.start()
 

@@ -129,8 +129,19 @@ const state = {
   priorityPeriod: normalizePriorityPeriod(readLocalPreference(MARKET_PRIORITY_PERIOD_KEY, "24h")),
   smartPriority: {},
   totalPage: 1,
-  trenchPage: 1
+  trenchPage: 1,
+  // Per-board switches (入池 / 弹窗), keyed by market source id.  Loaded once
+  // from /api/price-watch/boards; a board missing here renders no switch.
+  boardToggles: {},
+  boardTogglePending: ""
 };
+
+// Two switches per board card, mirroring the server-side roster in
+// src/app/core/state.py::PRICE_WATCH_BOARDS.
+const BOARD_TOGGLE_KINDS = [
+  { kind: "intake", label: "入池" },
+  { kind: "alert", label: "弹窗" }
+];
 
 const boardsEl = document.querySelector("#leaderboards");
 const summaryEl = document.querySelector("#summaryGrid");
@@ -1132,15 +1143,99 @@ function renderBoards() {
   requestExchangeAiNarratives(sources);
 }
 
+async function loadBoardToggles() {
+  try {
+    const response = await fetch("/api/price-watch/boards", { cache: "no-store" });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || "榜单开关读取失败");
+    const boards = Array.isArray(payload.boards) ? payload.boards : [];
+    state.boardToggles = Object.fromEntries(
+      boards.filter((board) => board && board.id).map((board) => [String(board.id), board])
+    );
+  } catch (error) {
+    // Fail open: without the roster we simply render no switches, exactly like
+    // before this feature existed.
+    state.boardToggles = {};
+  }
+  renderBoards();
+}
+
+async function toggleBoardSwitch(button) {
+  const board = String(button?.dataset?.board || "");
+  const kind = String(button?.dataset?.boardToggle || "");
+  if (!board || !kind || button.disabled) return;
+  const enabled = button.dataset.boardEnabled !== "1";
+  const entry = state.boardToggles[board] || {};
+  const previous = entry[kind] !== false;
+  // Optimistic flip so the pill responds instantly; the response carries the
+  // authoritative roster and replaces what we guessed.
+  state.boardToggles = { ...state.boardToggles, [board]: { ...entry, [kind]: enabled } };
+  state.boardTogglePending = board;
+  renderBoards();
+  try {
+    const response = await fetch("/api/price-watch", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "set_board_toggle", symbol: "", board, kind, enabled }),
+      signal: AbortSignal.timeout(15000)
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || "榜单开关更新失败");
+    const boards = Array.isArray(payload.boards) ? payload.boards : [];
+    if (boards.length) {
+      state.boardToggles = Object.fromEntries(
+        boards.filter((item) => item && item.id).map((item) => [String(item.id), item])
+      );
+    }
+    if (dataStatus) dataStatus.textContent = payload.message || "榜单开关已更新";
+  } catch (error) {
+    state.boardToggles = { ...state.boardToggles, [board]: { ...entry, [kind]: previous } };
+    if (dataStatus) dataStatus.textContent = error.message || "榜单开关更新失败";
+  } finally {
+    state.boardTogglePending = "";
+    renderBoards();
+  }
+}
+
+function boardToggleHtml(source) {
+  const board = state.boardToggles[String(source?.id || "")];
+  if (!board) return "";
+  const pills = BOARD_TOGGLE_KINDS.map(({ kind, label }) => {
+    const on = board[kind] !== false;
+    // Only aicoin / binance-wallet-hot / gmgn-hot-search really admit into the
+    // monitor pool; for every other card the intake switch is shown inert.
+    const applies = kind !== "intake" || board.intakeApplies !== false;
+    const note = applies ? (board.description || "") : "该榜单不进监控池，此开关无实际作用";
+    return `<button type="button" class="board-switch ${on ? "is-on" : "is-off"}${applies ? "" : " is-inert"}" data-board-toggle="${kind}" data-board="${escapeHtml(board.id)}" data-board-enabled="${on ? "1" : "0"}" aria-pressed="${on ? "true" : "false"}"${applies ? "" : " disabled"} title="${escapeHtml(`${board.label} · ${label}${note ? ` · ${note}` : ""}`)}">${label}${on ? "开" : "关"}</button>`;
+  }).join("");
+  return `<div class="board-switches${state.boardTogglePending === board.id ? " is-busy" : ""}" role="group" aria-label="${escapeHtml(`${board.label}开关`)}">${pills}</div>`;
+}
+
+// A header row under the title holding just the two switches, for the catalog
+// cards whose action box is too wide to also hold them (AVE / GMGN 热搜 — each
+// carries two period selects).  Only the pills drop to this row; the board label
+// (AVE / GMGN) stays inside ``.board-head-actions``, right of the selects, and is
+// size-aligned with them.  Rendered as a sibling of ``.board-head-actions``, never
+// nested inside it: nesting made that (non shrinking) box demand the full card
+// width and crushed the title.
+function boardHeadFootHtml(source) {
+  const switches = boardToggleHtml(source);
+  if (!switches) return "";
+  return `<div class="board-head-foot">${switches}</div>`;
+}
+
 function renderBoardHeadActions(source) {
+  const switches = boardToggleHtml(source);
   if (String(source?.id || "") === "total-board") {
-    return `<div class="board-head-actions is-total-head"><span>${source.totalCount || source.rows.length} 个去重标的</span><strong>ALL</strong></div>`;
+    return `<div class="board-head-actions is-total-head"><span>${source.totalCount || source.rows.length} 个去重标的</span><strong>ALL</strong>${switches}</div>`;
   }
   if (String(source?.id || "") === "gmgn-trenches") {
     return `
       <div class="board-head-actions is-gmgn-trenches-head">
         <span>${escapeHtml(source.currentCount || 0)} 个本轮</span>
         <strong>GMGN</strong>
+        ${switches}
       </div>`;
   }
   if (String(source?.id || "") === "ave") {
@@ -1176,6 +1271,7 @@ function renderBoardHeadActions(source) {
         </label>
         <strong>${escapeHtml(source.sourceLabel || "AVE")}</strong>
       </div>
+      ${boardHeadFootHtml(source)}
     `;
   }
   if (String(source?.id || "") === "gmgn-hot-search") {
@@ -1212,10 +1308,11 @@ function renderBoardHeadActions(source) {
         </label>
         <strong>${escapeHtml(source.sourceLabel || "GMGN")}</strong>
       </div>
+      ${boardHeadFootHtml(source)}
     `;
   }
   if (String(source?.id || "") !== "binance-wallet-hot") {
-    return `<div class="board-head-actions"><strong>${escapeHtml(source.sourceLabel || "--")}</strong></div>`;
+    return `<div class="board-head-actions"><strong>${escapeHtml(source.sourceLabel || "--")}</strong>${switches}</div>`;
   }
 
   const selectedPeriod = normalizeBinanceWalletPeriod(state.binanceWalletPeriod || source.period);
@@ -1244,6 +1341,7 @@ function renderBoardHeadActions(source) {
       </label>
       <strong>${escapeHtml(source.sourceLabel || "BW")}</strong>
     </div>
+    ${boardHeadFootHtml(source)}
   `;
 }
 
@@ -1782,6 +1880,13 @@ boardsEl.addEventListener("focusin", (event) => {
 });
 
 boardsEl.addEventListener("click", (event) => {
+  const toggleButton = event.target.closest?.("[data-board-toggle]");
+  if (toggleButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    void toggleBoardSwitch(toggleButton);
+    return;
+  }
   const contractButton = event.target.closest?.(".gmgn-trench-ca-copy[data-contract]");
   if (contractButton) {
     event.preventDefault();
@@ -1857,6 +1962,7 @@ boardsEl.addEventListener("change", (event) => {
 updateClock();
 setInterval(updateClock, 1000);
 hydrateMarketCache();
+loadBoardToggles();
 loadMarketData();
 setInterval(() => {
   if (document.visibilityState === "visible") loadMarketData();

@@ -806,6 +806,10 @@ class SmartMoneyMonitor:
         self.thread: threading.Thread | None = None
         self.running = False
         self.alert_callback: Callable[[dict[str, Any]], Any] | None = None
+        # Optional host-supplied gate.  When it returns False the monitor stops
+        # taking NEW buys in (the board's intake switch); already recorded buys
+        # stay untouched.
+        self.intake_guard: Callable[[], bool] | None = None
         self._metadata_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
         self._native_price_cache: dict[str, tuple[float, float]] = {}
         if seed_defaults:
@@ -831,6 +835,19 @@ class SmartMoneyMonitor:
 
     def set_alert_callback(self, callback: Callable[[dict[str, Any]], Any] | None) -> None:
         self.alert_callback = callback
+
+    def set_intake_guard(self, guard: Callable[[], bool] | None) -> None:
+        self.intake_guard = guard
+
+    def _intake_allowed(self) -> bool:
+        guard = self.intake_guard
+        if guard is None:
+            return True
+        try:
+            return bool(guard())
+        except Exception:
+            # A broken guard must never silently stop the monitor.
+            return True
 
     def add_wallet(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.store.upsert_wallet(
@@ -1125,6 +1142,8 @@ class SmartMoneyMonitor:
         return events
 
     def poll_once(self) -> list[dict[str, Any]]:
+        if not self._intake_allowed():
+            return []
         if not self.poll_lock.acquire(blocking=False):
             return []
         try:

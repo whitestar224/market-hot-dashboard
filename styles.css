@@ -1130,6 +1130,79 @@ select option {
   gap: 8px;
 }
 
+/* Per-board switches (入池 / 弹窗) rendered inside a 榜单 card header on the
+   榜单页 (index.html).  Two pills per card; an inert 入池 pill (a board that
+   never admits into the monitor pool) is dimmed and disabled. */
+.board-switches {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+}
+
+.board-switches.is-busy {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.board-switch {
+  appearance: none;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 8px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  line-height: 1.7;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.board-switch.is-on {
+  border-color: var(--amber);
+  color: var(--amber);
+  background: rgba(246, 187, 72, 0.12);
+}
+
+.board-switch.is-off {
+  border-color: var(--line-strong);
+  color: var(--muted);
+  background: rgba(241, 234, 215, 0.04);
+}
+
+.board-switch.is-inert,
+.board-switch:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.board-switch:hover:not(:disabled) {
+  border-color: var(--amber);
+  color: var(--paper);
+}
+
+/* Two extra pills widen the header by ~110px, which the 3-column card still
+   absorbs — but a 1–2 column card on a narrow window would push the title out
+   of the card.  Below the 3-column breakpoint (where ``.board-head`` has no
+   fixed height) let the header and its action row wrap instead. */
+@media (max-width: 720px) {
+  .leaderboard-grid .board-head:has(.board-switches) {
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+
+  .board-head-actions:has(.board-switches) {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    min-width: 0;
+    row-gap: 4px;
+  }
+}
+
 .board-head-actions.is-ave-hot,
 .board-head-actions.is-onchain-hot {
   flex-wrap: wrap;
@@ -1137,15 +1210,160 @@ select option {
   gap: 6px;
 }
 
+/* AVE / GMGN 热搜 cards carry TWO period ``<select>``s (周期 + 链).
+   2026-10-07 用户口径（三改后定稿）：下拉留在第一行（和标题同行）、整体靠右；
+   榜单标签（AVE / GMGN）放在**下拉右边**、与下拉**尺寸对齐**；两枚 pill 换到
+   下一行、也靠右；下拉允许缩小。
+
+   实测（Chrome，card=438）：标题单行 Ave 107 / GMGN 98，两个下拉（带「周期/链」
+   提示字）约 287、标签 46、两枚 pill 107。所以第一行放「标题 + 周期 + 链 + 标签」，
+   只有 pill 下移。 ``app.js`` 把 pill 那行渲染成 ``.board-head-foot``
+   （``.board-head-actions`` 的兄弟节点，绝不嵌进去——嵌进去时 ``flex-basis:100%``
+   会让那个不可收缩的盒子索要满宽，把标题压成竖排、并把标签顶出卡片右缘）。
+
+   这里用 grid 而不是 flex，且第一列是 ``minmax(max-content, 1fr)``：标题栏的
+   **下限恒等于标题的单行宽**，然后才轮到控制区拿剩下的宽度。用普通的
+   ``minmax(0, 1fr)`` 时网格会先把 ``auto`` 那一列喂到它的 max-content，标题栏被
+   压到 0 → 标题换行/竖排（这正是前两版翻车的地方）。反过来控制区可收缩到
+   min-content（≈ 两个下拉的 min-width 52 + 标签 46），所以窄卡里是「下拉变窄、
+   标题不换行」，永远不会把标题挤走。 */
+.board-head:has(> .board-head-foot) {
+  display: grid;
+  grid-template-columns: minmax(max-content, 1fr) auto;
+  grid-template-areas:
+    "copy    controls"
+    "foot    foot";
+  align-items: start;
+  column-gap: 8px;
+  row-gap: 4px;
+  /* 让下面的 @container 以「卡片头部宽度」为判据（≈ 卡片宽 - 28）。 */
+  container-type: inline-size;
+}
+
+.board-head:has(> .board-head-foot) .board-head-copy {
+  grid-area: copy;
+  min-width: 0;
+}
+
+/* 副标题不参与「标题栏自然宽度」的计算，否则它那串长文案（Ave 那条约 275px）
+   会把标题栏撑宽、把控制区挤到下一行。 */
+.board-head:has(> .board-head-foot) .board-head-copy > span {
+  contain: inline-size;
+}
+
+.board-head:has(> .board-head-foot) .board-head-actions {
+  grid-area: controls;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.board-head:has(> .board-head-foot) .board-head-foot {
+  grid-area: foot;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+/* 标签紧贴最后一个下拉的右边，尺寸与下拉对齐：高度同 32px（= ``.board-period-
+   control`` 的 min-height），宽度固定成一个值——标签是 2–4 个字（BW / AVE /
+   GMGN），不固定就会一宽一窄，几张卡摆在一起对不齐。``flex: 0 0 auto`` 保证
+   卡变窄时它**不参与收缩**，被压的是下拉（用户已允许），这样标签永远同尺寸。 */
+.board-head-actions.is-onchain-hot > strong,
+.board-head-actions.is-wallet-hot > strong {
+  flex: 0 0 auto;
+  width: 46px;
+  height: 32px;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+}
+
+/* 缩小一点（用户允许），让「标题 + 周期 + 链 + 标签」放得下第一行。
+   ``nowrap`` 是必须的：默认的 ``wrap`` 会让「放不下」表现为**折行**（标签掉回
+   下面，正是用户不要的），改成不换行后再靠收缩兜底——下拉的 min-width 与标签
+   宽度就是收缩下限。这里必须带上 ``.board-head:has(...)`` 前缀（优先级 (0,4,0)）：
+   上面那条 ``.board-head:has(> .board-head-foot) .board-head-actions`` 与窄屏
+   ``@media (max-width:720px)`` 里那条都写了 ``flex-wrap: wrap``，只写
+   ``.board-head-actions.is-onchain-hot`` 会被它们盖掉（同族选择器只看优先级，
+   不看先后）。 */
+.board-head:has(> .board-head-foot) .board-head-actions.is-onchain-hot {
+  flex-wrap: nowrap;
+  gap: 4px;
+}
+
+.board-head-actions.is-onchain-hot .board-period-control > span {
+  padding: 0 5px;
+  font-size: 9px;
+}
+
+/* 头部窄于 400px（≈ 卡片 428px）时，带着「周期 / 链」提示字的一行已经放不下
+   「标题 + 两个下拉 + 标签」，就把这两个提示字让给下拉本身（下拉仍能自解释：
+   24h / 综合，aria-label 也照旧），省出约 56px。隐字的同时必须收掉
+   ``.board-period-control`` 里的标签列，否则那个空轨道仍保留 46px 下限，控件
+   反而更宽。带 ``.board-head`` 前缀是为了把优先级抬到 (0,4,0)——外面那条
+   ``grid-template-columns`` 同为 (0,3,0) 但位置更靠后，否则会被它盖掉。 */
+@container (max-width: 400px) {
+  .board-head .board-head-actions.is-onchain-hot .board-period-control {
+    grid-template-columns: minmax(0, auto);
+  }
+
+  .board-head .board-head-actions.is-onchain-hot .board-period-control > span {
+    display: none;
+  }
+}
+
+/* 再窄（头部 < 268px ≈ 卡片 296px 以下）连「标题 + 两个下拉 + 标签」都保不住，
+   就藏掉标签——它是装饰性的，卡片标题里已经写着「Ave.ai 热搜榜 / GMGN 热搜榜」，
+   标题不被挤换行更要紧。 */
+@container (max-width: 268px) {
+  .board-head .board-head-actions.is-onchain-hot > strong {
+    display: none;
+  }
+}
+
+/* 币安钱包热门榜同一套思路（2026-10-07 用户点名）：pill 也下到第二行，标签贴下拉
+   右边。它的动作盒只有「观察窗口 + 一个下拉 + BW 标签」，比上面那两张宽，所以阈值
+   低一些。头窄于 332px（≈ 卡片 360px）时同样把「观察窗口」这几个提示字让给下拉
+   （副标题里本来就写着「当前观察 X 小时」）。 */
+.board-head-actions.is-wallet-hot {
+  flex-wrap: nowrap;
+  gap: 8px;
+}
+
+@container (max-width: 332px) {
+  .board-head .board-head-actions.is-wallet-hot .board-period-control {
+    grid-template-columns: minmax(0, auto);
+  }
+
+  .board-head .board-head-actions.is-wallet-hot .board-period-control > span {
+    display: none;
+  }
+}
+
+@container (max-width: 262px) {
+  .board-head .board-head-actions.is-wallet-hot > strong {
+    display: none;
+  }
+}
+
+@media (min-width: 721px) {
+  /* The fixed 90px header cannot hold both the title row and the pill row. */
+  .leaderboard-grid .board-head:has(> .board-head-foot) {
+    height: auto;
+    min-height: 90px;
+  }
+}
+
 .board-head-actions.is-ave-hot .board-period-control,
 .board-head-actions.is-onchain-hot .board-period-control {
-  grid-template-columns: auto minmax(62px, auto);
+  grid-template-columns: auto minmax(46px, auto);
 }
 
 .board-head-actions.is-ave-hot .board-period-control select,
 .board-head-actions.is-onchain-hot .board-period-control select {
-  min-width: 68px;
-  padding-left: 7px;
+  min-width: 46px;
+  padding: 0 16px 0 6px;
+  font-size: 11px;
 }
 
 .board-head-actions.is-binance-gainers-head {

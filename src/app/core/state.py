@@ -1195,6 +1195,135 @@ PRICE_MONITOR_SOURCE_GRACE_SECONDS = {
 }
 
 
+# The leaderboard cards a user sees on the 榜单页 (index.html).  Each card is a
+# market SOURCE that can feed the price monitor pool and/or pop desktop alerts,
+# so each one owns two runtime switches:
+#   * ``intake`` — keep taking NEW items from this board into the monitor pool
+#     (existing items are never touched; the board simply stops growing).
+#   * ``alert``  — keep popping desktop alerts for this board.
+# ``id`` MUST stay identical to the market source id emitted by
+# ``market_payload()`` in server.py and to ``source.id`` in index.html/app.js —
+# that is how the client finds the right card and how the server routes popups.
+#
+# ``intakeDefault`` / ``alertDefault`` override the default-on behaviour for a
+# board whose rule is noise until the user explicitly opts in.  ``intakeApplies``
+# is True only for a board that really admits items into the crypto monitor pool
+# (aicoin / binance-wallet-hot / gmgn-hot-search); the rest own only their popup
+# switch, and their intake switch is rendered disabled by the client.
+PRICE_WATCH_BOARDS = (
+    {
+        "id": "binance-wallet-hot",
+        "label": "币安钱包热门榜",
+        "short": "钱包榜",
+        "description": "币安钱包 4 小时热门榜新进入池",
+        "intakeApplies": True,
+    },
+    {
+        "id": "gmgn-trenches",
+        "label": "GMGN 战壕新币榜",
+        "short": "战壕榜",
+        "description": "GMGN 战壕新池发现（不进价池，仅控制弹窗）",
+        "intakeApplies": False,
+    },
+    {
+        "id": "aicoin",
+        "label": "AIcoin 热门榜",
+        "short": "AIcoin",
+        "description": "AIcoin 热门榜新进入池",
+        "intakeApplies": True,
+    },
+    {
+        "id": "binance",
+        "label": "Binance 热门币种",
+        "short": "币安榜",
+        "description": "币安热门币种榜（不进价池，仅控制弹窗）",
+        "intakeApplies": False,
+    },
+    {
+        "id": "gmgn-hot-search",
+        "label": "GMGN 热搜榜",
+        "short": "GMGN热搜",
+        "description": "GMGN 5 分钟热搜榜新进入池",
+        "intakeApplies": True,
+        # The 5m 「新进」 popup is pure noise until the user opts in, so it ships
+        # OFF (2026-10-06 用户拍板) while its intake keeps running.
+        "alertDefault": False,
+    },
+    {
+        "id": "bitget",
+        "label": "Bitget 热门榜",
+        "short": "Bitget",
+        "description": "Bitget 热门榜（不进价池，仅控制弹窗）",
+        "intakeApplies": False,
+    },
+    {
+        "id": "futu-hk",
+        "label": "富途港股热门榜",
+        "short": "富途港股",
+        "description": "港股热门榜（股票永不进币池，仅控制弹窗）",
+        "intakeApplies": False,
+    },
+    {
+        "id": "ave",
+        "label": "Ave.ai 热搜榜",
+        "short": "Ave热搜",
+        "description": "Ave.ai 热搜榜（已不再作为入池来源，仅控制弹窗）",
+        "intakeApplies": False,
+    },
+    {
+        "id": "okx",
+        "label": "OKX 热门榜",
+        "short": "OKX榜",
+        "description": "OKX 合约/现货热门榜（不进价池，仅控制弹窗）",
+        "intakeApplies": False,
+    },
+    {
+        "id": "okx-dex",
+        "label": "OKX DEX 热门榜",
+        "short": "OKX DEX",
+        "description": "OKX DEX 链上热门榜（不进价池，仅控制弹窗）",
+        "intakeApplies": False,
+    },
+    {
+        "id": "ths",
+        "label": "A股同花顺24h热门榜",
+        "short": "A股榜",
+        "description": "A股热门榜（股票永不进币池，仅控制弹窗）",
+        "intakeApplies": False,
+    },
+    {
+        "id": "futu-us",
+        "label": "富途美股热门榜",
+        "short": "富途美股",
+        "description": "美股热门榜（股票永不进币池，仅控制弹窗）",
+        "intakeApplies": False,
+    },
+)
+
+
+PRICE_WATCH_BOARD_IDS = tuple(board["id"] for board in PRICE_WATCH_BOARDS)
+
+
+PRICE_WATCH_BOARD_LABELS = {board["id"]: board["label"] for board in PRICE_WATCH_BOARDS}
+
+
+PRICE_WATCH_BOARD_SHORTS = {
+    board["id"]: board.get("short") or board["label"] for board in PRICE_WATCH_BOARDS
+}
+
+
+# Switch state for a board with no stored row.  ``price_watch_board_toggles``
+# starts from this so an untouched install keeps every switch on except the ones
+# that opted out via ``alertDefault`` / ``intakeDefault``.
+PRICE_WATCH_BOARD_DEFAULTS = {
+    board["id"]: {
+        "intake": bool(board.get("intakeDefault", True)),
+        "alert": bool(board.get("alertDefault", True)),
+    }
+    for board in PRICE_WATCH_BOARDS
+}
+
+
 PRICE_MONITOR_FAST_RETENTION_CONFIRM_INTERVAL_SECONDS = 6 * 60 * 60
 
 
