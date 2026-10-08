@@ -1212,13 +1212,12 @@ function boardToggleHtml(source) {
   return `<div class="board-switches${state.boardTogglePending === board.id ? " is-busy" : ""}" role="group" aria-label="${escapeHtml(`${board.label}开关`)}">${pills}</div>`;
 }
 
-// A header row under the title holding just the two switches, for the catalog
-// cards whose action box is too wide to also hold them (AVE / GMGN 热搜 — each
-// carries two period selects).  Only the pills drop to this row; the board label
-// (AVE / GMGN) stays inside ``.board-head-actions``, right of the selects, and is
-// size-aligned with them.  Rendered as a sibling of ``.board-head-actions``, never
-// nested inside it: nesting made that (non shrinking) box demand the full card
-// width and crushed the title.
+// A header row under the title holding just the two switches, for every 榜单 card.
+// The board label (ALL / GMGN / AVE / BW / AI …) always stays inside
+// ``.board-head-actions`` as its LAST item, so it anchors the card's right edge;
+// only the pills drop to this row (also right-aligned).  Rendered as a sibling of
+// ``.board-head-actions``, never nested inside it: nesting made that (non
+// shrinking) box demand the full card width and crushed the title.
 function boardHeadFootHtml(source) {
   const switches = boardToggleHtml(source);
   if (!switches) return "";
@@ -1226,17 +1225,16 @@ function boardHeadFootHtml(source) {
 }
 
 function renderBoardHeadActions(source) {
-  const switches = boardToggleHtml(source);
   if (String(source?.id || "") === "total-board") {
-    return `<div class="board-head-actions is-total-head"><span>${source.totalCount || source.rows.length} 个去重标的</span><strong>ALL</strong>${switches}</div>`;
+    return `<div class="board-head-actions is-total-head"><span>${source.totalCount || source.rows.length} 个去重标的</span><strong>ALL</strong></div>${boardHeadFootHtml(source)}`;
   }
   if (String(source?.id || "") === "gmgn-trenches") {
     return `
       <div class="board-head-actions is-gmgn-trenches-head">
         <span>${escapeHtml(source.currentCount || 0)} 个本轮</span>
         <strong>GMGN</strong>
-        ${switches}
-      </div>`;
+      </div>
+      ${boardHeadFootHtml(source)}`;
   }
   if (String(source?.id || "") === "ave") {
     const periodOptions = Array.isArray(source.periodOptions) && source.periodOptions.length
@@ -1312,7 +1310,7 @@ function renderBoardHeadActions(source) {
     `;
   }
   if (String(source?.id || "") !== "binance-wallet-hot") {
-    return `<div class="board-head-actions"><strong>${escapeHtml(source.sourceLabel || "--")}</strong>${switches}</div>`;
+    return `<div class="board-head-actions"><strong>${escapeHtml(source.sourceLabel || "--")}</strong></div>${boardHeadFootHtml(source)}`;
   }
 
   const selectedPeriod = normalizeBinanceWalletPeriod(state.binanceWalletPeriod || source.period);

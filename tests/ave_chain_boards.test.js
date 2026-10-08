@@ -28,7 +28,7 @@ test("Ave supports only 1h 4h and 24h and defaults to 4h", () => {
 
 test("Ave card precedes THS and Futu US after the requested position swap", () => {
   const ave = server.indexOf('("ave", fetch_ave_hot)');
-  const ths = server.indexOf('("ths", fetch_ths_hot)');
+  const ths = server.indexOf('("ths-cn", fetch_ths_hot)');
   const futu = server.indexOf('("futu-us", lambda: fetch_futu_hot("us"))');
   assert.ok(ave >= 0 && ths > ave && futu > ths);
 });

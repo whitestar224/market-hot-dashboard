@@ -1185,48 +1185,23 @@ select option {
   color: var(--paper);
 }
 
-/* Two extra pills widen the header by ~110px, which the 3-column card still
-   absorbs — but a 1–2 column card on a narrow window would push the title out
-   of the card.  Below the 3-column breakpoint (where ``.board-head`` has no
-   fixed height) let the header and its action row wrap instead. */
-@media (max-width: 720px) {
-  .leaderboard-grid .board-head:has(.board-switches) {
-    flex-wrap: wrap;
-    row-gap: 6px;
-  }
+/* 榜单页 12 张卡的头部都是「两行」结构（2026-10-07 用户连续四次反馈后定稿：先只要求
+   AVE / GMGN 热搜，再点名「图标要靠右，其他榜单的也改」）：
 
-  .board-head-actions:has(.board-switches) {
-    flex-wrap: wrap;
-    justify-content: flex-end;
-    min-width: 0;
-    row-gap: 4px;
-  }
-}
+     第一行： 分组 / 标题 / 副标题 ……  [只有带下拉的卡才有下拉]      榜单标签
+     第二行：                                            入池 pill   弹窗 pill
 
-.board-head-actions.is-ave-hot,
-.board-head-actions.is-onchain-hot {
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 6px;
-}
-
-/* AVE / GMGN 热搜 cards carry TWO period ``<select>``s (周期 + 链).
-   2026-10-07 用户口径（三改后定稿）：下拉留在第一行（和标题同行）、整体靠右；
-   榜单标签（AVE / GMGN）放在**下拉右边**、与下拉**尺寸对齐**；两枚 pill 换到
-   下一行、也靠右；下拉允许缩小。
-
-   实测（Chrome，card=438）：标题单行 Ave 107 / GMGN 98，两个下拉（带「周期/链」
-   提示字）约 287、标签 46、两枚 pill 107。所以第一行放「标题 + 周期 + 链 + 标签」，
-   只有 pill 下移。 ``app.js`` 把 pill 那行渲染成 ``.board-head-foot``
-   （``.board-head-actions`` 的兄弟节点，绝不嵌进去——嵌进去时 ``flex-basis:100%``
-   会让那个不可收缩的盒子索要满宽，把标题压成竖排、并把标签顶出卡片右缘）。
+   两行都靠右，标签与 pill 各自顶到卡片右缘；标签是那一行的**最后一个**元素，由它
+   把住右边界。 ``app.js::boardHeadFootHtml()`` 渲染第二行 ``.board-head-foot``，
+   它是 ``.board-head-actions`` 的**兄弟**节点，绝不嵌进去——嵌进去时
+   ``flex-basis:100%`` 会让那个不可收缩的盒子索要满宽，把标题压成竖排、标签顶出
+   卡片右缘（前两版翻车的原因）。
 
    这里用 grid 而不是 flex，且第一列是 ``minmax(max-content, 1fr)``：标题栏的
    **下限恒等于标题的单行宽**，然后才轮到控制区拿剩下的宽度。用普通的
    ``minmax(0, 1fr)`` 时网格会先把 ``auto`` 那一列喂到它的 max-content，标题栏被
-   压到 0 → 标题换行/竖排（这正是前两版翻车的地方）。反过来控制区可收缩到
-   min-content（≈ 两个下拉的 min-width 52 + 标签 46），所以窄卡里是「下拉变窄、
-   标题不换行」，永远不会把标题挤走。 */
+   压到 0 → 标题换行/竖排。控制区则一路收缩到 min-content（下拉的 min-width +
+   标签 46px），所以窄卡里是「下拉变窄 / 说明文字截断、标题永远不换行」。 */
 .board-head:has(> .board-head-foot) {
   display: grid;
   grid-template-columns: minmax(max-content, 1fr) auto;
@@ -1253,8 +1228,17 @@ select option {
 
 .board-head:has(> .board-head-foot) .board-head-actions {
   grid-area: controls;
-  flex-wrap: wrap;
+  /* ``nowrap`` 是必须的：默认的 ``wrap`` 会把「放不下」表现成**折行**（标签掉回
+     下面，正是用户不要的）。不换行后再靠收缩兜底：下拉的 min-width 与标签宽度
+     就是收缩下限，中间那个「69 个本轮」之类的说明文字则截断（见下面 span 那条）。 */
+  flex-wrap: nowrap;
   justify-content: flex-end;
+}
+
+/* 说明文字（「69 个本轮」「N 个去重标的」）可以截断，别把标签顶出卡片。 */
+.board-head:has(> .board-head-foot) .board-head-actions > span {
+  min-width: 0;
+  flex: 0 1 auto;
 }
 
 .board-head:has(> .board-head-foot) .board-head-foot {
@@ -1265,29 +1249,23 @@ select option {
   gap: 6px;
 }
 
-/* 标签紧贴最后一个下拉的右边，尺寸与下拉对齐：高度同 32px（= ``.board-period-
-   control`` 的 min-height），宽度固定成一个值——标签是 2–4 个字（BW / AVE /
-   GMGN），不固定就会一宽一窄，几张卡摆在一起对不齐。``flex: 0 0 auto`` 保证
-   卡变窄时它**不参与收缩**，被压的是下拉（用户已允许），这样标签永远同尺寸。 */
-.board-head-actions.is-onchain-hot > strong,
-.board-head-actions.is-wallet-hot > strong {
+/* 榜单标签顶到卡片右缘、当这一行最后一个元素：高度同 32px（= ``.board-period-
+   control`` 的 min-height），宽度固定成一个值——标签是 2–4 个字（BW / AVE / AI /
+   GMGN / THS），不固定就会一宽一窄，12 张卡竖着排下来对不齐。取 52px 是因为最宽
+   的 「GMGN」在 12px 下正好占满 52；``min-width: 0`` 很关键——flex 项的
+   ``min-width: auto`` 会把它顶到 min-content（同样是 52），那样宽度就跟着文字走、
+   又对不齐了。 */
+.board-head:has(> .board-head-foot) .board-head-actions > strong {
   flex: 0 0 auto;
-  width: 46px;
+  width: 52px;
+  min-width: 0;
   height: 32px;
   font-size: 12px;
   letter-spacing: 0.02em;
 }
 
-/* 缩小一点（用户允许），让「标题 + 周期 + 链 + 标签」放得下第一行。
-   ``nowrap`` 是必须的：默认的 ``wrap`` 会让「放不下」表现为**折行**（标签掉回
-   下面，正是用户不要的），改成不换行后再靠收缩兜底——下拉的 min-width 与标签
-   宽度就是收缩下限。这里必须带上 ``.board-head:has(...)`` 前缀（优先级 (0,4,0)）：
-   上面那条 ``.board-head:has(> .board-head-foot) .board-head-actions`` 与窄屏
-   ``@media (max-width:720px)`` 里那条都写了 ``flex-wrap: wrap``，只写
-   ``.board-head-actions.is-onchain-hot`` 会被它们盖掉（同族选择器只看优先级，
-   不看先后）。 */
-.board-head:has(> .board-head-foot) .board-head-actions.is-onchain-hot {
-  flex-wrap: nowrap;
+/* 缩小一点（用户允许），让「标题 + 周期 + 链 + 标签」放得下第一行。 */
+.board-head-actions.is-onchain-hot {
   gap: 4px;
 }
 
@@ -1321,15 +1299,10 @@ select option {
   }
 }
 
-/* 币安钱包热门榜同一套思路（2026-10-07 用户点名）：pill 也下到第二行，标签贴下拉
-   右边。它的动作盒只有「观察窗口 + 一个下拉 + BW 标签」，比上面那两张宽，所以阈值
-   低一些。头窄于 332px（≈ 卡片 360px）时同样把「观察窗口」这几个提示字让给下拉
-   （副标题里本来就写着「当前观察 X 小时」）。 */
-.board-head-actions.is-wallet-hot {
-  flex-wrap: nowrap;
-  gap: 8px;
-}
-
+/* 币安钱包热门榜：动作盒只有「观察窗口 + 一个下拉 + BW 标签」，比 AVE/GMGN 那两张
+   宽，所以阈值低一些。头窄于 332px（≈ 卡片 360px）时把「观察窗口」这几个提示字
+   让给下拉（副标题里本来就写着「当前观察 X 小时」）。换行/收缩由上面那条
+   ``.board-head:has(> .board-head-foot) .board-head-actions`` 统一管，这里不重复。 */
 @container (max-width: 332px) {
   .board-head .board-head-actions.is-wallet-hot .board-period-control {
     grid-template-columns: minmax(0, auto);

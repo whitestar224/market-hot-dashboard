@@ -1285,7 +1285,10 @@ PRICE_WATCH_BOARDS = (
         "intakeApplies": False,
     },
     {
-        "id": "ths",
+        # The A-share source ships as ``ths-cn`` (``build_ths_hot_source`` and the
+        # alert keys ``market-leader:ths-cn:…``), so the roster must use that id —
+        # with it, both the card's switches and the board's alert gate match.
+        "id": "ths-cn",
         "label": "A股同花顺24h热门榜",
         "short": "A股榜",
         "description": "A股热门榜（股票永不进币池，仅控制弹窗）",

@@ -1220,7 +1220,7 @@ def cached(key: str, fn):
 def clear_market_source_memory_cache() -> None:
     with CACHE_LOCK:
         for key in (
-            "binance", "okx", "okx-dex", "ave", "bitget", "aicoin", "futu-hk", "futu-us", "ths",
+            "binance", "okx", "okx-dex", "ave", "bitget", "aicoin", "futu-hk", "futu-us", "ths-cn",
             "binance-wallet-hot-5m", "binance-wallet-hot-1h", "binance-wallet-hot-4h", "binance-wallet-hot-24h",
             "binance-new", "okx-new", "bitget-new", "gate-new", "htx-new",
             "trade-xyz-new", "hyperliquid-new", "aster-new", "binance-alpha-new",
@@ -19249,7 +19249,7 @@ def market_payload() -> dict[str, Any]:
         ("ave", fetch_ave_hot),
         ("okx", fetch_okx),
         ("okx-dex", fetch_okx_dex_hot),
-        ("ths", fetch_ths_hot),
+        ("ths-cn", fetch_ths_hot),
         ("futu-us", lambda: fetch_futu_hot("us")),
     ]
 
@@ -19263,7 +19263,7 @@ def market_payload() -> dict[str, Any]:
                     accent="#777777", source_label="ERR", source_name=str(exc)[:120],
                     rows=[], status="unavailable",
                 )
-        fallback_group = "hk" if "futu-hk" in key else "us" if "futu-us" in key else "cn" if key == "ths" else "crypto"
+        fallback_group = "hk" if "futu-hk" in key else "us" if "futu-us" in key else "cn" if key == "ths-cn" else "crypto"
         return cached_or_fallback_source(
             key,
             fetcher,
@@ -19290,7 +19290,7 @@ def market_payload() -> dict[str, Any]:
         except Exception as exc:
             # A source that raised unexpectedly must not abort the whole board
             # or overwrite a successful independent cache with an ERR card.
-            fallback_group = "hk" if "futu-hk" in key else "us" if "futu-us" in key else "cn" if key == "ths" else "crypto"
+            fallback_group = "hk" if "futu-hk" in key else "us" if "futu-us" in key else "cn" if key == "ths-cn" else "crypto"
             cache_path = source_cache_path(key, "market-hot")
             fallback = (
                 cached_source_fallback(key, cache_path, api_key="market-hot")
@@ -23349,10 +23349,10 @@ def turnover_rankings_payload() -> dict[str, Any]:
         ("aicoin", fetch_aicoin),
         ("futu-hk-turnover", lambda: fetch_futu_turnover("hk")),
         ("futu-us-turnover", lambda: fetch_futu_turnover("us")),
-        ("ths", fetch_ths_hot),
+        ("ths-cn", fetch_ths_hot),
     ]
     for key, fetcher in fetchers:
-        fallback_group = "hk" if "futu-hk" in key else "us" if "futu-us" in key else "cn" if key == "ths" else "crypto"
+        fallback_group = "hk" if "futu-hk" in key else "us" if "futu-us" in key else "cn" if key == "ths-cn" else "crypto"
         sources.append(
             cached_or_fallback_source(
                 key,

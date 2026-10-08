@@ -32,7 +32,7 @@ import server
 # Mirrors market_payload()'s fetcher list — the cards rendered on the 榜单页.
 ALL_BOARDS = (
     "binance-wallet-hot", "gmgn-trenches", "aicoin", "binance", "gmgn-hot-search",
-    "bitget", "futu-hk", "ave", "okx", "okx-dex", "ths", "futu-us",
+    "bitget", "futu-hk", "ave", "okx", "okx-dex", "ths-cn", "futu-us",
 )
 # Only these three really admit into the price monitor pool.
 INTAKE_BOARDS = {"binance-wallet-hot", "aicoin", "gmgn-hot-search"}
