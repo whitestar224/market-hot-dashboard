@@ -13,13 +13,18 @@ PERCY = "2pA25N1kJdFMo5YApiykMsHwyDxRNbB62CTxsR1niZ5F"
 STIMMY = "7CHR2LVw4kwbR7p1ZRkdDgfySjMWtqXzXUNmrQ8RPUMP"
 
 
-def gmgn_source(rows):
+def gmgn_source(rows, chain=server.GMGN_HOT_SEARCH_ALERT_CHAIN):
+    """Build a hot-search source with ONE 5m board (Robinhood by default).
+
+    The alert feed reads the Robinhood 5-minute board only, so the aggregate
+    ``all`` board the real payload also carries must be irrelevant here.
+    """
     return {
         "id": "gmgn-hot-search",
         "title": "GMGN 热搜榜",
         "group": "crypto",
         "periodBoards": [
-            {"chain": "all", "period": "5m", "status": "ok", "rows": rows},
+            {"chain": chain, "label": chain, "period": "5m", "status": "ok", "rows": rows},
         ],
     }
 
@@ -28,9 +33,9 @@ def board_row(symbol, contract, rank):
     return {
         "symbol": symbol,
         "name": symbol,
-        "chain": "sol",
-        "chainId": "CT_501",
-        "chainLabel": "Solana",
+        "chain": "robinhood",
+        "chainId": "4663",
+        "chainLabel": "Robinhood Chain",
         "contractAddress": contract,
         "rank": rank,
         "price": "0.00020679",
@@ -139,6 +144,57 @@ class GmgnHotSearchAlertWarmupTests(unittest.TestCase):
         events = self.sync([board_row("SLEUTHY", SLEUTHY, 1)], 1791081000000)
 
         self.assertEqual(events, [])
+
+
+class GmgnHotSearchAlertBoardTests(unittest.TestCase):
+    """弹窗只观测 Robinhood 单链 5m 板，不观测「综合」板（2026-10-07 用户拍板）。"""
+
+    def alert_rows(self, source):
+        return server.gmgn_hot_search_5m_alert_rows(source)
+
+    def test_robinhood_5m_board_is_the_observed_board(self):
+        rows = [board_row("VAUL", "0xabc", 1)]
+        board = gmgn_source(rows)
+        snaps = self.alert_rows(board)
+        self.assertEqual([row["symbol"] for row in snaps], ["VAUL"])
+        self.assertEqual(snaps[0]["period"], server.GMGN_HOT_SEARCH_ALERT_PERIOD)
+        self.assertEqual(snaps[0]["chain"], "robinhood")
+        self.assertEqual(snaps[0]["chainLabel"], "Robinhood Chain")
+
+    def test_aggregate_board_is_ignored(self):
+        # 综合板被 sol/bsc 主导，robinhood 几乎挤不进前 10 —— 它的新进不该弹。
+        snaps = self.alert_rows(gmgn_source([board_row("SOLONLY", "0xsol", 1)], chain="all"))
+        self.assertEqual(snaps, [])
+
+    def test_other_chains_and_periods_are_ignored(self):
+        source = {
+            "id": "gmgn-hot-search",
+            "title": "GMGN 热搜榜",
+            "group": "crypto",
+            "periodBoards": [
+                {"chain": "sol", "period": "5m", "status": "ok", "rows": [board_row("S", "0xs", 1)]},
+                {"chain": "robinhood", "period": "1h", "status": "ok", "rows": [board_row("H", "0xh", 1)]},
+            ],
+        }
+        self.assertEqual(self.alert_rows(source), [])
+
+    def test_a_different_source_id_is_ignored(self):
+        source = dict(gmgn_source([board_row("VAUL", "0xabc", 1)]), id="ave")
+        self.assertEqual(self.alert_rows(source), [])
+
+    def test_chain_label_falls_back_to_robinhood_when_the_row_omits_it(self):
+        rows = [dict(board_row("VAUL", "0xabc", 1), chainLabel="")]
+        snaps = self.alert_rows(gmgn_source(rows))
+        self.assertEqual(snaps[0]["chainLabel"], server.GMGN_HOT_SEARCH_ALERT_CHAIN)
+
+    def test_event_title_names_the_chain(self):
+        snap = self.alert_rows(gmgn_source([board_row("VAUL", "0xabc", 1)]))[0]
+        event = server.rank_monitor_event("hot", snap, "new")
+        self.assertEqual(event["alertPeriod"], server.GMGN_HOT_SEARCH_ALERT_PERIOD)
+        self.assertIn("Robinhood", event["title"])
+        self.assertTrue(event["kind"].endswith("新进"))
+        # 这条事件必须能穿过 GMGN 热搜榜的静音闸门，否则弹不出来。
+        self.assertFalse(server.desktop_alert_source_is_muted(event))
 
 
 if __name__ == "__main__":

@@ -376,8 +376,10 @@ from app.core.state import (
     GLOBAL_HOTSPOT_LOCK,
     GLOBAL_HOTSPOT_STATE_PATH,
     GMGN_HOT_CHAINS,
+    GMGN_HOT_CHAIN_LABELS,
     GMGN_HOT_DEFAULT_PERIOD,
     GMGN_HOT_PERIODS,
+    GMGN_HOT_SEARCH_ALERT_CHAIN,
     GMGN_HOT_SEARCH_ALERT_INTERVAL_SECONDS,
     GMGN_HOT_SEARCH_ALERT_LOCK,
     GMGN_HOT_SEARCH_ALERT_PERIOD,
@@ -12083,7 +12085,7 @@ def fetch_gmgn_hot_search(max_rows: int = 10) -> dict[str, Any]:
         id="gmgn-hot-search",
         group="crypto",
         title="GMGN 热搜榜",
-        subtitle="",
+        subtitle="5 分钟榜新进弹窗只看 Robinhood 链",
         accent="#9cff00",
         source_label="GMGN",
         source_name="GMGN Agent API · hot-search",
@@ -45011,7 +45013,13 @@ def rank_monitor_event(board: str, current: dict[str, Any], reason: str) -> dict
     is_ave = str(current.get("sourceId") or "") == "ave"
     is_gmgn_hot_search = str(current.get("sourceId") or "") == "gmgn-hot-search"
     if is_gmgn_hot_search and str(current.get("period") or "") == GMGN_HOT_SEARCH_ALERT_PERIOD:
-        board_label = "GMGN 5 分钟热搜榜"
+        # The 5m feed only observes the Robinhood board, so name the chain in the
+        # popup title — otherwise "GMGN 5 分钟热搜榜新进" reads like an all-chain
+        # event while it is always Robinhood.  The row's own chainLabel is the
+        # ticker-style "RBN", so use the 榜单页 label map instead.
+        alert_chain = str(current.get("chain") or "").strip().casefold()
+        chain_label = GMGN_HOT_CHAIN_LABELS.get(alert_chain, "Robinhood")
+        board_label = f"GMGN 5 分钟热搜榜·{chain_label}"
     wallet_url = (
         binance_wallet_token_url(current.get("chain"), current.get("contractAddress"))
         if is_binance_wallet else ""
@@ -45102,7 +45110,7 @@ def rank_monitor_event(board: str, current: dict[str, Any], reason: str) -> dict
         event["speech"] = (
             f"币安钱包热门榜新进，{symbol} 新进入{clean_feed_text(current.get('periodLabel') or '24 小时', 24).replace(' ', '')}热门榜前十。"
             if is_binance_wallet
-            else f"GMGN 热搜榜新进，{symbol} 新进入 5 分钟热搜榜前十。"
+            else f"GMGN 5 分钟热搜榜 Robinhood 链新进，{symbol} 新进入前十。"
             if is_gmgn_hot_search
             else f"榜单新进，{symbol} 新进入{board_label}前十。"
         )
@@ -45259,13 +45267,18 @@ def sync_ave_hot_alert_feed(source: dict[str, Any] | None = None) -> list[dict[s
 
 
 def gmgn_hot_search_5m_alert_rows(source: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return the GMGN hot-search 5-minute aggregate board as snapshot rows.
+    """Return the GMGN hot-search Robinhood 5-minute board as snapshot rows.
 
     The GMGN hot-search source only surfaces the default 1h window as its
     ``rows``; the 5m membership lives inside ``periodBoards``.  This helper
-    extracts the 5m ``综合`` (all-chain) board so the dedicated 5m alert feed
-    can observe new entries without touching the generic rank monitor (which
+    extracts the 5m ``robinhood`` board so the dedicated 5m alert feed can
+    observe new entries without touching the generic rank monitor (which
     deliberately keeps every GMGN hot-search window quiet).
+
+    It used to read the 5m ``all`` (aggregate) board, but that board is driven
+    by sol/bsc turnover, so a Robinhood token essentially never held a top-10
+    slot (measured: 1 of 10).  The user only wants Robinhood new entries, so the
+    feed now watches that chain's own board.
     """
     if str(source.get("id") or "") != "gmgn-hot-search":
         return []
@@ -45275,7 +45288,7 @@ def gmgn_hot_search_5m_alert_rows(source: dict[str, Any]) -> list[dict[str, Any]
             item
             for item in boards
             if isinstance(item, dict)
-            and str(item.get("chain") or "") == "all"
+            and str(item.get("chain") or "") == GMGN_HOT_SEARCH_ALERT_CHAIN
             and normalize_gmgn_hot_period(item.get("period")) == GMGN_HOT_SEARCH_ALERT_PERIOD
         ),
         None,
@@ -45290,18 +45303,20 @@ def gmgn_hot_search_5m_alert_rows(source: dict[str, Any]) -> list[dict[str, Any]
         snapshot = rank_monitor_snapshot(source, row, index, "hot")
         snapshot["period"] = GMGN_HOT_SEARCH_ALERT_PERIOD
         snapshot["periodLabel"] = "5 分钟"
+        snapshot["chain"] = snapshot.get("chain") or GMGN_HOT_SEARCH_ALERT_CHAIN
+        snapshot["chainLabel"] = snapshot.get("chainLabel") or board.get("label") or ""
         if snapshot.get("key"):
             snapshots.append(snapshot)
     return snapshots
 
 
 def sync_gmgn_hot_search_alert_feed(source: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    """Observe GMGN hot-search 5m entries for popup + voice broadcast.
+    """Observe GMGN hot-search 5m Robinhood entries for popup + voice broadcast.
 
-    Unlike the 1h/6h/24h windows, a token newly entering the 5-minute window is
-    a fast-moving signal worth surfacing.  This feed is intentionally separate
-    from ``sync_rank_monitor_feed`` so it can deliver these events while the
-    generic rank monitor keeps the GMGN hot-search source silent.
+    Unlike the 1h/6h/24h windows, a token newly entering the 5-minute Robinhood
+    window is a fast-moving signal worth surfacing.  This feed is intentionally
+    separate from ``sync_rank_monitor_feed`` so it can deliver these events
+    while the generic rank monitor keeps the GMGN hot-search source silent.
     """
     gmgn_source = source if isinstance(source, dict) else cached("gmgn-hot-search", fetch_gmgn_hot_search)
     snapshots = gmgn_hot_search_5m_alert_rows(gmgn_source)

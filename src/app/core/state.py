@@ -985,6 +985,12 @@ GMGN_HOT_CHAINS = (
 )
 
 
+# Chain code -> the human label the 榜单页 dropdown shows ("SOL" / "Robinhood" …).
+# A row's own ``chainLabel`` is a ticker-style short code (robinhood -> "RBN"),
+# which reads badly inside a popup title, so the alert path uses this map.
+GMGN_HOT_CHAIN_LABELS = {value: label for value, label in GMGN_HOT_CHAINS}
+
+
 GMGN_OPENAPI_BASE = "https://openapi.gmgn.ai"
 
 
@@ -1243,11 +1249,10 @@ PRICE_WATCH_BOARDS = (
         "id": "gmgn-hot-search",
         "label": "GMGN 热搜榜",
         "short": "GMGN热搜",
-        "description": "GMGN 5 分钟热搜榜新进入池",
+        "description": "GMGN 5 分钟热搜榜新进入池；弹窗只报 Robinhood 链的新进",
         "intakeApplies": True,
-        # The 5m 「新进」 popup is pure noise until the user opts in, so it ships
-        # OFF (2026-10-06 用户拍板) while its intake keeps running.
-        "alertDefault": False,
+        # 弹窗在 2026-10-06 曾因「综合板全是 sol/bsc 噪声」默认关闭；2026-10-07 改
+        # 为只观测 Robinhood 单链板后噪声消失，重开为默认开。
     },
     {
         "id": "bitget",
@@ -2209,10 +2214,18 @@ BINANCE_WALLET_HOT_ALERT_STATE_PATH = PERSIST_CACHE_DIR / "binance_wallet_hot_al
 AVE_HOT_ALERT_STATE_PATH = PERSIST_CACHE_DIR / "ave_hot_alert_state.json"
 
 
-GMGN_HOT_SEARCH_ALERT_STATE_VERSION = 1
+# v2 (2026-10-07)：5 分钟「新进」弹窗的观测面从「综合」板换成 Robinhood 单链板，
+# 键空间随之改变 → 升版本强制重建基线（否则旧 membership 会与新键空间对不上）。
+GMGN_HOT_SEARCH_ALERT_STATE_VERSION = 2
 
 
 GMGN_HOT_SEARCH_ALERT_PERIOD = "5m"
+
+
+# 5 分钟热搜「新进」弹窗只观测这一条链。综合（all）板被 sol/bsc 的成交额主导，
+# robinhood 的币几乎永远挤不进前 10（实测综合 10 条里只有 1 条 robinhood），所以
+# 必须在单链板上观察它的新进（2026-10-07 用户拍板）。
+GMGN_HOT_SEARCH_ALERT_CHAIN = "robinhood"
 
 
 GMGN_HOT_SEARCH_REENTRY_SECONDS = 24 * 60 * 60

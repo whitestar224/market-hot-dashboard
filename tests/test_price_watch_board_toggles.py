@@ -7,9 +7,10 @@ Every market source a user sees as a card on the 榜单页 owns two switches:
 * ``alert``  — keep popping desktop alerts for this board.
 
 A board with no stored DB row keeps its declared default, so an untouched
-install behaves exactly as before — except the GMGN 5-minute hot-search board,
-whose popup switch ships OFF (2026-10-06 用户拍板: its 「新进」 popup is noise
-until explicitly enabled).
+install behaves exactly as before.  (The GMGN 5-minute hot-search popup shipped
+OFF on 2026-10-06 because its 「新进」 firehose was pure noise; on 2026-10-07 it
+was narrowed to the Robinhood chain board, which killed the noise, so it ships
+ON again.)
 
 There is exactly ONE suppression choke point per direction:
 
@@ -85,12 +86,10 @@ class PriceWatchBoardToggleTests(unittest.TestCase):
         block = block[: block.index("\n    ]")]
         self.assertEqual(re.findall(r'\(\s*"([a-z0-9-]+)"\s*,', block), list(ALL_BOARDS))
 
-    def test_only_the_gmgn_hot_search_popup_ships_off(self):
-        self.assertFalse(server.price_watch_board_alert_enabled("gmgn-hot-search"))
-        self.assertTrue(server.price_watch_board_intake_enabled("gmgn-hot-search"))
+    def test_every_board_ships_with_both_switches_on(self):
+        # 2026-10-07：GMGN 5 分钟热搜的弹窗从「综合板」改为只观测 Robinhood 单链板，
+        # 噪声消失后它重新回到默认开（此前 2026-10-06 曾默认关）。
         for board_id in ALL_BOARDS:
-            if board_id == "gmgn-hot-search":
-                continue
             self.assertTrue(server.price_watch_board_alert_enabled(board_id), board_id)
             self.assertTrue(server.price_watch_board_intake_enabled(board_id), board_id)
 
@@ -129,13 +128,12 @@ class PriceWatchBoardToggleTests(unittest.TestCase):
 
         with patch.object(server, "auth_db", boom):
             toggles = server.price_watch_board_toggles()
-        # A read failure must never mute the whole box: every default-on board
-        # stays on.  The board that opted out by design keeps its declared
-        # default rather than flipping to "on".
+        # A read failure must never mute the whole box: every board keeps the
+        # switch state it declared in the roster (all of them default ON today).
         for board_id, defaults in server.PRICE_WATCH_BOARD_DEFAULTS.items():
             self.assertEqual(toggles[board_id], defaults, board_id)
         self.assertTrue(server.price_watch_board_alert_enabled("aicoin"))
-        self.assertFalse(server.price_watch_board_alert_enabled("gmgn-hot-search"))
+        self.assertTrue(server.price_watch_board_alert_enabled("gmgn-hot-search"))
 
     # -- alert routing ----------------------------------------------------
 
@@ -160,17 +158,17 @@ class PriceWatchBoardToggleTests(unittest.TestCase):
         self.assertEqual(server.price_watch_alert_board({"key": "something-else"}), "")
         self.assertEqual(server.price_watch_alert_board(None), "")
 
-    def test_gmgn_hot_search_popup_is_muted_by_default(self):
+    def test_gmgn_hot_search_popup_ships_on_and_can_be_switched_off(self):
         item = {
-            "key": "rank-monitor:hot:GMGN:solana:abc:new:1",
+            "key": "rank-monitor:hot:GMGN:robinhood:abc:new:1",
             "sourceId": "gmgn-hot-search",
             "alertPeriod": "5m",
-            "kind": "GMGN 5 分钟热搜榜新进",
-            "title": "GMGN 5 分钟热搜榜新进：ABC",
+            "kind": "GMGN 5 分钟热搜榜·Robinhood新进",
+            "title": "GMGN 5 分钟热搜榜·Robinhood新进：ABC",
         }
-        self.assertEqual(server.price_watch_alert_board_muted(item), "gmgn-hot-search")
-        server.set_price_watch_board_toggle("gmgn-hot-search", "alert", True)
         self.assertEqual(server.price_watch_alert_board_muted(item), "")
+        server.set_price_watch_board_toggle("gmgn-hot-search", "alert", False)
+        self.assertEqual(server.price_watch_alert_board_muted(item), "gmgn-hot-search")
 
     def test_desktop_alert_is_dropped_when_the_board_alert_switch_is_off(self):
         # Binance Wallet 4h 新进 is the one hot-board popup the delivery policy
