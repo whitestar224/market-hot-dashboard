@@ -8,6 +8,7 @@ const GMGN_CHAIN_KEY = "xingyunshe:gmgn-hot-search:chain:v1";
 const GMGN_PERIOD_KEY = "xingyunshe:gmgn-hot-search:period:v1";
 const GMGN_CHAIN_OPTIONS = new Set(["all", "sol", "bsc", "base", "eth", "robinhood", "arc", "stable"]);
 const GMGN_PERIODS = new Set(["1m", "5m", "1h", "6h", "24h"]);
+const TRENCH_CHAIN_KEY = "xingyunshe:gmgn-trenches:chain:v1";
 const MARKET_CACHE_KEY = "xingyunshe:market-hot:payload:v15";
 const MARKET_PRIORITY_VIEW_KEY = "xingyunshe:market-hot:priority-view:v1";
 const MARKET_PRIORITY_PERIOD_KEY = "xingyunshe:market-hot:priority-period:v1";
@@ -96,6 +97,19 @@ function normalizeGmgnPeriod(value) {
   return GMGN_PERIODS.has(period) ? period : "1h";
 }
 
+// 战壕榜的链用服务端的 ONCHAIN_RESEARCH_DEFAULT_NETWORKS 原样值（solana / bsc /
+// robinhood / arc / base / eth）。这里**故意宽松**：不在前端固化白名单，否则服务端日后
+// 新增一条链时，旧缓存 bundle 会把用户的选择悄悄弹回「综合」。
+function normalizeTrenchChain(value) {
+  const chain = String(value ?? "all").trim().toLowerCase();
+  if (!chain || chain === "all") return "all";
+  return /^[a-z0-9][a-z0-9_-]{0,23}$/.test(chain) ? chain : "all";
+}
+
+function trenchRowChain(row) {
+  return String(row?.network || row?.chain || "").trim().toLowerCase();
+}
+
 function readBinanceWalletPeriod() {
   try {
     return normalizeBinanceWalletPeriod(localStorage.getItem(BINANCE_WALLET_PERIOD_KEY));
@@ -125,6 +139,7 @@ const state = {
   avePeriod: normalizeAvePeriod(readLocalPreference(AVE_PERIOD_KEY, "4h")),
   gmgnChain: normalizeGmgnChain(readLocalPreference(GMGN_CHAIN_KEY, "all")),
   gmgnPeriod: normalizeGmgnPeriod(readLocalPreference(GMGN_PERIOD_KEY, "1h")),
+  trenchChain: normalizeTrenchChain(readLocalPreference(TRENCH_CHAIN_KEY, "all")),
   gmgnHotLoading: false,
   priorityPeriod: normalizePriorityPeriod(readLocalPreference(MARKET_PRIORITY_PERIOD_KEY, "24h")),
   smartPriority: {},
@@ -501,7 +516,37 @@ function rowsForSourceView(source) {
   const sourceId = String(source?.id || "");
   if (sourceId === "ave") return aveRowsForSource(source);
   if (sourceId === "gmgn-hot-search") return gmgnRowsForSource(source);
+  if (sourceId === "gmgn-trenches") return trenchRowsForSource(source);
   return source?.rows || [];
+}
+
+// 战壕榜的链切换完全在客户端做：服务端只发一条扁平 tape（300 条重行），
+// 每条链的行由 row.network / row.chain 现筛。不带周期维度——战壕榜本身没有周期。
+function trenchRowsForSource(source) {
+  const rows = Array.isArray(source?.rows) ? source.rows : [];
+  const selected = normalizeTrenchChain(state.trenchChain);
+  if (selected === "all") return rows;
+  return rows.filter((row) => trenchRowChain(row) === selected);
+}
+
+// 当前选中链的计数（服务端 chainCounts 预计算；客户端不去数行）。
+function trenchSelectedCounts(source) {
+  const chain = normalizeTrenchChain(state.trenchChain);
+  const entry = source?.chainCounts?.[chain];
+  if (entry && typeof entry === "object") {
+    return {
+      total: Math.max(0, Number(entry.total) || 0),
+      current: Math.max(0, Number(entry.current) || 0),
+      backfilled: Math.max(0, Number(entry.backfilled) || 0)
+    };
+  }
+  // 旧 payload（未带 chainCounts，服务未重启）时退回扁平总量，卡片读数不至于失真。
+  const visible = Array.isArray(source?.rows) ? source.rows.length : 0;
+  return {
+    total: chain === "all" ? Math.max(0, Number(source?.historyCount) || visible) : 0,
+    current: chain === "all" ? Math.max(0, Number(source?.currentCount) || 0) : 0,
+    backfilled: chain === "all" ? Math.max(0, Number(source?.backfilledCount) || 0) : 0
+  };
 }
 
 function visibleSources() {
@@ -991,11 +1036,20 @@ function renderGmgnTrenchRow(row, source, index) {
 }
 
 function renderGmgnTrenchBoard(source) {
+  // ``source.rows`` 可能已经过链筛选（rowsForSourceView → trenchRowsForSource），
+  // 所以这里的条数、分页都跟着选中链走。
   const allRows = Array.isArray(source?.rows) ? source.rows : [];
+  const selectedChain = normalizeTrenchChain(state.trenchChain);
+  const chainOptions = Array.isArray(source?.chainOptions) ? source.chainOptions : [];
+  // 标签从服务端选项里取（"SOL" / "HOOD" …）；取不到就用 slug 兜底，不清空。
+  const chainLabel = selectedChain === "all"
+    ? ""
+    : chainOptions.find((option) => normalizeTrenchChain(option?.value) === selectedChain)?.label || selectedChain;
   // Cap at 300 most recent rows, paginated at TRENCH_PAGE_SIZE per page
   const cappedRows = allRows.slice(0, 300);
   const totalPages = Math.max(1, Math.ceil(cappedRows.length / TRENCH_PAGE_SIZE));
-  const page = state.trenchPage || 1;
+  // Clamp: 切链 / 换榜后旧的页码可能越界，留着会渲染成空白页。
+  const page = Math.min(Math.max(1, Number(state.trenchPage) || 1), totalPages);
   const startIdx = (page - 1) * TRENCH_PAGE_SIZE;
   const rows = cappedRows.slice(startIdx, startIdx + TRENCH_PAGE_SIZE);
   const online = Number(source?.sourceOnline || 0);
@@ -1005,9 +1059,17 @@ function renderGmgnTrenchBoard(source) {
     : source?.live
       ? `GMGN 来源在线 ${online}/${total}`
       : "实时源暂时断开 · 正在展示已接收历史";
-  if (!rows.length) return `<div class="rows">${renderEmpty(source)}</div>`;
+  if (!rows.length) {
+    // 选中某条链而该链为空 ≠ 整个榜没收到币，别用榜级的「尚未接收到」去误导。
+    if (chainLabel) {
+      return `<div class="rows"><div class="empty-state"><b>${escapeHtml(chainLabel)} 当前没有新币</b><span>所选链在本地接收窗口内暂无通过筛选的已迁移新池；切回「综合」可以看其它链。</span></div></div>`;
+    }
+    return `<div class="rows">${renderEmpty(source)}</div>`;
+  }
   const totalPagesToShow = totalPages <= 1 ? "" : `· <b>${totalPages}</b> 页`;
-  const backfilledCount = Number(source?.backfilledCount || 0);
+  const counts = trenchSelectedCounts(source);
+  const chainSummary = chainLabel ? ` · <span class="gmgn-trench-chain-summary">仅看 ${escapeHtml(chainLabel)}</span>` : "";
+  const backfilledCount = Math.max(0, Number(counts.backfilled) || 0);
   const backfillSummary = backfilledCount > 0
     ? ` · <span class="gmgn-trench-backfill-summary">含 ${backfilledCount} 条外部线索补录</span>`
     : "";
@@ -1023,8 +1085,8 @@ function renderGmgnTrenchBoard(source) {
     </div>` : "";
   return `
     <div class="gmgn-trench-history-strip">
-      <span><b>${escapeHtml(source.historyCount || cappedRows.length)}</b> 个已接收新币</span>
-      <small>${escapeHtml(liveState)}${totalPagesToShow} · 严格按开盘时间倒序${backfillSummary}</small>
+      <span><b>${escapeHtml(counts.total || cappedRows.length)}</b> 个已接收新币</span>
+      <small>${escapeHtml(liveState)}${totalPagesToShow} · 严格按开盘时间倒序${chainSummary}${backfillSummary}</small>
     </div>
     <div class="gmgn-trench-hot-scroll" role="list" aria-label="GMGN 战壕新币接收历史">
       ${rows.map((row, index) => renderGmgnTrenchRow(row, source, startIdx + index + 1)).join("")}
@@ -1229,9 +1291,28 @@ function renderBoardHeadActions(source) {
     return `<div class="board-head-actions is-total-head"><span>${source.totalCount || source.rows.length} 个去重标的</span><strong>ALL</strong></div>${boardHeadFootHtml(source)}`;
   }
   if (String(source?.id || "") === "gmgn-trenches") {
+    // 链下拉复用 AVE / GMGN 热搜那套 .board-period-control（含 ≤400px 隐提示字、
+    // ≤268px 隐标签的容器查询降级），所以这里也挂上 is-onchain-hot。
+    const chainOptions = Array.isArray(source.chainOptions) && source.chainOptions.length
+      ? source.chainOptions
+      : [{ value: "all", label: "综合" }];
+    const counts = trenchSelectedCounts(source);
     return `
-      <div class="board-head-actions is-gmgn-trenches-head">
-        <span>${escapeHtml(source.currentCount || 0)} 个本轮</span>
+      <div class="board-head-actions is-gmgn-trenches-head is-onchain-hot">
+        ${
+          chainOptions.length > 1
+            ? `<label class="board-period-control">
+          <span>链</span>
+          <select data-role="trench-chain" aria-label="选择 GMGN 战壕新币链">
+            ${chainOptions.map((option) => {
+              const value = normalizeTrenchChain(option?.value);
+              return `<option value="${escapeHtml(value)}" ${value === normalizeTrenchChain(state.trenchChain) ? "selected" : ""}>${escapeHtml(option?.label || value)}</option>`;
+            }).join("")}
+          </select>
+        </label>`
+            : ""
+        }
+        <span>${escapeHtml(counts.current)} 个本轮</span>
         <strong>GMGN</strong>
       </div>
       ${boardHeadFootHtml(source)}`;
@@ -1953,6 +2034,15 @@ boardsEl.addEventListener("change", (event) => {
   if (gmgnChainSelect) {
     state.gmgnChain = normalizeGmgnChain(gmgnChainSelect.value);
     saveLocalPreference(GMGN_CHAIN_KEY, state.gmgnChain);
+    queueMicrotask(renderBoards);
+    return;
+  }
+  const trenchChainSelect = event.target.closest('select[data-role="trench-chain"]');
+  if (trenchChainSelect) {
+    state.trenchChain = normalizeTrenchChain(trenchChainSelect.value);
+    saveLocalPreference(TRENCH_CHAIN_KEY, state.trenchChain);
+    // 换个链就是换一份列表，页码必须回到第一页（否则停在越界页会渲染空白）。
+    state.trenchPage = 1;
     queueMicrotask(renderBoards);
   }
 });

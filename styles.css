@@ -2033,6 +2033,10 @@ select option {
   color: #9fd8ff;
 }
 
+.gmgn-trench-history-strip .gmgn-trench-chain-summary {
+  color: #9cff57;
+}
+
 .gmgn-trench-name span {
   color: rgba(241, 234, 215, 0.46);
   font-size: 10px;

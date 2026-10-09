@@ -12301,6 +12301,72 @@ GMGN_TRENCH_CHAIN_LABELS: dict[str, str] = {
 }
 
 
+def gmgn_trench_chain_tally(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """Count trench board rows per chain, for the card's chain picker labels.
+
+    The board is served as ONE flat tape (see ``refresh_gmgn_trenches_hot_board``),
+    so the per-chain numbers have to be precomputed here whenever the client needs
+    to show a count for the selected chain.
+    """
+    tally: dict[str, int] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        chain = clean_feed_text(row.get("network") or row.get("chain"), 40).lower()
+        if chain:
+            tally[chain] = tally.get(chain, 0) + 1
+    return tally
+
+
+def gmgn_trench_chain_picker(
+    board_rows: list[dict[str, Any]],
+    current_rows: list[dict[str, Any]],
+    backfilled_count: Any = 0,
+) -> tuple[list[dict[str, str]], dict[str, dict[str, int]]]:
+    """Build the trench card's chain dropdown options + per-chain tallies.
+
+    The board ships as ONE flat tape — its rows are heavy (research marks, socials,
+    metrics, filter signals), so replicating them per chain the way the GMGN
+    hot-search ``periodBoards`` does would multiply the payload several times over.
+    The client therefore filters on ``row.network`` and only these counts are
+    precomputed here.  ``all`` mirrors the flat board totals so the client never
+    has to guess when nothing is selected.
+    """
+    chains = [
+        chain for chain in GMGN_TRENCH_CHAIN_FILTERS
+        if chain in ONCHAIN_RESEARCH_DEFAULT_NETWORKS
+    ]
+    board_tally = gmgn_trench_chain_tally(board_rows)
+    current_tally = gmgn_trench_chain_tally(current_rows)
+    backfill_tally = gmgn_trench_chain_tally([
+        row for row in board_rows if isinstance(row, dict) and row.get("backfilled")
+    ])
+    # ``backfilled_count`` is a plain count in production, but ``int(nan)`` raises,
+    # so keep this total defensive for direct callers.
+    backfilled_total = safe_float(backfilled_count)
+    backfilled_total = max(0, int(backfilled_total)) if math.isfinite(backfilled_total) else 0
+    options = [{"value": "all", "label": "综合"}] + [
+        {"value": chain, "label": GMGN_TRENCH_CHAIN_LABELS.get(chain, chain.upper())}
+        for chain in chains
+    ]
+    counts = {
+        "all": {
+            "total": len(board_rows),
+            "current": len(current_rows),
+            "backfilled": backfilled_total,
+        },
+        **{
+            chain: {
+                "total": board_tally.get(chain, 0),
+                "current": current_tally.get(chain, 0),
+                "backfilled": backfill_tally.get(chain, 0),
+            }
+            for chain in chains
+        },
+    }
+    return options, counts
+
+
 def gmgn_trench_board_rows(
     history_rows: list[dict[str, Any]],
     *,
@@ -13994,11 +14060,14 @@ def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
     )
     capped_rows = rows
     backfilled_count = sum(1 for row in capped_rows if isinstance(row, dict) and row.get("backfilled"))
+    chain_options, chain_counts = gmgn_trench_chain_picker(
+        capped_rows, current_display_rows, backfilled_count
+    )
     source = source_template(
         id="gmgn-trenches",
         group="crypto",
         title="GMGN 战壕新币榜",
-        subtitle="五链按真实开盘时间倒序 · MC > $10K · 至少一个社交媒体 · 漏采缺口按外部线索标注补录",
+        subtitle="五链可按链筛选 · 按真实开盘时间倒序 · MC > $10K · 至少一个社交媒体 · 漏采缺口按外部线索标注补录",
         accent="#9cff57",
         source_label="GMGN",
         source_name="GMGN Agent API · trenches/completed",
@@ -14029,6 +14098,9 @@ def refresh_gmgn_trenches_hot_board() -> dict[str, Any]:
         "refreshIntervalSeconds": GMGN_TRENCH_BOARD_REFRESH_SECONDS,
         "aiProvider": "binance",
         "aiPolicy": "visible-latest-10-cached",
+        # Chain picker for the 榜单页 card (see ``gmgn_trench_chain_picker``).
+        "chainOptions": chain_options,
+        "chainCounts": chain_counts,
         "chainFilters": {
             chain: {
                 key: list(value) if isinstance(value, tuple) else value
