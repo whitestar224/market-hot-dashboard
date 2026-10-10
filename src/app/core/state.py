@@ -1141,6 +1141,32 @@ GMGN_HOT_SEARCH_POOL_RETENTION_SECONDS = max(
 BINANCE_WALLET_4H_STRUCTURE_SYNC_SECONDS = 5 * 60
 
 
+# 币安钱包热门榜的「链」下拉。``(chainId, code, label)``：
+# * ``chainId`` 是上游 unified rank 接口 **服务端** 的过滤参数（2026-10-10 实测
+#   五条链都能过滤，各返回独立的前 20 名 —— 不是把综合榜前十筛一遍）；
+# * ``code`` 供前端 localStorage 持久化与旧缓存兼容（同 BINANCE_WALLET_CHAIN_META
+#   的路由码）；
+# * ``label`` 是行级标签与下拉文案的唯一来源，必须与 BINANCE_WALLET_CHAIN_META 一致
+#   （tests/test_binance_wallet_hot_chain_picker.py 里有断言锁住，防两表漂移）。
+# 顺序即下拉顺序，「综合」由客户端恒定拼在最前。
+BINANCE_WALLET_HOT_CHAINS = (
+    ("1", "eth", "Ethereum"),
+    ("56", "bsc", "BSC"),
+    ("8453", "base", "Base"),
+    ("4663", "robinhood", "Robinhood"),
+    ("CT_501", "sol", "Solana"),
+)
+
+
+# 一条链一次请求（上游只收单个 chainId，没有批量参数），所以并发取。
+# 默认 6 = 综合板 1 次 + 五条链 5 次，让它们落在**同一批**里并发跑：上游单次
+# 请求本身就是 10~20 秒量级，串行或分两批会把默认（综合）视图拖慢数倍。
+BINANCE_WALLET_CHAIN_POOL = ThreadPoolExecutor(
+    max_workers=max(2, min(8, int(os.getenv("BINANCE_WALLET_CHAIN_WORKERS", "6") or "6"))),
+    thread_name_prefix="bw-chain-hot",
+)
+
+
 # A Binance/OKX gainer gets a short discovery window.  It graduates into the
 # normal 30-day lifecycle only after AiCoin also observes it.
 GAINERS_MONITOR_PROMOTION_SECONDS = 3 * 24 * 60 * 60

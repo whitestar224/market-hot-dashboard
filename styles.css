@@ -1299,25 +1299,12 @@ select option {
   }
 }
 
-/* 币安钱包热门榜：动作盒只有「观察窗口 + 一个下拉 + BW 标签」，比 AVE/GMGN 那两张
-   宽，所以阈值低一些。头窄于 332px（≈ 卡片 360px）时把「观察窗口」这几个提示字
-   让给下拉（副标题里本来就写着「当前观察 X 小时」）。换行/收缩由上面那条
-   ``.board-head:has(> .board-head-foot) .board-head-actions`` 统一管，这里不重复。 */
-@container (max-width: 332px) {
-  .board-head .board-head-actions.is-wallet-hot .board-period-control {
-    grid-template-columns: minmax(0, auto);
-  }
-
-  .board-head .board-head-actions.is-wallet-hot .board-period-control > span {
-    display: none;
-  }
-}
-
-@container (max-width: 262px) {
-  .board-head .board-head-actions.is-wallet-hot > strong {
-    display: none;
-  }
-}
+/* 币安钱包热门榜自 2026-10-10 起也是「观察窗口 + 链 + 标签」两个下拉（控件数与
+   AVE / GMGN 热搜相同），所以降级规则不再单开：那两块的阈值（≤400px 隐提示字、
+   ≤268px 隐标签）与 min-width:46px 全部由 ``is-onchain-hot`` 组覆盖，卡片的
+   动作盒已同时挂上 is-wallet-hot is-onchain-hot。``is-wallet-hot`` 现在只是
+   语义标记，**不要再给它重复写降级规则**（同族选择器只比优先级不看先后，
+   重复写必然互相盖）。 */
 
 @media (min-width: 721px) {
   /* The fixed 90px header cannot hold both the title row and the pill row. */

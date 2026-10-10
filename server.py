@@ -277,10 +277,12 @@ from app.core.state import (
     BINANCE_WALLET_4H_STRUCTURE_PATH,
     BINANCE_WALLET_4H_STRUCTURE_RETENTION_SECONDS,
     BINANCE_WALLET_4H_STRUCTURE_SYNC_SECONDS,
+    BINANCE_WALLET_CHAIN_POOL,
     BINANCE_WALLET_HOT_ALERT_INTERVAL_SECONDS,
     BINANCE_WALLET_HOT_ALERT_LOCK,
     BINANCE_WALLET_HOT_ALERT_STATE_PATH,
     BINANCE_WALLET_HOT_ALERT_STATE_VERSION,
+    BINANCE_WALLET_HOT_CHAINS,
     BINANCE_WALLET_HOT_REENTRY_SECONDS,
     CACHE,
     CACHE_LOCK,
@@ -10534,13 +10536,20 @@ def exchange_ai_narratives_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def binance_wallet_hot_source_from_payload(payload: dict[str, Any], period: Any = "24h") -> dict[str, Any]:
+def binance_wallet_hot_rows_from_tokens(tokens: Any, period: Any = "24h") -> list[dict[str, Any]]:
+    """Parse one ranking payload's ``tokens`` into board rows (at most 10).
+
+    Shared by the unified (all-chain) board and by every per-chain board: the only
+    difference between the two requests is the ``chainId`` filter, so letting the
+    row shape diverge would silently give chain views different fields (and a
+    different 币安 AI 叙事 按钮).  ``rank`` is positional, i.e. rank *within the
+    board being built*.
+    """
+
     normalized_period = normalize_binance_wallet_hot_period(period)
     config = BINANCE_WALLET_HOT_PERIODS[normalized_period]
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    tokens = data.get("tokens") if isinstance(data.get("tokens"), list) else []
     rows: list[dict[str, Any]] = []
-    for raw in tokens:
+    for raw in tokens if isinstance(tokens, list) else []:
         if not isinstance(raw, dict):
             continue
         raw_symbol = clean_feed_text(raw.get("symbol") or raw.get("tokenSymbol"), 100)
@@ -10589,6 +10598,15 @@ def binance_wallet_hot_source_from_payload(payload: dict[str, Any], period: Any 
         })
         if len(rows) >= 10:
             break
+    return rows
+
+
+def binance_wallet_hot_source_from_payload(payload: dict[str, Any], period: Any = "24h") -> dict[str, Any]:
+    normalized_period = normalize_binance_wallet_hot_period(period)
+    config = BINANCE_WALLET_HOT_PERIODS[normalized_period]
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    tokens = data.get("tokens") if isinstance(data.get("tokens"), list) else []
+    rows = binance_wallet_hot_rows_from_tokens(tokens, normalized_period)
     source = source_template(
         id="binance-wallet-hot",
         group="crypto",
@@ -10680,7 +10698,18 @@ def record_binance_wallet_4h_structure_source(
     return items
 
 
-def fetch_binance_wallet_hot(period: Any = "24h") -> dict[str, Any]:
+BINANCE_WALLET_RANK_PATH = "/bapi/defi/v1/public/wallet-direct/buw/wallet/market/token/pulse/unified/rank/list/ai"
+
+
+def fetch_binance_wallet_rank_payload(period: Any = "24h", *, chain_id: Any = None) -> dict[str, Any]:
+    """POST the unified wallet rank endpoint, optionally filtered to one chain.
+
+    ``chainId`` filters **server-side** (verified 2026-10-10 against all five
+    chains: each returns its own top 20, not a re-slice of the global board), so
+    a chain view is the chain's genuine ranking — a token can top its own chain
+    without ever surfacing in the global top 10.
+    """
+
     normalized_period = normalize_binance_wallet_hot_period(period)
     config = BINANCE_WALLET_HOT_PERIODS[normalized_period]
     body = {
@@ -10691,6 +10720,9 @@ def fetch_binance_wallet_hot(period: Any = "24h") -> dict[str, Any]:
         "page": 1,
         "size": 20,
     }
+    normalized_chain = str(chain_id or "").strip()
+    if normalized_chain:
+        body["chainId"] = normalized_chain
     headers = {
         **HEADERS,
         "Accept": "application/json",
@@ -10700,26 +10732,138 @@ def fetch_binance_wallet_hot(period: Any = "24h") -> dict[str, Any]:
         "Referer": "https://web3.binance.com/en/markets",
     }
     errors: list[str] = []
-    path = "/bapi/defi/v1/public/wallet-direct/buw/wallet/market/token/pulse/unified/rank/list/ai"
     for host in ("https://web3.binance.com", "https://www.binance.com"):
         try:
-            response = requests.post(f"{host}{path}", json=body, headers=headers, timeout=(6, 20))
+            response = requests.post(f"{host}{BINANCE_WALLET_RANK_PATH}", json=body, headers=headers, timeout=(6, 20))
             response.raise_for_status()
             payload = response.json()
             if not isinstance(payload, dict) or payload.get("success") is False:
                 raise RuntimeError(clean_feed_text((payload or {}).get("message") or (payload or {}).get("msg") or "invalid response", 160))
-            source = binance_wallet_hot_source_from_payload(payload, normalized_period)
-            if source_has_rows(source):
-                enrich_binance_wallet_ai_narratives(source)
-                source["sourceName"] = f"Binance Wallet unified token rank · {urlparse(host).netloc}"
-                if normalized_period == "4h":
-                    wallet_history = record_binance_wallet_4h_structure_source(source)
-                    sync_price_watch_binance_wallet_candidates(wallet_history)
-                return source
-            errors.append(f"{urlparse(host).netloc}: empty rank")
+            payload["_binanceWalletHost"] = urlparse(host).netloc
+            return payload
         except Exception as exc:
             errors.append(f"{urlparse(host).netloc}: {safe_error_text(str(exc))}")
     raise RuntimeError("；".join(errors[-2:]) or "Binance Wallet 热门榜请求失败")
+
+
+def binance_wallet_chain_board_rows(period: Any, chain_id: Any) -> list[dict[str, Any]]:
+    payload = fetch_binance_wallet_rank_payload(period, chain_id=chain_id)
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    return binance_wallet_hot_rows_from_tokens(data.get("tokens"), period)
+
+
+def attach_binance_wallet_chain_boards(
+    source: dict[str, Any],
+    period: Any,
+    *,
+    prior_boards: dict[str, dict[str, Any]] | None = None,
+    chain_futures: dict[Any, tuple[str, str, str]] | None = None,
+) -> dict[str, Any]:
+    """Hang ``chainOptions`` / ``chainBoards`` off ``source`` from the per-chain requests.
+
+    ``chain_futures`` lets the caller submit the chain requests *before* the global
+    one so all of them overlap (the upstream takes 10–20 s per call, so serialising
+    would visibly slow the default 综合 view).  When omitted the requests are made
+    here.
+
+    Every chain's failure is contained: the board falls back to whatever the
+    previous payload cached for that chain (so a transient RPC hiccup shows a stale
+    chain board instead of an empty one) and records ``status`` / ``error``.  A
+    broken chain must never take down the board itself.
+    """
+
+    prior = prior_boards if isinstance(prior_boards, dict) else {}
+    futures = chain_futures if isinstance(chain_futures, dict) else {
+        BINANCE_WALLET_CHAIN_POOL.submit(
+            binance_wallet_chain_board_rows, period, chain_id
+        ): (chain_id, code, label)
+        for chain_id, code, label in BINANCE_WALLET_HOT_CHAINS
+    }
+    chain_results: dict[str, list[dict[str, Any]]] = {}
+    chain_errors: dict[str, str] = {}
+    for future in as_completed(futures):
+        _chain_id, code, _label = futures[future]
+        try:
+            chain_results[code] = future.result()
+        except Exception as exc:
+            stale_rows = prior.get(code, {}).get("rows")
+            chain_results[code] = stale_rows[:10] if isinstance(stale_rows, list) else []
+            chain_errors[code] = alert_text(exc, 100)
+
+    boards: list[dict[str, Any]] = []
+    for chain_id, code, label in BINANCE_WALLET_HOT_CHAINS:
+        rows = chain_results.get(code) or []
+        error = chain_errors.get(code, "")
+        boards.append({
+            "chain": code,
+            "chainId": chain_id,
+            "label": label,
+            "rows": rows[:10],
+            "status": "stale" if error and rows else "unavailable" if error else "ok",
+            "error": error,
+        })
+    # 链板**刻意不做**服务端 AI 叙事预取：五张板最多 50 行候选，实测要多花约 40 秒
+    # （每行一次上游调用，全局板那 10 行本来就已要 ~10 秒）。客户端会按需懒取
+    # （app.js::exchangeAiCandidate 已放行 binance-wallet-hot），只有用户真的把某条链
+    # 切出来看时才会去取 —— 行里的 ``binanceAiNarrativeAvailable`` 标记照旧，按钮
+    # 的出现条件不变。
+    source["chainOptions"] = [
+        {"value": "all", "label": "综合"},
+        *({"value": code, "label": label} for _chain_id, code, label in BINANCE_WALLET_HOT_CHAINS),
+    ]
+    source["chainBoards"] = boards
+    return source
+
+
+def fetch_binance_wallet_hot(period: Any = "24h") -> dict[str, Any]:
+    normalized_period = normalize_binance_wallet_hot_period(period)
+    # 综合板与五条链**同时**发出：总墙钟≈单次请求，不随链数线性增长。
+    chain_futures = {
+        BINANCE_WALLET_CHAIN_POOL.submit(
+            binance_wallet_chain_board_rows, normalized_period, chain_id
+        ): (chain_id, code, label)
+        for chain_id, code, label in BINANCE_WALLET_HOT_CHAINS
+    }
+    global_future = BINANCE_WALLET_CHAIN_POOL.submit(
+        fetch_binance_wallet_rank_payload, normalized_period
+    )
+    try:
+        payload = global_future.result()
+    except Exception:
+        # 综合板是这张卡的默认视图，它失败就整张卡失败（与改动前一致）。链板的
+        # future 不能留在池里空转，交给下面的收集逻辑统一吞掉。
+        for future in chain_futures:
+            future.cancel()
+        raise
+    source = binance_wallet_hot_source_from_payload(payload, normalized_period)
+    if not source_has_rows(source):
+        raise RuntimeError("Binance Wallet 热门榜返回空榜")
+    enrich_binance_wallet_ai_narratives(source)
+    host_netloc = clean_feed_text(payload.get("_binanceWalletHost"), 80) or "web3.binance.com"
+    source["sourceName"] = f"Binance Wallet unified token rank · {host_netloc}"
+    # Record the structure pool from the **global** board only. Chain boards are a
+    # view, not a second intake surface: feeding them in would quintuple the
+    # 4h-wallet pool and change what "新进入池" means.
+    if normalized_period == "4h":
+        wallet_history = record_binance_wallet_4h_structure_source(source)
+        sync_price_watch_binance_wallet_candidates(wallet_history)
+    prior_source = cached_source_fallback(
+        f"binance-wallet-hot-{normalized_period}",
+        source_cache_path(f"binance-wallet-hot-{normalized_period}", api_key="market-hot"),
+        api_key="market-hot",
+    )
+    prior_boards = {
+        str(board.get("chain") or ""): board
+        for board in (prior_source.get("chainBoards") or [])
+        if isinstance(board, dict)
+    }
+    attach_binance_wallet_chain_boards(
+        source,
+        normalized_period,
+        prior_boards=prior_boards,
+        chain_futures=chain_futures,
+    )
+    return source
 
 
 def binance_wallet_hot_source(period: Any = "24h", *, force_refresh: bool = False) -> dict[str, Any]:

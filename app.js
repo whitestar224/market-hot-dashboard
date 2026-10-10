@@ -1,5 +1,10 @@
 const BINANCE_WALLET_PERIOD_KEY = "xingyunshe:binance-wallet-hot:period:v2";
 const BINANCE_WALLET_PERIODS = new Set(["5m", "1h", "4h", "24h"]);
+// 币安钱包热门榜的「链」值 = 服务端 BINANCE_WALLET_HOT_CHAINS 的 code（同
+// BINANCE_WALLET_CHAIN_META 的路由码）。链视图来自服务端 chainBoards——上游
+// rank 接口的 chainId 是**服务端过滤**，不是把综合榜前十筛一遍。
+const BINANCE_WALLET_CHAIN_KEY = "xingyunshe:binance-wallet-hot:chain:v1";
+const BINANCE_WALLET_CHAIN_OPTIONS = new Set(["all", "eth", "bsc", "base", "robinhood", "sol"]);
 const AVE_CHAIN_KEY = "xingyunshe:ave-hot:chain:v1";
 const AVE_PERIOD_KEY = "xingyunshe:ave-hot:period:v1";
 const AVE_CHAIN_OPTIONS = new Set(["all", "robinhood", "solana", "eth", "bsc", "base"]);
@@ -77,6 +82,11 @@ function normalizeBinanceWalletPeriod(value) {
   return BINANCE_WALLET_PERIODS.has(period) ? period : "24h";
 }
 
+function normalizeBinanceWalletChain(value) {
+  const chain = String(value ?? "all").trim().toLowerCase();
+  return BINANCE_WALLET_CHAIN_OPTIONS.has(chain) ? chain : "all";
+}
+
 function normalizeAveChain(value) {
   const chain = String(value || "all").trim().toLowerCase();
   return AVE_CHAIN_OPTIONS.has(chain) ? chain : "all";
@@ -126,6 +136,22 @@ function saveBinanceWalletPeriod(period) {
   }
 }
 
+function readBinanceWalletChain() {
+  try {
+    return normalizeBinanceWalletChain(localStorage.getItem(BINANCE_WALLET_CHAIN_KEY));
+  } catch {
+    return "all";
+  }
+}
+
+function saveBinanceWalletChain(chain) {
+  try {
+    localStorage.setItem(BINANCE_WALLET_CHAIN_KEY, normalizeBinanceWalletChain(chain));
+  } catch {
+    // Preference persistence is optional.
+  }
+}
+
 const state = {
   filter: "all",
   sort: normalizePriorityView(readLocalPreference(MARKET_PRIORITY_VIEW_KEY, "smart")) === "smart" ? "priority" : "rank",
@@ -134,6 +160,7 @@ const state = {
   isLoading: false,
   lastRequestedAt: 0,
   binanceWalletPeriod: readBinanceWalletPeriod(),
+  binanceWalletChain: readBinanceWalletChain(),
   binanceWalletLoading: false,
   aveChain: normalizeAveChain(readLocalPreference(AVE_CHAIN_KEY, "all")),
   avePeriod: normalizeAvePeriod(readLocalPreference(AVE_PERIOD_KEY, "4h")),
@@ -517,7 +544,20 @@ function rowsForSourceView(source) {
   if (sourceId === "ave") return aveRowsForSource(source);
   if (sourceId === "gmgn-hot-search") return gmgnRowsForSource(source);
   if (sourceId === "gmgn-trenches") return trenchRowsForSource(source);
+  if (sourceId === "binance-wallet-hot") return binanceWalletRowsForSource(source);
   return source?.rows || [];
+}
+
+// 币安钱包热门榜按链切换：链视图直接取服务端 chainBoards 里那一条链自己的榜
+// （上游 chainId 是服务端过滤，排名是该链内的真实排名），不做客户端筛选——
+// 综合榜前十往往一条链只占 1~3 个，筛出来等于空。
+function binanceWalletRowsForSource(source) {
+  const rows = Array.isArray(source?.rows) ? source.rows : [];
+  const selected = normalizeBinanceWalletChain(state.binanceWalletChain);
+  if (selected === "all") return rows.slice(0, 10);
+  const board = (Array.isArray(source?.chainBoards) ? source.chainBoards : [])
+    .find((item) => normalizeBinanceWalletChain(item?.chain) === selected);
+  return (Array.isArray(board?.rows) ? board.rows : []).slice(0, 10);
 }
 
 // 战壕榜的链切换完全在客户端做：服务端只发一条扁平 tape（300 条重行），
@@ -1409,15 +1449,40 @@ function renderBoardHeadActions(source) {
       return `<option value="${escapeHtml(value)}" ${value === selectedPeriod ? "selected" : ""}>${escapeHtml(option?.label || value)}</option>`;
     })
     .join("");
+  // 链下拉只在服务端真的带了 chainBoards 时渲染：否则（旧缓存 bundle / 服务未重启）
+  // 把某条链切出来只会得到空白卡，不如保持改动前的单下拉形态。
+  const chainBoards = Array.isArray(source.chainBoards) ? source.chainBoards : [];
+  const chainOptions = chainBoards.length
+    ? (Array.isArray(source.chainOptions) && source.chainOptions.length
+      ? source.chainOptions
+      : [
+          { value: "all", label: "综合" }, { value: "eth", label: "Ethereum" },
+          { value: "bsc", label: "BSC" }, { value: "base", label: "Base" },
+          { value: "robinhood", label: "Robinhood" }, { value: "sol", label: "Solana" }
+        ])
+    : [];
+  const selectedChain = normalizeBinanceWalletChain(state.binanceWalletChain);
+  const chainHtml = chainOptions.length > 1
+    ? `<label class="board-period-control">
+        <span>链</span>
+        <select data-role="binance-wallet-chain" aria-label="选择币安钱包热门榜的链">
+          ${chainOptions.map((option) => {
+            const value = normalizeBinanceWalletChain(option?.value);
+            return `<option value="${escapeHtml(value)}" ${value === selectedChain ? "selected" : ""}>${escapeHtml(option?.label || value)}</option>`;
+          }).join("")}
+        </select>
+      </label>`
+    : "";
 
   return `
-    <div class="board-head-actions is-wallet-hot">
+    <div class="board-head-actions is-wallet-hot is-onchain-hot">
       <label class="board-period-control ${state.binanceWalletLoading ? "is-loading" : ""}">
         <span>观察窗口</span>
         <select data-role="binance-wallet-period" aria-label="选择币安钱包热度观察时间" ${state.binanceWalletLoading ? "disabled" : ""}>
           ${optionHtml}
         </select>
       </label>
+      ${chainHtml}
       <strong>${escapeHtml(source.sourceLabel || "BW")}</strong>
     </div>
     ${boardHeadFootHtml(source)}
@@ -1462,6 +1527,21 @@ function requestAiInsights(sources) {
 }
 
 function renderEmpty(source) {
+  // 币安钱包热门榜的空态要区分「整榜空」与「所选链空」：链视图是服务端单独请求的
+  // 榜，某条链这段时间没有标的时，说成整张榜为空是错的（战壕榜踩过同一个坑）。
+  if (String(source?.id || "") === "binance-wallet-hot") {
+    const chain = normalizeBinanceWalletChain(state.binanceWalletChain);
+    if (chain !== "all") {
+      const label = (Array.isArray(source.chainOptions) ? source.chainOptions : [])
+        .find((option) => normalizeBinanceWalletChain(option?.value) === chain)?.label || chain;
+      return `
+    <div class="empty-state">
+      <b>${escapeHtml(label)} 当前没有标的</b>
+      <span>所选链在这个观察窗口里没有进入币安钱包热门榜；切回「综合」可以看全链榜单。</span>
+    </div>
+  `;
+    }
+  }
   return `
     <div class="empty-state">
       <b>${source.emptyTitle || "暂无数据"}</b>
@@ -1545,7 +1625,14 @@ function exchangeAiCandidate(row, source) {
   ].includes(sourceId)) {
     return Boolean(String(row?.symbol || "").trim());
   }
-  if (!["okx-dex", "okx-dex-gainers", "ave", "gmgn-hot-search", "gmgn-trenches"].includes(sourceId)) return false;
+  // ``binance-wallet-hot`` 的综合榜由服务端预取叙事，但**链板刻意不预取**（五张板
+  // 最多 50 行候选、每行一次上游调用，实测要多花约 40 秒）。所以链视图的 ✦ 按钮
+  // 靠这里的懒取补上：行里已有 chain + contract，接口侧
+  // EXCHANGE_AI_BINANCE_CHAIN_IDS 也认得这几个 chainId。
+  if (![
+    "okx-dex", "okx-dex-gainers", "ave", "gmgn-hot-search", "gmgn-trenches",
+    "binance-wallet-hot"
+  ].includes(sourceId)) return false;
   if (sourceId === "gmgn-trenches") {
     const chain = String(row?.chain || row?.network || "").trim().toLowerCase();
     if (!["eth", "ethereum", "bsc", "bnb", "base", "robinhood", "sol", "solana"].includes(chain)) return false;
@@ -2007,6 +2094,14 @@ boardsEl.addEventListener("change", (event) => {
     state.binanceWalletPeriod = normalizeBinanceWalletPeriod(walletSelect.value);
     saveBinanceWalletPeriod(state.binanceWalletPeriod);
     void loadBinanceWalletPeriod(walletSelect.value);
+    return;
+  }
+  const walletChainSelect = event.target.closest('select[data-role="binance-wallet-chain"]');
+  if (walletChainSelect) {
+    // 纯客户端切换：chainBoards 随周期 payload 一起下发，不用再请求。
+    state.binanceWalletChain = normalizeBinanceWalletChain(walletChainSelect.value);
+    saveBinanceWalletChain(state.binanceWalletChain);
+    queueMicrotask(renderBoards);
     return;
   }
   const avePeriodSelect = event.target.closest('select[data-role="ave-period"]');

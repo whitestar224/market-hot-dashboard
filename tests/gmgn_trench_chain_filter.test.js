@@ -160,6 +160,6 @@ test("the server publishes the chain picker on the trench source", () => {
 });
 
 test("the static bundle is bumped for the new dropdown", () => {
-  assert.match(html, /app\.js\?v=45/);
-  assert.match(html, /styles\.css\?v=124/);
+  assert.match(html, /app\.js\?v=46/);
+  assert.match(html, /styles\.css\?v=125/);
 });
