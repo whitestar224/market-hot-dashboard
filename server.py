@@ -5295,6 +5295,148 @@ def x_kol_source_id(handle: str) -> str:
     return f"x:{normalize_x_handle(handle).lower()}"
 
 
+# ---------------------------------------------------------------------------
+# 繁体 → 简体（X 追踪的港台 KOL 常见繁体推文）
+# ---------------------------------------------------------------------------
+# 用 opencc 的 t2s 词表（TSCharacters + TSPhrases，约 40KB）在**入站时**统一成
+# 简体，这样弹窗、X 追踪页面、AI 分析提示词、聪明钱文本提取拿到的是同一份文本。
+# 三条约束：
+#   1. 必须 @lru_cache —— X 实时 worker 每 3 秒就把同一份快照（实测 240 条 /
+#      14 万字）重新 publish 一次，实测冷态一轮 ~170ms、热态 ~1.8ms；只有缓存
+#      才能把稳态成本压到"字典查表"级，否则会重演"热路径吃 GIL 饿死"的老问题。
+#   2. opencc 缺失必须是**降级**而不是崩溃：拿不到词表就原样返回，弹窗不能因此不弹。
+#   3. 转换在入站完成，因此是幂等的（简体再过一次 t2s 是恒等），重复经过无害。
+TRADITIONAL_TO_SIMPLIFIED_ENABLED_DEFAULT = True
+OPENCC_T2S_CONFIG = str(
+    os.getenv("XINGYUN_OPENCC_T2S_CONFIG", "t2s") or "t2s"
+).strip() or "t2s"
+
+_OPENCC_T2S_LOCK = threading.Lock()
+_OPENCC_T2S_CONVERTER: Any = None
+_OPENCC_T2S_UNAVAILABLE = False
+
+
+def opencc_t2s_converter() -> Any:
+    """Lazily build the Traditional→Simplified converter; ``None`` if unusable."""
+
+    global _OPENCC_T2S_CONVERTER, _OPENCC_T2S_UNAVAILABLE
+    if _OPENCC_T2S_CONVERTER is not None or _OPENCC_T2S_UNAVAILABLE:
+        return _OPENCC_T2S_CONVERTER
+    with _OPENCC_T2S_LOCK:
+        if _OPENCC_T2S_CONVERTER is None and not _OPENCC_T2S_UNAVAILABLE:
+            try:
+                from opencc import OpenCC
+
+                _OPENCC_T2S_CONVERTER = OpenCC(OPENCC_T2S_CONFIG)
+            except Exception as exc:
+                _OPENCC_T2S_UNAVAILABLE = True
+                print(
+                    f"Traditional→Simplified conversion disabled: {safe_error_text(str(exc))}",
+                    file=sys.stderr,
+                )
+    return _OPENCC_T2S_CONVERTER
+
+
+def traditional_to_simplified_enabled() -> bool:
+    return env_flag("XINGYUN_X_KOL_SIMPLIFIED", default=TRADITIONAL_TO_SIMPLIFIED_ENABLED_DEFAULT)
+
+
+@functools.lru_cache(maxsize=4096)
+def _simplified_chinese_text_cached(value: str) -> str:
+    """Cached conversion core — see :func:`simplified_chinese_text`.
+
+    Cached by text: the X realtime worker republishes the same snapshot every few
+    seconds, so the steady-state cost is one dict lookup per string.  Never
+    raises — an unavailable converter falls back to the original text.
+    """
+
+    converter = opencc_t2s_converter()
+    if converter is None:
+        return value
+    try:
+        return converter.convert(value)
+    except Exception:
+        return value
+
+
+def simplified_chinese_text(value: Any) -> str:
+    """Return ``value`` with Traditional Chinese folded to Simplified.
+
+    The enable switch deliberately sits OUTSIDE the cache: ``@lru_cache`` would
+    otherwise pin one answer per text and flipping the flag at runtime would have
+    no effect (and the popup and the feed funnel would disagree).
+    """
+
+    text = str(value or "")
+    if not text or not traditional_to_simplified_enabled():
+        return text
+    return _simplified_chinese_text_cached(text)
+
+
+def simplified_payload_text(payload: dict[str, Any]) -> dict[str, Any]:
+    """Fold the text fields of an ``x-kol`` payload to Simplified Chinese.
+
+    Returns the original object when nothing changed, so the caller's payload
+    signature (and therefore the SSE refresh) is untouched for Simplified /
+    English-only sources.
+
+    Display names are folded too: they are not merge keys (those are
+    ``id``/``handle``) and ``normalize_x_kol_category`` matches Simplified
+    markers such as 创始人 / 官方账号 against them.
+    """
+
+    if not isinstance(payload, dict):
+        return payload
+    text_fields = ("text", "fullText", "title", "sourceName")
+
+    def fold_row(row: Any, fields: tuple[str, ...]) -> tuple[Any, bool]:
+        if not isinstance(row, dict):
+            return row, False
+        folded = {
+            field: simplified_chinese_text(row[field])
+            for field in fields
+            if isinstance(row.get(field), str) and row[field]
+        }
+        quote = row.get("quote") if isinstance(row.get("quote"), dict) else None
+        if quote is not None and isinstance(quote.get("text"), str) and quote["text"]:
+            quote_text = simplified_chinese_text(quote["text"])
+            if quote_text != quote["text"]:
+                # Rebuild the quote so the shared dict from the upstream payload
+                # is never mutated in place.
+                folded["quote"] = {**quote, "text": quote_text}
+        if not any(row.get(field) != text for field, text in folded.items()):
+            return row, False
+        return {**row, **folded}, True
+
+    changed = False
+    converted_items: list[Any] = []
+    for item in payload.get("items") if isinstance(payload.get("items"), list) else []:
+        item, item_changed = fold_row(item, text_fields)
+        changed = changed or item_changed
+        converted_items.append(item)
+    converted_sources: list[Any] = []
+    for source in payload.get("sources") if isinstance(payload.get("sources"), list) else []:
+        source, source_changed = fold_row(source, ("displayName",))
+        changed = changed or source_changed
+        converted_sources.append(source)
+    if not changed:
+        return payload
+    result = dict(payload)
+    if converted_items:
+        result["items"] = converted_items
+    if converted_sources:
+        result["sources"] = converted_sources
+    return result
+
+
+def x_kol_simplified_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Entry point used by the X feed funnels (no-op when the feature is off)."""
+
+    if not isinstance(payload, dict) or not traditional_to_simplified_enabled():
+        return payload
+    return simplified_payload_text(payload)
+
+
 def user_runtime_dir(user: dict[str, Any] | None) -> Path:
     if not user:
         return PERSIST_CACHE_DIR
@@ -42721,6 +42863,10 @@ def hydrate_x_kol_realtime_history(user: dict[str, Any] | None) -> None:
             return
     cached = read_json_cache(x_kol_realtime_snapshot_path(user))
     cached_payload = cached.get("payload") if isinstance(cached.get("payload"), dict) else None
+    # 磁盘历史可能是本次转换上线之前写下的繁体文本；水合时补一次转换，避免
+    # 重启后页面上「新帖是简体、旧帖还是繁体」的割裂。
+    if cached_payload:
+        cached_payload = x_kol_simplified_payload(cached_payload)
     if cached_payload and cached_payload.get("items"):
         # Retained posts must restore their monitoring side effects too. Previously
         # they were rendered after restart but never re-entered the watch pools.
@@ -42767,6 +42913,9 @@ def publish_x_kol_realtime_payload(
     *,
     monitor_max_age_seconds: int | None = None,
 ) -> dict[str, Any]:
+    # 港台 KOL 的繁体推文在**入站这里**统一成简体：弹窗、X 追踪页面、AI 分析提示词
+    # 和聪明钱文本提取都消费这份快照，一处转换就全部一致。
+    payload = x_kol_simplified_payload(payload)
     payload = x_kol_overlay_official_stream_status(payload)
     key = x_kol_realtime_key(user)
     hydrate_x_kol_realtime_history(user)
