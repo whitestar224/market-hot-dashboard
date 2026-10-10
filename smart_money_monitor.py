@@ -53,6 +53,16 @@ DEFAULT_SMART_MONEY_SEEDS = (
         "sourceEvidence": "由 Inq5️⃣连杆提供；公开钱包标签未识别",
     },
     {
+        "address": "0xcc291dcd83bd9f2600cca4d65ae3b724eaf4f5a9",
+        "nickname": "CryptoCharming",
+        "sourceName": "用户提供 · Robinhood 链",
+        "sourceUrl": "https://robinhoodchain.blockscout.com/address/0xcc291dcd83bd9f2600cca4d65ae3b724eaf4f5a9",
+        "sourceEvidence": "用户提供的 Robinhood 链 KOL 地址（CryptoCharming）；链上核验为普通钱包（非合约），GMGN 活动截图佐证",
+        # 链上实测该地址单笔成交在数十美元量级（持仓 800~2300U），沿用默认
+        # 10000U 阈值等于永不提醒，故按实际规模下调；面板里仍可随时改。
+        "alertThresholdUsd": 100.0,
+    },
+    {
         "address": "0x0a6ebed0155edb4b21d92ad02897a626cd90119e",
         "nickname": "Bonk Guy (Unipcs)",
         "sourceName": "Bonk Guy 公开钱包",
@@ -80,6 +90,71 @@ DEFAULT_SMART_MONEY_SEED_ADDRESSES = tuple(row["address"] for row in DEFAULT_SMA
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 EVM_CHAINS = ("ethereum", "bsc", "base", "robinhood")
 SUPPORTED_CHAINS = (*EVM_CHAINS, "solana")
+
+# Blocks scanned per poll, per chain.  Chains do not agree on block time:
+# Robinhood Chain mines ~10 blocks/second, so the generic 120-block window only
+# covers ~12 seconds — a fraction of one poll cycle — and the monitor silently
+# drops most buys (health showed "已扫描最近 120 个区块，跳过 198 个旧区块").
+# The Robinhood RPC stays cheap on a wide span as long as the ERC-20 transfer
+# topic filter is present (30000 blocks ≈ 0.8s, and its per-query span limit is
+# exactly 30000), so fast chains get a window that comfortably outlasts a cycle.
+EVM_MAX_BLOCKS_PER_POLL_DEFAULT = 120
+EVM_MAX_BLOCKS_PER_POLL_BY_CHAIN = {"robinhood": 3000}
+EVM_MAX_BLOCKS_PER_POLL_CEILING = 30000
+
+# Blocks scanned per poll when the fast log path is unavailable.  This is a
+# CATCH-UP budget: while the monitor keeps up, ``start`` is ``previous + 1`` and
+# only the new blocks are fetched, so a larger budget costs nothing in steady
+# state — it only decides how far back a lagging poll may reach before it starts
+# dropping blocks silently.  BSC mines ~0.45 s/block, so the generic 24-block
+# budget covers barely 11 s: any poll cycle slower than that (the monitor walks
+# its chains sequentially) leaves an unannounced gap.  Public BSC RPCs refuse
+# address-less ``eth_getLogs`` (publicnode: "Please specify an address";
+# bnbchain dataseeds: "limit exceeded"), so this fallback IS the BSC path.
+EVM_FALLBACK_BLOCKS_DEFAULT = 24
+EVM_FALLBACK_BLOCKS_BY_CHAIN = {"bsc": 120}
+EVM_FALLBACK_BLOCKS_CEILING = 600
+
+
+def evm_fallback_blocks(chain: str) -> int:
+    """Catch-up block budget for one chain when ``eth_getLogs`` is unusable.
+
+    ``SMART_MONEY_EVM_FALLBACK_BLOCKS`` still overrides every chain when set.
+    """
+
+    override = str(os.getenv("SMART_MONEY_EVM_FALLBACK_BLOCKS", "") or "").strip()
+    if override:
+        try:
+            value = int(float(override))
+        except ValueError:
+            value = 0
+        if value > 0:
+            return max(5, min(value, EVM_FALLBACK_BLOCKS_CEILING))
+    return max(5, min(
+        int(EVM_FALLBACK_BLOCKS_BY_CHAIN.get(chain, EVM_FALLBACK_BLOCKS_DEFAULT)),
+        EVM_FALLBACK_BLOCKS_CEILING,
+    ))
+
+
+def evm_max_blocks_per_poll(chain: str) -> int:
+    """How many blocks to scan per poll on ``chain``.
+
+    ``SMART_MONEY_EVM_MAX_BLOCKS_PER_POLL`` overrides every chain when set; the
+    per-chain table only supplies the default.
+    """
+
+    override = str(os.getenv("SMART_MONEY_EVM_MAX_BLOCKS_PER_POLL", "") or "").strip()
+    if override:
+        try:
+            value = int(float(override))
+        except ValueError:
+            value = 0
+        if value > 0:
+            return max(5, min(value, EVM_MAX_BLOCKS_PER_POLL_CEILING))
+    default = EVM_MAX_BLOCKS_PER_POLL_BY_CHAIN.get(
+        chain, EVM_MAX_BLOCKS_PER_POLL_DEFAULT
+    )
+    return max(5, min(default, EVM_MAX_BLOCKS_PER_POLL_CEILING))
 CHAIN_META = {
     "ethereum": {
         "label": "Ethereum", "vm": "evm", "native": "ETH", "dex": "ethereum",
@@ -146,7 +221,9 @@ CHAIN_TEXT_PATTERNS = {
     "robinhood": re.compile(r"(?:robinhood\s*chain|hood\s*chain|robinhood)", re.I),
     "solana": re.compile(r"(?:solana|索拉纳|\bsol\b)", re.I),
 }
-STABLE_SYMBOLS = {"USDT", "USDC", "USDBC", "DAI", "FDUSD", "USDE", "USD1", "USDO"}
+# USDG is Robinhood Chain's quote currency.  Without it every USDG-quoted buy
+# reads as "received two tokens, paid nothing" and classify_evm_buy returns None.
+STABLE_SYMBOLS = {"USDT", "USDC", "USDBC", "DAI", "FDUSD", "USDE", "USD1", "USDO", "USDG"}
 WRAPPED_NATIVE_SYMBOLS = {"WETH", "WBNB", "WSOL"}
 SOLANA_STABLE_MINTS = {
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
@@ -826,7 +903,7 @@ class SmartMoneyMonitor:
                 "sourceKind": "seed",
                 "sourceUrl": seed.get("sourceUrl", ""),
                 "sourceEvidence": seed["sourceEvidence"],
-                "alertThresholdUsd": DEFAULT_ALERT_THRESHOLD_USD,
+                "alertThresholdUsd": float(seed.get("alertThresholdUsd") or DEFAULT_ALERT_THRESHOLD_USD),
             }
             for seed in DEFAULT_SMART_MONEY_SEEDS
             for chain in seed.get("chains", EVM_CHAINS)
@@ -873,10 +950,14 @@ class SmartMoneyMonitor:
     def record_buy(self, event: dict[str, Any]) -> dict[str, Any]:
         wallet = self.store.wallet(event.get("chain"), event.get("walletAddress"))
         threshold = float(wallet.get("alertThresholdUsd") or DEFAULT_ALERT_THRESHOLD_USD)
+        details = event.get("details") if isinstance(event.get("details"), dict) else {}
         normalized = {
             **event,
             "walletNickname": event.get("walletNickname") or wallet.get("nickname") or wallet.get("sourceName") or "聪明钱",
             "popupEligible": float(event.get("paymentUsd") or 0) >= threshold,
+            # The popup card prints the line the event cleared.  The threshold is
+            # PER WALLET, so the card cannot hardcode it — carry it on the event.
+            "details": {**details, "alertThresholdUsd": threshold},
         }
         result = self.store.record_event(normalized)
         stored = result["event"]
@@ -1035,13 +1116,20 @@ class SmartMoneyMonitor:
             return []
         watched = {row["address"]: row for row in wallets}
         events: list[dict[str, Any]] = []
-        max_blocks = max(5, min(500, int(os.getenv("SMART_MONEY_EVM_MAX_BLOCKS_PER_POLL", "120") or 120)))
+        max_blocks = evm_max_blocks_per_poll(chain)
         start = max(previous + 1, latest - max_blocks + 1)
         skipped = max(0, start - previous - 1)
         candidates: dict[str, set[str]] = {}
         candidate_transactions: dict[str, dict[str, Any]] = {}
         recipient_topics = ["0x" + wallet.removeprefix("0x").rjust(64, "0") for wallet in watched]
-        log_error: Exception | None = RuntimeError("BSC 公共日志接口受限") if chain == "bsc" else None
+        # Public BSC RPCs refuse address-less ``eth_getLogs`` (verified 2026-10-10:
+        # publicnode → -32701 "Please specify an address in your request", bnbchain
+        # dataseeds → -32005 "limit exceeded"), and this filter cannot carry an
+        # ``address`` because the bought token is unknown before the query.  So BSC
+        # always takes the raw-block path; ``evm_fallback_blocks`` sizes its window.
+        log_error: Exception | None = (
+            RuntimeError("BSC 公共日志接口受限") if chain == "bsc" else None
+        )
         if log_error is None:
             try:
                 logs = self.rpc(chain, "eth_getLogs", [{
@@ -1061,7 +1149,7 @@ class SmartMoneyMonitor:
                 log_error = exc
 
         if log_error is not None:
-            fallback_max = max(5, min(100, int(os.getenv("SMART_MONEY_EVM_FALLBACK_BLOCKS", "24") or 24)))
+            fallback_max = evm_fallback_blocks(chain)
             fallback_start = max(previous + 1, latest - fallback_max + 1)
             skipped = max(skipped, max(0, fallback_start - previous - 1))
             block_numbers = list(range(fallback_start, latest + 1))
@@ -1101,7 +1189,7 @@ class SmartMoneyMonitor:
             message = "快速日志接口受限，已自动切换新区块扫描"
         if skipped:
             scanned = min(max_blocks, latest - start + 1) if log_error is None else min(
-                int(os.getenv("SMART_MONEY_EVM_FALLBACK_BLOCKS", "24") or 24), latest - previous
+                evm_fallback_blocks(chain), latest - previous
             )
             message = f"{message}；已扫描最近 {scanned} 个区块，跳过 {skipped} 个旧区块"
         self.store.update_health(chain, "ok", message, str(latest))

@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,8 @@ from smart_money_monitor import (
     SmartMoneyStore,
     classify_evm_buy,
     classify_solana_buy,
+    evm_fallback_blocks,
+    evm_max_blocks_per_poll,
     extract_smart_money_mentions,
     normalize_chain,
     normalize_wallet_address,
@@ -23,6 +26,7 @@ SOL_WALLET = "So11111111111111111111111111111111111111112"
 BONK_GUY_EVM_WALLET = "0x0a6ebed0155edb4b21d92ad02897a626cd90119e"
 BONK_GUY_SOL_WALLET = "2heJbC32Tpfcb3nbUb5ER61K11FGZVfVGtVnDm6LDogF"
 BONK_GUY_USELESS_WALLET = "5M8ACGKEXG1ojKDTMH3sMqhTihTgHYMSsZc6W8i7QW3Y"
+CRYPTO_CHARMING_WALLET = "0xcc291dcd83bd9f2600cca4d65ae3b724eaf4f5a9"
 SOL_TOKEN = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6JgB263QP6Bpump"
 SOL_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
@@ -151,6 +155,43 @@ class SmartMoneyClassificationTests(unittest.TestCase):
         self.assertFalse(classify(9_999)["popupEligible"])
         self.assertTrue(classify(10_000)["popupEligible"])
 
+    def test_robinhood_usdg_swap_is_classified_as_a_buy(self):
+        """Robinhood Chain quotes in USDG.  If USDG is not recognised as a
+        stablecoin the swap looks like 'two tokens in, nothing paid' and the buy
+        is silently dropped."""
+        usdg = "0x5fc5360d0400a0fd4f2b3f1a5b0b0f7b8a5c1e2d"
+
+        def meta(address):
+            if address == usdg:
+                # No DEX price for a Robinhood-chain token -> price stays 0, so
+                # the STABLE_SYMBOLS fallback is the only thing that can save it.
+                return {"symbol": "USDG", "decimals": 18, "priceUsd": 0, "stable": False}
+            return {"symbol": "AMC", "decimals": 18, "priceUsd": 0.0117, "stable": False}
+
+        receipt = {
+            "status": "0x1",
+            "transactionHash": "0xhood",
+            "blockNumber": "0x20",
+            "logs": [
+                transfer_log(usdg, CRYPTO_CHARMING_WALLET, EVM_OTHER, 320 * 10**18),
+                transfer_log(TOKEN, EVM_OTHER, CRYPTO_CHARMING_WALLET, 27_000 * 10**18),
+            ],
+        }
+        event = classify_evm_buy(
+            "robinhood",
+            CRYPTO_CHARMING_WALLET,
+            {"hash": "0xhood", "from": CRYPTO_CHARMING_WALLET, "to": EVM_OTHER, "value": "0x0"},
+            receipt,
+            meta,
+            native_price_usd=2500,
+            threshold_usd=100,
+        )
+        self.assertIsNotNone(event)
+        self.assertEqual(event["symbol"], "AMC")
+        self.assertEqual(event["paymentAsset"], "USDG")
+        self.assertAlmostEqual(event["paymentUsd"], 320)
+        self.assertTrue(event["popupEligible"])
+
     def test_solana_swap_uses_pre_and_post_wallet_balances(self):
         payload = {
             "slot": 101,
@@ -264,13 +305,14 @@ class SmartMoneyMonitorTests(unittest.TestCase):
         seeded = SmartMoneyMonitor(Path(self.tmp.name) / "seeded.sqlite", seed_defaults=True)
         try:
             rows = seeded.store.list_wallets()
-            self.assertEqual(len(rows), 26)
+            self.assertEqual(len(rows), 30)
             self.assertEqual({row["chain"] for row in rows}, {"ethereum", "bsc", "base", "robinhood", "solana"})
             by_address = {}
             for row in rows:
                 by_address.setdefault(row["address"], set()).add((row["nickname"], row["sourceName"]))
             self.assertEqual(by_address[EVM_WALLET], {("Inq", "Inq5️⃣连杆提供")})
             self.assertEqual(by_address[EVM_OTHER], {("身份待核验 · a0ed…ff85", "Inq5️⃣连杆提供")})
+            self.assertEqual(by_address[CRYPTO_CHARMING_WALLET], {("CryptoCharming", "用户提供 · Robinhood 链")})
             self.assertEqual(by_address[BONK_GUY_EVM_WALLET], {("Bonk Guy (Unipcs)", "Bonk Guy 公开钱包")})
             self.assertEqual(by_address[BONK_GUY_SOL_WALLET], {("Bonk Guy (Unipcs)", "Bonk Guy 公开钱包")})
             self.assertEqual(by_address[BONK_GUY_USELESS_WALLET], {("Bonk Guy (Unipcs)", "Bonk Guy 公开钱包")})
@@ -279,6 +321,29 @@ class SmartMoneyMonitorTests(unittest.TestCase):
             seeded.store.save_wallet(first["id"], enabled=False)
             self.assertEqual(seeded.seed_defaults(), 0)
             self.assertFalse(seeded.store.wallet(first["chain"], first["address"])["enabled"])
+        finally:
+            seeded.close()
+
+    def test_crypto_charming_seed_is_monitored_on_robinhood(self):
+        seeded = SmartMoneyMonitor(Path(self.tmp.name) / "charming.sqlite", seed_defaults=True)
+        try:
+            wallet = seeded.store.wallet("robinhood", CRYPTO_CHARMING_WALLET)
+            self.assertTrue(wallet)
+            self.assertEqual(wallet["nickname"], "CryptoCharming")
+            self.assertEqual(wallet["sourceName"], "用户提供 · Robinhood 链")
+            self.assertEqual(wallet["sourceKind"], "seed")
+            self.assertTrue(wallet["enabled"])
+            # 链上实测单笔成交在数十美元量级，默认 10000 阈值等于永不提醒。
+            self.assertEqual(wallet["alertThresholdUsd"], 100)
+            # An EVM address is keyed by the same private key on every EVM chain,
+            # so the seed follows the existing four-EVM-chain convention.
+            self.assertEqual(
+                sorted(
+                    row["chain"] for row in seeded.store.list_wallets()
+                    if row["address"] == CRYPTO_CHARMING_WALLET
+                ),
+                ["base", "bsc", "ethereum", "robinhood"],
+            )
         finally:
             seeded.close()
 
@@ -465,6 +530,150 @@ class SmartMoneyServerIntegrationTests(unittest.TestCase):
         self.assertGreaterEqual(source.count('route == "/api/smart-money-monitor"'), 1)
         self.assertIn('source_kind="personal-x"', source)
         self.assertIn('source_kind="qq" if platform == "qq" else "wechat"', source)
+
+
+class SmartMoneyPollWindowTests(unittest.TestCase):
+    """Robinhood Chain mines ~10 blocks/second, so the generic 120-block window
+    only covers ~12 seconds and drops most buys between polls.  The fast-chain
+    window has to outlast a poll cycle while staying inside the RPC's 30000-block
+    getLogs span limit."""
+
+    def test_fast_chain_window_outlasts_a_poll_cycle(self):
+        self.assertEqual(evm_max_blocks_per_poll("robinhood"), 3000)
+        self.assertEqual(evm_max_blocks_per_poll("ethereum"), 120)
+        self.assertEqual(evm_max_blocks_per_poll("bsc"), 120)
+        self.assertEqual(evm_max_blocks_per_poll("base"), 120)
+
+    def test_env_override_applies_to_every_chain(self):
+        with patch.dict(os.environ, {"SMART_MONEY_EVM_MAX_BLOCKS_PER_POLL": "900"}):
+            self.assertEqual(evm_max_blocks_per_poll("robinhood"), 900)
+            self.assertEqual(evm_max_blocks_per_poll("bsc"), 900)
+
+    def test_window_never_exceeds_the_rpc_span_limit(self):
+        with patch.dict(os.environ, {"SMART_MONEY_EVM_MAX_BLOCKS_PER_POLL": "999999"}):
+            self.assertEqual(evm_max_blocks_per_poll("robinhood"), 30000)
+
+    def test_unusable_env_value_falls_back_to_the_per_chain_default(self):
+        for value in ("abc", "0", "-5", ""):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {"SMART_MONEY_EVM_MAX_BLOCKS_PER_POLL": value}):
+                    self.assertEqual(evm_max_blocks_per_poll("robinhood"), 3000)
+
+    def test_poll_scans_the_wide_window_when_blocks_were_missed(self):
+        monitor = SmartMoneyMonitor(Path(tempfile.mkdtemp()) / "window.sqlite")
+        try:
+            monitor.add_wallet({
+                "chain": "robinhood", "address": CRYPTO_CHARMING_WALLET, "nickname": "CryptoCharming",
+            })
+            monitor.store.set_cursor("evm:robinhood:block", "100")
+            calls = []
+
+            def fake_rpc(chain, method, params, *args, **kwargs):
+                calls.append((method, params))
+                if method == "eth_blockNumber":
+                    return hex(20_100)  # 20,000 blocks behind the cursor
+                if method == "eth_getLogs":
+                    return []
+                return {}
+
+            wallets = [row for row in monitor.store.list_wallets(enabled_only=True) if row["chain"] == "robinhood"]
+            with patch.object(monitor, "rpc", side_effect=fake_rpc):
+                monitor._poll_evm("robinhood", wallets)
+
+            windows = [params[0] for method, params in calls if method == "eth_getLogs"]
+            self.assertEqual(len(windows), 1)
+            span = int(windows[0]["toBlock"], 16) - int(windows[0]["fromBlock"], 16) + 1
+            self.assertEqual(span, 3000)
+            health = [row for row in monitor.store.health() if row["chain"] == "robinhood"]
+            self.assertTrue(health)
+        finally:
+            monitor.close()
+
+
+class SmartMoneyFallbackWindowTests(unittest.TestCase):
+    """Public BSC RPCs refuse address-less eth_getLogs, so BSC always scans raw
+    blocks.  BSC mines ~0.45 s/block, so the generic 24-block budget covers only
+    ~11 seconds — less than a single poll cycle once the monitor has walked its
+    other chains — and every block beyond it is dropped without warning."""
+
+    def test_fast_block_chain_gets_a_wider_catch_up_budget(self):
+        self.assertEqual(evm_fallback_blocks("bsc"), 120)
+        self.assertEqual(evm_fallback_blocks("ethereum"), 24)
+        self.assertEqual(evm_fallback_blocks("base"), 24)
+
+    def test_env_override_applies_to_every_chain(self):
+        with patch.dict(os.environ, {"SMART_MONEY_EVM_FALLBACK_BLOCKS": "200"}):
+            self.assertEqual(evm_fallback_blocks("bsc"), 200)
+            self.assertEqual(evm_fallback_blocks("ethereum"), 200)
+
+    def test_unusable_env_value_falls_back_to_the_per_chain_default(self):
+        for value in ("abc", "0", "-5", ""):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {"SMART_MONEY_EVM_FALLBACK_BLOCKS": value}):
+                    self.assertEqual(evm_fallback_blocks("bsc"), 120)
+
+    def test_requested_budget_is_clamped_to_the_ceiling(self):
+        with patch.dict(os.environ, {"SMART_MONEY_EVM_FALLBACK_BLOCKS": "999999"}):
+            self.assertEqual(evm_fallback_blocks("bsc"), 600)
+
+    def test_bsc_poll_scans_the_wide_catch_up_window(self):
+        monitor = SmartMoneyMonitor(Path(tempfile.mkdtemp()) / "fallback.sqlite")
+        try:
+            monitor.add_wallet({
+                "chain": "bsc", "address": CRYPTO_CHARMING_WALLET, "nickname": "CryptoCharming",
+            })
+            monitor.store.set_cursor("evm:bsc:block", "1000")
+            scanned: list[int] = []
+
+            def fake_rpc(chain, method, params, *args, **kwargs):
+                if method == "eth_blockNumber":
+                    return hex(1300)  # 300 blocks behind: beyond the old 24-block cap
+                if method == "eth_getBlockByNumber":
+                    scanned.append(int(params[0], 16))
+                    return {"transactions": []}
+                return {}
+
+            wallets = [row for row in monitor.store.list_wallets(enabled_only=True) if row["chain"] == "bsc"]
+            with patch.object(monitor, "rpc", side_effect=fake_rpc):
+                monitor._poll_evm("bsc", wallets)
+
+            # BSC never uses eth_getLogs, and the window reaches back 120 blocks.
+            self.assertEqual(len(scanned), 120)
+            self.assertEqual(min(scanned), 1181)
+            self.assertEqual(max(scanned), 1300)
+            health = [row for row in monitor.store.health() if row["chain"] == "bsc"][0]
+            self.assertIn("已扫描最近 120 个区块", health["message"])
+        finally:
+            monitor.close()
+
+
+class SmartMoneyAlertLineTests(unittest.TestCase):
+    """The popup card prints the line the event cleared, and that line is stored
+    PER WALLET.  ``record_buy`` therefore has to stamp the threshold onto the
+    persisted event, otherwise the card falls back to a meaningless 10,000U."""
+
+    def test_recorded_buy_carries_the_wallets_popup_line(self):
+        monitor = SmartMoneyMonitor(Path(tempfile.mkdtemp()) / "threshold.sqlite")
+        try:
+            monitor.add_wallet({
+                "chain": "bsc", "address": CRYPTO_CHARMING_WALLET,
+                "nickname": "CryptoCharming", "alertThresholdUsd": 100,
+            })
+            result = monitor.record_buy({
+                "chain": "bsc", "walletAddress": CRYPTO_CHARMING_WALLET,
+                "transactionHash": "0x" + "cd" * 32, "tokenAddress": TOKEN,
+                "symbol": "MEME", "tokenAmount": 10.0, "paymentAsset": "USDT",
+                "paymentAmount": 150.0, "paymentUsd": 150.0, "priceUsd": 15.0,
+                "details": {"classification": "net-token-flow", "readOnly": True},
+            })
+            self.assertTrue(result["created"])
+            event = result["event"]
+            self.assertTrue(event["popupEligible"])
+            self.assertEqual(event["details"]["alertThresholdUsd"], 100.0)
+            # The classifier's own detail keys must survive the merge.
+            self.assertEqual(event["details"]["classification"], "net-token-flow")
+        finally:
+            monitor.close()
 
 
 if __name__ == "__main__":

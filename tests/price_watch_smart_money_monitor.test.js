@@ -14,7 +14,8 @@ test("monitor page exposes the five-chain smart-money buy console", () => {
   assert.match(js, /data-smart-money-toggle/);
   assert.match(js, /data-smart-money-remove/);
   assert.match(js, /Ethereum.*BSC.*Base.*Solana.*Robinhood/s);
-  assert.match(js, /单笔净买入达到.*10,000U/);
+  // 弹窗线是「按地址」的（CryptoCharming 为 100U），文案不能再写死 10,000U。
+  assert.match(js, /单笔净买入达到该地址弹窗线才弹窗/);
   assert.match(js, /小额仅记录/);
   assert.match(js, /免费只读方案/);
   assert.match(js, /monitorBuyButton\(buyRow\)/);

@@ -1343,7 +1343,7 @@
       <div class="smart-money-summary">
         <span><b>${summary.running ? "运行中" : "准备中"}</b><em>只读监控</em></span>
         <span><b>${Number(summary.enabledWallets || 0).toLocaleString("zh-CN")}</b><em>启用地址</em></span>
-        <span><b>${Number(summary.todayEligibleBuys || 0).toLocaleString("zh-CN")}</b><em>今日 ≥10,000U</em></span>
+        <span><b>${Number(summary.todayEligibleBuys || 0).toLocaleString("zh-CN")}</b><em>今日达线买入</em></span>
         <span><b>${Number(summary.events || 0).toLocaleString("zh-CN")}</b><em>买入记录</em></span>
       </div>
       <form class="smart-money-add-form" data-smart-money-form>
@@ -1358,7 +1358,7 @@
       <div class="smart-money-health-grid">${chains.map(smartMoneyHealthTemplate).join("")}</div>
       <div class="smart-money-columns">
         <section class="smart-money-panel"><header><span><p class="section-label">WATCHED WALLETS</p><h3>地址库</h3></span><em>${wallets.length} 条链上地址</em></header><div class="smart-money-wallet-list">${wallets.length ? wallets.map(smartMoneyWalletTemplate).join("") : `<div class="chain-section-empty"><b>还没有监控地址</b><span>可在上方手动添加，也会从明确写有“聪明钱地址”的群聊、个人 X 和 News Trade 自动收集。</span></div>`}</div></section>
-        <section class="smart-money-panel"><header><span><p class="section-label">VERIFIED BUY FLOW</p><h3>买入记录</h3></span><em>≥10,000U 弹窗 · 小额仅记录</em></header><div class="smart-money-event-list">${events.length ? events.map(smartMoneyEventTemplate).join("") : `<div class="chain-section-empty"><b>暂时没有新的买入</b><span>已建立的地址会继续在五条链上只读扫描。</span></div>`}</div></section>
+        <section class="smart-money-panel"><header><span><p class="section-label">VERIFIED BUY FLOW</p><h3>买入记录</h3></span><em>按各地址弹窗线 · 小额仅记录</em></header><div class="smart-money-event-list">${events.length ? events.map(smartMoneyEventTemplate).join("") : `<div class="chain-section-empty"><b>暂时没有新的买入</b><span>已建立的地址会继续在五条链上只读扫描。</span></div>`}</div></section>
       </div>
     </section>`);
   }
@@ -2680,7 +2680,7 @@
     if (smartmoney) {
       headingLabel.textContent = "SMART MONEY / WALLET / VERIFIED BUY";
       headingTitle.textContent = "聪明钱地址买入监控";
-      headingDescription.innerHTML = `Ethereum · BSC · Base · Solana · Robinhood · 单笔净买入达到 <b>10,000U</b> 才弹窗，小额仅记录`;
+      headingDescription.innerHTML = `Ethereum · BSC · Base · Solana · Robinhood · 单笔净买入达到该地址弹窗线才弹窗，小额仅记录`;
       return;
     }
     if (chains) {
@@ -3209,7 +3209,7 @@
       lastSmartMoneyLoadAt = Date.now();
       renderSmartMoneyMonitor();
       const summary = smartMoneyPayload.summary || {};
-      statusNode.textContent = `${Number(summary.enabledWallets || 0)} 条地址监控中 · 今日达到 10,000U 的买入 ${Number(summary.todayEligibleBuys || 0)} 笔 · 全程只读`;
+      statusNode.textContent = `${Number(summary.enabledWallets || 0)} 条地址监控中 · 今日达到弹窗线的买入 ${Number(summary.todayEligibleBuys || 0)} 笔 · 全程只读`;
     } catch (error) {
       if (!quiet) statusNode.textContent = error.message;
       if (!smartMoneyLoaded) {

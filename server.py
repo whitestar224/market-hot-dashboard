@@ -9841,6 +9841,9 @@ EXCHANGE_AI_NARRATIVE_ALLOWED_SOURCES = {
     "ave",
     "gmgn-hot-search",
     "gmgn-trenches",
+    # Smart-money wallet buys carry a real chain+contract pair, so the popup can
+    # offer the same Binance AI narrative lookup as the ranked boards.
+    "smart-money-buy",
     # X 追踪直连弹窗：只有当帖子正文里出现可核验的链+合约时才会渲染按钮，所以
     # 放行不会给纯文字帖凭空造出一个查不到的按钮。
     "x-kol",
@@ -25809,22 +25812,36 @@ def send_smart_money_buy_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
     tx_hash = clean_feed_text(event.get("transactionHash"), 180)
     explorer = clean_feed_text(chain_meta.get("explorer"), 300)
     url = explorer.format(quote(tx_hash, safe="")) if explorer and tx_hash else ""
+    wallet_address = clean_feed_text(event.get("walletAddress"), 60)
+    # The popup line is PER WALLET (e.g. 100U for a small KOL wallet), so the card
+    # must print the line this event actually cleared instead of a fixed 10,000U.
+    # ``record_buy`` stamps the threshold onto the event's details.
+    event_details = event.get("details") if isinstance(event.get("details"), dict) else {}
+    alert_threshold_usd = safe_float(event_details.get("alertThresholdUsd"))
+    priority_label = (
+        f"单笔 ≥ {alert_threshold_usd:,.0f}U" if alert_threshold_usd > 0 else "单笔 ≥ 10,000U"
+    )
     return launch_desktop_alert({
         "key": f"smart-money-buy:{clean_feed_text(event.get('eventKey'), 160)}",
         "kind": "聪明钱买入",
         "source": "聪明钱买入监控",
         "sourceLabel": "SM",
         "sourceType": "smart-money-buy",
-        "title": f"{nickname} 买入 {symbol} · ${payment_usd:,.0f}",
+        # Opens the Binance AI narrative lookup for the bought token in the
+        # popup action row.  ``contractAddress`` + ``chain`` + ``sourceId`` are
+        # all required for the button to render, and ``sourceId`` must stay in
+        # EXCHANGE_AI_NARRATIVE_ALLOWED_SOURCES or the lookup returns UNAVAILABLE.
+        "sourceId": "smart-money-buy",
+        "title": f"KOL {nickname} 买入 {symbol} · ${payment_usd:,.0f}",
         "body": (
             f"{chain_meta.get('label') or chain} · 支付 {payment_amount:,.4g} {payment_asset} · "
-            f"钱包 {clean_feed_text(event.get('walletAddress'), 60)}"
+            f"钱包 {wallet_address}"
         ),
         "contractAddress": clean_feed_text(event.get("tokenAddress"), 180),
         "chain": chain,
         "url": url,
         "time": int(safe_float(event.get("observedAt"))) or int(time.time() * 1000),
-        "priority": "单笔 ≥ 10,000U",
+        "priority": priority_label,
         "queuePriority": 120,
         "speech": f"聪明钱 {nickname} 买入 {symbol}，金额约 {payment_usd:,.0f} 美元",
         "originalText": json.dumps(event, ensure_ascii=False)[:1800],
