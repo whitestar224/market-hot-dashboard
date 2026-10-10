@@ -5964,6 +5964,13 @@ def normalize_x_source(value: Any) -> dict[str, Any] | None:
     avatar = x_kol_avatar_url(handle, value.get("avatar") or value.get("avatarUrl"))
     if avatar:
         source["avatar"] = avatar
+    # Opt-in per source: this X account's own new posts pop desktop alerts
+    # directly instead of only feeding the pinned-chat analysis bridge.
+    # ``merge_x_kol_manual_source_payloads`` re-normalises every row on load, so
+    # an unknown key would be dropped here — the flag must be part of the
+    # canonical shape or it silently disappears after the first save.
+    if value.get("directAlert") is True or value.get("popupOnPost") is True:
+        source["directAlert"] = True
     return source
 
 
@@ -6017,6 +6024,67 @@ def x_kol_priority_handles() -> tuple[str, ...]:
             seen.add(handle)
             handles.append(handle)
     return tuple(handles or ["whitestar224"])
+
+
+# X 追踪默认是「只入分析桥、不直接弹窗」的输入源。个别 KOL 由用户点名要求
+# 「有新帖就弹窗」，因此这里给出一条**按账号**开关的直连弹窗通道：
+#   * ``directAlert: true`` 写在 X 追踪名册的来源行上（见 normalize_x_source）；
+#   * 环境变量 ``X_KOL_DIRECT_ALERT_HANDLES`` 可临时加账号（逗号分隔）；
+#   * 下面的常量是「用户明确要求过」的默认集合。
+# 直连弹窗只影响被点名的账号，其余来源仍然只走分析桥，不会把 X 追踪变成
+# 泛洪弹窗源。
+X_KOL_DIRECT_ALERT_DEFAULT_HANDLES: tuple[str, ...] = (
+    # 用户点名：Robinhood 链 KOL，车头。
+    "cryptocharming",
+)
+
+
+def x_kol_direct_alert_handles() -> frozenset[str]:
+    """Accounts whose new tracked X posts should pop a desktop alert directly."""
+
+    handles: set[str] = set()
+    for value in X_KOL_DIRECT_ALERT_DEFAULT_HANDLES:
+        folded = normalize_x_handle(value).casefold()
+        if folded:
+            handles.add(folded)
+    for value in str(os.getenv("X_KOL_DIRECT_ALERT_HANDLES", "") or "").split(","):
+        folded = normalize_x_handle(value).casefold()
+        if folded:
+            handles.add(folded)
+    try:
+        # Source rows are the durable opt-in: the user can add another KOL from
+        # the X 追踪 名册 without touching code.
+        for source in load_x_kol_sources(None):
+            if not isinstance(source, dict) or source.get("directAlert") is not True:
+                continue
+            if source.get("enabled") is False:
+                continue
+            folded = normalize_x_handle(source.get("handle")).casefold()
+            if folded:
+                handles.add(folded)
+    except Exception as exc:
+        # A broken roster store must never mute the user's explicitly requested
+        # accounts — the constant/env set still applies.
+        print(f"X KOL direct alert roster read failed: {safe_error_text(str(exc))}", file=sys.stderr)
+    return frozenset(handles)
+
+
+def x_kol_direct_alert_allowed(
+    value: dict[str, Any], handles: frozenset[str] | None = None
+) -> bool:
+    """Whether one ``x-kol`` feed event belongs to a direct-popup account."""
+
+    if not isinstance(value, dict):
+        return False
+    if str(value.get("sourceType") or "").strip().casefold() != "x-kol":
+        return False
+    folded = normalize_x_handle(
+        value.get("authorHandle") or value.get("handle")
+    ).casefold()
+    if not folded:
+        return False
+    allowed = x_kol_direct_alert_handles() if handles is None else handles
+    return folded in allowed
 
 
 def x_kol_personal_api_handle() -> str:
@@ -9773,6 +9841,9 @@ EXCHANGE_AI_NARRATIVE_ALLOWED_SOURCES = {
     "ave",
     "gmgn-hot-search",
     "gmgn-trenches",
+    # X 追踪直连弹窗：只有当帖子正文里出现可核验的链+合约时才会渲染按钮，所以
+    # 放行不会给纯文字帖凭空造出一个查不到的按钮。
+    "x-kol",
 }
 EXCHANGE_AI_SYMBOL_IDENTITY_SOURCES = {
     "binance",
@@ -28737,6 +28808,7 @@ PRICE_WATCH_ALERT_BOARD_KEY_PREFIXES = (
     ("price-watch:structure-first:", "structure"),
     ("price-watch:", "prior"),
     ("x-tweet-analysis:", "personalx"),
+    ("x-kol:", "personalx"),
     ("smart-money-buy:", "smartmoney"),
     ("chain-ecosystem:", "chains"),
     ("chat-new-ca:", "wechat"),
@@ -46002,6 +46074,52 @@ def parse_site_x_kol_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return events
 
 
+def send_x_kol_direct_alert(event: dict[str, Any]) -> dict[str, Any]:
+    """Pop one desktop alert for a tracked X account's brand-new post.
+
+    Used only for accounts opted in via ``x_kol_direct_alert_handles``.  The raw
+    post is delivered as-is; the pinned-chat analysis bridge (if it is running)
+    may later add its own verdict popup.
+    """
+
+    handle = normalize_x_handle(event.get("authorHandle") or event.get("handle"))
+    display = clean_feed_text(event.get("source"), 80) or handle or "X 追踪"
+    original = simplified_chinese_text(clean_feed_text(event.get("originalText"), 1800))
+    # Same extractor the personal-X monitor already trusts: it only reads an
+    # explicit chain+contract and never guesses from a ticker.  Passing both
+    # through is what renders the ✦ 币安 AI 叙事 button when the post carries a CA.
+    identity = personal_x_onchain_identity_from_text(original)
+    headline = clean_feed_text(original, 60) or "新的 X 动态"
+    speech_text = clean_feed_text(original, 90)
+    return launch_desktop_alert({
+        # Prefix matters: ``price_watch_alert_board`` maps ``x-kol:`` to the
+        # ``personalx`` board, so this popup answers to the same switch as the
+        # analysis-bridge popups.
+        "key": f"x-kol:{clean_feed_text(event.get('key'), 200)}",
+        "eventFlowKey": clean_feed_text(event.get("key"), 240),
+        "board": "personalx",
+        "kind": "X 追踪动态",
+        "sourceType": "x-kol",
+        "sourceId": "x-kol",
+        "source": display,
+        "sourceLabel": "X",
+        "authorHandle": handle,
+        "xCategory": clean_feed_text(event.get("xCategory"), 48),
+        "title": f"{display} 新帖：{headline}",
+        "body": simplified_chinese_text(clean_feed_text(event.get("body"), 300)),
+        "url": clean_feed_text(event.get("url"), 600) or "./xwatch.html",
+        "contractAddress": clean_feed_text(identity.get("contractAddress"), 180),
+        "chain": clean_feed_text(identity.get("chain"), 50),
+        "time": event.get("time") or int(time.time() * 1000),
+        "expiresAt": int(time.time() * 1000) + 30 * 60_000,
+        "priority": "X 追踪",
+        "queuePriority": 300,
+        "speech": f"{display} 发新帖：{speech_text}" if speech_text else "",
+        "originalText": original,
+        "quoteText": simplified_chinese_text(clean_feed_text(event.get("quoteText"), 1200)),
+    })
+
+
 def x_tweet_analysis_person_source_allowed(value: dict[str, Any]) -> bool:
     """Only curated high-impact personal accounts may enter person AI popups."""
     if not isinstance(value, dict):
@@ -53878,11 +53996,18 @@ def sync_site_alert_feed(feed: dict[str, Any]) -> None:
             and (feed["name"] != "newboards" or clean_feed_text(event.get("sourceScope"), 60) in ready_scopes)
         )
     ]
+    failed: set[str] = set()
     if feed.get("name") == "x-kol":
         # X tracking is an input source, not a raw popup channel.  Once the
         # baseline is ready, every genuinely unseen important-person post
         # enters the dedicated pinned-chat analysis bridge. A popup is emitted only when the
         # matching structured result comes back.
+        #
+        # 例外：被用户点名要求「有新帖就弹窗」的账号（x_kol_direct_alert_handles）
+        # 不等分析桥回包，直接弹窗。注意必须用 send_x_kol_direct_alert 构造 payload
+        # —— 原始的 x-kol 事件缺少 key 前缀 / board / sourceId，直接丢给
+        # launch_desktop_alert 会绕过榜单开关，也拿不到币安 AI 叙事按钮。
+        direct_posts: list[dict[str, Any]] = []
         if is_ready and fresh:
             try:
                 important_posts = [
@@ -53905,8 +54030,25 @@ def sync_site_alert_feed(feed: dict[str, Any]) -> None:
                 # source pass can retry without losing a post.
                 print(f"X tweet analysis queue failed: {safe_error_text(str(exc))}", file=sys.stderr)
                 return
+            try:
+                direct_handles = x_kol_direct_alert_handles()
+                if direct_handles:
+                    direct_posts = [
+                        event for event in fresh
+                        if x_kol_direct_alert_allowed(event, direct_handles)
+                    ]
+            except Exception as exc:
+                # Falling back to no direct popup is the safe direction: the post
+                # is still marked seen below, so this cannot loop forever.
+                print(f"X KOL direct alert filter failed: {safe_error_text(str(exc))}", file=sys.stderr)
+            for event in direct_posts:
+                try:
+                    if not send_x_kol_direct_alert(event).get("ok"):
+                        failed.update(alert_dedupe_keys(event))
+                except Exception as exc:
+                    failed.update(alert_dedupe_keys(event))
+                    print(f"X KOL direct popup failed: {safe_error_text(str(exc))}", file=sys.stderr)
         fresh = []
-    failed = set()
     for event in fresh if is_ready else []:
         try:
             result = launch_desktop_alert(event)
