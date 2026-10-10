@@ -1251,18 +1251,20 @@ PRICE_WATCH_BOARDS = (
         "intakeApplies": True,
     },
     {
-        "id": "gmgn-trenches",
-        "label": "GMGN 战壕新币榜",
-        "short": "战壕榜",
-        "description": "GMGN 战壕新池发现（不进价池，仅控制弹窗）",
-        "intakeApplies": False,
-    },
-    {
+        # 2026-10-11：与 GMGN 战壕新币榜对调，卡片顺序由 fetchers 决定，
+        # 本表顺序被 tests/test_price_watch_board_toggles.py 按序锁定，必须同步。
         "id": "aicoin",
         "label": "AIcoin 热门榜",
         "short": "AIcoin",
         "description": "AIcoin 热门榜新进入池",
         "intakeApplies": True,
+    },
+    {
+        "id": "gmgn-trenches",
+        "label": "GMGN 战壕新币榜",
+        "short": "战壕榜",
+        "description": "GMGN 战壕新池发现（不进价池，仅控制弹窗）",
+        "intakeApplies": False,
     },
     {
         "id": "binance",

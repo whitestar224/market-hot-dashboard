@@ -19672,10 +19672,14 @@ def recover_market_sources_from_independent_caches(payload: dict[str, Any]) -> d
 
 def market_payload() -> dict[str, Any]:
     sources = []
+    # 卡片顺序 = 本列表顺序：结果按原序收集，前端 renderBoards() 只做
+    # filter/map、不再重排（2026-10-11 用户要求把 AIcoin 热门榜与 GMGN 战壕新币榜
+    # 对调，于是 aicoin 提到第 2 位、gmgn-trenches 落到第 3 位）。
+    # 改这里的顺序必须同步 state.py::PRICE_WATCH_BOARDS（测试会按序比对两处）。
     fetchers = [
         ("binance-wallet-hot", lambda: binance_wallet_hot_source("24h")),
-        ("gmgn-trenches", fetch_gmgn_trenches_hot_board),
         ("aicoin", fetch_aicoin),
+        ("gmgn-trenches", fetch_gmgn_trenches_hot_board),
         ("binance", fetch_binance),
         ("gmgn-hot-search", fetch_gmgn_hot_search),
         ("bitget", fetch_bitget),
@@ -19828,7 +19832,9 @@ def market_hot_response_payload(*, force_refresh: bool = False) -> dict[str, Any
         else:
             updated_sources.append(source)
     if not replaced:
-        updated_sources.insert(1 if updated_sources else 0, latest_gmgn)
+        # 战壕榜的规范位置 = fetchers 里的下标 2（2026-10-11 与 AIcoin 对调后；
+        # 此前是 1）。list.insert 超出长度会追加，空列表落到 0，都安全。
+        updated_sources.insert(2, latest_gmgn)
     return {**payload, "sources": updated_sources}
 
 

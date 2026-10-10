@@ -24,13 +24,14 @@ test("GMGN Hot Search has the native five periods and chain switch", () => {
   assert.match(server, /parsed\.path == "\/api\/gmgn-hot-search"/);
 });
 
-test("wallet, GMGN trenches, and AIcoin occupy the first row in that order", () => {
+test("wallet, AIcoin, and GMGN trenches occupy the first row in that order", () => {
+  // 2026-10-11 用户要求把 AIcoin 热门榜与 GMGN 战壕新币榜对调，于是 aicoin 升到第 2 位。
   const wallet = server.indexOf('(\"binance-wallet-hot\", lambda: binance_wallet_hot_source(\"24h\"))');
-  const trenches = server.indexOf('(\"gmgn-trenches\", fetch_gmgn_trenches_hot_board)');
   const aicoin = server.indexOf('(\"aicoin\", fetch_aicoin)');
+  const trenches = server.indexOf('(\"gmgn-trenches\", fetch_gmgn_trenches_hot_board)');
   const binance = server.indexOf('(\"binance\", fetch_binance)');
-  assert.ok(wallet >= 0 && trenches > wallet && aicoin > trenches);
-  assert.ok(binance > aicoin);
+  assert.ok(wallet >= 0 && aicoin > wallet && trenches > aicoin);
+  assert.ok(binance > trenches);
   assert.match(server, /RANK_MONITOR_SKIP_UPDATE_SOURCES = \{[\s\S]{0,300}"gmgn-hot-search"/);
 });
 
