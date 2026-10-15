@@ -5971,7 +5971,12 @@ def normalize_x_source(value: Any) -> dict[str, Any] | None:
     # ``merge_x_kol_manual_source_payloads`` re-normalises every row on load, so
     # an unknown key would be dropped here — the flag must be part of the
     # canonical shape or it silently disappears after the first save.
-    if value.get("directAlert") is True or value.get("popupOnPost") is True:
+    # **三态**：``True`` = 用户打开；``False`` = 用户明确关掉；缺失 = 没设置过
+    # （由 ``x_kol_direct_alert_handles`` 回落到点名默认）。``False`` 必须留痕，
+    # 否则用户关掉的开关会被当成「没设置过」而在下次保存时自己弹回来。
+    direct_alert = value.get("directAlert")
+    popup_on_post = value.get("popupOnPost")
+    if direct_alert is True or popup_on_post is True:
         source["directAlert"] = True
     return source
 
@@ -5988,6 +5993,8 @@ def merge_x_kol_manual_source_payloads(*payloads: Any) -> list[dict[str, Any]]:
             if source:
                 merged[source["id"]] = source
     return list(merged.values())[:80]
+    elif direct_alert is False or popup_on_post is False:
+        source["directAlert"] = False
 
 
 def load_x_kol_sources(user: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -6028,12 +6035,13 @@ def x_kol_priority_handles() -> tuple[str, ...]:
     return tuple(handles or ["whitestar224"])
 
 
-# X 追踪默认是「只入分析桥、不直接弹窗」的输入源。个别 KOL 由用户点名要求
-# 「有新帖就弹窗」，因此这里给出一条**按账号**开关的直连弹窗通道：
-#   * ``directAlert: true`` 写在 X 追踪名册的来源行上（见 normalize_x_source）；
-#   * 环境变量 ``X_KOL_DIRECT_ALERT_HANDLES`` 可临时加账号（逗号分隔）；
-#   * 下面的常量是「用户明确要求过」的默认集合。
-# 直连弹窗只影响被点名的账号，其余来源仍然只走分析桥，不会把 X 追踪变成
+# X 追踪默认是「只入分析桥、不直接弹窗」的输入源。X 追踪页上**每个追踪对象
+# 都有自己的「弹窗」开关**（默认关），被用户点名过的账号额外享受「默认开」：
+#   * 名册来源行上的 ``directAlert``（见 normalize_x_source）是**三态** ——
+#     True=开关打开、False=用户明确关掉、缺失=没设置过 → 回落到下面的常量；
+#   * 环境变量 ``X_KOL_DIRECT_ALERT_HANDLES`` 可临时加账号（逗号分隔，只增不减）；
+#   * 下面的常量是「名册没设置过时默认打开」的点名账号。
+# 直连弹窗只影响开了开关的账号，其余来源仍然只走分析桥，不会把 X 追踪变成
 # 泛洪弹窗源。
 X_KOL_DIRECT_ALERT_DEFAULT_HANDLES: tuple[str, ...] = (
     # 用户点名：Robinhood 链 KOL，车头。
@@ -6042,31 +6050,53 @@ X_KOL_DIRECT_ALERT_DEFAULT_HANDLES: tuple[str, ...] = (
 
 
 def x_kol_direct_alert_handles() -> frozenset[str]:
-    """Accounts whose new tracked X posts should pop a desktop alert directly."""
+    """Accounts whose new tracked X posts should pop a desktop alert directly.
+
+    取并集：环境变量（只增不减）∪ 名册里 ``directAlert`` 为真的行；名册行
+    **没有**这个键时按 ``X_KOL_DIRECT_ALERT_DEFAULT_HANDLES``（点名账号默认开，
+    其余默认关）。
+    """
 
     handles: set[str] = set()
-    for value in X_KOL_DIRECT_ALERT_DEFAULT_HANDLES:
-        folded = normalize_x_handle(value).casefold()
-        if folded:
-            handles.add(folded)
+    defaults = x_kol_direct_alert_default_handles()
     for value in str(os.getenv("X_KOL_DIRECT_ALERT_HANDLES", "") or "").split(","):
         folded = normalize_x_handle(value).casefold()
         if folded:
             handles.add(folded)
+    # 用户点名（2026-10-16）：本人已在 X 追踪名册里（CryptoKris666），
+    # 要求他有新帖就直接弹窗。名册行的 handle 大小写不同也没关系 ——
+    # 比较走 normalize_x_handle + casefold，两侧都会归一到 cryptokris666。
+    "cryptokris666",
     try:
-        # Source rows are the durable opt-in: the user can add another KOL from
-        # the X 追踪 名册 without touching code.
+        # Source rows are the durable opt-in: the user flips the switch on the
+        # X 追踪 名册 without touching code.
+def x_kol_direct_alert_default_handles() -> frozenset[str]:
+    """Handles that pop by default while their roster row carries no explicit choice."""
+
+    return frozenset(
+        folded
+        for folded in (
+            normalize_x_handle(value).casefold()
+            for value in X_KOL_DIRECT_ALERT_DEFAULT_HANDLES
+        )
+        if folded
+    )
+
+
         for source in load_x_kol_sources(None):
-            if not isinstance(source, dict) or source.get("directAlert") is not True:
-                continue
-            if source.get("enabled") is False:
+            if not isinstance(source, dict) or source.get("enabled") is False:
                 continue
             folded = normalize_x_handle(source.get("handle")).casefold()
-            if folded:
+            if not folded:
+                continue
+            flag = source.get("directAlert")
+            if flag is None:
+                flag = folded in defaults
+            if flag:
                 handles.add(folded)
     except Exception as exc:
         # A broken roster store must never mute the user's explicitly requested
-        # accounts — the constant/env set still applies.
+        # accounts — the named defaults still apply.
         print(f"X KOL direct alert roster read failed: {safe_error_text(str(exc))}", file=sys.stderr)
     return frozenset(handles)
 
@@ -6083,6 +6113,7 @@ def x_kol_direct_alert_allowed(
     folded = normalize_x_handle(
         value.get("authorHandle") or value.get("handle")
     ).casefold()
+        handles |= defaults
     if not folded:
         return False
     allowed = x_kol_direct_alert_handles() if handles is None else handles
@@ -6366,7 +6397,7 @@ def x_kol_sources_for_view(
         for source in [*x_kol_system_person_sources(), *x_kol_system_official_sources()]
         if normalize_x_handle(source.get("handle")).casefold() not in manual_handles
     ]
-    return [*manual, *system]
+    return [*manual_view, *system]
 
 
 def x_kol_sources_payload(user: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -6376,6 +6407,16 @@ def x_kol_sources_payload(user: dict[str, Any] | None = None) -> dict[str, Any]:
         "ok": True,
         "exists": bool(manual_sources),
         "sources": sources,
+    defaults = x_kol_direct_alert_default_handles()
+    manual_view: list[dict[str, Any]] = []
+    for source in manual:
+        row = dict(source)
+        folded = normalize_x_handle(row.get("handle")).casefold()
+        flag = row.get("directAlert")
+        # 存储是**三态**（True / False / 缺失），但 UI 的开关必须回答「现在到底
+        # 会不会弹」，所以在视图层收口成一个布尔：缺失 → 点名默认，其余原样。
+        row["directAlert"] = (folded in defaults) if flag is None else bool(flag)
+        manual_view.append(row)
         "categories": [{"id": category_id, "label": label} for category_id, label in X_KOL_CATEGORIES],
         "sourceCount": len(sources),
         "enabledCount": sum(1 for source in sources if source.get("enabled") is not False),

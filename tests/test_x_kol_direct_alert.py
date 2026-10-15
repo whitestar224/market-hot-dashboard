@@ -50,10 +50,28 @@ class DirectAlertHandleSetTests(unittest.TestCase):
                     os.environ.pop("X_KOL_DIRECT_ALERT_HANDLES", None)
                 return server.x_kol_direct_alert_handles()
 
-    def test_user_requested_kol_is_on_by_default(self):
-        # The constant alone must be enough: a roster read failure or an empty
-        # roster must not silently drop the account the user asked for.
-        self.assertIn("cryptocharming", self._handles())
+    def test_named_kol_defaults_to_on_when_its_row_has_no_choice(self):
+        # 点名账号的默认是「开」：名册行上没有 directAlert 时回落到常量，
+        # 所以新增开关这件事不会把用户先前点名的账号弹窗关掉。
+        handles = self._handles(sources=[
+            {"id": "x:cryptocharming", "handle": "CryptoCharming", "enabled": True},
+        ])
+        self.assertIn("cryptocharming", handles)
+
+    def test_untouched_rows_default_to_off(self):
+        # 「默认不开」：名册行没有 directAlert、也不在点名常量里 → 不弹窗。
+        handles = self._handles(sources=[
+            {"id": f"x:{OTHER_KOL}", "handle": OTHER_KOL, "enabled": True},
+        ])
+        self.assertNotIn(OTHER_KOL, handles)
+
+    def test_explicit_off_beats_the_named_default(self):
+        # 开关关掉必须真的关得掉，否则用户会觉得开关坏了。
+        handles = self._handles(sources=[
+            {"id": "x:cryptocharming", "handle": "CryptoCharming",
+             "directAlert": False, "enabled": True},
+        ])
+        self.assertNotIn("cryptocharming", handles)
 
     def test_other_tracked_kols_are_not_promoted(self):
         self.assertNotIn(OTHER_KOL, self._handles())

@@ -306,6 +306,7 @@
         category: normalizeCategory(source.category || source.categoryId || source.categoryType),
         keywords: splitKeywords(source.keywords),
         enabled: source.enabled !== false,
+        directAlert: source.directAlert === true || source.popupOnPost === true,
         avatar: source.avatar || source.avatarUrl || fallbackAvatar(handle),
         createdAt: Number(source.createdAt) || Date.now(),
         systemManaged: Boolean(source.systemManaged),
@@ -489,6 +490,11 @@
           </div>
           <em>@${escapeHtml(source.handle)} · ${escapeHtml(live.provider || (isSystem ? "人物快速监控" : state.provider) || "--")} · ${escapeHtml(source.personRole || "")}</em>
           ${isSystem ? "" : `<input data-action="keywords" value="${escapeHtml((source.keywords || []).join(", "))}" placeholder="关注词，不裁剪动态" />`}
+          ${isSystem ? "" : `<label class="xwatch-alert-toggle" title="打开后，这个 KOL 一发新帖就直接弹窗（默认关闭）">
+            <input data-action="direct-alert" type="checkbox" ${source.directAlert ? "checked" : ""} />
+            <i></i>
+            <em>有新帖就弹窗</em>
+          </label>`}
           ${live.error ? `<small>${escapeHtml(live.error)}</small>` : ""}
         </div>
         ${isSystem ? "" : `<label class="xwatch-switch" title="启用/暂停">
@@ -756,6 +762,11 @@
       updateSource(id, { enabled: event.target.checked });
       await saveSources({ silent: true });
       await loadFeed({ refresh: true });
+    }
+    if (action === "direct-alert") {
+      // 只决定「后续新帖弹不弹」，feed 本身没变，不用重拉。
+      updateSource(id, { directAlert: event.target.checked });
+      await saveSources({ silent: true });
     }
     if (action === "keywords") {
       updateSource(id, { keywords: splitKeywords(event.target.value) });
