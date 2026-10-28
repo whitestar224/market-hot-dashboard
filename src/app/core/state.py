@@ -34,7 +34,12 @@ import httpx
 from alert_delivery import AlertDeliveryStore
 from app.core.paths import ROOT
 from chain_ecosystem_monitor import ChainEcosystemMonitor, ChainEcosystemStore
+from dev_launch_monitor import DevLaunchMonitor, DevLaunchStore
 from event_flow import EventFlowStore
+from arkham_cluster_monitor import ArkhamClusterMonitor, ArkhamClusterStore
+from market_maker_monitor import MarketMakerMonitor, MarketMakerStore
+from price_move_monitor import PriceMoveMonitor, PriceMoveStore
+from sandwich_detector import SandwichDetector, SandwichStore
 from smart_money_monitor import SmartMoneyMonitor
 from trench_person_signals import important_person_sources
 from x_tweet_analysis import XTweetAnalysisQueue
@@ -2189,6 +2194,46 @@ SMART_MONEY_MONITOR = SmartMoneyMonitor(
 )
 
 
+# 监控页「被夹检测」子板块：按钱包拉 GMGN 成交，回链上取证是否落进三明治夹。
+# 独立库（不与 auth_db / 聪明钱库抢锁）；这里只构造，线程由 server 在
+# 主监控端口上启动 —— 多端口并存时只有主端口该扫链。
+SANDWICH_DETECTOR = SandwichDetector(
+    SandwichStore(PERSIST_CACHE_DIR / "sandwich_detector.sqlite")
+)
+
+
+# 监控页「Dev 发币」子板块：盯住给定的 Dev 地址，一有新币发出来就提醒，并按该地址
+# 历史发过的币的最高市值打级别标签（顶级/精品/优质/普通·流水）。
+# 同样独立库；线程由 server 在主监控端口上启动 —— 多端口并存时只有主端口该扫链。
+DEV_LAUNCH_MONITOR = DevLaunchMonitor(
+    DevLaunchStore(PERSIST_CACHE_DIR / "dev_launch_monitor.sqlite")
+)
+
+
+# 监控页「做市商监控」子板块：按 Blockscout 的标签地址簿轮询 8 家做市商的 ERC-20 流水，
+# 汇总「它们正在动哪些标的」；同一板块还并进「做市商控盘达标标的」（五条判据的唯一
+# 实现仍在 alpha_mm_monitor，这里只读它的状态，不重判）。
+# 同样独立库；线程由 server 在主监控端口上启动 —— 多端口并存时只有主端口该扫链。
+MARKET_MAKER_MONITOR = MarketMakerMonitor(
+    MarketMakerStore(PERSIST_CACHE_DIR / "market_maker_monitor.sqlite")
+)
+
+# 价格异动监控（2026-10-21）：6 小时内涨 ≥20%。自己每 5 分钟记一帧全市场价格 ——
+# 币安 /fapi/v1/ticker/price 不带 symbol 时一次返回全部合约，一帧只要 1 个请求。
+# 独立库（帧序列每轮上百行，别和 auth_db 抢锁）；线程同样只在主端口起。
+PRICE_MOVE_MONITOR = PriceMoveMonitor(
+    PriceMoveStore(PERSIST_CACHE_DIR / "price_move_monitor.sqlite")
+)
+
+
+# 地址集群监控（2026-10-21）：用 Arkham 的实体归因，把「同一批人在多个标的里同时
+# 占流通 ≥5%」的集群挑出来提醒。数据走网页端签名通路（零成本，官方 API 起步 $100/月）。
+# 独立库；线程同样只在主端口起 —— 多端口并存时只有主端口该去抓外网。
+ARKHAM_CLUSTER_MONITOR = ArkhamClusterMonitor(
+    ArkhamClusterStore(PERSIST_CACHE_DIR / "arkham_cluster_monitor.sqlite")
+)
+
+
 RUNTIME_QR_MAX_AGE_SECONDS = 30 * 60
 
 
@@ -2302,6 +2347,18 @@ TRENCH_PERSON_WATCH_STATE_PATH = PERSIST_CACHE_DIR / "gmgn_trench_person_watch.j
 
 
 TRENCH_PERSON_SEMANTIC_CACHE_PATH = PERSIST_CACHE_DIR / "gmgn_trench_person_semantic_cache.json"
+
+
+# 战壕悬浮窗的「当前查看链」：榜单页切链时 POST 写进来，桌面上那个独立进程的悬浮窗
+# 轮询读取 —— 面板是 pythonw 起的另一个人，看不到浏览器的 localStorage，只能靠服务端
+# 转达。落盘是为了服务重启后仍记得上一次的选择，否则面板会悄悄跳回「综合」。
+TRENCH_OVERLAY_CHAIN_PREFERENCE_PATH = PERSIST_CACHE_DIR / "trench_overlay_chain.json"
+
+
+TRENCH_OVERLAY_CHAIN_PREFERENCE_LOCK = threading.Lock()
+
+
+TRENCH_OVERLAY_CHAIN_PREFERENCE: dict[str, Any] = {"loaded": False, "chain": "all"}
 
 
 THS_SOURCE_CACHE_PATH = PERSIST_CACHE_DIR / "ths_hot_source.json"

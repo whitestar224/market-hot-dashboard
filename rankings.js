@@ -492,9 +492,12 @@ function renderRow(row, index, board) {
   const sourceTag = escapeHtml(row.sourceLabel || groupLabels[row.group] || "MK");
   const insight = renderInsight(row, row.source || board, index + 1);
   const liveKey = `${row.sourceId || row.source || board?.id || board?.title || "ranking"}:${row.contractAddress || row.address || row.symbol || row.name || index}`;
+  // 悬停浮层要的 CMC 基本面；股票行没有 CMC 条目，不挂。
+  const cmcSymbol = stockGroup ? "" : String(row.symbol || "").trim();
+  const cmcAttr = /[A-Za-z0-9]/.test(cmcSymbol) ? ` data-cmc-symbol="${escapeHtml(cmcSymbol)}"` : "";
 
   return `
-    <a class="rank-row rank-row-link ranking-row" data-live-key="row:${escapeHtml(liveKey)}" href="${url}" target="_blank" rel="noreferrer" title="打开 ${symbol} 交易/行情页面">
+    <a class="rank-row rank-row-link ranking-row"${cmcAttr} data-live-key="row:${escapeHtml(liveKey)}" href="${url}" target="_blank" rel="noreferrer" title="打开 ${symbol} 交易/行情页面">
       <div class="rank-badge">${index + 1}</div>
       <div class="asset-cell">
         ${renderAssetIcon(row, row.source)}

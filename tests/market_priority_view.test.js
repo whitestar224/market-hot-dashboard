@@ -140,7 +140,7 @@ test("Binance gainers card switches between spot and futures without duplicating
   assert.match(rankings, /现货涨幅榜/);
   assert.match(rankings, /合约涨幅榜/);
   assert.match(rankings, /state\.binanceGainersMode/);
-  assert.match(gainers, /rankings\.js\?v=20/);
+  assert.match(gainers, /rankings\.js\?v=21/);
   assert.match(server, /def fetch_binance_futures_gainers\(\)/);
   assert.match(server, /"binance-futures-gainers"/);
 });

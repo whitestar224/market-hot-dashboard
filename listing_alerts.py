@@ -45,11 +45,22 @@ def number(value):
 
 
 def attach_inventory(source, entries):
+    """挂全量收录清单。条目是 ``(symbol, stamp)``，也接受 ``(symbol, stamp, chain)``。
+
+    ``chain`` 可选：上游给了链就带上，用来回答「这个币在 Alpha 上是哪条链」
+    （弹窗文案里的链提醒靠它，不是靠猜 symbol）。缺链的条目照旧只存 asset/listedAt，
+    所以老调用点传二元组的行为完全不变。
+    """
     inventory = []
-    for symbol, stamp in entries:
+    for entry in entries:
+        symbol, stamp = entry[0], entry[1]
+        chain = str(entry[2]).strip() if len(entry) > 2 and entry[2] else ""
         key = asset_key(symbol)
         if key:
-            inventory.append({"asset": key, "listedAt": number(stamp)})
+            item = {"asset": key, "listedAt": number(stamp)}
+            if chain:
+                item["chain"] = chain
+            inventory.append(item)
     return {**source, "listingInventory": inventory, "listingInventoryComplete": bool(inventory)}
 
 

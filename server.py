@@ -110,6 +110,42 @@ from onchain_research_framework import (
 )
 from rapid_decision_compare import RAPID_DECISION_VERSION, analyze_rapid_candidates
 from jev_decision import JEV_SEMANTIC_VERSION, analyze_jev_person_semantics
+from dev_launch_monitor import (
+    chain_availability as dev_launch_chain_availability,
+    chain_label as dev_launch_chain_label,
+    gmgn_token_url as dev_launch_gmgn_url,
+    money_text as dev_launch_money_text,
+    peak_market_cap as dev_launch_peak_market_cap,
+    tier_for_market_cap as dev_launch_tier,
+    token_market as dev_launch_token_market,
+)
+from sandwich_detector import explorer_url as sandwich_explorer_url
+from market_maker_monitor import (
+    amount_text as mm_amount_text,
+    board_symbol_index as mm_board_symbol_index,
+    chain_label as mm_chain_label,
+    explorer_tx_url as mm_explorer_tx_url,
+    firm_label as mm_firm_label,
+    gmgn_token_url as mm_gmgn_token_url,
+    money_text as mm_money_text,
+    price_text as mm_price_text,
+    symbol_key as mm_symbol_key,
+)
+# 价格异动：稳定币 / 杠杆代币在**采集端**就剔掉，别写进帧。
+# 下游 collect_prices 还会再滤一次（纵深防御），但覆盖面统计只认第一次的结果。
+from price_move_monitor import is_tradable_symbol as price_move_is_tradable
+import alpha_mm_monitor as ALPHA_MM
+# 地址集群：候选标的只取「热门榜 + 涨幅榜」**榜上的**标的（价格异动 2026-10-22 起
+# 不算候选 —— 那个板块现在是币安合约，本来也没有链上合约可查），集群与跨标的判定
+# 全在模块里，这里只负责喂候选、拼文案、开路由。
+import arkham_client as ARKHAM_API
+import arkham_cluster_monitor as ARKHAM_CLUSTER
+# 链上 Top10 持仓集中度（口径 = Arkham 网页「主要持有者」前十行）：榜单与异动弹窗
+# 统一在 launch_desktop_alert 出闸时补一句「Top10 持仓 x%」，>70% 再加风险提示。
+import top10_holders as TOP10
+# 弹窗里的 CoinMarketCap 流通市值（用户 2026-10-24）：整榜快照 + 后台刷新，
+# 出闸时统一补一句「流通市值 $…（CMC #rank）」。拿不到就沉默，绝不写 0。
+import cmc_market_cap as CMC_MC
 from smart_money_monitor import CHAIN_META as SMART_MONEY_CHAIN_META, SmartMoneyMonitor
 from trench_person_signals import (
     EXCHANGE_OFFICIAL_HANDLES,
@@ -236,6 +272,7 @@ from app.core.state import (
     API_REFRESH_POOL,
     API_REFRESH_STALL_LOGGED,
     API_REFRESH_STUCK_SECONDS,
+    ARKHAM_CLUSTER_MONITOR,
     ASTER_ANNOUNCEMENT_LOCK,
     ASTER_ANNOUNCEMENT_STATE_PATH,
     ASTER_X_LISTING_CACHE_PATH,
@@ -354,6 +391,7 @@ from app.core.state import (
     DESKTOP_ALERT_TTL,
     DESKTOP_ALERT_URGENT_INTERVAL_SECONDS,
     DESKTOP_ALERT_WHALE_PNL_PATTERN,
+    DEV_LAUNCH_MONITOR,
     DRAGON_WAVE_MONITOR_BRIDGE,
     EVENT_FLOW_NEWS_RECORD_LOCK,
     EVENT_FLOW_STORE,
@@ -414,6 +452,7 @@ from app.core.state import (
     MARKET_PRIORITY_HISTORY_SECONDS,
     MARKET_PRIORITY_SNAPSHOT_INTERVAL_SECONDS,
     MARKET_PRIORITY_WINDOWS,
+    MARKET_MAKER_MONITOR,
     MARKET_SOURCE_POOL,
     MAX_JSON_BODY_BYTES,
     MONITOR_ALERT_REPLAY_MAX_GAP_MS,
@@ -483,6 +522,7 @@ from app.core.state import (
     PRICE_MONITOR_SOURCE_GRACE_SECONDS,
     PRICE_MONITOR_STALE_SOURCE_SECONDS,
     PRICE_MONITOR_TECHNICAL_EDGE_GRACE_SECONDS,
+    PRICE_MOVE_MONITOR,
     PRICE_STRUCTURE_CACHE,
     PRICE_STRUCTURE_CACHE_LOCK,
     PRICE_STRUCTURE_CACHE_TTL_SECONDS,
@@ -681,6 +721,7 @@ from app.core.state import (
     SELF_OPTIMIZATION_STATE_LOCK,
     SELF_OPTIMIZATION_STATE_PATH,
     SELF_OPTIMIZATION_WORK_ROOT,
+    SANDWICH_DETECTOR,
     SERVER_BOOT_AT_MS,
     SERVER_SHUTDOWN_EVENT,
     SHARED_EXECUTORS,
@@ -731,6 +772,9 @@ from app.core.state import (
     TRENCH_PERSON_SIGNAL_LOCK,
     TRENCH_PERSON_SIGNAL_PATH,
     TRENCH_PERSON_SOURCE_LIMIT,
+    TRENCH_OVERLAY_CHAIN_PREFERENCE,
+    TRENCH_OVERLAY_CHAIN_PREFERENCE_LOCK,
+    TRENCH_OVERLAY_CHAIN_PREFERENCE_PATH,
     TRENCH_PERSON_TOKEN_LOOKBACK_MS,
     TRENCH_PERSON_WATCH_FAILURES,
     TRENCH_PERSON_WATCH_LOCK,
@@ -5978,6 +6022,8 @@ def normalize_x_source(value: Any) -> dict[str, Any] | None:
     popup_on_post = value.get("popupOnPost")
     if direct_alert is True or popup_on_post is True:
         source["directAlert"] = True
+    elif direct_alert is False or popup_on_post is False:
+        source["directAlert"] = False
     return source
 
 
@@ -5993,8 +6039,6 @@ def merge_x_kol_manual_source_payloads(*payloads: Any) -> list[dict[str, Any]]:
             if source:
                 merged[source["id"]] = source
     return list(merged.values())[:80]
-    elif direct_alert is False or popup_on_post is False:
-        source["directAlert"] = False
 
 
 def load_x_kol_sources(user: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -6046,7 +6090,24 @@ def x_kol_priority_handles() -> tuple[str, ...]:
 X_KOL_DIRECT_ALERT_DEFAULT_HANDLES: tuple[str, ...] = (
     # 用户点名：Robinhood 链 KOL，车头。
     "cryptocharming",
+    # 用户点名（2026-10-16）：本人已在 X 追踪名册里（CryptoKris666），
+    # 要求他有新帖就直接弹窗。名册行的 handle 大小写不同也没关系 ——
+    # 比较走 normalize_x_handle + casefold，两侧都会归一到 cryptokris666。
+    "cryptokris666",
 )
+
+
+def x_kol_direct_alert_default_handles() -> frozenset[str]:
+    """Handles that pop by default while their roster row carries no explicit choice."""
+
+    return frozenset(
+        folded
+        for folded in (
+            normalize_x_handle(value).casefold()
+            for value in X_KOL_DIRECT_ALERT_DEFAULT_HANDLES
+        )
+        if folded
+    )
 
 
 def x_kol_direct_alert_handles() -> frozenset[str]:
@@ -6063,26 +6124,9 @@ def x_kol_direct_alert_handles() -> frozenset[str]:
         folded = normalize_x_handle(value).casefold()
         if folded:
             handles.add(folded)
-    # 用户点名（2026-10-16）：本人已在 X 追踪名册里（CryptoKris666），
-    # 要求他有新帖就直接弹窗。名册行的 handle 大小写不同也没关系 ——
-    # 比较走 normalize_x_handle + casefold，两侧都会归一到 cryptokris666。
-    "cryptokris666",
     try:
         # Source rows are the durable opt-in: the user flips the switch on the
         # X 追踪 名册 without touching code.
-def x_kol_direct_alert_default_handles() -> frozenset[str]:
-    """Handles that pop by default while their roster row carries no explicit choice."""
-
-    return frozenset(
-        folded
-        for folded in (
-            normalize_x_handle(value).casefold()
-            for value in X_KOL_DIRECT_ALERT_DEFAULT_HANDLES
-        )
-        if folded
-    )
-
-
         for source in load_x_kol_sources(None):
             if not isinstance(source, dict) or source.get("enabled") is False:
                 continue
@@ -6098,6 +6142,7 @@ def x_kol_direct_alert_default_handles() -> frozenset[str]:
         # A broken roster store must never mute the user's explicitly requested
         # accounts — the named defaults still apply.
         print(f"X KOL direct alert roster read failed: {safe_error_text(str(exc))}", file=sys.stderr)
+        handles |= defaults
     return frozenset(handles)
 
 
@@ -6113,7 +6158,6 @@ def x_kol_direct_alert_allowed(
     folded = normalize_x_handle(
         value.get("authorHandle") or value.get("handle")
     ).casefold()
-        handles |= defaults
     if not folded:
         return False
     allowed = x_kol_direct_alert_handles() if handles is None else handles
@@ -6392,6 +6436,16 @@ def x_kol_sources_for_view(
         for source in manual
         if normalize_x_handle(source.get("handle"))
     }
+    defaults = x_kol_direct_alert_default_handles()
+    manual_view: list[dict[str, Any]] = []
+    for source in manual:
+        row = dict(source)
+        folded = normalize_x_handle(row.get("handle")).casefold()
+        flag = row.get("directAlert")
+        # 存储是**三态**（True / False / 缺失），但 UI 的开关必须回答「现在到底
+        # 会不会弹」，所以在视图层收口成一个布尔：缺失 → 点名默认，其余原样。
+        row["directAlert"] = (folded in defaults) if flag is None else bool(flag)
+        manual_view.append(row)
     system = [
         source
         for source in [*x_kol_system_person_sources(), *x_kol_system_official_sources()]
@@ -6407,16 +6461,6 @@ def x_kol_sources_payload(user: dict[str, Any] | None = None) -> dict[str, Any]:
         "ok": True,
         "exists": bool(manual_sources),
         "sources": sources,
-    defaults = x_kol_direct_alert_default_handles()
-    manual_view: list[dict[str, Any]] = []
-    for source in manual:
-        row = dict(source)
-        folded = normalize_x_handle(row.get("handle")).casefold()
-        flag = row.get("directAlert")
-        # 存储是**三态**（True / False / 缺失），但 UI 的开关必须回答「现在到底
-        # 会不会弹」，所以在视图层收口成一个布尔：缺失 → 点名默认，其余原样。
-        row["directAlert"] = (folded in defaults) if flag is None else bool(flag)
-        manual_view.append(row)
         "categories": [{"id": category_id, "label": label} for category_id, label in X_KOL_CATEGORIES],
         "sourceCount": len(sources),
         "enabledCount": sum(1 for source in sources if source.get("enabled") is not False),
@@ -9983,6 +10027,51 @@ def binance_wallet_token_url(chain_id: Any, contract_address: Any) -> str:
     return binance_wallet_contract_url(chain_id, contract_address) or "https://web3.binance.com/zh-CN/markets"
 
 
+#: Subsystem chain codes → the path alias GMGN actually serves. GMGN only
+#: knows its own slugs: feeding it the smart-money monitor's ``ethereum`` /
+#: ``solana`` lands on a 404 page, because the same chains are ``eth`` / ``sol``
+#: there. Chain IDs (1 / 56 / 8453 / 4663) are deliberately NOT mapped — the
+#: caller falls back to a block explorer rather than emitting a dead link.
+GMGN_CHAIN_SLUGS = {
+    "ethereum": "eth", "eth": "eth", "以太坊": "eth",
+    "solana": "sol", "sol": "sol", "索拉纳": "sol",
+    "bsc": "bsc", "bnb": "bsc", "币安智能链": "bsc",
+    "base": "base",
+    "robinhood": "robinhood",
+}
+
+
+def gmgn_chain_slug(chain: Any) -> str:
+    """Fold a chain code into the alias ``gmgn_token_trade_url`` accepts.
+
+    Returns "" for anything it cannot vouch for (missing, chain IDs), which is
+    what makes the caller's explorer fallback kick in.
+    """
+    return GMGN_CHAIN_SLUGS.get(clean_feed_text(chain, 40).strip().casefold(), "")
+
+
+def gmgn_token_trade_url(chain: Any, contract_address: Any) -> str:
+    """Return the GMGN in-site trade page for an on-chain token.
+
+    GMGN hot-search rows already carry this link as their ``url``; the 5-minute
+    Robinhood 「新进」 popup and the smart-money 「KOL 买入」 popup reuse it so
+    their 「查看」 lands on the same page instead of a Binance Wallet / block
+    explorer page.  ``desktop_alert.py`` hands the URL to the user's own Chrome
+    profile, so the opened GMGN page is authenticated with the browser's
+    existing login session.
+
+    ``chain`` must already be a GMGN slug; callers holding an internal chain
+    code (``ethereum`` / ``solana``) run it through ``gmgn_chain_slug`` first.
+    Returns "" when the chain slug or contract is missing, so callers can fall
+    back instead of emitting a half-built link.
+    """
+    chain_code = clean_feed_text(chain, 40).strip().casefold()
+    contract = clean_feed_text(contract_address, 180)
+    if not chain_code or not contract or chain_code.isdigit():
+        return ""
+    return f"https://gmgn.ai/{quote(chain_code, safe='')}/token/{quote(contract, safe='')}"
+
+
 def binance_wallet_ai_narrative_available(raw: dict[str, Any]) -> bool:
     meta_info = raw.get("metaInfo") if isinstance(raw.get("metaInfo"), dict) else {}
     if int(safe_float(meta_info.get("aiNarrativeFlag"), 0)) == 1:
@@ -12375,7 +12464,7 @@ def gmgn_hot_rows_from_tokens(
             "marketCapUsd": market_cap,
             "tags": unique_values(["GMGN", "热搜", row_chain.upper()]),
             "note": f"GMGN {selected_period} 热搜 · {visits} 次访问",
-            "url": f"https://gmgn.ai/{quote(row_chain, safe='')}/token/{quote(contract, safe='')}",
+            "url": gmgn_token_trade_url(row_chain, contract),
         })
         if len(rows) >= max_rows:
             break
@@ -12766,6 +12855,55 @@ def gmgn_trench_chain_picker(
         },
     }
     return options, counts
+
+
+TRENCH_OVERLAY_CHAIN_ALL = "all"
+
+
+def normalize_trench_overlay_chain(value: Any) -> str:
+    """只接受「综合」或服务端真的在监控的链，其余一律回落 ``all``。
+
+    悬浮窗会把这个值直接拼进 ``/api/onchain-trenches?network=...``，所以必须在这里
+    收口：一个脏值（旧版本前端可能存过 ``sol`` 这类别名）不该让整个面板取不到数。
+    """
+    chain = clean_feed_text(value, 40).lower()
+    if not chain or chain == TRENCH_OVERLAY_CHAIN_ALL:
+        return TRENCH_OVERLAY_CHAIN_ALL
+    return chain if chain in ONCHAIN_RESEARCH_DEFAULT_NETWORKS else TRENCH_OVERLAY_CHAIN_ALL
+
+
+def trench_overlay_chain_preference() -> str:
+    """读榜单页写下的「当前查看链」；首次调用时从磁盘恢复。"""
+    with TRENCH_OVERLAY_CHAIN_PREFERENCE_LOCK:
+        if TRENCH_OVERLAY_CHAIN_PREFERENCE.get("loaded"):
+            return str(TRENCH_OVERLAY_CHAIN_PREFERENCE.get("chain") or TRENCH_OVERLAY_CHAIN_ALL)
+        chain = TRENCH_OVERLAY_CHAIN_ALL
+        try:
+            raw = json.loads(TRENCH_OVERLAY_CHAIN_PREFERENCE_PATH.read_text(encoding="utf-8"))
+            chain = normalize_trench_overlay_chain(
+                raw.get("chain") if isinstance(raw, dict) else raw
+            )
+        except (OSError, ValueError):
+            chain = TRENCH_OVERLAY_CHAIN_ALL
+        TRENCH_OVERLAY_CHAIN_PREFERENCE.update({"loaded": True, "chain": chain})
+        return chain
+
+
+def set_trench_overlay_chain_preference(value: Any) -> str:
+    """写入「当前查看链」并落盘，返回归一化后的值。"""
+    chain = normalize_trench_overlay_chain(value)
+    with TRENCH_OVERLAY_CHAIN_PREFERENCE_LOCK:
+        TRENCH_OVERLAY_CHAIN_PREFERENCE.update({"loaded": True, "chain": chain})
+    try:
+        TRENCH_OVERLAY_CHAIN_PREFERENCE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        TRENCH_OVERLAY_CHAIN_PREFERENCE_PATH.write_text(
+            json.dumps({"chain": chain, "updatedAt": int(time.time())}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        # 落盘失败只影响「重启后还记得」，当前进程照样生效，不该让请求跟着失败。
+        pass
+    return chain
 
 
 def gmgn_trench_board_rows(
@@ -15648,22 +15786,102 @@ def htx_contract_is_tradfi(item: Any) -> bool:
     return bool(labels & TRADFI_HTX_LABELS)
 
 
+BINANCE_FUTURES_HOSTS: tuple[str, ...] = (
+    "https://fapi.binance.com",
+    "https://fapi1.binance.com",
+    "https://fapi2.binance.com",
+    "https://fapi3.binance.com",
+    "https://fapi4.binance.com",
+)
+# Binance 新币榜最后一版成功结果。fapi 被限流/地域限制时会回一个**没有 symbols 的 JSON**
+# （{"code":-1003,...}），旧代码不校验响应体，直接当「榜单空了」渲染成
+# 「已请求 exchangeInfo，但没有返回可展示的新合约数据」——用户 2026-10-20 看到的就是这个。
+# 现在失败先退上一版数据，实在没有才报错，绝不把上游故障伪装成「没有新币」。
+BINANCE_NEW_LAST_GOOD: dict[str, dict[str, Any]] = {}
+
+
+def binance_futures_json(path: str, *, timeout: int = 18) -> Any:
+    """取 USDⓈ-M Futures 的公开接口，带镜像回退与响应体校验。
+
+    ``fapi1~4`` 是官方镜像（会 302 到健康节点），主站被限流时能顶上。
+    返回体不是预期结构时抛 RuntimeError，让调用方走「请求失败/退上一版」而不是空榜。
+    """
+    headers = {"User-Agent": HEADERS["User-Agent"], "Accept": "application/json"}
+    errors: list[str] = []
+    for host in BINANCE_FUTURES_HOSTS:
+        try:
+            response = requests.get(host + path, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:
+            errors.append(f"{host}: {safe_error_text(str(exc))[:80]}")
+            continue
+        # 限流/封禁时 HTTP 仍是 200，但 body 是 {"code":-1003,"msg":...}。
+        if isinstance(data, dict) and data.get("code") not in (None, 0):
+            errors.append(f"{host}: code={data.get('code')} {str(data.get('msg') or '')[:60]}")
+            continue
+        return data
+    raise RuntimeError("Binance Futures 接口不可用（" + " | ".join(errors[:2]) + "）")
+
+
+def _binance_new_disk_snapshot() -> dict[str, Any] | None:
+    """进程里还没有成功记录时（刚重启就赶上上游挂了），退回落盘的上一份快照。"""
+    try:
+        payload = read_json_cache(PERSIST_CACHE_DIR / "api_new-coin-rankings.json")
+        sections = payload.get("sections") if isinstance(payload, dict) else []
+        for section in sections or []:
+            if isinstance(section, dict) and section.get("id") == "binance-new" and section.get("rows"):
+                return section
+    except Exception as exc:
+        print(f"Binance new-coin disk snapshot failed: {safe_error_text(str(exc))[:120]}", file=sys.stderr)
+    return None
+
+
 def fetch_binance_new_coins() -> dict[str, Any]:
-    exchange_payload = requests.get(
-        "https://fapi.binance.com/fapi/v1/exchangeInfo",
-        headers={"User-Agent": HEADERS["User-Agent"], "Accept": "application/json"},
-        timeout=18,
-    ).json()
-    ticker_payload = requests.get(
-        "https://fapi.binance.com/fapi/v1/ticker/24hr",
-        headers={"User-Agent": HEADERS["User-Agent"], "Accept": "application/json"},
-        timeout=18,
-    ).json()
-    tickers = {item.get("symbol"): item for item in ticker_payload if isinstance(item, dict)}
+    try:
+        return _build_binance_new_coins()
+    except Exception as exc:
+        last_good = BINANCE_NEW_LAST_GOOD.get("payload") or _binance_new_disk_snapshot()
+        reason = safe_error_text(str(exc))[:140]
+        print(f"Binance new-coin board failed: {reason}", file=sys.stderr)
+        if last_good:
+            # 上游抖一下不该把整张榜清空：沿用上一版，并在副标题注明是上一版。
+            return {**last_good, "sourceName": f"Binance Futures exchangeInfo（当前请求失败，显示上一版：{reason[:60]}）"}
+        return source_template(
+            id="binance-new",
+            group="new-coin",
+            title="Binance 新币榜",
+            subtitle="USDⓈ-M Futures 官方 exchangeInfo onboardDate 排序",
+            accent="#f4b740",
+            source_label="BN",
+            source_name="Binance Futures exchangeInfo",
+            rows=[],
+            status="unavailable",
+            empty_title="Binance 新币榜请求失败",
+            empty_message=f"Binance Futures exchangeInfo 请求失败：{reason}",
+        )
+
+
+def _build_binance_new_coins() -> dict[str, Any]:
+    exchange_payload = binance_futures_json("/fapi/v1/exchangeInfo")
+    symbols_payload = exchange_payload.get("symbols") if isinstance(exchange_payload, dict) else None
+    if not isinstance(symbols_payload, list) or not symbols_payload:
+        raise RuntimeError("exchangeInfo 未返回 symbols 列表")
+    try:
+        ticker_payload = binance_futures_json("/fapi/v1/ticker/24hr")
+    except Exception as exc:
+        # 行情拿不到只影响价格/涨跌两列，榜本身照出。
+        print(f"Binance futures tickers failed: {safe_error_text(str(exc))[:120]}", file=sys.stderr)
+        ticker_payload = []
+    tickers = {
+        item.get("symbol"): item for item in (ticker_payload if isinstance(ticker_payload, list) else [])
+        if isinstance(item, dict)
+    }
     symbols = [
         item
-        for item in exchange_payload.get("symbols", [])
-        if item.get("status") == "TRADING"
+        for item in symbols_payload
+        if isinstance(item, dict)
+        and item.get("status") == "TRADING"
         and item.get("quoteAsset") == "USDT"
         and not binance_contract_is_tradfi(item)
         and not is_excluded_crypto_asset(item.get("baseAsset"))
@@ -15703,7 +15921,22 @@ def fetch_binance_new_coins() -> dict[str, Any]:
         )
         if len(rows) >= 10:
             break
-    return attach_listing_inventory(source_template(
+    empty_message = "已请求 Binance USDⓈ-M Futures exchangeInfo，但没有返回可展示的新合约数据。"
+    if not rows:
+        # 最近上线的全是美股/指数合约时，写清「不是接口坏了，是都被 TradFi 规则排掉了」，
+        # 免得又看到「没有返回可展示的新合约数据」以为抓取挂了（2026-10-20）。
+        recent = sorted(
+            (
+                item for item in symbols_payload
+                if isinstance(item, dict)
+                and item.get("status") == "TRADING"
+                and item.get("quoteAsset") == "USDT"
+            ),
+            key=lambda item: safe_float(item.get("onboardDate")), reverse=True,
+        )[:10]
+        if recent and all(binance_contract_is_tradfi(item) for item in recent):
+            empty_message = "最近上线的合约全部是美股/指数类（TradFi），按规则不计入新币榜。"
+    section = attach_listing_inventory(source_template(
         id="binance-new",
         group="new-coin",
         title="Binance 新币榜",
@@ -15714,8 +15947,12 @@ def fetch_binance_new_coins() -> dict[str, Any]:
         rows=rows,
         status="ok" if rows else "unavailable",
         empty_title="Binance 新币榜当前为空",
-        empty_message="已请求 Binance USDⓈ-M Futures exchangeInfo，但没有返回可展示的新合约数据。",
-    ), [(item.get("baseAsset"), item.get("onboardDate")) for item in exchange_payload.get("symbols", []) if isinstance(item, dict)])
+        empty_message=empty_message,
+    ), [(item.get("baseAsset"), item.get("onboardDate")) for item in symbols_payload if isinstance(item, dict)])
+    if rows:
+        # 只记成功结果：失败时靠它顶住上游抖动，不能把「请求失败」缓存成「没有新币」。
+        BINANCE_NEW_LAST_GOOD["payload"] = section
+    return section
 
 
 def fetch_okx_new_coins() -> dict[str, Any]:
@@ -16272,6 +16509,115 @@ def binance_alpha_timestamp_ms(value: Any) -> int:
     return timestamp
 
 
+# Alpha 全量元数据索引（symbol → 链/合约/流通市值）：做市商控盘提醒要用市值和合约地址，
+# 而「Alpha 新币榜」那 10 行只有榜上币、也没有市值。单独一条 10 分钟缓存，别跟榜单互相拖累。
+BINANCE_ALPHA_INDEX: dict[str, Any] = {"at": 0.0, "payload": {}}
+BINANCE_ALPHA_INDEX_LOCK = threading.Lock()
+BINANCE_ALPHA_INDEX_TTL_SECONDS = 600
+
+
+def binance_alpha_token_index(force_refresh: bool = False) -> dict[str, Any]:
+    """返回 `{"updatedAt", "tokens": {SYMBOL: {...}}}`，抓不到就退上一版（绝不返回假空）。"""
+    now = time.time()
+    with BINANCE_ALPHA_INDEX_LOCK:
+        cached_payload = BINANCE_ALPHA_INDEX.get("payload")
+        if (not force_refresh and isinstance(cached_payload, dict) and cached_payload
+                and now - safe_float(BINANCE_ALPHA_INDEX.get("at"), 0) < BINANCE_ALPHA_INDEX_TTL_SECONDS):
+            return cached_payload
+    try:
+        response = requests.get(
+            "https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list",
+            headers={**HEADERS, "Accept": "application/json", "clienttype": "web", "lang": "zh-CN"},
+            timeout=18,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        print(f"Binance Alpha index failed: {safe_error_text(str(exc))}", file=sys.stderr)
+        with BINANCE_ALPHA_INDEX_LOCK:
+            previous = BINANCE_ALPHA_INDEX.get("payload")
+        return previous if isinstance(previous, dict) else {}
+    data = payload.get("data") if isinstance(payload, dict) else []
+    items = data.get("tokens") if isinstance(data, dict) and isinstance(data.get("tokens"), list) else data
+    tokens: dict[str, dict[str, Any]] = {}
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        symbol = clean_price_watch_symbol(item.get("symbol") or item.get("tokenSymbol"))
+        if not symbol:
+            continue
+        chain_label = alpha_chain_label(item.get("chainName") or item.get("chain"))
+        market_cap = safe_float(item.get("marketCap") or item.get("mc") or item.get("marketCapUsd"), 0)
+        tokens[symbol] = {
+            "symbol": symbol,
+            "name": clean_feed_text(item.get("name") or item.get("tokenName") or symbol, 80),
+            "chain": chain_label,
+            "contract": clean_feed_text(item.get("contractAddress"), 96),
+            "marketCap": market_cap,
+            "price": safe_float(item.get("price") or item.get("priceUsd"), 0),
+            "change24h": safe_float(item.get("percentChange24h") or item.get("change24h"), 0),
+            "volume24h": safe_float(item.get("volume24h") or item.get("volume24hUsd"), 0),
+            "listedAt": binance_alpha_timestamp_ms(
+                item.get("listingTime") or item.get("onlineTgeTime") or item.get("onlineTime")
+            ),
+            # 「曾经是 Alpha、后来转正/下架」全靠这几个标记（2026-10-20 用户点名要纳入）。
+            # offline=True  = 已不在 Alpha 内交易（BMT 就是这种：offline + listingCex）。
+            # listingCex    = 已经上了币安现货（用户说的「上市后踢出 Alpha」的正解）。
+            # fullyDelisted = Alpha 轨道彻底结束；**不代表交易所退市**，BMT 也是 True，别拿它当排除条件。
+            "offline": bool(item.get("offline")),
+            "fullyDelisted": bool(item.get("fullyDelisted")),
+            "listingCex": bool(item.get("listingCex")),
+            "cexSymbol": clean_feed_text(item.get("cexCoinName"), 24),
+            "holders": int(safe_float(item.get("holders"), 0)) or 0,
+            "circulatingSupply": safe_float(item.get("circulatingSupply"), 0),
+            "fdv": safe_float(item.get("fdv"), 0),
+            "liquidity": safe_float(item.get("liquidity"), 0),
+        }
+    index_payload = {"updatedAt": int(now * 1000), "tokens": tokens}
+    if tokens:
+        with BINANCE_ALPHA_INDEX_LOCK:
+            BINANCE_ALPHA_INDEX["at"] = now
+            BINANCE_ALPHA_INDEX["payload"] = index_payload
+    return index_payload
+
+
+# 币安 U 本位永续的标的集合：做市商控盘提醒要用它判「条件 2：有永续合约」。
+# 涨幅榜只收 10 行，币可能压根没进榜；用 exchangeInfo 直接核对才准。
+BINANCE_PERP_BASE_ASSETS: dict[str, Any] = {"at": 0.0, "symbols": frozenset()}
+BINANCE_PERP_LOCK = threading.Lock()
+BINANCE_PERP_TTL_SECONDS = 600
+
+
+def binance_perp_base_assets() -> frozenset[str]:
+    """USDⓈ-M 永续的 base asset 集合（如 JCT/APR）；抓不到就退上一版。"""
+    now = time.time()
+    with BINANCE_PERP_LOCK:
+        cached_symbols = BINANCE_PERP_BASE_ASSETS.get("symbols")
+        if (isinstance(cached_symbols, frozenset) and cached_symbols
+                and now - safe_float(BINANCE_PERP_BASE_ASSETS.get("at"), 0) < BINANCE_PERP_TTL_SECONDS):
+            return cached_symbols
+    try:
+        payload = binance_futures_json("/fapi/v1/exchangeInfo", timeout=18)
+    except Exception as exc:
+        print(f"Binance perp list failed: {safe_error_text(str(exc))}", file=sys.stderr)
+        with BINANCE_PERP_LOCK:
+            previous = BINANCE_PERP_BASE_ASSETS.get("symbols")
+        return previous if isinstance(previous, frozenset) else frozenset()
+    symbols = {
+        str(item.get("baseAsset") or "").strip().upper()
+        for item in (payload.get("symbols") or [])
+        if isinstance(item, dict)
+        and str(item.get("contractType") or "").upper() == "PERPETUAL"
+        and str(item.get("quoteAsset") or "").upper() == "USDT"
+        and str(item.get("baseAsset") or "").strip()
+    }
+    if symbols:
+        with BINANCE_PERP_LOCK:
+            BINANCE_PERP_BASE_ASSETS["at"] = now
+            BINANCE_PERP_BASE_ASSETS["symbols"] = frozenset(symbols)
+    return frozenset(symbols)
+
+
 def fetch_binance_alpha_new_coins() -> dict[str, Any]:
     response = requests.get(
         "https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list",
@@ -16321,8 +16667,12 @@ def fetch_binance_alpha_new_coins() -> dict[str, Any]:
             "dateLabel": date_yyyy_mm_dd(listed_at) if listed_at else "Alpha 新近收录",
             "status": "Alpha",
             "assetType": "crypto",
+            # Alpha 是多链收录（BSC / ETH / Solana / Base / Sonic / Robinhood …），不是 BSC 专区。
+            # 链要单独成字段：弹窗文案与「某币在 Alpha 上是哪条链」都靠它，别再让人从前端 tags 里猜。
+            "chain": chain_name,
             "tags": list(dict.fromkeys(["Binance Alpha", chain_name or "链上", contract[:8] if contract else ""])),
-            "url": "https://www.binance.com/zh-CN/alpha",
+            # 直达这个币的 Alpha 交易页（/alpha/bsc/<合约>）；slug 没实测过的链退回首页。
+            "url": ALPHA_MM.binance_alpha_token_url(chain_name, contract),
         })
         if len(rows) >= 10:
             break
@@ -16330,7 +16680,7 @@ def fetch_binance_alpha_new_coins() -> dict[str, Any]:
         id="binance-alpha-new",
         group="new-coin",
         title="Binance Alpha 新币榜",
-        subtitle="Binance Alpha 官方公开代币清单，按收录时间展示最近 10 个",
+        subtitle="Binance Alpha 官方公开代币清单，按收录时间展示最近 10 个 · 合约极其恶心，拉盘预期极猛，千万别碰，买现货",
         accent="#f3ba2f",
         source_label="BA",
         source_name="Binance Alpha token list",
@@ -16338,7 +16688,13 @@ def fetch_binance_alpha_new_coins() -> dict[str, Any]:
         status="ok" if rows else "unavailable",
         empty_title="Binance Alpha 新币榜当前为空",
         empty_message="Binance Alpha 公开代币接口暂未返回可展示的收录时间数据。",
-    ), [(item.get("symbol") or item.get("tokenSymbol"), stamp) for stamp, item in normalized])
+    ), [
+        # 链一起存进清单：AIcoin 之类「某榜新进 + 是 Alpha 币」的弹窗要靠 asset→链 映射，
+        # 而那个币通常不在榜上这 10 行里，只有全量清单认得它。
+        (item.get("symbol") or item.get("tokenSymbol"), stamp,
+         clean_feed_text(item.get("chainName") or item.get("chain"), 40))
+        for stamp, item in normalized
+    ])
 
 
 def new_coin_rankings_payload() -> dict[str, Any]:
@@ -24272,6 +24628,17 @@ def normalize_desktop_alert(payload: dict[str, Any]) -> dict[str, Any]:
             payload.get("chain"),
             50,
         ),
+        # 链的展示标签与「哪个币」必须活到渲染层，否则弹窗没法标注链。
+        # 注意 ``chain`` 在各类事件里有四种形态（数字 chainId / GMGN slug /
+        # 内部代号 / 展示标签），统一归一由 annotate_desktop_alert_chain 负责。
+        "chainLabel": alert_text(
+            payload.get("chainLabel") or payload.get("network"),
+            40,
+        ),
+        "symbol": alert_text(
+            payload.get("symbol") or payload.get("ticker"),
+            32,
+        ),
         "imageUrl": alert_text(payload.get("imageUrl"), 600),
         "imagePath": alert_text(payload.get("imagePath"), 600),
         "time": payload.get("time") or int(time.time() * 1000),
@@ -24324,6 +24691,19 @@ def normalize_desktop_alert(payload: dict[str, Any]) -> dict[str, Any]:
         # Must survive normalization or the delivery-time mute bypass silently
         # stops working (learned the hard way with launchpadPlatform).
         "platformOwnToken": bool(payload.get("platformOwnToken")),
+        # 同上：这个标记也要活着穿过 normalization，否则投递期「Alpha 币热榜新进」
+        # 的静默豁免会失效，AIcoin 新进弹窗又被吞掉。
+        "alphaListed": bool(payload.get("alphaListed")),
+        # 做市商控盘提醒（alpha-mm-*）的结构化字段。正文里已经写了链和 Alpha 阶段，
+        # 但白名单不显式放行的话渲染层永远拿不到这些值（2026-10-21 补）。
+        "alphaPhase": alert_text(payload.get("alphaPhase"), 60),
+        "mmControlPct": safe_float(payload.get("mmControlPct"), 0),
+        "mmMarketCapUsd": safe_float(payload.get("mmMarketCapUsd"), 0),
+        "mmSupportPrice": safe_float(payload.get("mmSupportPrice"), 0),
+        # 弹窗价（数值）。只给「链上 Top10 持仓率」的 symbol 反查当身份闸用：
+        # 榜单行只有 symbol 时，靠「弹窗价 ÷ Arkham 价」拦掉同名不同币
+        # （AIcoin 的 CL 是原油，Arkham 搜出来的第一个 cl 是 CoinLancer）。
+        "priceValue": safe_float(payload.get("priceValue"), 0),
         # Marks a popup as a ``project`` (vs meme) finding.  Purely a label —
         # it does not affect delivery or mute policy.
         "projectCandidate": bool(payload.get("projectCandidate")),
@@ -24348,6 +24728,610 @@ def normalize_desktop_alert(payload: dict[str, Any]) -> dict[str, Any]:
             and source == "News Trade 监控"
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# 「这条弹窗说的是哪个币、在哪条链」
+#
+# 用户 2026-10-17：凡是弹窗中涉及到币的，都要标注它对应的链。难点在于 ``chain``
+# 在各类事件里有四种互不兼容的形态：
+#   * 数字 chainId / 币安钱包链号 —— "1"、"56"、"8453"、"4663"、"CT_501"
+#   * GMGN slug —— "sol"、"bsc"、"eth"、"robinhood"
+#   * 项目内部代号 —— "ethereum"、"solana"、"bsc"、"base"
+#   * 展示标签 —— "BSC"、"Solana"、"Robinhood"（Alpha 那条线直接写标签）
+# 不归一就会出现同一个 Solana 在三个弹窗里写成 SOL / CT_501 / solana。
+# 事件里没带链的按「合约地址形态 → Alpha 收录清单 → 监控池 onchain 记录」依次兜底；
+# 仍然算不出、但明确只出现在交易所行情/榜单里的，标「中心化」——那是「没有链上合约」，
+# 不是「不知道是哪条链」。跨界事件（X 推文、快讯）宁可留空，也不硬标一条链。
+# ---------------------------------------------------------------------------
+def _desktop_alert_chain_key(value: Any) -> str:
+    return re.sub(r"[^0-9a-z]", "", clean_feed_text(value, 40).casefold())
+
+
+DESKTOP_ALERT_CHAIN_ALIASES: dict[str, str] = {
+    # ETH
+    "1": "ETH", "eth": "ETH", "ethereum": "ETH", "mainnet": "ETH",
+    # BSC
+    "56": "BSC", "bsc": "BSC", "bnb": "BSC", "binance": "BSC",
+    "bnbchain": "BSC", "bnbsmartchain": "BSC", "binancesmartchain": "BSC",
+    # Solana
+    "501": "Solana", "ct501": "Solana", "sol": "Solana", "solana": "Solana",
+    # Base
+    "8453": "Base", "base": "Base",
+    # Robinhood
+    "4663": "Robinhood", "robinhood": "Robinhood", "robinhoodchain": "Robinhood",
+    "rbn": "Robinhood",
+    # 其余见得到的链
+    "sonic": "Sonic", "sui": "Sui", "tron": "Tron", "trx": "Tron", "near": "NEAR",
+    "42161": "Arbitrum", "arb": "Arbitrum", "arbitrum": "Arbitrum",
+    "10": "Optimism", "op": "Optimism", "optimism": "Optimism",
+    "137": "Polygon", "pol": "Polygon", "polygon": "Polygon", "matic": "Polygon",
+    "43114": "Avalanche", "avax": "Avalanche", "avalanche": "Avalanche",
+    "ton": "TON", "apt": "Aptos", "aptos": "Aptos", "monad": "Monad", "arc": "Arc",
+    "starknet": "Starknet", "strk": "Starknet", "hyperliquid": "Hyperliquid",
+    "hyperevm": "Hyperliquid", "mantle": "Mantle", "sei": "Sei", "plasma": "Plasma",
+    "megaeth": "MegaETH", "berachain": "Berachain", "blast": "Blast", "linea": "Linea",
+}
+# 上游占位符不是链名（「链上」「多链」清洗后为空，这里再兜一层英文占位）。
+DESKTOP_ALERT_CHAIN_PLACEHOLDERS = frozenset({
+    "", "chain", "onchain", "unknown", "na", "none", "null", "multichain",
+})
+# 只在交易所/行情榜里出现（没有链上合约）的来源与文案标记。
+DESKTOP_ALERT_CEX_MARKERS = (
+    "binance", "okx", "gate", "htx", "bitget", "bybit", "kucoin", "mexc",
+    "aicoin", "market-leader", "成交额榜", "涨幅榜", "热门榜", "热榜", "榜首",
+)
+# 股票/商品/宏观类弹窗：不是币，不标链。
+DESKTOP_ALERT_STOCK_MARKERS = (
+    "富途", "nasdaq", "东方财富", "港股", "美股", "a股", "tradfi", "stock", "futu",
+)
+# **只有这些来源的弹窗才配标链**：它们的 key 前缀本身就说明「这条弹窗在讲某个币」。
+# 快讯 / 推文 / 简报（key 前缀是 flash / x-kol / brief / event-monitor …）一律不标——
+# 它们只是「提到了币」，而且没有币身份，靠标题尾部猜出来的「币名」全是噪音：
+# 「马斯克：美债危机…AI 和机器人」被抽成 AI（池里真有叫 AI 的币，于是整类快讯被标成
+# Robinhood 链）、「谷歌 Gemini 4…连中 7 次」被抽成 7。用户 2026-10-17 报的就是这个。
+DESKTOP_ALERT_CHAIN_KEY_PREFIXES = (
+    "price-watch:", "rank-monitor:", "rank-cross:", "market-leader:",
+    "gainers-leader:", "first-listing:", "venue-listing:", "listing:",
+    "alpha-new:", "alpha-mm-", "smart-money-buy:", "chat-ca-hourly:", "gmgn-",
+    # 价格异动（2026-10-21）：合约币没有 chain、也没有合约地址，不加前缀就会被
+    # 「作用域闸」挡在 Alpha 身份之外 —— 币在 Alpha 清单里却标不出来。
+    "price-move:",
+    # 地址集群（2026-10-21）：key 形如 ``arkham-cluster:entity:<id>``，
+    # 不在这里就会被作用域闸挡掉，链标签与 Alpha 身份全失效。
+    "arkham-cluster:",
+)
+
+
+def desktop_alert_chain_label(value: Any) -> str:
+    """把任意形态的链标识归一成展示标签（BSC / ETH / Solana / Base / Robinhood …）。"""
+    text = clean_feed_text(value, 40).strip()
+    if not text:
+        return ""
+    key = _desktop_alert_chain_key(text)
+    if key in DESKTOP_ALERT_CHAIN_PLACEHOLDERS:
+        return ""
+    label = DESKTOP_ALERT_CHAIN_ALIASES.get(key)
+    if label:
+        return label
+    if key.isdigit():
+        # 别名表以外的裸链号对用户没有任何意义（监控池里真出现过 onchain_chain="5042"），
+        # 与其把数字印在弹窗上，不如不写。
+        return ""
+    # 表里没的交给既有展示标签兜底——宁可显示上游生名，也别把已知的链写成空白。
+    return chain_display_label(text)
+
+
+PRICE_WATCH_CHAIN_MAP_LOCK = threading.Lock()
+PRICE_WATCH_CHAIN_MAP_CACHE: tuple[float, dict[str, str]] = (0.0, {})
+PRICE_WATCH_CHAIN_MAP_SECONDS = 120
+
+
+def price_watch_chain_map() -> dict[str, str]:
+    """监控池的 ``symbol → 链展示标签`` 快照（带 TTL 缓存）。
+
+    弹窗每分钟几十条，不能每条都打一次库；池子的链记录很少变，两分钟一次足够。
+
+    值可以是 ``""``：那代表「这个币在池里，但池子没有它的链上记录」——多数是从交易所
+    合约上新进来的币，没有链上合约。查询方靠 ``in`` 判断在不在池里，别用 ``get() or``
+    把这两种情况混成一个空。
+    """
+    global PRICE_WATCH_CHAIN_MAP_CACHE
+    now = time.time()
+    with PRICE_WATCH_CHAIN_MAP_LOCK:
+        cached_at, cached_map = PRICE_WATCH_CHAIN_MAP_CACHE
+        if cached_at and now - cached_at < PRICE_WATCH_CHAIN_MAP_SECONDS:
+            return cached_map
+    try:
+        mapping: dict[str, str] = {}
+        # 纯读：与 WAL 写入天然互斥，绝不能去抢全局应用锁（锁序倒挂）。
+        with auth_db() as conn:
+            for row in conn.execute(
+                "SELECT symbol, onchain_chain, onchain_chain_label, onchain_contract_address "
+                "FROM price_watch_assets"
+            ):
+                symbol = price_structure_monitor_symbol(row["symbol"])
+                if not symbol:
+                    continue
+                contract = str(row["onchain_contract_address"] or "").strip()
+                raw_chain = str(row["onchain_chain_label"] or row["onchain_chain"] or "").strip()
+                label = desktop_alert_chain_label(raw_chain)
+                if not label:
+                    if contract and not contract.lower().startswith("0x") and re.fullmatch(
+                        r"[1-9A-HJ-NP-Za-km-z]{32,44}", contract
+                    ):
+                        # 有合约地址却没记链：base58 = Solana mint（池里 ARC / ZEREBRO 这类）。
+                        label = "Solana"
+                    elif raw_chain:
+                        # 池里记了链名却认不出来（真出现过 onchain_chain="5042" 这种裸链号）
+                        # ——说不清是哪条链，宁可不标，也别退化成「中心化」。
+                        continue
+                mapping[symbol] = label
+    except Exception as exc:
+        print(
+            "Desktop alert chain map failed: " + safe_error_text(str(exc))[:160],
+            file=sys.stderr,
+        )
+        return PRICE_WATCH_CHAIN_MAP_CACHE[1]
+    with PRICE_WATCH_CHAIN_MAP_LOCK:
+        PRICE_WATCH_CHAIN_MAP_CACHE = (now, mapping)
+    return mapping
+
+
+def desktop_alert_asset_symbol(item: dict[str, Any]) -> str:
+    """这条弹窗对应哪个币（尽力而为，取第一个可靠的线索）。"""
+    if not isinstance(item, dict):
+        return ""
+    # 价格/结构类：key 里或 confirm/exclude 字段里就是标的。
+    monitor = desktop_alert_monitor_symbol(item)
+    if monitor:
+        return monitor
+    for field in ("symbol", "ticker"):
+        symbol = price_structure_monitor_symbol(item.get(field))
+        if symbol:
+            return symbol
+    key = alert_text(item.get("key"), 220)
+    # rank-monitor:<board>|<sourceId>:<group>:<asset>|...
+    # 注意币安钱包热榜的 key 是 ``…:wallet:56:0xea37…``——冒号段是「链号 + 合约」，
+    # 直接当币名会拼出 ``560XEA37A8DE1DE2D9D1`` 这种假 symbol（2026-10-21 实测），
+    # 于是 Alpha 身份和监控池都查不到。这种 key 本身不含币名，交给标题兜底。
+    match = re.match(r"rank-monitor:[^|]*\|[^|:]+:[^|:]*:([^|]+)", key, re.I)
+    if match:
+        candidate = alert_text(match.group(1), 96)
+        chain_or_contract = bool(
+            re.fullmatch(r"\d+", candidate) or re.search(r"0x[0-9a-f]{6,}", candidate, re.I)
+        )
+        if candidate and not chain_or_contract:
+            return price_structure_monitor_symbol(candidate)
+    # market-leader:<sourceId>|<asset>|...
+    match = re.match(r"market-leader:[^|]+\|([^|]+)", key, re.I)
+    if match:
+        return price_structure_monitor_symbol(match.group(1))
+    # price-watch:<family>:<SYMBOL>:<detail>...（结构观察 / 起爆预判 / Fib 收复）
+    match = re.match(r"price-watch:[^:]+:([^:]+)", key, re.I)
+    if match:
+        return price_structure_monitor_symbol(match.group(1))
+    # gainers-leader:<board>|<asset>（涨幅榜榜首易主，标题里只有中文没有币名分隔符）
+    match = re.match(r"gainers-leader:[^|]*\|([^|]+)", key, re.I)
+    if match:
+        return price_structure_monitor_symbol(match.group(1))
+    # first-listing:<SYMBOL>:<stamp>
+    match = re.match(r"first-listing:([^:|]+)", key, re.I)
+    if match:
+        return price_structure_monitor_symbol(match.group(1))
+    # venue-listing:<feed>:<SYMBOL>:<stamp>（OKX 新合约这类按交易所分 feed 的上新）
+    match = re.match(r"venue-listing:[^:]+:([^:|]+)", key, re.I)
+    if match:
+        return price_structure_monitor_symbol(match.group(1))
+    # listing:<id>|<source>|<name>|<ticker>|...（港美股用 ticker，链上币用 symbol）
+    match = re.match(r"listing:[^|]*\|[^|]*\|[^|]*\|([^|]+)", key, re.I)
+    if match:
+        return price_structure_monitor_symbol(match.group(1))
+    # alpha-new:<asset>
+    match = re.match(r"alpha-new:([^:|]+)", key, re.I)
+    if match:
+        return price_structure_monitor_symbol(match.group(1))
+    # 标题尾部「…：SYMBOL」是这批榜单弹窗的固定写法。
+    match = re.search(r"[：:]\s*([0-9A-Za-z\u3400-\u9fff][^：:]{0,23})\s*$", alert_text(item.get("title"), 120))
+    if match:
+        return price_structure_monitor_symbol(match.group(1))
+    return ""
+
+
+def desktop_alert_chain_scope_allows(item: dict[str, Any]) -> bool:
+    """这条弹窗该不该标链（见 DESKTOP_ALERT_CHAIN_KEY_PREFIXES 的注释）。
+
+    自带合约地址（链上币）或自带链的事件不受前缀限制——那已经是硬证据。
+    """
+    if alert_text(item.get("contractAddress"), 180):
+        return True
+    if desktop_alert_chain_label(item.get("chainLabel")) or desktop_alert_chain_label(item.get("chain")):
+        return True
+    key = alert_text(item.get("key"), 220).casefold()
+    return bool(key) and any(
+        key.startswith(prefix) for prefix in DESKTOP_ALERT_CHAIN_KEY_PREFIXES
+    )
+
+
+def alpha_phase_for_asset(symbol: str) -> str:
+    """这个币在币安 Alpha 清单里吗？在就给出「Alpha · BSC」/「Alpha 在列」。
+
+    唯一的判定实现：``desktop_alert_alpha_phase``（读弹窗字段）和
+    ``price_move_payload``（给列表每行标 Alpha）都走这里。**必须在清单里**才算，
+    不能因为「查不到链」就当成在列。
+    """
+    key = listing_asset_key(symbol)
+    if not key or (key not in ALPHA_LISTED_CHAINS and key not in ALPHA_LISTED_ASSETS):
+        return ""
+    chain = desktop_alert_chain_label(ALPHA_LISTED_CHAINS.get(key) or "")
+    return f"Alpha · {chain}" if chain else "Alpha 在列"
+
+
+def desktop_alert_alpha_phase(item: dict[str, Any]) -> str:
+    """这条弹窗的币在币安 Alpha 清单里吗？在就给出「Alpha · BSC」。
+
+    为什么不直接写进 ``chainLabel``：交易所榜单上的标的是「交易所标的」，拿 Alpha 的链
+    去顶链标注会重演 2026-10-17 的「现货 XRP 被标成 BSC」（那条错在拿监控池里同 ticker
+    的桥接代币顶包，池子那条 XRP 是 BSC 上的 0x1d2f0da1…）。但「它在币安 Alpha 清单里、
+    清单上写的链是 BSC」是另一层事实——用户 2026-10-21 原话「可是 JCT 是 alpha 里的啊」，
+    他要的就是这层信息出现在弹窗上。所以：``chainLabel`` 继续保守，``alphaPhase`` 负责
+    「这币在 Alpha」这件事，两者不互相冒充。
+    """
+    if not isinstance(item, dict):
+        return ""
+    if not desktop_alert_chain_scope_allows(item):
+        return ""
+    symbol = desktop_alert_asset_symbol(item)
+    if not symbol:
+        return ""
+    return alpha_phase_for_asset(symbol)
+
+
+def desktop_alert_chain_annotation(item: dict[str, Any], *, allow_pool_lookup: bool = True) -> str:
+    """算出这条弹窗的链标注；算不出返回 ""（宁缺勿错）。
+
+    ``allow_pool_lookup=False`` 供"持有价格库事务"的调用方使用：那条路径明确不许
+    再做额外 I/O，只认事件自带的链与 Alpha 清单。
+    """
+    if not isinstance(item, dict):
+        return ""
+    direct = desktop_alert_chain_label(item.get("chainLabel")) or desktop_alert_chain_label(
+        item.get("chain")
+    )
+    if direct:
+        return direct
+    haystack = " ".join(
+        alert_text(item.get(field), 80).casefold()
+        for field in ("sourceId", "source", "kind", "title")
+    )
+    if any(marker in haystack for marker in DESKTOP_ALERT_STOCK_MARKERS):
+        return ""
+    if not desktop_alert_chain_scope_allows(item):
+        return ""
+    symbol = desktop_alert_asset_symbol(item)
+    contract = alert_text(item.get("contractAddress"), 180)
+    # base58 且无 0x 前缀 = Solana mint（GMGN / Alpha 的链上行都带 CA）。
+    if contract and not contract.lower().startswith("0x") and re.fullmatch(
+        r"[1-9A-HJ-NP-Za-km-z]{32,44}", contract
+    ):
+        return "Solana"
+    # **有合约 = 链上币，才允许去 Alpha 清单 / 监控池里找链。**
+    # 没有合约、又出自交易所行情榜（成交额榜 / 涨幅榜 / 热门榜 / AIcoin）的，是「交易所
+    # 标的」，和同 ticker 的链上币是两种东西——拿池子里的链去凑就是 2026-10-17 那个
+    # 「XRP 标成 BSC」：池里那条 XRP 是 BSC 上的桥接代币 0x1d2f0da1…，跟币安现货 XRP
+    # 毫无关系。这种情况只能说「中心化」，不能给一条假链。
+    if not contract and any(marker in haystack for marker in DESKTOP_ALERT_CEX_MARKERS):
+        return "中心化"
+    if symbol:
+        alpha_chain = desktop_alert_chain_label(
+            binance_alpha_chain_for_asset({"symbol": symbol})
+        )
+        if alpha_chain:
+            return alpha_chain
+        if allow_pool_lookup:
+            pool_key = price_structure_monitor_symbol(symbol)
+            pool_map = price_watch_chain_map()
+            if pool_key in pool_map:
+                # 在池里但链记录是空的 = 从交易所合约上新进来的币，没有链上合约。
+                return pool_map[pool_key] or "中心化"
+    return ""
+
+
+def alpha_risk_note_body(body: Any, *, limit: int = 180) -> str:
+    """把 Alpha 那句风险提示拼到正文末尾；正文过长时**优先保住提示**。
+
+    正文在 ``normalize_desktop_alert`` 里已经被截到 180 字符，直接往后接会被砍掉半句，
+    所以先给提示留出位置再从尾巴上裁。
+    """
+    text = alert_text(body, limit)
+    note = ALPHA_NEW_RISK_NOTE
+    if not note or note in text:
+        return text
+    room = limit - len(note) - 3  # " / " 分隔符
+    trimmed = text[:room].rstrip(" /·,，。;；|") if room > 0 else ""
+    return f"{trimmed} / {note}" if trimmed else note
+
+
+def annotate_desktop_alert_alpha_skin(item: dict[str, Any]) -> dict[str, Any]:
+    """BSC 链的 Alpha 币：染红 + 正文补那句风险提示。
+
+    用户 2026-10-21 把这条从「只属于 Alpha 新币榜」放开到**所有**弹窗：不再看来源是
+    涨幅榜 / AIcoin / 钱包热榜 / 价格监控，只看「这币在 Alpha 清单里、清单上标的是 BSC」。
+    （2026-10-17 曾因币安钱包热榜的 POP 被套上那句话而收紧，但那次的前提是用户以为
+    POP「不是 alpha 的」；确认「Alpha 收录过、后来转正/下架也算」之后，这条限制就没
+    依据了。）实测放开面：近 7 天新增 104 条 ≈ 15 条/天，占总量 6%。
+
+    和 ``apply_alpha_red_tone`` 同一纪律：**只换皮肤**——不动 ``queuePriority``、
+    不绕静默。红色是「更该看」，不是「更该抢队列」。
+    """
+    if not isinstance(item, dict):
+        return item
+    phase = alert_text(item.get("alphaPhase"), 60)
+    if not phase:
+        return item
+    # alphaPhase 有两种形态：「Alpha · BSC」（榜单自动补）和 alpha-mm 自己的
+    # 「Alpha 在列 / 已下架…」（没有链），后者退回 chainLabel 取链。
+    chain = phase.split("·")[-1].strip() if "·" in phase else alert_text(item.get("chainLabel"), 20)
+    if not alpha_chain_is_red(chain):
+        return item
+    item["alertTone"] = "red"
+    item["body"] = alpha_risk_note_body(item.get("body"))
+    return item
+
+
+def annotate_desktop_alert_chain(
+    item: dict[str, Any], *, allow_pool_lookup: bool = True
+) -> dict[str, Any]:
+    """投递前的统一整理：补 ``alphaPhase`` → 补 ``chainLabel`` → Alpha 风险皮肤。
+
+    所有弹窗都从 ``launch_desktop_alert`` 这一处出闸，所以这三件事都挂在这里，别指望
+    26 个调用点各自记得带上。
+    """
+    if not isinstance(item, dict):
+        return item
+    # Alpha 身份先补。alpha-mm-* 自己已经把「Alpha 在列 / 已下架」写进 alphaPhase，
+    # 别用这里的「Alpha · BSC」把它覆盖掉。只查内存清单，不做 I/O。
+    if not alert_text(item.get("alphaPhase"), 60):
+        phase = desktop_alert_alpha_phase(item)
+        if phase:
+            item["alphaPhase"] = phase
+    existing = desktop_alert_chain_label(item.get("chainLabel"))
+    if existing:
+        item["chainLabel"] = existing
+    else:
+        label = desktop_alert_chain_annotation(item, allow_pool_lookup=allow_pool_lookup)
+        if label:
+            item["chainLabel"] = label
+    return annotate_desktop_alert_alpha_skin(item)
+
+
+# ---------------------------------------------------------------------------
+# 「这个币的链上筹码集不集中」—— 弹窗里的 Top10 持仓率
+#
+# 用户 2026-10-21：
+#   「把 AIcoin 热门榜的标的，还有异动提醒，涨幅榜提醒里的标的，再做一个链上 top10
+#     持仓计算，如果超过了 70%，也在弹窗里提醒」
+#   「并且把具体的 top10 持仓率显示出来」
+#
+# 只有这两类、三个来源的弹窗算（:func:`top10_alert_in_scope`）：快讯 / X 推文 /
+# 简报 / 结构观察要么没有一个可靠的「这是哪个币」，要么本来就不是筹码问题，
+# 一条条去查 Arkham 只会白烧请求（单请求 1.6–2.4 秒，还有全局限速）。
+#
+# 口径（Arkham 前十行直接相加）、symbol → 链上合约的三道闸、「失败不写 0%」这些
+# 全部在 ``top10_holders`` 里；这里只管「哪条弹窗该挂」和「挂上去怎么写」。
+# ---------------------------------------------------------------------------
+TOP10_HOLDERS = TOP10.Top10Holders()
+
+#: 这些 key 前缀本身就说明「这条弹窗在讲某个币的价格/排名」，可以算 Top10。
+TOP10_ALERT_KEY_PREFIXES = (
+    "price-move:", "gainers-leader:", "market-leader:", "rank-cross:",
+)
+
+
+def top10_alert_in_scope(item: dict[str, Any]) -> bool:
+    """这条弹窗要不要算 Top10 持仓率（用户点名的三个来源）。"""
+    if not isinstance(item, dict):
+        return False
+    key = alert_text(item.get("key"), 220).casefold()
+    if not key:
+        return False
+    if key.startswith(TOP10_ALERT_KEY_PREFIXES):
+        return True
+    if not key.startswith("rank-monitor:"):
+        return False
+    # rank-monitor 覆盖所有榜单（A股 / 美股 / 港股 / 成交额 / 钱包 / AIcoin / 涨幅）。
+    # 只取用户点名的两个：AIcoin 热门榜、涨幅榜。key 里就带 sourceId
+    # （``rank-monitor:hot|aicoin:…``），所以和标题一起看。
+    haystack = " ".join(
+        [key]
+        + [
+            alert_text(item.get(field), 80).casefold()
+            for field in ("sourceId", "source", "kind", "title")
+        ]
+    )
+    return "aicoin" in haystack or "gainers" in haystack or "涨幅" in haystack
+
+
+def append_alert_body_note(body: Any, note: str, *, limit: int = 200) -> str:
+    """把一句话接到正文末尾；正文过长时从**中间正文**上裁，绝不裁掉末尾的风险提示。
+
+    正文在 ``normalize_desktop_alert`` 里已经被截到 180 字符，而 Alpha 那句
+    「合约极其恶心…千万别碰，买现货」是这条弹窗最该看完的话 —— 先把它摘下来，
+    裁完正文再放回最尾巴。否则 Top10 一拼上去就把「买现货」吃掉半句。
+    """
+    text = alert_text(body, 400)
+    tail = ALPHA_NEW_RISK_NOTE if (ALPHA_NEW_RISK_NOTE and ALPHA_NEW_RISK_NOTE in text) else ""
+    if tail:
+        text = text.replace(f" / {tail}", "").replace(tail, "").rstrip(" /·,，。;；|")
+    addition = note if note and note not in text else ""
+    head = " / ".join(bit for bit in (text, addition) if bit)
+    budget = max(0, limit - (3 + len(tail) if tail else 0))
+    if len(head) > budget:
+        room = max(0, budget - len(addition) - 3) if addition else budget
+        head = (
+            f"{head[:room].rstrip(' /·,，。;；|')} / {addition}" if room > 0 else addition
+        )
+    if tail:
+        head = f"{head} / {tail}" if head else tail
+    return head
+
+
+def annotate_desktop_alert_top10(item: dict[str, Any]) -> dict[str, Any]:
+    """给榜单 / 异动弹窗补「链上 Top10 持仓率」（Arkham + GMGN 两个口径）。
+
+    * 数字**恒显示**（用户要求），两个源并排标源；拿不到就写「未收录 / 暂不可用」，
+      绝不写 0%；
+    * 任一源 ≥70% 追加「筹码高度集中」（只有一边超线时点名是谁）；
+    * **只动正文和顶部字段**：不改 ``queuePriority``、不动皮肤、不绕静默 ——
+      和 ``annotate_desktop_alert_alpha_skin`` 同一纪律。红色留给 Alpha 控盘那条。
+    """
+    if not top10_alert_in_scope(item):
+        return item
+    contract = alert_text(item.get("contractAddress"), 180)
+    symbol = desktop_alert_asset_symbol(item)
+    if not contract and not symbol:
+        return item
+    entry = TOP10_HOLDERS.lookup(
+        alert_text(item.get("chain"), 60),
+        contract,
+        symbol=symbol,
+        price=safe_float(item.get("priceValue"), 0),
+    )
+    text = TOP10.body_text(entry)
+    if not text:
+        return item
+    sources = entry.get("sources") if isinstance(entry.get("sources"), dict) else {}
+    arkham = sources.get("arkham") or {}
+    gmgn = sources.get("gmgn") or {}
+    item["top10Status"] = str(entry.get("status") or "")
+    # 两个口径各存一份（用户 2026-10-21：「两个版本都做一个统计」）。
+    item["top10ArkhamPct"] = safe_float(arkham.get("pct"), 0)
+    item["top10GmgnPct"] = safe_float(gmgn.get("pct"), 0)
+    # 兼容旧读法：``top10Pct`` 仍是 Arkham 那个数，「有没有超线」看两源里高的那个。
+    item["top10Pct"] = safe_float(entry.get("pct"), 0)
+    item["top10Count"] = int(safe_float(entry.get("count"), 0))
+    item["top10High"] = any(
+        str(source.get("status") or "") == "ok"
+        and safe_float(source.get("pct"), 0) >= TOP10.RISK_THRESHOLD_PCT - 1e-9
+        for source in (arkham, gmgn)
+    )
+    pricing_id = str(entry.get("pricingId") or "").strip()
+    if pricing_id:
+        item["top10Url"] = ARKHAM_API.arkham_token_url(pricing_id)
+    item["body"] = append_alert_body_note(item.get("body"), text)
+    return item
+
+
+# ---------------------------------------------------------------------------
+# 弹窗里的 CoinMarketCap 流通市值（用户 2026-10-24：「帮我在弹窗中加上相应币的
+# 流通市值，用coinmarket的数据」）。
+#
+# 数据走 CMC 网页端免 key 的 data-api 整榜快照（5000 名、后台 4 小时一刷），弹窗
+# 路径只查内存。挂点和 Top10 完全同构：出闸处、去重之后、入库渲染之前；作用域
+# 沿用「该不该标链」那道闸（``desktop_alert_chain_scope_allows``），股票标记的
+# 排除沿用链标注同一份名单。**拿不到就沉默**——没有市值就不加正文，绝不写 $0。
+# ---------------------------------------------------------------------------
+CMC_MARKET_CAP = CMC_MC.default_store()
+
+
+def annotate_desktop_alert_mcap(item: dict[str, Any]) -> dict[str, Any]:
+    """给弹窗补 CoinMarketCap 流通市值；查不到时保持沉默（只记诊断字段）。"""
+    if not isinstance(item, dict):
+        return item
+    if not desktop_alert_chain_scope_allows(item):
+        return item
+    haystack = " ".join(
+        alert_text(item.get(field), 80).casefold()
+        for field in ("sourceId", "source", "kind", "title")
+    )
+    if any(marker in haystack for marker in DESKTOP_ALERT_STOCK_MARKERS):
+        return item
+    symbol = desktop_alert_asset_symbol(item)
+    if not symbol:
+        return item
+    entry = CMC_MARKET_CAP.lookup(symbol)
+    status = str(entry.get("status") or "")
+    item["cmcMcapStatus"] = status
+    if status != "ok":
+        return item
+    item["cmcMcapUsd"] = safe_float(entry.get("mcapUsd"), 0)
+    item["cmcRank"] = int(safe_float(entry.get("rank"), 0))
+    item["cmcSlug"] = alert_text(entry.get("slug"), 120)
+    # 基本面四项（2026-10-25）：弹窗上除了市值，还要能直接看到流通量/流通率/总量，
+    # 否则「市值很小」和「总量巨大、只流通 1%」会看成同一件事。
+    basics = CMC_MARKET_CAP.fundamentals(entry)
+    item["cmcCirculating"] = basics["circulating"]
+    item["cmcTotalSupply"] = basics["total"]
+    item["cmcMaxSupply"] = basics["max"]
+    item["cmcFloatRatio"] = basics["floatRatio"]
+    item["cmcFdvUsd"] = basics["fdvUsd"]
+    note = CMC_MARKET_CAP.body_text(entry)
+    if note:
+        item["body"] = append_alert_body_note(item.get("body"), note)
+    return item
+
+
+def start_cmc_market_cap() -> bool:
+    """开启弹窗路径上的 CMC 流通市值查询（含后台整榜刷新线程）。
+
+    不 enable 就只读落盘缓存、一次都不联网 —— 与 :func:`start_top10_holders`
+    同一条纪律：测试与离线脚本会大量调用弹窗，不该因为跑一遍单测就去打 CMC。
+    """
+    if env_flag("XINGYUN_DISABLE_CMC_MCAP", default=False):
+        return False
+    CMC_MARKET_CAP.enable(True)
+    CMC_MARKET_CAP.start()
+    return True
+
+
+def attach_trench_cmc_fundamentals(payload: dict[str, Any]) -> dict[str, Any]:
+    """给战壕榜每一行挂上 CMC 基本面（悬浮窗要显示：市值 / 流通量 / 流通率 / 总量）。
+
+    纯内存查表（``CMC_MARKET_CAP.lookup`` 只碰快照），24 行的开销可以忽略；
+    查不到的行**不写任何字段**，让悬浮窗退回原来的「GMGN 市值」显示 ——
+    绝不写 0（和弹窗那条铁律一致）。
+    """
+    if not isinstance(payload, dict):
+        return payload
+    original = payload.get("items")
+    if not isinstance(original, list):
+        return payload
+    result = dict(payload)
+    items: list[dict[str, Any]] = []
+    for raw in original:
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        symbol = alert_text(row.get("symbol"), 40)
+        entry = CMC_MARKET_CAP.lookup(symbol) if symbol else {"status": "no-symbol"}
+        if str(entry.get("status") or "") == "ok":
+            basics = CMC_MARKET_CAP.fundamentals(entry)
+            row["cmc"] = {
+                "mcapUsd": safe_float(entry.get("mcapUsd"), 0),
+                "rank": int(safe_float(entry.get("rank"), 0)),
+                "slug": alert_text(entry.get("slug"), 120),
+                "circulating": basics["circulating"],
+                "total": basics["total"],
+                "max": basics["max"],
+                "floatRatio": basics["floatRatio"],
+                "fdvUsd": basics["fdvUsd"],
+                "text": CMC_MARKET_CAP.fundamentals_text(entry),
+            }
+        items.append(row)
+    result["items"] = items
+    return result
+
+
+def start_top10_holders() -> bool:
+    """开启弹窗路径上的 Top10 查询。
+
+    不 enable 就只读缓存、一次都不联网 —— 测试与离线脚本会大量调用弹窗，
+    不该因为跑一遍单测就去打 Arkham。
+    """
+    if env_flag("XINGYUN_DISABLE_TOP10_HOLDERS", default=False):
+        return False
+    TOP10_HOLDERS.enable(True)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -25079,6 +26063,11 @@ def desktop_alert_source_is_muted(item: dict[str, Any]) -> bool:
     # never let any board-level mute swallow it.
     if item.get("platformOwnToken"):
         return False
+    # 2026-10-17 起**没有生产者**再写 ``alphaListed``：Alpha 的语气与红色皮肤只属于
+    # binance-alpha-new 自己的弹窗，不再外溢到别的榜。这里保留豁免只为消化改动前
+    # 已经入队的旧投递，别据此认为「Alpha 币能绕过热榜静默」。
+    if item.get("alphaListed"):
+        return False
     # NOTE: the old "发射台项目" (alertTone==red + launchpadPlatform) bypass was
     # removed on 2026-10-03 together with that alert.  ``launchpadPlatform`` may
     # still ride along as plain data, so it must never re-open a mute on its own.
@@ -25109,10 +26098,10 @@ def desktop_alert_source_is_muted(item: dict[str, Any]) -> bool:
             return True
     if (
         re.search(r"(?:热门榜|热搜榜|hot[\s_-]?search|hot[\s_-]?board|hot[\s_-]?rank).{0,12}(?:新进|new\s+entry)", f"{kind} {title}", re.I)
-        and (gmgn_hot_rank_source(item) or rank_monitor_hot_new_is_silent(item))
+        and (gmgn_hot_rank_source(item) or rank_monitor_hot_new_is_muted(item))
     ):
         return True
-    if not key.startswith(("first-listing:", "price-watch:")) and kind != "价格监控":
+    if not key.startswith(("first-listing:", "price-watch:", "alpha-new:")) and kind != "价格监控":
         exchange = re.search(r"币安|Binance|OKX|欧易|Bitget|Gate|HTX|KuCoin|Bybit|Hyperliquid|Aster", title, re.I)
         listing = re.search(r"将上线|将上架|上新公告|上币公告|上线.{0,45}(?:永续|现货|交易对|合约)|(?:new|will).{0,25}(?:listing|list\b|perp)", title, re.I)
         if exchange and listing:
@@ -25158,7 +26147,7 @@ def desktop_alert_source_is_muted(item: dict[str, Any]) -> bool:
                     and not (latest.get("window") or {}).get("eligible")):
                 return True
         return False
-    if (key.startswith(("newboard:", "listing:", "aster-contract:", "first-listing:", "venue-listing:"))
+    if (key.startswith(("newboard:", "listing:", "aster-contract:", "first-listing:", "venue-listing:", "alpha-new:"))
             and ("新币" in kind or "交易所上新" in kind or key.startswith("aster-contract:"))):
         return (item.get("listingPolicyVersion") != 1
                 or safe_float(item.get("expiresAt")) <= time.time() * 1000)
@@ -25904,7 +26893,8 @@ def launch_desktop_alert(payload: dict[str, Any]) -> dict[str, Any]:
     global DESKTOP_ALERT_SEEN_LOADED
     if env_flag("XINGYUN_DISABLE_DESKTOP_ALERT", default=is_production_mode()):
         return {"ok": True, "skipped": True, "reason": "desktop alerts disabled"}
-    normalized = normalize_desktop_alert(payload)
+    # 所有弹窗都从这一处出闸：在这里统一补「这个币在哪条链」，别指望 26 个调用点各自记得带上。
+    normalized = annotate_desktop_alert_chain(normalize_desktop_alert(payload))
     if normalized.get("sourceType") != "smart-money-buy":
         ingest_smart_money_text(
             " ".join(filter(None, (
@@ -25969,6 +26959,14 @@ def launch_desktop_alert(payload: dict[str, Any]) -> dict[str, Any]:
             DESKTOP_ALERT_SEEN.pop(item_key, None)
         if any(key in DESKTOP_ALERT_SEEN for key in keys):
             return {"ok": True, "deduped": True}
+    # 链上 Top10 持仓率（AIcoin 热门榜 / 涨幅榜 / 价格异动）。**放在所有「要不要弹」的
+    # 过滤和去重之后**：一次查询要等 Arkham + GMGN 好几秒，为一条马上被静默或去重掉的
+    # 消息去等它是纯浪费；但必须在入库和渲染之前，否则弹窗上就没有这个数。
+    # 同时它必须在任何全局锁之外等（这一段仍在 DESKTOP_ALERT_LOCK 外面）。
+    normalized = annotate_desktop_alert_top10(normalized)
+    # CoinMarketCap 流通市值（用户 2026-10-24）。同一条纪律：内存快照、查不到沉默；
+    # 快照为空时只异步 kick 后台刷新 —— 整榜下载+解析实测 ~54 秒，绝不在弹窗路径上等。
+    normalized = annotate_desktop_alert_mcap(normalized)
     priority = desktop_alert_queue_priority(normalized)
     result = ALERT_DELIVERY_STORE.admit(normalized, keys, priority, now=now,
                                        ttl=180 if priority >= DESKTOP_ALERT_CRITICAL_PRIORITY else 600)
@@ -26001,8 +26999,14 @@ def send_smart_money_buy_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
     payment_asset = clean_feed_text(event.get("paymentAsset") or "USDT", 20)
     payment_amount = safe_float(event.get("paymentAmount"))
     tx_hash = clean_feed_text(event.get("transactionHash"), 180)
+    token_address = clean_feed_text(event.get("tokenAddress"), 180)
+    # 「查看」必须落在 GMGN 的对应 CA 交易页（用户就在那儿下单），而不是链上交易
+    # 记录查询页。链代号先折算成 GMGN 的 slug（ethereum→eth、solana→sol），折算不出来
+    # 时才回落到区块浏览器，保证这个按钮永远不会变成死链接。
     explorer = clean_feed_text(chain_meta.get("explorer"), 300)
-    url = explorer.format(quote(tx_hash, safe="")) if explorer and tx_hash else ""
+    url = gmgn_token_trade_url(gmgn_chain_slug(chain), token_address) or (
+        explorer.format(quote(tx_hash, safe="")) if explorer and tx_hash else ""
+    )
     wallet_address = clean_feed_text(event.get("walletAddress"), 60)
     # The popup line is PER WALLET (e.g. 100U for a small KOL wallet), so the card
     # must print the line this event actually cleared instead of a fixed 10,000U.
@@ -26028,7 +27032,7 @@ def send_smart_money_buy_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
             f"{chain_meta.get('label') or chain} · 支付 {payment_amount:,.4g} {payment_asset} · "
             f"钱包 {wallet_address}"
         ),
-        "contractAddress": clean_feed_text(event.get("tokenAddress"), 180),
+        "contractAddress": token_address,
         "chain": chain,
         "url": url,
         "time": int(safe_float(event.get("observedAt"))) or int(time.time() * 1000),
@@ -26037,6 +27041,833 @@ def send_smart_money_buy_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
         "speech": f"聪明钱 {nickname} 买入 {symbol}，金额约 {payment_usd:,.0f} 美元",
         "originalText": json.dumps(event, ensure_ascii=False)[:1800],
     })
+
+
+def send_kol_sync_desktop_alert(context: dict[str, Any]) -> dict[str, Any]:
+    """「三个人同时上车」的单独提醒（用户 2026-10-27）。
+
+    和单笔买入弹窗（``smart-money-buy``）是**两条独立消息**：那条讲「某人买了多少钱」，
+    这条讲「这三个人撞到同一个标的上」。判定与去重全在
+    ``smart_money_monitor._maybe_emit_kol_sync``，这里只负责排版。
+
+    排版纪律：标题两行以内（卡片恒 374 宽），正文一行列完三个人 + 各自金额，超长时
+    ``append_alert_body_note`` 会从中间裁；**不动静音、只提优先级**（130 > 单笔的 120），
+    红色留给 Alpha 控盘那种真风险。
+    """
+    if not isinstance(context, dict):
+        return {"ok": False, "error": "invalid kol-sync context"}
+    chain = clean_feed_text(context.get("chain"), 30).lower()
+    chain_meta = SMART_MONEY_CHAIN_META.get(chain) or {}
+    token = clean_feed_text(context.get("tokenAddress"), 180)
+    symbol = clean_feed_text(context.get("symbol") or "未知代币", 40)
+    buyers = context.get("buyers") if isinstance(context.get("buyers"), list) else []
+    min_buyers = max(2, int(safe_float(context.get("minBuyers"), 3)))
+    if not token or len(buyers) < min_buyers:
+        return {"ok": True, "skipped": True, "reason": "kol-sync context incomplete"}
+    total_usd = safe_float(context.get("totalUsd"))
+    window_hours = max(1, int(safe_float(context.get("windowHours"), 24)))
+    # 按「谁先上车」排序，金额取该钱包在这个币上的合计。
+    parts = [
+        f"{clean_feed_text(buyer.get('label'), 30) or clean_feed_text(buyer.get('address'), 12)} "
+        f"${safe_float(buyer.get('usd')):,.0f}"
+        for buyer in sorted(buyers, key=lambda item: safe_float(item.get("firstAt")))
+    ]
+    first_at = min((safe_float(buyer.get("firstAt")) for buyer in buyers), default=0)
+    count_label = "三人" if len(buyers) == 3 else f"{len(buyers)} 人"
+    url = gmgn_token_trade_url(gmgn_chain_slug(chain), token) or (
+        (clean_feed_text(chain_meta.get("explorer"), 300) or "").format(quote(token, safe=""))
+    )
+    return launch_desktop_alert({
+        "key": f"kol-sync:{chain}:{token.lower()}",
+        "kind": "KOL 共振",
+        "source": "聪明钱买入监控",
+        "sourceLabel": "SM",
+        "sourceType": "kol-sync",
+        "sourceId": "smart-money-buy",
+        "title": f"KOL {count_label}同时上车：{symbol} · 合计 ${total_usd:,.0f}",
+        "body": f"{chain_meta.get('label') or chain} · {window_hours} 小时内 {' / '.join(parts)}",
+        "contractAddress": token,
+        "chain": chain,
+        "url": url,
+        "time": int(first_at) or int(time.time() * 1000),
+        "priority": f"{len(buyers)} 人同时买入",
+        "queuePriority": 130,
+        "speech": (
+            f"注意，{len(buyers)} 个 KOL 同时买入 {symbol}，"
+            f"合计约 {total_usd:,.0f} 美元"
+        ),
+        "originalText": json.dumps(
+            {"chain": chain, "tokenAddress": token, "symbol": symbol,
+             "buyers": buyers, "windowHours": window_hours},
+            ensure_ascii=False,
+        )[:1800],
+    })
+
+
+def send_sandwich_detected_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
+    """把一笔**链上已确认**的被夹交易推到桌面弹窗。
+
+    只在 ``confirmed``（同块内同地址先顺向抬价、后反向落袋，且筹码往返）时由
+    ``SandwichDetector.on_confirmed`` 调用 —— 疑似不弹，避免把噪声做成红点疲劳。
+
+    ``board`` 写 ``sandwich-detector``：它不在榜单页的卡片名单里（那是 12 个行情
+    榜单，被夹检测不是榜单），所以走不通「按榜单静音」那条路；静音改由子板块自己的
+    弹窗总开关（``sandwich_detector.SandwichStore.alerts_enabled``）在源头拦。
+    """
+    if not SANDWICH_DETECTOR.alerts_enabled():
+        return {"ok": True, "skipped": True, "reason": "sandwich popups disabled"}
+    chain = clean_feed_text(event.get("chain"), 30).lower()
+    detail = event.get("detail") if isinstance(event.get("detail"), dict) else {}
+    price = detail.get("price") if isinstance(detail.get("price"), dict) else {}
+    symbol = clean_feed_text(event.get("symbol") or "未知代币", 40)
+    tx_hash = clean_feed_text(event.get("tx_hash"), 180)
+    attacker = clean_feed_text(detail.get("attacker"), 60)
+    direction = "买入" if str(event.get("event_type") or "").lower() == "buy" else "卖出"
+    loss_usd = safe_float(price.get("lossUsd"))
+    impact_pct = safe_float(price.get("impactPct"))
+    # 损失算不出来时不要把 0 说成「多付 0 美元」—— 只报冲击百分比，并标明是估算。
+    if loss_usd > 0:
+        headline = f"被夹：{symbol} · 多付 ${loss_usd:,.2f}"
+    elif impact_pct > 0:
+        headline = f"被夹：{symbol} · 成交价被抬高 {impact_pct:,.1f}%"
+    else:
+        headline = f"被夹：{symbol} · 同区块前后夹"
+    body_bits = [
+        f"{clean_feed_text((SMART_MONEY_CHAIN_META.get(chain) or {}).get('label') or chain, 40)} · {direction}",
+        f"池子 {clean_feed_text(detail.get('pool'), 60)}" if detail.get("pool") else "",
+        f"夹子 {attacker}" if attacker else "",
+        f"同块第 {int(safe_float(detail.get('txIndex')))} 笔" if detail.get("txIndex") is not None else "",
+    ]
+    return launch_desktop_alert({
+        "key": f"sandwich-detected:{chain}:{tx_hash}:{clean_feed_text(event.get('event_type'), 12)}",
+        "kind": "被夹检测",
+        "source": "链上被夹检测",
+        "sourceLabel": "SW",
+        "sourceType": "sandwich-detector",
+        "sourceId": "sandwich-detector",
+        "board": "sandwich-detector",
+        "title": headline,
+        "body": " · ".join(bit for bit in body_bits if bit),
+        "contractAddress": clean_feed_text(event.get("token"), 180),
+        "chain": chain,
+        "url": sandwich_explorer_url(chain, tx_hash),
+        "time": int(safe_float(event.get("trade_at")) * 1000) or int(time.time() * 1000),
+        "priority": "链上取证",
+        "queuePriority": 130,
+        "speech": f"检测到被夹，{symbol} 这笔交易在同区块被前后夹击",
+        "originalText": json.dumps(event, ensure_ascii=False)[:1800],
+    })
+
+
+def send_dev_launch_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
+    """Dev 发币提醒：把「你盯的这个地址刚发了一个新币」推到桌面弹窗。
+
+    ``board`` 写 ``dev-launch``：它不在榜单页的 12 张行情卡里，所以走不通「按榜单
+    静音」，静音由子板块自己的弹窗总开关在入口拦（和被夹检测同一套口径）。
+
+    弹窗发出前先补一次市场数据：新币的 symbol / 市值 / 该 Dev 的级别标签都要现取，
+    否则提醒里只有一个裸合约地址，用户根本判断不了这是不是一个值得看的盘子。
+    市场数据取不到也照弹 —— 「谁发了币」这个事实本身不依赖行情。
+    """
+    if not DEV_LAUNCH_MONITOR.alerts_enabled():
+        return {"ok": True, "skipped": True, "reason": "dev launch popups disabled"}
+    chain = clean_feed_text(event.get("chain"), 30).lower()
+    token = clean_feed_text(event.get("token"), 180)
+    dev = clean_feed_text(event.get("dev_address"), 180)
+    if not chain or not token:
+        return {"ok": True, "skipped": True, "reason": "missing chain or token"}
+    wallet = DEV_LAUNCH_MONITOR.store.wallet(chain, dev) or {}
+    # 先补市场数据再读级别：级别是「历史峰值市值」派生的，不补就永远是「普通 / 流水」。
+    market = dev_launch_token_market(chain, token)
+    peak = dev_launch_peak_market_cap(chain, token, market)
+    market.update({"peakUsd": peak["peakUsd"], "peakSource": peak["source"]})
+    try:
+        DEV_LAUNCH_MONITOR.store.update_token_market(chain, token, dev, market)
+    except Exception:
+        pass
+    tier = dev_launch_tier(peak.get("peakUsd"))
+    symbol = clean_feed_text(market.get("symbol"), 40) or f"{token[:10]}…"
+    dev_label = clean_feed_text(wallet.get("label"), 40) or f"{dev[:8]}…{dev[-4:]}"
+    via_label = "发射台代发" if str(event.get("via")) == "factory" else "直接部署"
+    body_bits = [
+        f"{dev_label} · {dev_launch_chain_label(chain)}",
+        via_label,
+        f"市值 {dev_launch_money_text(peak.get('peakUsd'))}" if peak.get("peakUsd") else "",
+        f"该 Dev 级别：{tier['label']}",
+    ]
+    return launch_desktop_alert({
+        "key": f"dev-launch:{chain}:{token}",
+        "kind": "Dev 发币",
+        "source": "Dev 发币监控",
+        "sourceLabel": "DEV",
+        "sourceType": "dev-launch",
+        "sourceId": "dev-launch",
+        "board": "dev-launch",
+        "title": f"Dev 发币：{symbol}",
+        "body": " · ".join(bit for bit in body_bits if bit),
+        "contractAddress": token,
+        "chain": chain,
+        # 「查看」走 GMGN 站内交易页（与热搜榜弹窗同一口径）：用户在 GMGN 下单，
+        # 且 desktop_alert 用本机 Chrome 默认配置打开，天然带已登录会话。
+        "url": dev_launch_gmgn_url(chain, token),
+        "time": int(safe_float(event.get("launched_at"))) or int(time.time() * 1000),
+        "priority": f"{tier['label']} Dev",
+        "queuePriority": 150,
+        "speech": f"Dev 发币，{dev_label} 在 {dev_launch_chain_label(chain)} 发了 {symbol}，级别{tier['label']}",
+        "originalText": json.dumps(event, ensure_ascii=False)[:1800],
+    })
+
+
+#: 做市商「进场」弹窗的共振闸（用户 2026-10-21）：
+#: 只在**涨幅榜 ∩ AIcoin 热门榜**同时出现的标的上才弹，其余只进列表。
+#: 大额调仓不受这条限制 —— 它本身就是「异常动作」，不需要榜单独背书。
+MARKET_MAKER_ENTRY_GATE_TTL_SECONDS = 120.0
+MARKET_MAKER_ENTRY_GATE_LOCK = threading.Lock()
+MARKET_MAKER_ENTRY_GATE_STATE: dict[str, Any] = {
+    "at": 0.0,
+    "symbols": frozenset(),
+    "details": {},
+    "note": "尚未计算",
+    "gainers": 0,
+    "aicoin": 0,
+}
+
+
+def market_maker_entry_symbol_key(value: Any) -> str:
+    """把 ``BTCUSDT`` / ``btc`` / ``BTC/USDT`` 压成同一个 ``BTC``。
+
+    实现在 ``market_maker_monitor.symbol_key`` —— 涨幅榜与共振明细都走同一份归一，
+    两边各写一套迟早会分叉（一个认 ``BTCUSDT`` 一个不认，交集就永远是空的）。
+    """
+    return mm_symbol_key(value)
+
+
+def market_maker_board_symbols(payload: dict[str, Any], source_ids: Iterable[str]) -> set:
+    """从榜单 payload 里抽 symbol 归一集合（只认给定来源）。"""
+    return set(mm_board_symbol_index(payload, source_ids))
+
+
+def market_maker_entry_resonance() -> dict[str, Any]:
+    """涨幅榜 ∩ AIcoin 热门榜。两分钟缓存，**只读既有缓存不同步重建**（别跟页面抢锁）。"""
+    now = time.time()
+    with MARKET_MAKER_ENTRY_GATE_LOCK:
+        cached = dict(MARKET_MAKER_ENTRY_GATE_STATE)
+    if cached["at"] and now - float(cached["at"]) < MARKET_MAKER_ENTRY_GATE_TTL_SECONDS:
+        return cached
+    gainers_payload = cached_api_payload(
+        "gainers-rankings", gainers_rankings_payload, 60,
+        allow_sync_rebuild=False, max_age_seconds=900,
+    )
+    hot_payload = cached_api_payload(
+        "turnover-rankings", turnover_rankings_payload, 60,
+        allow_sync_rebuild=False, max_age_seconds=1800,
+    )
+    gainers_index = mm_board_symbol_index(gainers_payload, ALPHA_MM.MM_GAINERS_SOURCES, origin="涨幅榜")
+    hot_index = mm_board_symbol_index(hot_payload, ("aicoin",), origin="AIcoin 热门榜")
+    if not gainers_index or not hot_index:
+        # 抓取失败**不等于空榜**：明确写「数据不可用」，让闸门知道自己是瞎的，
+        # 而不是把「读不到」当成「没共振」（那会把整条链路静音成哑巴）。
+        note = "涨幅榜不可用" if not gainers_index else "AIcoin 热门榜不可用"
+    else:
+        note = ""
+    symbols = set(gainers_index) & set(hot_index)
+    # 明细跟着集合走：弹窗要写「涨幅榜第 3（+18.2%）· AIcoin 热门第 12」。
+    details = {
+        key: {
+            "gainersRank": int(gainers_index[key]["rank"]),
+            "gainersChangePct": float(gainers_index[key]["changePct"]),
+            "aicoinRank": int(hot_index[key]["rank"]),
+        }
+        for key in symbols
+    }
+    state = {
+        "at": now,
+        "symbols": frozenset(symbols),
+        "details": details,
+        "note": note,
+        "gainers": len(gainers_index),
+        "aicoin": len(hot_index),
+    }
+    with MARKET_MAKER_ENTRY_GATE_LOCK:
+        MARKET_MAKER_ENTRY_GATE_STATE.update(state)
+    return state
+
+
+def market_maker_entry_qualifies(symbol: Any) -> tuple[bool, str]:
+    """做市商进场弹窗的唯一放行条件：与涨幅榜 / AIcoin 热门榜共振。"""
+    gate = market_maker_entry_resonance()
+    key = market_maker_entry_symbol_key(symbol)
+    if key and key in gate["symbols"]:
+        return True, ""
+    if gate["note"]:
+        return False, gate["note"]
+    return False, "未与涨幅榜 / AIcoin 热门榜共振"
+
+
+def market_maker_resonance_info(symbol: Any) -> dict[str, Any]:
+    """三方共振的明细查询（用户 2026-10-21）：大额异动时先问一句。
+
+    返回 ``{"ok": True, "gainersRank": 3, "gainersChangePct": 18.2, "aicoinRank": 12}``，
+    没命中就是 ``{"ok": False, "note": ...}`` —— 抓不到数据时 ``note`` 写真实原因，
+    **绝不把「读不到」当成「共振了」**。
+    """
+    gate = market_maker_entry_resonance()
+    key = market_maker_entry_symbol_key(symbol)
+    if not key:
+        return {"ok": False, "note": "标的名为空"}
+    if gate["note"]:
+        return {"ok": False, "note": str(gate["note"])}
+    if key not in gate["symbols"]:
+        return {"ok": False, "note": "未与涨幅榜 / AIcoin 热门榜共振"}
+    detail = (gate.get("details") or {}).get(key) or {}
+    return {
+        "ok": True,
+        "gainersRank": int(detail.get("gainersRank") or 0),
+        "gainersChangePct": float(detail.get("gainersChangePct") or 0.0),
+        "aicoinRank": int(detail.get("aicoinRank") or 0),
+    }
+
+
+def market_maker_payload_with_gate(*, force_refresh: bool = False) -> dict[str, Any]:
+    """子板块快照 + 进场闸状态（页面要显示「当前共振 N 只 / 为什么静音」）。
+
+    GET 走缓存（轮询线程每轮结束会热一遍，页面零等待）；POST 改完设置必须
+    ``force_refresh=True`` —— 否则用户点完「暂停」看到的是 30 秒前的旧状态。
+    """
+    payload = MARKET_MAKER_MONITOR.payload(force_refresh=force_refresh)
+    try:
+        gate = market_maker_entry_resonance()
+    except Exception as exc:
+        gate = {"symbols": frozenset(), "note": safe_error_text(str(exc)), "gainers": 0, "aicoin": 0}
+    monitor_gate = payload.get("summary", {}).get("entryGate") or {}
+    payload["entryGate"] = {
+        "mode": "resonance",
+        "enabled": MARKET_MAKER_MONITOR.entry_qualifier is not None,
+        "resonance": len(gate.get("symbols") or ()),
+        "gainers": int(gate.get("gainers") or 0),
+        "aicoin": int(gate.get("aicoin") or 0),
+        "note": str(gate.get("note") or ""),
+        # 「已暂缓几次」直接读监控器的实时计数：快照有 30 秒缓存，这个数每轮都在涨。
+        "filtered": int(getattr(MARKET_MAKER_MONITOR, "entry_filtered", 0) or monitor_gate.get("filtered") or 0),
+    }
+    # 三方共振（大额异动 × 涨幅榜 × AIcoin）的状态：页面要说明「为什么这条是共振弹窗」。
+    payload["resonance"] = {
+        "armed": MARKET_MAKER_MONITOR.resonance_qualifier is not None,
+        "cooldownSeconds": int(getattr(MARKET_MAKER_MONITOR, "resonance_cooldown", 0) or 0),
+        "blocked": int(getattr(MARKET_MAKER_MONITOR, "resonance_blocked", 0) or 0),
+        "symbols": int(len(gate.get("symbols") or ())),
+        "note": str(getattr(MARKET_MAKER_MONITOR, "resonance_note", "") or ""),
+    }
+    return payload
+
+
+def send_market_maker_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
+    """做市商监控提醒：新标的进场 / 三方共振 / 大额调仓（单笔 ≥100 万美元）。
+
+    ``board`` 写 ``market-maker``：它不在榜单页的 12 张行情卡里，走不通「按榜单静音」，
+    静音由子板块自己的弹窗总开关在入口拦（和被夹检测 / Dev 发币同一套口径）。
+
+    内容口径（用户 2026-10-20 拍板）：「新标的」与「大额调仓」两类；2026-10-21 追加
+    **三方共振**——大额调仓的标的如果同时挂在涨幅榜与 AIcoin 热门榜上，那笔流水改发
+    共振这一条（不再发普通大额），同一标的 6 小时内只提示一次。
+    「新标的」只在**整家做完一轮基线之后**才可能触发——首次接线时每个地址都会吐一屏
+    历史流水，那批一律 ``baseline=1``，不弹。
+    """
+    if not MARKET_MAKER_MONITOR.alerts_enabled():
+        return {"ok": True, "skipped": True, "reason": "market maker popups disabled"}
+    reason = str(event.get("reason") or "")
+    if reason not in {"new-token", "large-transfer", "triple-resonance"}:
+        return {"ok": True, "skipped": True, "reason": f"unsupported reason: {reason}"}
+    chain = clean_feed_text(event.get("chain"), 30).lower()
+    token = clean_feed_text(event.get("token"), 180)
+    firm = clean_feed_text(event.get("firm"), 40)
+    if not chain or not token or not firm:
+        return {"ok": True, "skipped": True, "reason": "missing chain / token / firm"}
+    symbol = clean_feed_text(event.get("symbol"), 40) or f"{token[:10]}…"
+    firm_name = mm_firm_label(firm)
+    chain_name = mm_chain_label(chain)
+    direction = "收到" if str(event.get("direction")) == "in" else "转出"
+    amount_text = mm_amount_text(event.get("amount"))
+    usd = safe_float(event.get("usd"))
+    tx_hash = clean_feed_text(event.get("txHash"), 100)
+    body_bits = [
+        firm_name,
+        f"{direction} {amount_text} {symbol}",
+        mm_money_text(usd),
+        chain_name,
+    ]
+    if reason == "new-token":
+        title = f"做市商进场：{firm_name} 开始操作 {symbol}"
+        priority, queue_priority = "做市商新标的", 78
+        speech = f"做市商监控，{firm_name} 开始操作 {symbol}，{direction} {amount_text}"
+    elif reason == "triple-resonance":
+        detail = event.get("resonance") if isinstance(event.get("resonance"), dict) else {}
+        gainers_rank = int(safe_float(detail.get("gainersRank")))
+        gainers_change = safe_float(detail.get("gainersChangePct"))
+        aicoin_rank = int(safe_float(detail.get("aicoinRank")))
+        board_bits = []
+        if gainers_rank:
+            board_bits.append(
+                f"涨幅榜第 {gainers_rank}" + (f"（{gainers_change:+.1f}%）" if gainers_change else "")
+            )
+        if aicoin_rank:
+            board_bits.append(f"AIcoin 热门第 {aicoin_rank}")
+        body_bits.append(" · ".join(board_bits) if board_bits else "涨幅榜 · AIcoin 热门")
+        title = f"做市商三方共振：{firm_name} {direction} {mm_money_text(usd) or ''} {symbol}".strip()
+        priority, queue_priority = "做市商三方共振", 90
+        speech = f"三方共振，{firm_name} {direction} {symbol}，约 {mm_money_text(usd)}"
+    else:
+        title = f"做市商大额调仓：{firm_name} {direction} {mm_money_text(usd) or ''} {symbol}".strip()
+        priority, queue_priority = "做市商大额调仓", 84
+        speech = f"做市商大额调仓，{firm_name} {direction} {symbol}，约 {mm_money_text(usd)}"
+    return launch_desktop_alert({
+        "key": f"market-maker:{reason}:{firm}:{chain}:{token}:{tx_hash}",
+        "kind": "做市商监控",
+        "source": "做市商监控",
+        "sourceLabel": "MM",
+        "sourceType": "market-maker",
+        "sourceId": "market-maker",
+        "board": "market-maker",
+        "title": title,
+        "body": " · ".join(bit for bit in body_bits if bit),
+        "contractAddress": token,
+        "chain": chain,
+        # 「查看」落在 GMGN 的对应 CA 交易页（与热搜榜 / KOL 买入同一口径）：
+        # 区块浏览器只做兜底，保证按钮永远不会是死链。
+        "url": mm_gmgn_token_url(chain, token) or mm_explorer_tx_url(chain, tx_hash),
+        "time": int(safe_float(event.get("occurredAt"))) or int(time.time() * 1000),
+        "priority": priority,
+        "queuePriority": queue_priority,
+        "speech": speech,
+        "originalText": json.dumps(event, ensure_ascii=False)[:1800],
+    })
+
+
+# --------------------------------------------------------------------------- #
+# 价格异动监控（2026-10-21）：6 小时内涨 ≥20%。独立子板块 ?mode=pricemove
+# --------------------------------------------------------------------------- #
+def price_move_market_prices() -> dict[str, float]:
+    """币安 U 本位**全部**合约的当前价。
+
+    ``/fapi/v1/ticker/price`` 不带 symbol 时一次返回全市场（weight 2）——
+    这就是这个子板块能做到「全市场覆盖、每轮只花一个请求」的原因。
+    """
+    rows = binance_futures_json("/fapi/v1/ticker/price")
+    out: dict[str, float] = {}
+    for item in rows if isinstance(rows, list) else []:
+        if not isinstance(item, dict):
+            continue
+        pair = clean_feed_text(item.get("symbol"), 40).upper()
+        if not pair.endswith("USDT"):
+            continue
+        asset = pair[:-4]
+        if not asset or is_excluded_crypto_asset(asset):
+            continue
+        # USDCUSDT / FDUSDUSDT 这类也能「涨 0.3%」，留着只会污染覆盖面统计。
+        if not price_move_is_tradable(asset):
+            continue
+        price = safe_float(item.get("price"))
+        if price > 0:
+            out[asset] = price
+    if not out:
+        raise RuntimeError("币安合约行情为空")
+    return out
+
+
+def price_move_trade_url(symbol: str, chain: str = "", contract: str = "") -> str:
+    """「查看」优先去 GMGN 的对应 CA 页；没有 CA 的合约币去币安合约页。"""
+    if contract:
+        url = mm_gmgn_token_url(chain, contract)
+        if url:
+            return url
+    return f"https://www.binance.com/zh-CN/futures/{symbol}USDT"
+
+
+def price_move_alpha_control(symbol: str) -> dict[str, Any]:
+    """这条异动标的在「项目方控盘达标」名单里吗？（只读 alpha_mm 状态）
+
+    用户 2026-10-21：**控盘 ≥90% + Alpha 合约 + 流通市值 ≤3000 万美元** 三条同时满足
+    → 弹窗爆红，并标成 Alpha 标的。
+
+    **绝不在这里重判**这五条：控盘度（GoPlus 前 10 剔池/销毁/交易所托管）、流通市值、
+    Alpha 收录 + 有永续身份全是 `alpha_mm_monitor.run_round()` 写进 `watch` 的结论。
+    这里只转调 `ALPHA_MM.control_targets()`，它负责阈值复核、墓碑（拉盘后暴跌 ≥60%
+    永久排除）与新鲜度过滤。两边各判一次的话，口径一改就会分叉。
+
+    查不到 / 状态文件没写过 / 抛异常 → 一律当「不在名单」：宁可漏一次爆红，
+    也不可假爆红（红线：**抓取失败不许伪装成结论**）。
+    """
+    key = mm_symbol_key(symbol)
+    if not key:
+        return {}
+    try:
+        return ALPHA_MM.control_targets().get(key) or {}
+    except Exception:
+        return {}
+
+
+def price_move_control_label(control: dict[str, Any]) -> tuple[str, float, float]:
+    """控盘名单条目 → ``(Alpha 阶段标签, 控盘%, 流通市值)``，弹窗与列表共用一份。"""
+    chain_label = desktop_alert_chain_label((control or {}).get("chain")) or ""
+    phase = f"Alpha · {chain_label}" if chain_label else "Alpha 在列"
+    return (
+        phase,
+        safe_float((control or {}).get("controlPct")),
+        safe_float((control or {}).get("marketCap")),
+    )
+
+
+def send_price_move_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
+    """价格异动提醒：6 小时窗口内涨 ≥20%，**触线即报**（用户 2026-10-21 二次拍板）。
+
+    ``board`` 写 ``price-move``：不在榜单页的 12 张行情卡里，静音走子板块自己的开关。
+    同一个币 6 小时只弹一次由 ``PriceMoveMonitor.maybe_alert()`` 记账，这里只负责文案。
+
+    基准价是**窗口内最低价**（不是「6 小时前那一帧」），所以 ``windowSeconds`` 是
+    「最低点到现在」的真实跨度 —— 文案照它写，别硬编成 6 小时。
+
+    命中「控盘 ≥90% + Alpha 合约 + 流通市值 ≤3000 万」时**爆红**（``alertTone="red"``，
+    ``alphaPhase`` 标成「Alpha · BSC」）：这三条同时成立的币，价格异动就是项目方在拉。
+    """
+    if not PRICE_MOVE_MONITOR.alerts_enabled():
+        return {"ok": True, "skipped": True, "reason": "price move popups disabled"}
+    symbol = clean_feed_text(event.get("symbol"), 40)
+    if not symbol:
+        return {"ok": True, "skipped": True, "reason": "missing symbol"}
+    pct = safe_float(event.get("pct"))
+    threshold = safe_float(event.get("thresholdPct")) or 20.0
+    if pct < threshold - 1e-9:
+        return {"ok": True, "skipped": True, "reason": "below threshold"}
+    price = safe_float(event.get("price"))
+    base = safe_float(event.get("basePrice"))
+    chain = clean_feed_text(event.get("chain"), 30).lower()
+    contract = clean_feed_text(event.get("contract"), 180)
+    window_hours = round((safe_float(event.get("windowSeconds")) or 6 * 3600) / 3600, 1)
+    control = price_move_alpha_control(symbol)
+    alpha_phase, control_pct, market_cap = price_move_control_label(control) if control else ("", 0.0, 0.0)
+    # 窗口还没走满时跨度可能只有十几分钟 —— 那也是「这么短时间内涨了 20%」，比 6 小时更值得看。
+    title = f"价格异动：{symbol} {window_hours:g} 小时涨 {pct:.1f}%"
+    body_bits = [
+        f"{mm_price_text(base)}（窗口最低）→ {mm_price_text(price)}",
+        f"{window_hours:g} 小时 {pct:+.1f}%",
+        "链上" if chain else "币安合约",
+    ]
+    if chain:
+        body_bits.append(mm_chain_label(chain))
+    if control:
+        # 「控盘 97.4%」才是这条为什么该看的理由，排在链名后面、风险提示前面。
+        body_bits.append(
+            f"项目方控盘 {control_pct:.1f}% · 流通市值 {mm_money_text(market_cap)}"
+        )
+    payload = {
+        "key": f"price-move:{symbol}:{int(safe_float(event.get('at')) or time.time() * 1000)}",
+        "kind": "价格异动",
+        "source": "价格异动监控",
+        "sourceLabel": "PM",
+        "sourceType": "price-move",
+        "sourceId": "price-move",
+        "board": "price-move",
+        # 让「标链 / 标 Alpha」那一步能认出这是哪个币（合约币没有合约地址可依赖）。
+        "symbol": symbol,
+        "title": title,
+        "body": " · ".join(bit for bit in body_bits if bit),
+        "contractAddress": contract,
+        "chain": chain,
+        "url": price_move_trade_url(symbol, chain, contract),
+        # 数值价：Top10 反查的 symbol 身份闸要用（合约币没有合约地址时靠它认币）。
+        "priceValue": price,
+        "time": int(safe_float(event.get("at"))) or int(time.time() * 1000),
+        "priority": "价格异动 · 高度控盘" if control else "价格异动",
+        "queuePriority": 82,
+        "speech": (
+            f"价格异动，{symbol} {window_hours:g} 小时涨 {pct:.0f} 个百分点"
+            + (f"，项目方控盘 {control_pct:.0f} 个百分点" if control else "")
+        ),
+        "originalText": json.dumps(event, ensure_ascii=False)[:1800],
+    }
+    if control:
+        # 皮肤与 Alpha 身份：控盘达标的币绝大多数在 BSC（Alpha 报红那条本来就会红），
+        # 但 ETH / Solana / Base 的 Alpha 币否则不会红 —— 这三条才是「爆红」的判据。
+        payload["alertTone"] = "red"
+        payload["alphaPhase"] = alpha_phase
+        payload["alphaListed"] = True
+        payload["mmControlPct"] = control_pct
+        payload["mmMarketCapUsd"] = market_cap
+    return launch_desktop_alert(payload)
+
+
+def price_move_payload(*, force_refresh: bool = False) -> dict[str, Any]:
+    """页面快照 + 每条记录的「查看」链接、链名、Alpha 身份与控盘标注。
+
+    链接在这里拼、不在前端拼：GMGN 的 slug 折算规则只有后端知道（前端拼必然是死链）。
+    Alpha 身份与控盘数据同理 —— 前端拿不到 ``ALPHA_LISTED_*`` 和 alpha_mm 的状态。
+    """
+    payload = PRICE_MOVE_MONITOR.payload(force_refresh=force_refresh)
+    try:
+        targets = ALPHA_MM.control_targets()
+    except Exception:
+        targets = {}
+    for row in payload.get("moves") or []:
+        symbol = row.get("symbol") or ""
+        row["url"] = price_move_trade_url(
+            symbol, row.get("chain") or "", row.get("contract") or ""
+        )
+        row["chainLabel"] = mm_chain_label(row.get("chain") or "")
+        control = targets.get(mm_symbol_key(symbol)) or {}
+        if control:
+            phase, control_pct, market_cap = price_move_control_label(control)
+            row["alphaPhase"] = phase
+            row["alphaHot"] = True
+            row["alphaControlPct"] = round(control_pct, 2)
+            row["alphaMarketCapUsd"] = round(market_cap, 0)
+            row["alphaMarketCapText"] = mm_money_text(market_cap)
+        else:
+            # 不在控盘名单里也要标 Alpha（用户：是 Alpha 标的就在弹窗/列表里标出来）。
+            phase = alpha_phase_for_asset(symbol)
+            if phase:
+                row["alphaPhase"] = phase
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# 地址集群（Arkham，2026-10-21）
+#
+# 用户口径（2026-10-22 收窄）：**只做榜上的标的** —— 热门榜 + 涨幅榜。去 Arkham
+# 查这些币的地址集群 / 实体，标记并保存下来；当同一个集群出现在另一个**榜上**
+# 标的、并且两边都占流通 ≥5% 时提醒。
+#
+# 为什么剔掉价格异动、又为什么要单独记「榜上集合」：库里的持仓是历史累积的，
+# 标的掉榜之后行还在。上线首日就弹了一条 ``SHIB 6.5% · STA 6.1%`` —— SHIB 是
+# 6 小时前扫的、早就不在榜上，却和一个在榜标的凑成了「跨 2 标的」。所以候选只喂
+# 榜上的，跨标的判定也只数榜上的（见 ``ArkhamClusterMonitor.board_scope``）。
+#
+# 数据走网页端签名通路（见 ``arkham_client`` 模块注释）：官方 API 起步 $100/月，
+# x402 按次 ``/token/holders`` 是 $6/次 —— 10 分钟一轮的常驻监控烧不起；
+# 网页端这条零成本、端点与数据完全一样。
+# ---------------------------------------------------------------------------
+
+
+def arkham_cluster_pool_index() -> dict[str, dict[str, Any]]:
+    """``symbol_key → 监控池里的链上元数据``。
+
+    榜单行经常只有 symbol（交易所榜尤其），链和合约要靠监控池补。纯读 DB，
+    不抢全局应用锁（锁序倒挂），失败返回空表而不是抛 —— 大不了这轮少几个候选。
+    """
+    index: dict[str, dict[str, Any]] = {}
+    try:
+        with auth_db() as conn:
+            rows = conn.execute(
+                "SELECT symbol, name, onchain_chain, onchain_chain_label,"
+                " onchain_contract_address, current_price"
+                " FROM price_watch_assets"
+                " WHERE onchain_contract_address != ''"
+            ).fetchall()
+    except Exception:
+        return index
+    for row in rows:
+        symbol = price_structure_monitor_symbol(row["symbol"]) or str(row["symbol"] or "")
+        key = mm_symbol_key(symbol)
+        if not key:
+            continue
+        contract = str(row["onchain_contract_address"] or "").strip()
+        chain = str(row["onchain_chain"] or row["onchain_chain_label"] or "").strip()
+        if not contract or not chain:
+            continue
+        index.setdefault(key, {
+            "symbol": symbol,
+            "name": str(row["name"] or ""),
+            "chain": chain,
+            "contract": contract,
+            "price": safe_float(row["current_price"]),
+        })
+    return index
+
+
+#: 单张榜单卡最多取多少行当候选（每张卡默认也就 10 行左右，留点余量给翻页数据）。
+ARKHAM_CLUSTER_BOARD_ROWS_PER_SOURCE = 12
+
+#: **这些源是「新币流」不是「榜」**，不进候选（用户 2026-10-22 第二次收窄）。
+#:
+#: ``gmgn-trenches`` 是「GMGN 战壕新币榜」：300 行、按真实开盘时间倒序，币的生命周期
+#: 常常只有十几分钟。地址集群找的是「同一批人在多个标的布局」这种**慢变量**，拿这种
+#: 一闪而过的 Solana meme 当样本，凑出来的「跨 2 标的」几乎必然是同一批 sniper /
+#: 发币工厂地址 —— 用户连着两次截图否掉的就是这类（STA、DINO、GUARDDOG 全来自这里）。
+#: 而且这些行在榜上停留不到一轮（10 分钟），用户回头在页面上根本找不到它们。
+ARKHAM_CLUSTER_BOARD_SKIP_SOURCES = frozenset({"gmgn-trenches"})
+
+
+def arkham_cluster_candidates() -> list[dict[str, Any]]:
+    """候选标的 = **行情榜各卡里当前显示的行** ∪ 涨幅榜，只要**有链上合约**的。
+
+    「榜上」是硬口径（用户 2026-10-22：「不是榜上的标的，不做这个地址集群提醒」）：
+    ① 价格异动整条腿删掉 —— 它只收币安 U 本位合约，本来没有链上合约可查；
+    ② **`ARKHAM_CLUSTER_BOARD_SKIP_SOURCES` 里的新币流不算榜**（战壕新币榜那种）。
+    没有合约的标的（纯交易所合约币）也直接跳过：Arkham 查持币人要链上地址。
+    """
+    index = arkham_cluster_pool_index()
+    picked: dict[str, dict[str, Any]] = {}
+
+    def add(row: dict[str, Any], source: str) -> None:
+        if not isinstance(row, dict):
+            return
+        symbol = clean_feed_text(row.get("symbol"), 40)
+        key = mm_symbol_key(symbol)
+        if not key:
+            return
+        chain = clean_feed_text(row.get("chain") or row.get("chainLabel"), 30)
+        contract = clean_feed_text(row.get("contractAddress") or row.get("contract"), 180)
+        meta = index.get(key) or {}
+        if not contract or not chain:
+            chain = chain or str(meta.get("chain") or "")
+            contract = contract or str(meta.get("contract") or "")
+        if not contract or not chain:
+            return
+        if not ARKHAM_API.arkham_chain_slug(chain):
+            return
+        entry = picked.get(key)
+        if entry is None:
+            entry = {
+                "symbol": symbol,
+                "name": clean_feed_text(row.get("name"), 80) or str(meta.get("name") or ""),
+                "chain": chain,
+                "contract": contract,
+                "price": safe_float(row.get("price")) or safe_float(meta.get("price")),
+                "sources": [],
+            }
+            picked[key] = entry
+        if source not in entry["sources"]:
+            entry["sources"].append(source)
+
+    # 1) 涨幅榜。
+    try:
+        for snapshot in rank_monitor_gainers_assets(gainers_rankings_payload()).values():
+            add(snapshot, "gainer")
+    except Exception as exc:
+        print(f"arkham cluster: gainers source failed: {safe_error_text(str(exc))}", file=sys.stderr)
+
+    # 2) 热门榜：**逐张卡**遍历（不能先拍平成一个大列表，那样就分不清行来自哪张卡，
+    #    也就没法把战壕新币榜那张剔掉）。
+    try:
+        hot_payload = market_payload()
+        for source in hot_payload.get("sources") or []:
+            if not isinstance(source, dict):
+                continue
+            source_id = clean_feed_text(source.get("id"), 60)
+            if source_id in ARKHAM_CLUSTER_BOARD_SKIP_SOURCES:
+                continue
+            if source.get("status") == "unavailable":
+                continue
+            rows = source.get("rows") if isinstance(source.get("rows"), list) else []
+            for row_index, row in enumerate(rows[:ARKHAM_CLUSTER_BOARD_ROWS_PER_SOURCE]):
+                if not isinstance(row, dict):
+                    continue
+                snapshot = rank_monitor_snapshot(source, row, row_index, "hot")
+                if snapshot.get("assetKey"):
+                    add(snapshot, "hot")
+    except Exception as exc:
+        print(f"arkham cluster: hot board source failed: {safe_error_text(str(exc))}", file=sys.stderr)
+
+    return list(picked.values())
+
+
+def arkham_cluster_chain_label(value: Any) -> str:
+    """板块里的链展示名。**先过 Arkham 自己的 slug 归一**，再退到通用表。
+
+    这里踩过一次：候选标的的链来自各处（价格异动写 ``solana``、币安钱包写 ``CT_501``、
+    交易所写 ``56``），而 ``mm_chain_label()`` 的表里没有 ``CT_501``，返回空串后前端
+    ``row.chainLabel || row.chain`` 就把内部链号 ``CT_501`` 原样印在卡片上。
+    Arkham 的链映射才是本板块的真源，前端一律不吃裸链号。
+    """
+    return ARKHAM_API.chain_label(value) or mm_chain_label(value)
+
+
+def arkham_cluster_payload(*, force_refresh: bool = False) -> dict[str, Any]:
+    """板块快照：给每行补链展示标签与「查看」链接。
+
+    链接与标签在这里拼、不在前端拼 —— Arkham 的 pricingID 只有后端知道。
+    """
+    payload = ARKHAM_CLUSTER_MONITOR.payload(force_refresh=force_refresh)
+    for cluster in payload.get("clusters") or []:
+        cluster["chainLabel"] = arkham_cluster_chain_label(cluster.get("chain") or "")
+        for token in cluster.get("tokens") or []:
+            token["chainLabel"] = arkham_cluster_chain_label(token.get("chain") or "")
+    for token in payload.get("tokens") or []:
+        token["chainLabel"] = arkham_cluster_chain_label(token.get("chain") or "")
+        if not token.get("url") and token.get("contract"):
+            token["url"] = mm_gmgn_token_url(token.get("chain") or "", token.get("contract") or "")
+    return payload
+
+
+def send_arkham_cluster_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
+    """地址集群跨标的提醒。
+
+    ``board`` 写 ``arkham-cluster``：不在榜单页的行情卡里，静音走子板块自己的开关。
+    同一个集群 6 小时只弹一次由 ``ArkhamClusterMonitor.dispatch_alerts()`` 记账。
+
+    **不改 queuePriority 之外的东西**：皮肤（报红）留给 ``annotate_desktop_alert_alpha_skin``
+    按「这条标的是不是 BSC 上的 Alpha 币」自己判 —— 这里不重复实现那套判据。
+    """
+    if not ARKHAM_CLUSTER_MONITOR.alerts_enabled():
+        return {"ok": True, "skipped": True, "reason": "arkham cluster popups disabled"}
+    tokens = [dict(row) for row in (event.get("tokens") or []) if isinstance(row, dict)]
+    if len(tokens) < 2:
+        return {"ok": True, "skipped": True, "reason": "need at least two tokens"}
+    name = clean_feed_text(event.get("name"), 80) or str(event.get("clusterId") or "").strip()
+    if not name:
+        return {"ok": True, "skipped": True, "reason": "missing cluster name"}
+    threshold = safe_float(event.get("significantPct")) or ARKHAM_CLUSTER.CLUSTER_SIGNIFICANT_PCT
+    kind_label = "匿名地址簇" if str(event.get("kind") or "") == "address" else "实体集群"
+    lead = tokens[0]
+    brief = "，".join(
+        f"{clean_feed_text(row.get('symbol'), 30)} {safe_float(row.get('pct')):.1f}%"
+        for row in tokens[:3]
+    )
+    more = f"，另 {len(tokens) - 3} 个标的" if len(tokens) > 3 else ""
+    cluster_type = clean_feed_text(event.get("clusterType"), 30)
+    body_bits = [
+        # 「榜上标的」要写出来：这条提醒只数榜上的币（用户 2026-10-22 收窄口径），
+        # 不写清楚用户会以为拿掉了某个「明明也在持仓里」的币。
+        f"同一个{kind_label}在 {len(tokens)} 个榜上标的占流通 ≥{threshold:g}%：{brief}{more}",
+    ]
+    if cluster_type:
+        body_bits.append(f"类型 {cluster_type}")
+    if event.get("kind") == "address" and event.get("address"):
+        body_bits.append(str(event["address"])[:20])
+    url = str(lead.get("url") or "").strip()
+    if not url:
+        url = mm_gmgn_token_url(lead.get("chain") or "", lead.get("contract") or "")
+    return launch_desktop_alert({
+        "key": f"arkham-cluster:{event.get('clusterId') or name}",
+        "kind": "地址集群",
+        "source": "地址集群监控",
+        "sourceLabel": "AC",
+        "sourceType": "arkham-cluster",
+        "sourceId": "arkham-cluster",
+        "board": "arkham-cluster",
+        "symbol": clean_feed_text(lead.get("symbol"), 40),
+        "title": f"地址集群跨标的：{name}",
+        "body": " · ".join(bit for bit in body_bits if bit),
+        "contractAddress": clean_feed_text(lead.get("contract"), 180),
+        "chain": clean_feed_text(lead.get("chain"), 30),
+        "url": url,
+        "time": int(time.time() * 1000),
+        "priority": f"地址集群 · 跨 {len(tokens)} 标的",
+        # 高于做市商新标的（78）、低于大额（84）与三方共振（90）：
+        # 「同一批人同时控多个盘」比单币异动更值得看，但还不到三方共振那一档。
+        "queuePriority": 86,
+        "speech": (
+            f"地址集群提醒，{name} 同时在 {len(tokens)} 个榜上标的占流通超过 {threshold:g} 个百分点"
+        ),
+        "originalText": json.dumps(event, ensure_ascii=False)[:1800],
+    })
+
+
+def start_arkham_cluster_monitor() -> bool:
+    if env_flag("XINGYUN_DISABLE_ARKHAM_CLUSTER_MONITOR", default=False):
+        return False
+    ARKHAM_CLUSTER_MONITOR.set_candidate_provider(arkham_cluster_candidates)
+    ARKHAM_CLUSTER_MONITOR.set_alert_callback(send_arkham_cluster_desktop_alert)
+    return ARKHAM_CLUSTER_MONITOR.start()
 
 
 def send_chain_ecosystem_desktop_alert(alert: dict[str, Any]) -> dict[str, Any]:
@@ -38362,7 +40193,11 @@ def launch_price_watch_alert(event: dict[str, Any], *, persist_only: bool = Fals
         # Do not re-enter AUTH_DB_LOCK, start workers, or perform source intake here.
         if env_flag('XINGYUN_DISABLE_DESKTOP_ALERT', default=is_production_mode()):
             return {'ok': True, 'skipped': True}
-        normalized = normalize_desktop_alert(payload)
+        # 这条路径被设计成"只落库、不做 I/O"（调用方还持有价格库事务），所以只认
+        # 事件自带的链与 Alpha 清单，不去查监控池。
+        normalized = annotate_desktop_alert_chain(
+            normalize_desktop_alert(payload), allow_pool_lookup=False
+        )
         return ALERT_DELIVERY_STORE.admit(normalized, alert_dedupe_keys(normalized), desktop_alert_queue_priority(normalized))
 
     symbol = price_structure_monitor_symbol(event.get("symbol")) or "--"
@@ -45110,6 +46945,206 @@ def parse_site_newboard_events(payload: dict[str, Any], *, track_listings: bool 
     return events
 
 
+# Binance Alpha 是币安钱包生态的「早鸟收录区」：它常常先于主站上新收录项目方代币，
+# 所以它不参与「全球首发」判定（见 listing_alerts.NON_OWNER_SOURCES），否则它的过早
+# 时间戳会把币安/OKX/Bitget 主站正式上新永久压掉。但用户明确要求「Alpha 新币新进」
+# 也要弹窗，于是在这里给它一条独立的按榜「新进」策略：
+#   事件源 = Alpha 榜行自身的出现。服务启动的首轮只建基线（sync_site_alert_feed 的
+#   is_ready 门禁），之后只有真正新进榜的代币弹一次，key = alpha-new:<资产>，天然幂等。
+# 不用「15 分钟内被收录」这种新鲜度判定：Alpha 的收录时间戳是日期粒度（当天 00:00），
+# 落在窗口外的概率接近 100%，那样会永远弹不出来。
+ALPHA_NEW_ALERT_TTL_MS = 24 * 60 * 60 * 1000
+ALPHA_NEW_KEY_PREFIX = "alpha-new:"
+# 早期 Alpha 代币在链上流动性极薄，合约（永续/杠杆）的强平与插针风险远高于现货。用户要求
+# 用最重的语气直接给结论（2026-10-16 两次加码后的定稿）。
+# **只用于 Alpha 新币榜自己的弹窗**（parse_binance_alpha_new_events）：2026-10-17 线上出现
+# 「币安钱包热门榜新进 POP」被套上这句话的翻车，用户拍板「只用在 binance alpha 币上」——
+# 别的榜命中 Alpha 币照弹、照标链，但不许借用这句话，也不许染色。
+ALPHA_NEW_RISK_NOTE = "合约极其恶心，拉盘预期极猛，千万别碰，买现货"
+
+# Alpha 已收录资产集合（全量清单，不只是榜上 10 行），由 binance-alpha-new 弹窗 feed
+# 每轮刷新，空集合 = 未知，一律按「不是」处理。
+# 2026-10-17 起它**不再决定弹窗力度**（那句话/红色只属于 Alpha 新币榜本身），剩下两个用途：
+# ① 给别的榜的弹窗做「这个币在 Alpha 上是哪条链」的兜底（配合下面的 ALPHA_LISTED_CHAINS）；
+# ② 回答「这个币在不在 Alpha」这类查询（binance_alpha_listed_asset，含单测）。
+ALPHA_LISTED_ASSETS: frozenset[str] = frozenset()
+# 同一份清单的 asset → 链 映射（Alpha 是多链收录：BSC / ETH / Solana / Base / Sonic /
+# Robinhood …）。弹窗里的「XX 链」提醒要靠它：命中 Alpha 币的那个榜常常不是 Alpha 榜，
+# 链在榜行里往往是空的，只能从这里查。
+ALPHA_LISTED_CHAINS: dict[str, str] = {}
+
+# 上游 chainName 五花八门（"BSC" / "BNB Chain" / "ethereum" / "sol"），统一成给用户看的
+# 短标签；表里没有的原样透出——宁可显示上游生名，也别显示空白。
+ALPHA_CHAIN_LABEL_ALIASES = {
+    "bsc": "BSC",
+    "bnb": "BSC",
+    "bnb chain": "BSC",
+    "bnb smart chain": "BSC",
+    "binance smart chain": "BSC",
+    "eth": "ETH",
+    "ethereum": "ETH",
+    "sol": "Solana",
+    "solana": "Solana",
+    "base": "Base",
+    "robinhood": "Robinhood",
+    "sonic": "Sonic",
+    "sui": "Sui",
+    "tron": "Tron",
+    "trx": "Tron",
+}
+# 榜单行的 tags 在上游没给链时会塞占位符「链上」，那不是链名——别拼成「链上 链」。
+ALPHA_CHAIN_PLACEHOLDERS = frozenset({"链上", "chain", "-", "--", "unknown"})
+
+
+def alpha_chain_label(value: Any) -> str:
+    """把上游链名归一成展示标签（拿不到、或只是占位符时返回空串）。"""
+    text = clean_feed_text(value, 40).strip()
+    if not text or text.casefold() in ALPHA_CHAIN_PLACEHOLDERS:
+        return ""
+    return ALPHA_CHAIN_LABEL_ALIASES.get(text.casefold(), text)
+
+
+def binance_alpha_listed_asset(row: dict[str, Any]) -> bool:
+    """该榜单行/快照对应的币是否在 Binance Alpha 收录清单里。
+
+    注意：2026-10-17 起**不再**用它给别的榜新进加 Alpha 文案/染色（用户否掉了）。
+    保留它是为了「这个币在不在 Alpha」这类查询本身（含单测）。
+    """
+    if not ALPHA_LISTED_ASSETS or not isinstance(row, dict):
+        return False
+    for value in (row.get("assetKey"), row.get("symbol"), row.get("asset"), row.get("name")):
+        key = listing_asset_key(clean_price_watch_symbol(value))
+        if key and key in ALPHA_LISTED_ASSETS:
+            return True
+    return False
+
+
+def binance_alpha_chain_for_asset(row: dict[str, Any]) -> str:
+    """该币在 Alpha 上是哪条链；不在清单里、或上游没给链时返回 ""。"""
+    if not ALPHA_LISTED_CHAINS or not isinstance(row, dict):
+        return ""
+    for value in (row.get("assetKey"), row.get("symbol"), row.get("asset"), row.get("name")):
+        key = listing_asset_key(clean_price_watch_symbol(value))
+        if key and key in ALPHA_LISTED_CHAINS:
+            return ALPHA_LISTED_CHAINS[key]
+    return ""
+
+
+# BSC 是币安自家的链，Alpha 里这档早期代币的拉盘/插针烈度最高，用户 2026-10-17 要求
+# 单独给它们红色提醒（其它链维持普通皮肤）。
+ALPHA_RED_CHAINS = frozenset({"bsc"})
+
+
+def alpha_chain_is_red(chain_label: str) -> bool:
+    return str(chain_label or "").strip().casefold() in ALPHA_RED_CHAINS
+
+
+def apply_alpha_red_tone(event: dict[str, Any], chain_label: str) -> dict[str, Any]:
+    """BSC 链的 Alpha 币换成红色皮肤。
+
+    只动 ``alertTone``（渲染层按它把标题和优先级标签染红，见 desktop_alert.is_hot），
+    **不动** ``queuePriority`` 与静默判定——红色是"更该看"，不是"更该抢队列"，也不是
+    绕过静默的通行证（那条 2026-10-03 就随着发射台档一起废除了）。
+    """
+    if isinstance(event, dict) and alpha_chain_is_red(chain_label):
+        event["alertTone"] = "red"
+    return event
+
+
+def binance_alpha_new_feed_payload() -> dict[str, Any]:
+    """只取 Alpha 那一段，避免与 18 秒一轮的新币榜全量轮询互相拖累。"""
+    try:
+        section = cached("binance-alpha-new", fetch_binance_alpha_new_coins)
+    except Exception as exc:
+        print(f"Binance Alpha new feed failed: {safe_error_text(str(exc))}", file=sys.stderr)
+        section = None
+    return {
+        "updatedAt": int(time.time() * 1000),
+        "sections": [section] if isinstance(section, dict) else [],
+    }
+
+
+def parse_binance_alpha_new_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    global ALPHA_LISTED_ASSETS, ALPHA_LISTED_CHAINS
+    sections = payload.get("sections") if isinstance(payload.get("sections"), list) else []
+    rows: list[dict[str, Any]] = []
+    for section in sections:
+        if isinstance(section, dict) and str(section.get("id") or "") == "binance-alpha-new":
+            rows = section.get("rows") if isinstance(section.get("rows"), list) else []
+            # 顺手记下全量收录清单（不只是榜上这 10 行），供其它榜单新进弹窗做 Alpha 判定
+            # （AIcoin 热榜新进 + Alpha 币要放行并带链提醒）。抓取失败时清单为空，此时保留
+            # 上一轮结果，避免提示忽有忽无。
+            inventory: set[str] = set()
+            chains: dict[str, str] = {}
+            for entry in (section.get("listingInventory") or []):
+                if not isinstance(entry, dict):
+                    continue
+                key = listing_asset_key(entry.get("asset") or entry.get("symbol"))
+                if not key:
+                    continue
+                inventory.add(key)
+                label = alpha_chain_label(entry.get("chain"))
+                if label:
+                    chains[key] = label
+            if inventory:
+                ALPHA_LISTED_ASSETS = frozenset(inventory)
+                # 链映射与清单同批刷新；上游某条这次没给链就沿用上一轮的，别把已知的链丢成空。
+                merged_chains: dict[str, str] = {}
+                for key in inventory:
+                    label = chains.get(key) or ALPHA_LISTED_CHAINS.get(key) or ""
+                    if label:
+                        merged_chains[key] = label
+                ALPHA_LISTED_CHAINS = merged_chains
+            break
+    now_ms = int(time.time() * 1000)
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("assetType") == "tradfi":
+            continue
+        symbol = clean_price_watch_symbol(row.get("symbol") or row.get("asset"))
+        asset = listing_asset_key(symbol)
+        if not symbol or not asset:
+            continue
+        tags = [clean_feed_text(value, 60) for value in (row.get("tags") or []) if clean_feed_text(value, 60)]
+        # 链优先取行上的独立字段（fetch 时已写入）；老缓存里没有该字段就退回 tags[1]。
+        # Alpha 是多链收录，链是这条弹窗最有用的上下文之一，所以显式写成「BSC 链」。
+        chain_label = alpha_chain_label(row.get("chain")) or alpha_chain_label(tags[1] if len(tags) > 1 else "")
+        chain_note = f"{chain_label} 链" if chain_label else ""
+        body_parts = [
+            row.get("name") if str(row.get("name") or "").strip().upper() != symbol.upper() else "",
+            chain_note,
+            row.get("price"),
+            row.get("change"),
+            row.get("turnover"),
+            ALPHA_NEW_RISK_NOTE,
+        ]
+        events.append(apply_alpha_red_tone({
+            # key 只挂资产名：同一个币只会「新进」一次；Alpha 榜按收录时间单调排序，
+            # 出榜的币不会被更新的币挤回来后重弹。
+            "key": f"{ALPHA_NEW_KEY_PREFIX}{asset}",
+            "listingPolicyVersion": 1,
+            "expiresAt": now_ms + ALPHA_NEW_ALERT_TTL_MS,
+            "sourceScope": "binance-alpha-new",
+            "sourceId": "binance-alpha-new",
+            "kind": "Binance Alpha 新币新进",
+            "source": "Binance Alpha",
+            "sourceLabel": "BA",
+            "title": f"Binance Alpha 新币新进：{symbol}",
+            "body": alert_body_join(*body_parts),
+            "chain": chain_label,
+            "url": row.get("url") or "./newboards.html",
+            "time": now_ms,
+            "priority": "Alpha新币新进",
+            "queuePriority": 84,
+            "speech": (
+                f"Binance Alpha 新币新进提醒，{symbol}，{chain_note}。{ALPHA_NEW_RISK_NOTE}。"
+                if chain_note
+                else f"Binance Alpha 新币新进提醒，{symbol}。{ALPHA_NEW_RISK_NOTE}。"
+            ),
+        }, chain_label))
+    return events
+
+
 def parse_site_newsflash_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
     items = payload.get("items") if isinstance(payload.get("items"), list) else []
     events: list[dict[str, Any]] = []
@@ -45170,6 +47205,11 @@ def parse_site_market_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "title": f"{source.get('sourceLabel') or '榜单'} 榜首变为 {display}",
                 "body": alert_body_join(leader.get("name"), leader.get("price"), leader.get("change"), leader.get("turnover") or leader.get("note")),
                 "url": "./index.html",
+                # 「榜首是哪个币」要能被 Top10 那一步认出来：链上标的（OKX DEX 榜）
+                # 自带合约；交易所标的没有，靠 symbol + 价格去 Arkham 反查。
+                "contractAddress": leader.get("contractAddress") or "",
+                "chain": leader.get("chain") or "",
+                "priceValue": price_watch_numeric(leader.get("price")),
                 "time": source.get("updatedAt") or payload.get("updatedAt") or int(time.time() * 1000),
                 "priority": "资金切换" if change >= 8 else "榜首换手",
             }
@@ -45212,6 +47252,10 @@ def parse_site_gainers_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "title": f"{source.get('sourceLabel') or '涨幅榜'} 涨幅榜榜首变为 {display}",
                 "body": alert_body_join(*parts),
                 "url": "./gainers.html",
+                # 同上：涨幅榜首的链上合约（OKX DEX 榜有，交易所榜没有）。
+                "contractAddress": leader.get("contractAddress") or "",
+                "chain": leader.get("chain") or "",
+                "priceValue": price_watch_numeric(leader.get("price")),
                 "time": source.get("updatedAt") or payload.get("updatedAt") or int(time.time() * 1000),
                 "priority": "催化重定价" if change >= 15 else "榜首换手",
                 "speech": f"涨幅榜榜首异动，{display} 成为{source.get('title') or '涨幅榜'}榜首。",
@@ -45451,6 +47495,10 @@ def rank_monitor_board_label(board: str, current: dict[str, Any]) -> str:
         return f"币安钱包{period_label}热门榜"
     if str(current.get("sourceId") or "") == "ave":
         return "AVE.ai热门榜"
+    if str(current.get("sourceId") or "") == "aicoin":
+        # AIcoin 热门榜新进现在会真的弹窗（用户 2026-10-16），标题得说清是哪张榜，
+        # 不能只写"热门榜新进"。
+        return "AIcoin热门榜"
     group = str(current.get("group") or "").lower()
     if group == "hk":
         return "港股热门榜"
@@ -45525,12 +47573,18 @@ def rank_monitor_event(board: str, current: dict[str, Any], reason: str) -> dict
         binance_wallet_token_url(current.get("chain"), current.get("contractAddress"))
         if is_binance_wallet else ""
     )
-    gmgn_wallet_url = ""
+    gmgn_trade_url = ""
     if is_gmgn_hot_search:
-        chain = str(current.get("chain") or "").strip().casefold()
-        chain_meta = BINANCE_WALLET_KLINE_CHAINS.get(chain)
-        chain_id = chain_meta[0] if chain_meta else ""
-        gmgn_wallet_url = binance_wallet_token_url(chain_id, current.get("contractAddress"))
+        # 「查看」必须落在 GMGN 站内交易页 (https://gmgn.ai/<chain>/token/<CA>)，而不是
+        # 币安钱包代币页：用户在 GMGN 上做单，跳去 web3.binance.com 等于断了他的下一步。
+        # 榜单行自己的 url 就是这个链接，优先原样复用，缺失时按 chain + CA 重建。
+        row_url = str(current.get("url") or "").strip()
+        if row_url.startswith("https://gmgn.ai/") and "/token/" in row_url:
+            gmgn_trade_url = row_url
+        else:
+            gmgn_trade_url = gmgn_token_trade_url(
+                current.get("chain"), current.get("contractAddress")
+            )
     reason_label = {
         "new": "新进",
         "rank": "排名更新",
@@ -45571,8 +47625,8 @@ def rank_monitor_event(board: str, current: dict[str, Any], reason: str) -> dict
         "title": f"{board_label}{reason_label}：{symbol}",
         "body": body,
         "url": (
-            gmgn_wallet_url
-            if is_gmgn_hot_search and "/token/" in gmgn_wallet_url
+            gmgn_trade_url
+            if is_gmgn_hot_search and gmgn_trade_url
             else wallet_url
             if is_binance_wallet and "/token/" in wallet_url
             else current.get("url")
@@ -45583,6 +47637,8 @@ def rank_monitor_event(board: str, current: dict[str, Any], reason: str) -> dict
         ),
         "contractAddress": current.get("contractAddress") or "",
         "chain": current.get("chain") or "",
+        # 数值价：Top10 反查的 symbol 身份闸要用（见 normalize_desktop_alert）。
+        "priceValue": price_watch_numeric(current.get("price")),
         "time": int(time.time() * 1000),
         "priority": "钱包热榜新进" if is_binance_wallet and reason == "new" else reason_label,
         "queuePriority": 74 if is_binance_wallet and reason == "new" else 0,
@@ -45615,6 +47671,17 @@ def rank_monitor_event(board: str, current: dict[str, Any], reason: str) -> dict
             if is_gmgn_hot_search
             else f"榜单新进，{symbol} 新进入{board_label}前十。"
         )
+        # 别在这里给「Alpha 币」加任何重提示或红色皮肤（用户 2026-10-17 第二次拍板）。
+        #
+        # 曾经的做法是：只要这条新进是 Alpha 已收录的币，就追加「合约极其恶心…」那句并
+        # 按 BSC 染红。上线当天就被否掉了——币安钱包热门榜新进 POP（Zypher，确实是
+        # Alpha 收录币）被套上了 Alpha 的推销式文案，读起来像是 Alpha 新币公告，
+        # 而它只是一条「热门榜新进」。用户原话：**我是要 BINANCE ALPHA 的新币才这样播报**。
+        #
+        # 所以重提示 + 报红只归 ``binance-alpha-new`` 自己那条 feed
+        # （parse_binance_alpha_new_events，key=alpha-new:<资产>）。别的榜命中 Alpha 币时，
+        # 该弹的照弹、链照标（走 launch_desktop_alert 的统一 annotate），但**不许**借用
+        # Alpha 的语气，也不许染色。别再往这里加回来。
     # A launchpad's OWN token ("台子币") is the rare, real signal: the platform
     # itself is trading.  Checked first and returns immediately so nothing can
     # overwrite its tone/speech.
@@ -45656,6 +47723,19 @@ def rank_monitor_hot_new_is_silent(row: dict[str, Any]) -> bool:
     if re.search(r"钱包|\bwallet\b|\bdex\b|gmgn", source_text, re.I):
         return False
     return any(marker in source_text for marker in RANK_MONITOR_SILENT_HOT_NEW_EXCHANGE_MARKERS)
+
+
+def rank_monitor_hot_new_is_muted(row: dict[str, Any]) -> bool:
+    """热榜新进的最终静默判定：AIcoin 热门榜被用户点名要求整体弹窗。
+
+    AIcoin 热门榜的「新进」在 2026-10-06 曾被定性为纯噪音闸门而静默；2026-10-16 用户
+    明确要求「AIcoin 热门榜新进，要弹窗」，于是整榜放行（含普通币；里面若是 Binance
+    Alpha 币，弹窗仍会额外带「合约极其恶心…」那句提示）。其余来源（币安/OKX/Bitget/
+    Gate/HTX 等二级市场热榜）维持原状，别顺手把 firehose 一起放回来。
+    """
+    if not rank_monitor_hot_new_is_silent(row):
+        return False
+    return str(row.get("sourceId") or "").strip().casefold() != "aicoin"
 
 
 def sync_binance_wallet_hot_alert_feed(source: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -46114,7 +48194,7 @@ def sync_rank_monitor_feed() -> None:
                 changed, reason = rank_monitor_changed(snapshots.get(board, {}).get(key) if isinstance(snapshots.get(board), dict) else None, row, board)
                 if not changed or reason != "new":
                     continue
-                if board == "hot" and rank_monitor_hot_new_is_silent(row):
+                if board == "hot" and rank_monitor_hot_new_is_muted(row):
                     continue
                 alert_key = f"{board}:new:{key}"
                 if now - safe_float(last_alerts.get(alert_key)) < RANK_MONITOR_COOLDOWN_SECONDS:
@@ -54139,6 +56219,10 @@ def site_alert_feeds() -> list[dict[str, Any]]:
         {"name": "listings", "interval": 18, "maxAgeMs": 24 * 60 * 60 * 1000, "fetch": listing_events_payload, "parse": parse_site_listing_events},
         {"name": "aster-contracts", "interval": 12, "maxAgeMs": 48 * 60 * 60 * 1000, "fetch": aster_contracts_payload, "parse": parse_site_aster_contract_events},
         {"name": "newboards", "interval": 18, "maxAgeMs": 15 * 60 * 1000, "fetch": new_coin_rankings_payload, "parse": lambda payload: parse_site_newboard_events(payload, track_listings=True)},
+        # Binance Alpha 新进走独立一路：它不参与新币榜的 first/venue listing 判定
+        # （Alpha 是早鸟收录区，见 parse_binance_alpha_new_events 的注释），
+        # 只做按榜「新进」弹窗。收录频率低，60 秒一轮足够。
+        {"name": "binance-alpha-new", "interval": 60, "maxAgeMs": ALPHA_NEW_ALERT_TTL_MS, "fetch": binance_alpha_new_feed_payload, "parse": parse_binance_alpha_new_events},
         {"name": "market", "interval": 30, "maxAgeMs": 15 * 60 * 1000, "fetch": market_payload, "parse": parse_site_market_events},
         {"name": "gainers", "interval": 30, "maxAgeMs": 15 * 60 * 1000, "fetch": gainers_rankings_payload, "parse": parse_site_gainers_events},
         {"name": "briefs", "interval": 60, "maxAgeMs": 24 * 60 * 60 * 1000, "fetch": automation_briefs_payload, "parse": parse_site_brief_events},
@@ -54285,6 +56369,52 @@ def sync_site_alert_feed(feed: dict[str, Any]) -> None:
     save_site_alert_state()
 
 
+def alpha_mm_control_round() -> None:
+    """做市商控盘提醒：涨幅榜里的 Alpha 币（且已上永续）→ 高控盘 + 小市值入选，回踩支撑弹买点。
+
+    判据、阈值与剔除规则全在 `alpha_mm_monitor` 里（用户 2026-10-20 拍板）：
+    控盘 ≥90%（前 10 持币剔池/销毁/交易所钱包）、流通市值 ≤3000 万美元、
+    历史高点回撤 ≥60% 永久排除、上涨结构回踩支撑才提示买点。
+    """
+    if not env_flag("XINGYUN_ALPHA_MM_ALERT", default=True):
+        return
+    # 复用涨幅榜的既有缓存（60s TTL）：绝不为了这个监控再打一遍 8 个榜，
+    # 也绝不同步重建，避免和页面轮询抢同一个后台刷新单飞锁。
+    gainers = cached_api_payload(
+        "gainers-rankings", gainers_rankings_payload, 60, allow_sync_rebuild=False, max_age_seconds=900
+    )
+    # 热门榜（成交额 / 热度榜）同样只读缓存：用户 2026-10-21 要求把热门榜里满足
+    # 五条判据的标的也算候选。这条榜通常比涨幅榜晚一点被页面拉过，所以放宽到
+    # 30 分钟 —— 宁可拿到一份旧快照，也不要为了它去同步重建整张榜。
+    hot = cached_api_payload(
+        "turnover-rankings", turnover_rankings_payload, 60,
+        allow_sync_rebuild=False, max_age_seconds=1800,
+    )
+    try:
+        stats = ALPHA_MM.run_round(
+            gainers_payload=gainers,
+            hot_payload=hot,
+            alpha_index=binance_alpha_token_index(),
+            alert=launch_desktop_alert,
+            log=lambda message: print(f"Alpha 控盘提醒：{message}", file=sys.stderr),
+            perp_symbols=binance_perp_base_assets(),
+        )
+    except Exception as exc:
+        print(f"Alpha 控盘提醒失败：{safe_error_text(str(exc))}", file=sys.stderr)
+        return
+    if stats.get("seeded") or stats.get("buyPoints") or stats.get("blocked"):
+        print(
+            "Alpha 控盘提醒：候选 {candidates} / Alpha {alpha} / 有合约 {perp} / 市值达标 {marketCap}"
+            " / 控盘达标 {control} / 回撤达标 {drawdown} → 入选 {seeded}，买点 {buyPoints}，排除 {blocked}".format(
+                **{key: int(stats.get(key) or 0) for key in (
+                    "candidates", "alpha", "perp", "marketCap", "control", "drawdown",
+                    "seeded", "buyPoints", "blocked",
+                )}
+            ),
+            file=sys.stderr,
+        )
+
+
 def site_alert_monitor_loop() -> None:
     """Fixed one thread per source: slow AI/X requests cannot stall price/news intake."""
     feeds = [feed for feed in site_alert_feeds() if feed["name"] != "event-monitor"]
@@ -54300,6 +56430,15 @@ def site_alert_monitor_loop() -> None:
     for feed in feeds:
         threading.Thread(target=run_source, args=(feed['name'], lambda f=feed: sync_site_alert_feed(f), float(feed.get('interval') or 30)), daemon=True, name=f"alert-feed-{feed['name']}").start()
     threading.Thread(target=run_source, args=('rank', sync_rank_monitor_feed, RANK_MONITOR_INTERVAL), daemon=True, name='alert-feed-rank').start()
+    # 做市商控盘提醒：3 分钟一轮。数据链是「涨幅榜缓存 → Alpha 元数据（10 分钟）→
+    # GoPlus 持仓（6 小时，匿名额度约 1 次/分钟、一次只回 1 个合约）→ Gecko 日线（30 分钟）」。
+
+    threading.Thread(
+        target=run_source,
+        args=('alpha-mm-control', alpha_mm_control_round, 180),
+        daemon=True,
+        name='alpha-mm-control',
+    ).start()
     def run_maintenance() -> None:
         # Bound in-memory caches, reap expired login QR images + orphaned
         # atomic-write .tmp files, retire disk cache keys whose source has
@@ -54602,7 +56741,11 @@ class Handler(SimpleHTTPRequestHandler):
         if not skip_identity_enrichment and status == 200 and getattr(self, "path", "").split("?", 1)[0] in {
             "/api/price-watch", "/api/price-structures", "/api/new-coin-low-structures", "/api/rotation-map",
             "/api/aster-contracts", "/api/event-monitor", "/api/wechat-group-monitor", "/api/personal-x-monitor",
-            "/api/smart-money-monitor", "/api/chain-ecosystem", "/api/event-flow", "/api/ai/news-trade", "/api/news-trade/search",
+            "/api/smart-money-monitor", "/api/sandwich-detector", "/api/dev-launch", "/api/chain-ecosystem", "/api/event-flow", "/api/ai/news-trade", "/api/news-trade/search",
+            # 价格异动列表里的币也要能一键加入监控（identity 富化后才显示得对）。
+            "/api/price-move",
+            # 地址集群列表里的标的同理。
+            "/api/arkham-clusters",
         }:
             payload = MONITOR_BUY.identities.enrich(payload)
         if isinstance(payload, dict) and "error" in payload:
@@ -55345,6 +57488,60 @@ class Handler(SimpleHTTPRequestHandler):
                 ).start()
             self.send_json(SMART_MONEY_MONITOR.payload())
             return
+        if parsed.path == "/api/sandwich-detector":
+            # 手动「立即检测」跑一轮就返回；一轮是 GMGN + 多次 RPC，可能几十秒，
+            # 所以只丢给后台线程，页面照常先拿到当前快照。
+            if force_refresh and self.request_is_local_or_admin():
+                threading.Thread(
+                    target=SANDWICH_DETECTOR.run_cycle,
+                    daemon=True,
+                    name="sandwich-manual-cycle",
+                ).start()
+            self.send_json(SANDWICH_DETECTOR.payload())
+            return
+        if parsed.path == "/api/dev-launch":
+            # 手动「立即扫描」是一串外部索引器请求（含逐笔内部交易查询），可能几十秒，
+            # 所以只丢后台线程，页面照常先拿到当前快照。
+            if force_refresh and self.request_is_local_or_admin():
+                threading.Thread(
+                    target=DEV_LAUNCH_MONITOR.run_cycle,
+                    daemon=True,
+                    name="dev-launch-manual-cycle",
+                ).start()
+            self.send_json(DEV_LAUNCH_MONITOR.payload())
+            return
+        if parsed.path == "/api/arkham-clusters":
+            # 手动「立刻查询」= 一轮最多 40 个 Arkham 请求（每个 ~2 秒），
+            # 丢后台线程，页面先拿当前快照。
+            if force_refresh and self.request_is_local_or_admin():
+                threading.Thread(
+                    target=ARKHAM_CLUSTER_MONITOR.run_cycle,
+                    daemon=True,
+                    name="arkham-cluster-manual-cycle",
+                ).start()
+            self.send_json(arkham_cluster_payload())
+            return
+        if parsed.path == "/api/price-move":
+            # 手动「立刻采样」= 一次全市场 ticker（很轻），但仍丢后台线程，页面先拿快照。
+            if force_refresh and self.request_is_local_or_admin():
+                threading.Thread(
+                    target=PRICE_MOVE_MONITOR.run_cycle,
+                    daemon=True,
+                    name="price-move-manual-cycle",
+                ).start()
+            self.send_json(price_move_payload())
+            return
+        if parsed.path == "/api/market-maker":
+            # 手动「立即刷新」= 一轮几十个 Blockscout 请求（30 个地址 × 1 页），
+            # 只丢后台线程，页面照常先拿到当前快照。
+            if force_refresh and self.request_is_local_or_admin():
+                threading.Thread(
+                    target=MARKET_MAKER_MONITOR.run_cycle,
+                    daemon=True,
+                    name="market-maker-manual-cycle",
+                ).start()
+            self.send_json(market_maker_payload_with_gate())
+            return
         if parsed.path == "/api/dragon-wave-feedback":
             user = self.require_auth()
             if not user:
@@ -55528,6 +57725,46 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"ok": False, "maps": [], "error": str(exc)}, status=502)
             return
+        if parsed.path == "/api/cmc-fundamentals":
+            # 榜单页悬停浮层用：一次问最多 80 个 symbol，全部走 CMC 整榜快照的内存倒排，
+            # 零网络等待。**查不到就整条不返回**（前端显示「未收录」），绝不写 0。
+            raw = (query.get("symbols") or [""])[0]
+            symbols = []
+            for chunk in str(raw).split(","):
+                text = clean_feed_text(chunk, 40).strip()
+                if text and text.upper() not in symbols:
+                    symbols.append(text.upper())
+                if len(symbols) >= 80:
+                    break
+            items: dict[str, Any] = {}
+            for sym in symbols:
+                entry = CMC_MARKET_CAP.lookup(sym)
+                if str(entry.get("status") or "") != "ok":
+                    continue
+                basics = CMC_MARKET_CAP.fundamentals(entry)
+                items[sym] = {
+                    "symbol": sym,
+                    "rank": int(safe_float(entry.get("rank"), 0)),
+                    "slug": alert_text(entry.get("slug"), 120),
+                    "mcapUsd": safe_float(entry.get("mcapUsd"), 0),
+                    "circulating": basics["circulating"],
+                    "total": basics["total"],
+                    "max": basics["max"],
+                    "floatRatio": basics["floatRatio"],
+                    "fdvUsd": basics["fdvUsd"],
+                    "mcapText": CMC_MARKET_CAP.cn_usd_text(entry.get("mcapUsd")),
+                    "fdvText": CMC_MARKET_CAP.cn_usd_text(basics["fdvUsd"]),
+                    "circText": CMC_MARKET_CAP.supply_text(basics["circulating"]),
+                    "totalText": CMC_MARKET_CAP.supply_text(basics["total"]),
+                    "text": CMC_MARKET_CAP.fundamentals_text(entry),
+                }
+            self.send_json({"ok": True, "items": items, "requested": len(symbols)})
+            return
+        if parsed.path == "/api/trench-overlay-preference":
+            # 桌面悬浮窗是独立 pythonw 进程，看不到浏览器的 localStorage；榜单页把
+            # 当前选的链写在这里，面板轮询这个接口来保持两边同一条链。
+            self.send_json({"ok": True, "chain": trench_overlay_chain_preference()})
+            return
         if parsed.path == "/api/onchain-trenches":
             try:
                 page = max(1, int((query.get("page") or [1])[0]))
@@ -55561,8 +57798,10 @@ class Handler(SimpleHTTPRequestHandler):
                         match_recent_news=True,
                     )
                 self.send_json(
-                    attach_counterfeit_platform_labels(
-                        attach_trench_person_signals(attach_gmgn_native_trench_narrative(trench_payload))
+                    attach_trench_cmc_fundamentals(
+                        attach_counterfeit_platform_labels(
+                            attach_trench_person_signals(attach_gmgn_native_trench_narrative(trench_payload))
+                        )
                     )
                 )
             except (TypeError, ValueError) as exc:
@@ -55904,6 +58143,22 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         route = parsed.path.rstrip("/")
         if not self.validate_post_request(route):
+            return
+        if route == "/api/trench-overlay-preference":
+            # 战壕榜切链时前端把选择写进来，桌面悬浮窗（独立进程）轮询读它，
+            # 于是面板永远显示榜单上那条链的叙事。会影响本机面板，故限本机/管理员。
+            if not self.request_is_local_or_admin():
+                self.send_json({"ok": False, "error": "仅限本机同步战壕悬浮窗的链"}, status=403)
+                return
+            try:
+                payload = self.read_json()
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            self.send_json({
+                "ok": True,
+                "chain": set_trench_overlay_chain_preference(payload.get("chain")),
+            })
             return
         if route == "/api/x-tweet-analysis/claim":
             if not self.request_is_local_or_admin() or not self.request_origin_allowed():
@@ -56678,6 +58933,299 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"ok": False, "error": safe_error_text(str(exc))}, status=502)
             return
+        if route == "/api/sandwich-detector" or route.endswith("/api/sandwich-detector"):
+            if not self.request_is_local_or_admin():
+                self.send_json({"ok": False, "error": "仅限本机或管理员配置被夹检测"}, status=403)
+                return
+            if self.headers.get("Origin") == "null" or not self.request_origin_allowed():
+                self.send_json({"ok": False, "error": "请求来源不合法"}, status=403)
+                return
+            try:
+                payload = self.read_json()
+                action = clean_feed_text(payload.get("action"), 30).lower()
+                changed: Any = None
+                if action == "add":
+                    # 表单一定带 label（可能为空串，表示用户就是要清空备注）；接口
+                    # 调用方没带这个键时保持原备注不动。
+                    next_label = None
+                    if "label" in payload or "nickname" in payload:
+                        next_label = payload.get("label") or payload.get("nickname") or ""
+                    changed = SANDWICH_DETECTOR.store.save_wallet(
+                        payload.get("chain"),
+                        payload.get("address"),
+                        next_label,
+                        True,
+                    )
+                elif action in {"save", "toggle"}:
+                    # 只更新这次真的带来的字段；前端「暂停/恢复」不发 label，
+                    # 不能顺手把用户写的备注抹掉。
+                    next_label = None
+                    if "label" in payload or "nickname" in payload:
+                        next_label = payload.get("label") or payload.get("nickname") or ""
+                    changed = SANDWICH_DETECTOR.store.save_wallet(
+                        payload.get("chain"),
+                        payload.get("address"),
+                        next_label,
+                        payload.get("enabled") if "enabled" in payload else None,
+                    )
+                elif action in {"remove", "delete"}:
+                    changed = {"removed": SANDWICH_DETECTOR.store.remove_wallet(
+                        payload.get("chain"), payload.get("address")
+                    )}
+                elif action == "settings":
+                    changed = {}
+                    if "minTradeUsd" in payload:
+                        changed["minTradeUsd"] = SANDWICH_DETECTOR.store.set_setting(
+                            "minTradeUsd", payload.get("minTradeUsd")
+                        )
+                    if "alertsEnabled" in payload:
+                        changed["alertsEnabled"] = SANDWICH_DETECTOR.set_alerts_enabled(
+                            payload.get("alertsEnabled")
+                        )
+                elif action == "refresh":
+                    threading.Thread(
+                        target=SANDWICH_DETECTOR.run_cycle,
+                        daemon=True,
+                        name="sandwich-manual-cycle",
+                    ).start()
+                    changed = {"refreshing": True}
+                else:
+                    self.send_json({"ok": False, "error": "unsupported action"}, status=400)
+                    return
+                self.send_json({**SANDWICH_DETECTOR.payload(), "changed": changed})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": safe_error_text(str(exc))}, status=502)
+            return
+        if route == "/api/dev-launch" or route.endswith("/api/dev-launch"):
+            if not self.request_is_local_or_admin():
+                self.send_json({"ok": False, "error": "仅限本机或管理员配置 Dev 发币监控"}, status=403)
+                return
+            if self.headers.get("Origin") == "null" or not self.request_origin_allowed():
+                self.send_json({"ok": False, "error": "请求来源不合法"}, status=403)
+                return
+            try:
+                payload = self.read_json()
+                action = clean_feed_text(payload.get("action"), 30).lower()
+                changed: Any = None
+                if action == "add":
+                    # 表单一定带 label（可能空串 = 用户就是要清空备注）；接口调用方没带
+                    # 这个键时保持原备注不动（与被夹检测同一口径）。
+                    next_label = None
+                    if "label" in payload or "nickname" in payload:
+                        next_label = payload.get("label") or payload.get("nickname") or ""
+                    changed = DEV_LAUNCH_MONITOR.store.save_wallet(
+                        payload.get("chain"), payload.get("address"), next_label, True
+                    )
+                    # 加进来立刻回扫一次：级别标签与历史发币当时就能看到，否则新地址永远
+                    # 是「普通 / 流水」，用户会以为分级坏了。回扫要翻多页 + 逐笔查内部交易，
+                    # 几十秒起步，所以丢后台线程 —— 页面先拿到「回扫中」，10 秒后轮询就见效。
+                    threading.Thread(
+                        target=DEV_LAUNCH_MONITOR.scan_wallet_now,
+                        args=(payload.get("chain"), payload.get("address")),
+                        daemon=True,
+                        name="dev-launch-backfill",
+                    ).start()
+                    changed["scanning"] = True
+                elif action in {"save", "toggle"}:
+                    next_label = None
+                    if "label" in payload or "nickname" in payload:
+                        next_label = payload.get("label") or payload.get("nickname") or ""
+                    changed = DEV_LAUNCH_MONITOR.store.save_wallet(
+                        payload.get("chain"),
+                        payload.get("address"),
+                        next_label,
+                        payload.get("enabled") if "enabled" in payload else None,
+                    )
+                elif action in {"remove", "delete"}:
+                    changed = {"removed": DEV_LAUNCH_MONITOR.store.remove_wallet(
+                        payload.get("chain"), payload.get("address")
+                    )}
+                elif action == "settings":
+                    changed = {}
+                    if "alertsEnabled" in payload:
+                        changed["alertsEnabled"] = DEV_LAUNCH_MONITOR.set_alerts_enabled(
+                            payload.get("alertsEnabled")
+                        )
+                elif action == "scan":
+                    # 单地址重扫（想立刻刷新级别时用），同样丢后台。
+                    threading.Thread(
+                        target=DEV_LAUNCH_MONITOR.scan_wallet_now,
+                        args=(payload.get("chain"), payload.get("address")),
+                        daemon=True,
+                        name="dev-launch-backfill",
+                    ).start()
+                    changed = {"scanning": True}
+                elif action == "refresh":
+                    threading.Thread(
+                        target=DEV_LAUNCH_MONITOR.run_cycle,
+                        daemon=True,
+                        name="dev-launch-manual-cycle",
+                    ).start()
+                    changed = {"refreshing": True}
+                else:
+                    self.send_json({"ok": False, "error": "unsupported action"}, status=400)
+                    return
+                self.send_json({**DEV_LAUNCH_MONITOR.payload(), "changed": changed})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": safe_error_text(str(exc))}, status=502)
+            return
+        if route == "/api/arkham-clusters" or route.endswith("/api/arkham-clusters"):
+            if not self.request_is_local_or_admin():
+                self.send_json({"ok": False, "error": "仅限本机或管理员配置地址集群监控"}, status=403)
+                return
+            if self.headers.get("Origin") == "null" or not self.request_origin_allowed():
+                self.send_json({"ok": False, "error": "请求来源不合法"}, status=403)
+                return
+            try:
+                payload = self.read_json()
+                action = clean_feed_text(payload.get("action"), 30).lower()
+                changed: Any = None
+                if action == "settings":
+                    changed = {"alertsEnabled": ARKHAM_CLUSTER_MONITOR.set_alerts_enabled(
+                        payload.get("alertsEnabled")
+                    )}
+                elif action == "refresh":
+                    threading.Thread(
+                        target=ARKHAM_CLUSTER_MONITOR.run_cycle,
+                        daemon=True,
+                        name="arkham-cluster-manual-cycle",
+                    ).start()
+                    changed = {"refreshing": True}
+                else:
+                    self.send_json({"ok": False, "error": "unsupported action"}, status=400)
+                    return
+                # 改完设置立刻要看到结果，绕过 30 秒快照缓存重建一次。
+                self.send_json({**arkham_cluster_payload(force_refresh=True), "changed": changed})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": safe_error_text(str(exc))}, status=502)
+            return
+        if route == "/api/price-move" or route.endswith("/api/price-move"):
+            if not self.request_is_local_or_admin():
+                self.send_json({"ok": False, "error": "仅限本机或管理员配置价格异动监控"}, status=403)
+                return
+            if self.headers.get("Origin") == "null" or not self.request_origin_allowed():
+                self.send_json({"ok": False, "error": "请求来源不合法"}, status=403)
+                return
+            try:
+                payload = self.read_json()
+                action = clean_feed_text(payload.get("action"), 30).lower()
+                changed: Any = None
+                if action == "settings":
+                    changed = {"alertsEnabled": PRICE_MOVE_MONITOR.set_alerts_enabled(
+                        payload.get("alertsEnabled")
+                    )}
+                elif action == "refresh":
+                    threading.Thread(
+                        target=PRICE_MOVE_MONITOR.run_cycle,
+                        daemon=True,
+                        name="price-move-manual-cycle",
+                    ).start()
+                    changed = {"refreshing": True}
+                else:
+                    self.send_json({"ok": False, "error": "unsupported action"}, status=400)
+                    return
+                # 改完设置立刻要看到结果，绕过 20 秒快照缓存重建一次。
+                self.send_json({**price_move_payload(force_refresh=True), "changed": changed})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": safe_error_text(str(exc))}, status=502)
+            return
+        if route == "/api/market-maker" or route.endswith("/api/market-maker"):
+            if not self.request_is_local_or_admin():
+                self.send_json({"ok": False, "error": "仅限本机或管理员配置做市商监控"}, status=403)
+                return
+            if self.headers.get("Origin") == "null" or not self.request_origin_allowed():
+                self.send_json({"ok": False, "error": "请求来源不合法"}, status=403)
+                return
+            try:
+                payload = self.read_json()
+                action = clean_feed_text(payload.get("action"), 30).lower()
+                changed: Any = None
+                if action == "add":
+                    changed = MARKET_MAKER_MONITOR.store.save_address(
+                        payload.get("chain"),
+                        payload.get("address"),
+                        payload.get("firm"),
+                        tag=payload.get("tag") or "",
+                        # 手工加的非名册地址一律标「手动添加」，别冒充链上标签。
+                        evidence="manual",
+                        enabled=True,
+                    )
+                    # 加进来立刻拉一次流水：否则用户要等下一个轮询周期才看到这家的持仓。
+                    # 一次就是几页 Blockscout，丢后台线程，页面先拿「拉取中」。
+                    threading.Thread(
+                        target=MARKET_MAKER_MONITOR.poll_address_now,
+                        args=(payload.get("chain"), payload.get("address")),
+                        daemon=True,
+                        name="market-maker-address-poll",
+                    ).start()
+                    changed["polling"] = True
+                elif action in {"save", "toggle"}:
+                    # 只改开关时不碰 tag/firm（表单没带这两个键）；带了就一起更新。
+                    if "tag" in payload or "firm" in payload:
+                        current = MARKET_MAKER_MONITOR.store.address(
+                            payload.get("chain"), payload.get("address")
+                        ) or {}
+                        changed = MARKET_MAKER_MONITOR.store.save_address(
+                            payload.get("chain"),
+                            payload.get("address"),
+                            payload.get("firm") or current.get("firm"),
+                            tag=payload.get("tag") if "tag" in payload else current.get("tag"),
+                            evidence=current.get("evidence") or "manual",
+                            source_url=current.get("source_url") or "",
+                            enabled=payload.get("enabled") if "enabled" in payload else None,
+                        )
+                    else:
+                        changed = {
+                            "enabled": MARKET_MAKER_MONITOR.store.set_enabled(
+                                payload.get("chain"),
+                                payload.get("address"),
+                                payload.get("enabled"),
+                            )
+                        }
+                elif action in {"remove", "delete"}:
+                    changed = {"removed": MARKET_MAKER_MONITOR.store.remove_address(
+                        payload.get("chain"), payload.get("address")
+                    )}
+                elif action == "settings":
+                    changed = {}
+                    if "alertsEnabled" in payload:
+                        changed["alertsEnabled"] = MARKET_MAKER_MONITOR.set_alerts_enabled(
+                            payload.get("alertsEnabled")
+                        )
+                elif action == "scan":
+                    threading.Thread(
+                        target=MARKET_MAKER_MONITOR.poll_address_now,
+                        args=(payload.get("chain"), payload.get("address")),
+                        daemon=True,
+                        name="market-maker-address-poll",
+                    ).start()
+                    changed = {"polling": True}
+                elif action == "refresh":
+                    threading.Thread(
+                        target=MARKET_MAKER_MONITOR.run_cycle,
+                        daemon=True,
+                        name="market-maker-manual-cycle",
+                    ).start()
+                    changed = {"refreshing": True}
+                else:
+                    self.send_json({"ok": False, "error": "unsupported action"}, status=400)
+                    return
+                # 改完设置立刻要能看到结果，所以这里**绕过 30 秒快照缓存**重建一次；
+                # 手动动作本来就是低频操作，多等一次读库值得。
+                self.send_json({**market_maker_payload_with_gate(force_refresh=True), "changed": changed})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": safe_error_text(str(exc))}, status=502)
+            return
         if route == "/api/strategy-board" or route.endswith("/api/strategy-board"):
             try:
                 payload = self.read_json()
@@ -57020,10 +59568,49 @@ def main():
     start_price_watch_monitor(enable_workers=args.port == primary_monitor_port)
     start_chat_hourly_summary_monitor()
     SMART_MONEY_MONITOR.set_alert_callback(send_smart_money_buy_desktop_alert)
+    # 三个人同时上车同一个币 → 另一条独立弹窗（用户 2026-10-27 点名要的）。
+    SMART_MONEY_MONITOR.set_sync_alert_callback(send_kol_sync_desktop_alert)
     # The smart-money board's intake switch stops new buys at the poll layer.
     SMART_MONEY_MONITOR.set_intake_guard(lambda: price_watch_board_intake_enabled("smartmoney"))
     if args.port == primary_monitor_port:
         SMART_MONEY_MONITOR.start()
+    # 被夹检测只做「自己钱包的交易记录」回链取证。它不在榜单页的卡片名单里
+    # （那是 12 个行情榜单），所以静音不走榜单开关，而是子板块自己的弹窗总开关，
+    # 在 send_sandwich_detected_desktop_alert 入口拦。多端口并存时只有主端口扫链。
+    SANDWICH_DETECTOR.set_alert_callback(send_sandwich_detected_desktop_alert)
+    if args.port == primary_monitor_port:
+        SANDWICH_DETECTOR.start()
+    # Dev 发币监控同样不在榜单页卡片名单里，静音走子板块自己的弹窗总开关。
+    # 它要打 Blockscout / DexScreener / GeckoTerminal 三类外部接口，主端口独跑。
+    DEV_LAUNCH_MONITOR.set_alert_callback(send_dev_launch_desktop_alert)
+    if args.port == primary_monitor_port:
+        DEV_LAUNCH_MONITOR.start()
+    # 做市商监控：只读 Blockscout 的标签地址簿流水，同样不在榜单页卡片名单里，
+    # 静音走子板块自己的弹窗总开关（send_market_maker_desktop_alert 入口拦）。
+    MARKET_MAKER_MONITOR.set_alert_callback(send_market_maker_desktop_alert)
+    # 进场弹窗的共振闸：只报「涨幅榜 ∩ AIcoin 热门榜」同时出现的标的（用户 2026-10-21）。
+    MARKET_MAKER_MONITOR.set_entry_qualifier(market_maker_entry_qualifies)
+    # 三方共振：大额调仓的标的若同时挂在两榜，弹窗升级成「三方共振」（同标的 6 小时一次）。
+    MARKET_MAKER_MONITOR.set_resonance_qualifier(market_maker_resonance_info)
+    # 价格异动：6 小时内涨 ≥20%。**只有币安 U 本位合约这一路**（用户 2026-10-21：
+    # 链上标的不用做价格异动 —— 命中的十有八九是 Solana/BSC 的 meme，20% 对它们太廉价）。
+    PRICE_MOVE_MONITOR.set_market_provider(price_move_market_prices)
+    PRICE_MOVE_MONITOR.set_alert_callback(send_price_move_desktop_alert)
+    if args.port == primary_monitor_port:
+        PRICE_MOVE_MONITOR.start()
+    # 地址集群：候选来自热门榜 + 涨幅榜 + 价格异动，数据走 Arkham 网页端签名通路。
+    # 只在主端口起 —— 多端口并存时不该几条线一起去抓外网。
+    if args.port == primary_monitor_port:
+        start_arkham_cluster_monitor()
+    # 弹窗里的链上 Top10 持仓率。enable 之后才会联网：不 enable 时只读缓存，
+    # 测试/离线脚本调一次弹窗不会去打 Arkham。
+    if args.port == primary_monitor_port:
+        start_top10_holders()
+    # 弹窗里的 CoinMarketCap 流通市值：整榜快照 + 后台 4 小时刷新（同样只在主端口起）。
+    if args.port == primary_monitor_port:
+        start_cmc_market_cap()
+    if args.port == primary_monitor_port:
+        MARKET_MAKER_MONITOR.start()
 
     def bootstrap_noncritical_monitors() -> None:
         """Restore slower feeds without delaying HTTP or real-time price alerts."""
@@ -57068,6 +59655,11 @@ def main():
     atexit.register(stop_price_watch_realtime_process)
     atexit.register(stop_network_proxy_adapter)
     atexit.register(SMART_MONEY_MONITOR.close)
+    atexit.register(SANDWICH_DETECTOR.close)
+    atexit.register(DEV_LAUNCH_MONITOR.close)
+    atexit.register(MARKET_MAKER_MONITOR.close)
+    atexit.register(PRICE_MOVE_MONITOR.close)
+    atexit.register(ARKHAM_CLUSTER_MONITOR.close)
     atexit.register(shutdown_shared_executors)
     stop_file = os.environ.get("XINGYUN_SERVICE_STOP_FILE")
     if stop_file:
@@ -57087,6 +59679,11 @@ def main():
         ONCHAIN_FAST_RESEARCH.stop()
         CHAIN_ECOSYSTEM_MONITOR.stop()
         SMART_MONEY_MONITOR.stop()
+        SANDWICH_DETECTOR.stop()
+        DEV_LAUNCH_MONITOR.stop()
+        MARKET_MAKER_MONITOR.stop()
+        PRICE_MOVE_MONITOR.stop()
+        ARKHAM_CLUSTER_MONITOR.stop()
         shutdown_shared_executors()
         stop_qq_onebot_bridge()
         stop_discord_newsflash_bridge()

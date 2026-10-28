@@ -319,7 +319,7 @@ class DeliveryPreferenceTests(unittest.TestCase):
         self.assertTrue(server.desktop_alert_source_is_muted({"sourceId": "ave", "kind": "AVE热门榜新进"}))
 
     def test_large_exchange_hot_new_entries_are_silent_but_other_alerts_remain(self):
-        for source_id in ("binance", "okx", "bitget", "aicoin"):
+        for source_id in ("binance", "okx", "bitget"):
             row = {"sourceId": source_id, "kind": "热门榜新进", "title": "热门榜新进：TEST"}
             self.assertTrue(server.rank_monitor_hot_new_is_silent(row))
             self.assertTrue(server.desktop_alert_source_is_muted(row))
@@ -328,6 +328,11 @@ class DeliveryPreferenceTests(unittest.TestCase):
                 "kind": "成交额榜新进",
                 "title": "成交额榜新进：TEST",
             }))
+        # AIcoin 热门榜是被用户点名放行的唯一例外（2026-10-16「AIcoin 热门榜新进，要弹窗」）：
+        # 底层静默集没动，只是最终闸门对它豁免，所以新进要能弹。
+        aicoin_row = {"sourceId": "aicoin", "kind": "热门榜新进", "title": "AIcoin热门榜新进：TEST"}
+        self.assertTrue(server.rank_monitor_hot_new_is_silent(aicoin_row))
+        self.assertFalse(server.desktop_alert_source_is_muted(aicoin_row))
         self.assertTrue(server.rank_monitor_hot_new_is_silent({
             "sourceId": "gate-hot",
             "sourceTitle": "Gate 热门榜",

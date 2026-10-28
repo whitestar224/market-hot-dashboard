@@ -89,6 +89,8 @@ class GmgnHotSearchTests(unittest.TestCase):
         self.assertEqual(sol_1m["rows"][0]["searchHeat"], 999)
         self.assertEqual(sol_1m["rows"][0]["contractAddress"], "sol-1m-1")
         self.assertEqual(sol_1m["rows"][0]["note"], "GMGN 1m 热搜 · 999 次访问")
+        # 「查看」跳 GMGN 站内交易页（不是币安钱包）。
+        self.assertEqual(sol_1m["rows"][0]["url"], "https://gmgn.ai/sol/token/sol-1m-1")
         self.assertEqual(len(source["rows"]), 10)
 
     def test_parser_rejects_a_non_success_response(self):
@@ -98,6 +100,63 @@ class GmgnHotSearchTests(unittest.TestCase):
         with patch.object(gmgn_agentic._GMGN_HTTP_SESSION, "post", return_value=response):
             with self.assertRaisesRegex(RuntimeError, "quota error"):
                 server.fetch_gmgn_hot_search()
+
+
+class GmgnTokenTradeUrlTests(unittest.TestCase):
+    """GMGN 交易页链接的唯一构造点（榜单行 + 弹窗「查看」共用）。"""
+
+    def test_robinhood_token_matches_the_user_provided_sample(self):
+        self.assertEqual(
+            server.gmgn_token_trade_url("robinhood", "0x500e89cec6a0dfbd5ddc28b773d189ab3fc40cbb"),
+            "https://gmgn.ai/robinhood/token/0x500e89cec6a0dfbd5ddc28b773d189ab3fc40cbb",
+        )
+
+    def test_chain_is_lowercased_and_the_contract_is_path_encoded(self):
+        self.assertEqual(
+            server.gmgn_token_trade_url("Robinhood", "0xAbC/../x"),
+            "https://gmgn.ai/robinhood/token/0xAbC%2F..%2Fx",
+        )
+
+    def test_missing_or_numeric_chain_yields_no_link(self):
+        self.assertEqual(server.gmgn_token_trade_url("", "0xabc"), "")
+        self.assertEqual(server.gmgn_token_trade_url("robinhood", ""), "")
+        # 4663 是链 ID，不是 GMGN 的路径别名：宁可不给链接，也不给一条 404 的链接。
+        self.assertEqual(server.gmgn_token_trade_url("4663", "0xabc"), "")
+
+
+class GmgnChainSlugTests(unittest.TestCase):
+    """子系统链代号 → GMGN 路径别名。
+
+    热搜榜那条路拿到的是 GMGN 自己吐出来的 slug（sol / eth / arc …），原样拼就行；
+    但「聪明钱买入」弹窗拿到的是项目内部代号（ethereum / solana），直接拼进链接会
+    落到 404 页面 —— 同一批链在 GMGN 上叫 eth / sol。
+    """
+
+    def test_internal_codes_fold_to_the_gmgn_slug(self):
+        self.assertEqual(server.gmgn_chain_slug("ethereum"), "eth")
+        self.assertEqual(server.gmgn_chain_slug("solana"), "sol")
+
+    def test_chains_that_already_match_pass_through(self):
+        # 热搜榜那条路不能被我改坏：它传进来的就是最终 slug。
+        for slug in ("sol", "eth", "bsc", "base", "robinhood"):
+            self.assertEqual(server.gmgn_chain_slug(slug), slug)
+
+    def test_case_and_padding_do_not_matter(self):
+        self.assertEqual(server.gmgn_chain_slug("  Robinhood "), "robinhood")
+        self.assertEqual(server.gmgn_chain_slug("Solana"), "sol")
+
+    def test_an_unknown_chain_never_becomes_a_dead_link(self):
+        # 链 ID 与不明代号都折算不出来，调用方会回落到区块浏览器。
+        self.assertEqual(server.gmgn_chain_slug("4663"), "")
+        self.assertEqual(server.gmgn_chain_slug("arc"), "")
+        self.assertEqual(server.gmgn_chain_slug(""), "")
+        self.assertEqual(server.gmgn_chain_slug(None), "")
+
+    def test_the_slug_is_what_the_url_builder_consumes(self):
+        self.assertEqual(
+            server.gmgn_token_trade_url(server.gmgn_chain_slug("ethereum"), "0xabc"),
+            "https://gmgn.ai/eth/token/0xabc",
+        )
 
 
 if __name__ == "__main__":

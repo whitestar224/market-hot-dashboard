@@ -27,6 +27,9 @@ BONK_GUY_EVM_WALLET = "0x0a6ebed0155edb4b21d92ad02897a626cd90119e"
 BONK_GUY_SOL_WALLET = "2heJbC32Tpfcb3nbUb5ER61K11FGZVfVGtVnDm6LDogF"
 BONK_GUY_USELESS_WALLET = "5M8ACGKEXG1ojKDTMH3sMqhTihTgHYMSsZc6W8i7QW3Y"
 CRYPTO_CHARMING_WALLET = "0xcc291dcd83bd9f2600cca4d65ae3b724eaf4f5a9"
+ROBINHOOD_PLAIN_WALLET = "0xe28601398a5448d1147e6e8b0e0c6d686f0d216d"
+AFENG_WALLET = "0xbf004bff64725914ee36d03b87d6965b0ced4903"
+COWBOY_WALLET = "0xe1e3252b8b2f9bf2a8335389ba8ee62e6ea29407"
 SOL_TOKEN = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6JgB263QP6Bpump"
 SOL_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
@@ -305,7 +308,8 @@ class SmartMoneyMonitorTests(unittest.TestCase):
         seeded = SmartMoneyMonitor(Path(self.tmp.name) / "seeded.sqlite", seed_defaults=True)
         try:
             rows = seeded.store.list_wallets()
-            self.assertEqual(len(rows), 30)
+            # cowboy 占三行（BSC/ETH/Base 各一），阿峰占一行（只 BSC）。
+            self.assertEqual(len(rows), 38)
             self.assertEqual({row["chain"] for row in rows}, {"ethereum", "bsc", "base", "robinhood", "solana"})
             by_address = {}
             for row in rows:
@@ -313,6 +317,10 @@ class SmartMoneyMonitorTests(unittest.TestCase):
             self.assertEqual(by_address[EVM_WALLET], {("Inq", "Inq5️⃣连杆提供")})
             self.assertEqual(by_address[EVM_OTHER], {("身份待核验 · a0ed…ff85", "Inq5️⃣连杆提供")})
             self.assertEqual(by_address[CRYPTO_CHARMING_WALLET], {("CryptoCharming", "用户提供 · Robinhood 链")})
+            self.assertEqual(
+                by_address[ROBINHOOD_PLAIN_WALLET],
+                {("NΞO", "用户提供 · Robinhood 链")},
+            )
             self.assertEqual(by_address[BONK_GUY_EVM_WALLET], {("Bonk Guy (Unipcs)", "Bonk Guy 公开钱包")})
             self.assertEqual(by_address[BONK_GUY_SOL_WALLET], {("Bonk Guy (Unipcs)", "Bonk Guy 公开钱包")})
             self.assertEqual(by_address[BONK_GUY_USELESS_WALLET], {("Bonk Guy (Unipcs)", "Bonk Guy 公开钱包")})
@@ -346,6 +354,127 @@ class SmartMoneyMonitorTests(unittest.TestCase):
             )
         finally:
             seeded.close()
+
+    def test_user_supplied_robinhood_wallet_seed_alerts_at_a_reachable_threshold(self):
+        seeded = SmartMoneyMonitor(Path(self.tmp.name) / "rh-plain.sqlite", seed_defaults=True)
+        try:
+            wallet = seeded.store.wallet("robinhood", ROBINHOOD_PLAIN_WALLET)
+            self.assertTrue(wallet)
+            self.assertEqual(wallet["nickname"], "NΞO")
+            self.assertEqual(wallet["sourceName"], "用户提供 · Robinhood 链")
+            self.assertEqual(wallet["sourceKind"], "seed")
+            self.assertTrue(wallet["enabled"])
+            # 链上实测买入在 0.05~0.15 ETH（约 $120~$350），默认 10000 阈值等于永不提醒。
+            self.assertEqual(wallet["alertThresholdUsd"], 100)
+            self.assertEqual(
+                sorted(
+                    row["chain"] for row in seeded.store.list_wallets()
+                    if row["address"] == ROBINHOOD_PLAIN_WALLET
+                ),
+                ["base", "bsc", "ethereum", "robinhood"],
+            )
+        finally:
+            seeded.close()
+
+    def test_afeng_seed_watches_bsc_only_at_the_agreed_threshold(self):
+        """用户 2026-10-22 指定监控的 KOL「阿峰_Afeng」。
+
+        拍板两点：**只盯 BSC**（他没要 ETH/Base 那两份）、单笔 **≥500U** 才弹
+        （GMGN 统计单笔买入均值约 $344，沿用默认 10000U 等于永不提醒）。
+        """
+        seeded = SmartMoneyMonitor(Path(self.tmp.name) / "afeng.sqlite", seed_defaults=True)
+        try:
+            wallet = seeded.store.wallet("bsc", AFENG_WALLET)
+            self.assertTrue(wallet)
+            self.assertEqual(wallet["nickname"], "阿峰_Afeng")
+            self.assertEqual(wallet["sourceName"], "用户提供 · GMGN KOL")
+            self.assertEqual(wallet["sourceKind"], "seed")
+            self.assertTrue(wallet["enabled"])
+            self.assertEqual(wallet["alertThresholdUsd"], 500)
+            self.assertEqual(
+                [row["chain"] for row in seeded.store.list_wallets()
+                 if row["address"] == AFENG_WALLET],
+                ["bsc"],
+            )
+        finally:
+            seeded.close()
+
+    def test_cowboy_seed_watches_his_three_active_chains_at_500(self):
+        """用户 2026-10-27 指定监控的 KOL「cowboy」。
+
+        链上核验（2026-10-27）：BSC nonce 11,164 / 83.41 BNB、ETH nonce 298 /
+        1.78 ETH、Base nonce 162 / 1.34 ETH，全是普通 EOA。监控面给这三条
+        **他真实活跃的链**（不给 Robinhood）；提醒门槛沿用阿峰的拍板：单笔 ≥500U。
+        """
+        seeded = SmartMoneyMonitor(Path(self.tmp.name) / "cowboy.sqlite", seed_defaults=True)
+        try:
+            rows = [
+                row for row in seeded.store.list_wallets()
+                if row["address"] == COWBOY_WALLET
+            ]
+            self.assertEqual(
+                sorted(row["chain"] for row in rows),
+                ["base", "bsc", "ethereum"],
+            )
+            for row in rows:
+                with self.subTest(chain=row["chain"]):
+                    self.assertEqual(row["nickname"], "cowboy")
+                    self.assertEqual(row["sourceName"], "用户提供 · KOL")
+                    self.assertEqual(row["sourceKind"], "seed")
+                    self.assertTrue(row["enabled"])
+                    self.assertEqual(row["alertThresholdUsd"], 500)
+        finally:
+            seeded.close()
+
+    def test_placeholder_seed_label_is_claimed_once_the_user_names_the_wallet(self):
+        """线上真实序列：先以占位名入库，用户后来说出真名 → 重启时自愈成真名。"""
+
+        database = Path(self.tmp.name) / "placeholder-seeded.sqlite"
+        first = SmartMoneyStore(database)
+        try:
+            for chain in ("ethereum", "bsc", "base", "robinhood"):
+                first.upsert_wallet(
+                    chain, ROBINHOOD_PLAIN_WALLET,
+                    nickname="身份待核验 · e286…216d", source_name="用户提供 · Robinhood 链",
+                    source_kind="seed", source_evidence="用户提供的 Robinhood 链地址",
+                    alert_threshold_usd=100.0,
+                )
+        finally:
+            first.close()
+
+        renamed = SmartMoneyMonitor(database, seed_defaults=True)
+        try:
+            for chain in ("ethereum", "bsc", "base", "robinhood"):
+                wallet = renamed.store.wallet(chain, ROBINHOOD_PLAIN_WALLET)
+                self.assertEqual(wallet["nickname"], "NΞO")
+                self.assertEqual(wallet["sourceName"], "用户提供 · Robinhood 链")
+            # 认领之后不再重复命中（幂等）。
+            self.assertEqual(renamed.seed_defaults(), 0)
+        finally:
+            renamed.close()
+
+    def test_placeholder_seed_label_never_overwrites_a_panel_rename(self):
+        """用户自己在面板改过名 → 占位标签对不上，自愈必须放手。"""
+
+        database = Path(self.tmp.name) / "user-renamed.sqlite"
+        first = SmartMoneyStore(database)
+        try:
+            row = first.upsert_wallet(
+                "robinhood", ROBINHOOD_PLAIN_WALLET,
+                nickname="身份待核验 · e286…216d", source_name="用户提供 · Robinhood 链",
+                source_kind="seed", source_evidence="用户提供的 Robinhood 链地址",
+                alert_threshold_usd=100.0,
+            )
+            first.save_wallet(row["id"], nickname="我自己起的名字")
+        finally:
+            first.close()
+
+        reopened = SmartMoneyMonitor(database, seed_defaults=True)
+        try:
+            wallet = reopened.store.wallet("robinhood", ROBINHOOD_PLAIN_WALLET)
+            self.assertEqual(wallet["nickname"], "我自己起的名字")
+        finally:
+            reopened.close()
 
     def test_seed_upgrade_repairs_only_untouched_legacy_inq_labels(self):
         database = Path(self.tmp.name) / "legacy-seeded.sqlite"
@@ -597,7 +726,7 @@ class SmartMoneyFallbackWindowTests(unittest.TestCase):
     other chains — and every block beyond it is dropped without warning."""
 
     def test_fast_block_chain_gets_a_wider_catch_up_budget(self):
-        self.assertEqual(evm_fallback_blocks("bsc"), 120)
+        self.assertEqual(evm_fallback_blocks("bsc"), 240)
         self.assertEqual(evm_fallback_blocks("ethereum"), 24)
         self.assertEqual(evm_fallback_blocks("base"), 24)
 
@@ -610,7 +739,7 @@ class SmartMoneyFallbackWindowTests(unittest.TestCase):
         for value in ("abc", "0", "-5", ""):
             with self.subTest(value=value):
                 with patch.dict(os.environ, {"SMART_MONEY_EVM_FALLBACK_BLOCKS": value}):
-                    self.assertEqual(evm_fallback_blocks("bsc"), 120)
+                    self.assertEqual(evm_fallback_blocks("bsc"), 240)
 
     def test_requested_budget_is_clamped_to_the_ceiling(self):
         with patch.dict(os.environ, {"SMART_MONEY_EVM_FALLBACK_BLOCKS": "999999"}):
@@ -637,12 +766,13 @@ class SmartMoneyFallbackWindowTests(unittest.TestCase):
             with patch.object(monitor, "rpc", side_effect=fake_rpc):
                 monitor._poll_evm("bsc", wallets)
 
-            # BSC never uses eth_getLogs, and the window reaches back 120 blocks.
-            self.assertEqual(len(scanned), 120)
-            self.assertEqual(min(scanned), 1181)
+            # BSC never uses eth_getLogs, and the window reaches back 240 blocks
+            # (≈108 s) so a ~80 s poll cycle no longer leaves a silent gap.
+            self.assertEqual(len(scanned), 240)
+            self.assertEqual(min(scanned), 1061)
             self.assertEqual(max(scanned), 1300)
             health = [row for row in monitor.store.health() if row["chain"] == "bsc"][0]
-            self.assertIn("已扫描最近 120 个区块", health["message"])
+            self.assertIn("已扫描最近 240 个区块", health["message"])
         finally:
             monitor.close()
 
@@ -674,6 +804,95 @@ class SmartMoneyAlertLineTests(unittest.TestCase):
             self.assertEqual(event["details"]["classification"], "net-token-flow")
         finally:
             monitor.close()
+
+
+# 真实主网成交（Robinhood Chain block 88,921,965）：用户新加的钱包
+# 0xe2860139…0d216d 用 0.144117 ETH（原生）买入 12,056,495.70822647 MINNIE。
+# 该 receipt 共 26 条日志，但只有下面这一条涉及被监控钱包，其余与钱包无关、
+# 不参与 net 计算，所以这里只保留这一条真机日志即可如实复现。
+ROBINHOOD_REAL_BUY_WALLET = ROBINHOOD_PLAIN_WALLET
+ROBINHOOD_REAL_BUY_TOKEN = "0x76edd94f5eb7aeac551980a2134174d5ce0c1e18"
+ROBINHOOD_REAL_BUY_POOL = "0x8366a39cc670b4001a1121b8f6a443a643e40951"
+ROBINHOOD_REAL_BUY_RAW_AMOUNT = 12056495708226470144892637
+ROBINHOOD_REAL_BUY_TX_VALUE = 0x20001712DA4016C  # 0.1441167736845111 ETH
+ROBINHOOD_REAL_BUY_ETH_USD = 2416.0  # 2026-10-15 币安 ETHUSDT 现价
+
+
+class RobinhoodNativePaymentBuyTests(unittest.TestCase):
+    """Robinhood 链用原生 ETH 付款的买入必须能被判定并越过阈值。
+
+    该链的代币在 DexScreener 上没有报价（``_token_price`` 返回 0），所以金额
+    只能靠 ``native_price_usd`` 换算 —— 这条用例同时守住「原生 ETH 支付腿
+    依旧参与 payment_options」这个易碎点。
+    """
+
+    def test_real_native_eth_buy_clears_the_hundred_dollar_threshold(self):
+        receipt = {
+            "status": "0x1",
+            "transactionHash": "0x75c58340b9327ca85e7647896bd7e5701c73b4dd6a4548ee16f295d4a1aac9e2",
+            "blockNumber": "0x54ccf9d",
+            "logs": [
+                transfer_log(
+                    ROBINHOOD_REAL_BUY_TOKEN,
+                    ROBINHOOD_REAL_BUY_POOL,
+                    ROBINHOOD_REAL_BUY_WALLET,
+                    ROBINHOOD_REAL_BUY_RAW_AMOUNT,
+                )
+            ],
+        }
+        transaction = {
+            "hash": receipt["transactionHash"],
+            "from": ROBINHOOD_REAL_BUY_WALLET,
+            "to": ROBINHOOD_REAL_BUY_POOL,
+            "value": hex(ROBINHOOD_REAL_BUY_TX_VALUE),
+        }
+
+        event = classify_evm_buy(
+            "robinhood", ROBINHOOD_REAL_BUY_WALLET, transaction, receipt,
+            lambda token: {"symbol": "MINNIE", "decimals": 18, "priceUsd": 0.0},
+            native_price_usd=ROBINHOOD_REAL_BUY_ETH_USD,
+            threshold_usd=100.0,
+        )
+
+        self.assertIsNotNone(event)
+        self.assertEqual(event["symbol"], "MINNIE")
+        self.assertAlmostEqual(event["tokenAmount"], 12_056_495.70822647, places=6)
+        self.assertEqual(event["paymentAsset"], "ETH")
+        self.assertAlmostEqual(event["paymentAmount"], 0.1441167736845111, places=12)
+        self.assertAlmostEqual(
+            event["paymentUsd"], 0.1441167736845111 * ROBINHOOD_REAL_BUY_ETH_USD, places=6
+        )
+        # $348 的真实成交必须过 100U 阈值；若原生 ETH 腿被丢掉就会退回 None。
+        self.assertTrue(event["popupEligible"])
+
+    def test_native_price_of_zero_never_invents_a_buy_signal(self):
+        """取不到 ETH 价时必须安静地不产信号，而不是把 0 当成合格成交。"""
+
+        receipt = {
+            "status": "0x1",
+            "transactionHash": "0xdead",
+            "blockNumber": "0x54ccf9d",
+            "logs": [
+                transfer_log(
+                    ROBINHOOD_REAL_BUY_TOKEN,
+                    ROBINHOOD_REAL_BUY_POOL,
+                    ROBINHOOD_REAL_BUY_WALLET,
+                    ROBINHOOD_REAL_BUY_RAW_AMOUNT,
+                )
+            ],
+        }
+        transaction = {
+            "hash": "0xdead",
+            "from": ROBINHOOD_REAL_BUY_WALLET,
+            "value": hex(ROBINHOOD_REAL_BUY_TX_VALUE),
+        }
+
+        self.assertIsNone(classify_evm_buy(
+            "robinhood", ROBINHOOD_REAL_BUY_WALLET, transaction, receipt,
+            lambda token: {"symbol": "MINNIE", "decimals": 18, "priceUsd": 0.0},
+            native_price_usd=0.0,
+            threshold_usd=100.0,
+        ))
 
 
 if __name__ == "__main__":

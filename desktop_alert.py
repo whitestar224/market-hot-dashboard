@@ -114,6 +114,25 @@ def ai_narrative_looks_english(value: object) -> bool:
     return looks_english(value)
 
 
+def chain_chip_label(payload: dict, *, body_text: str = "", title_text: str = "") -> str:
+    """「类型 · 链」里那半截链标签（用户 2026-10-17：凡是涉及币的弹窗都要标链）。
+
+    服务端 ``annotate_desktop_alert_chain()`` 已经把各种形态的链号归一成展示标签；
+    正文自己已经写了链（Alpha 那几句带「BSC 链」）就不重复挂一次。
+
+    ``alphaPhase`` 优先：有它就说明这个币在币安 Alpha 清单里，显示「Alpha · BSC」
+    比「中心化」有用得多。交易所榜单的标的没有合约，链标注只能保守地写「中心化」，
+    但「这币在 Alpha」是确定的事实（用户 2026-10-21：「可是 JCT 是 alpha 里的啊」）。
+    """
+    alpha = clamp_text(payload.get("alphaPhase") or "", 24)
+    if alpha and alpha not in body_text and alpha not in title_text:
+        return alpha
+    label = clamp_text(payload.get("chainLabel") or "", 20)
+    if not label or label in body_text or label in title_text:
+        return ""
+    return label
+
+
 def chinese_ai_narrative(value: object, limit: int = 1600) -> str:
     """Return the tooltip text only when it is Chinese.
 
@@ -240,8 +259,9 @@ def _chrome_executable() -> str | None:
     """Locate the local Chrome executable, preferring the user's logged-in profile.
 
     We deliberately launch Chrome directly (instead of ``webbrowser.open``) so the
-    opened Binance Wallet token page reuses the *existing* Chrome window and its
-    Default-profile login cookies, instead of a fresh, unauthenticated session.
+    opened token page (Binance Wallet ``web3.binance.com``, GMGN ``gmgn.ai`` …)
+    reuses the *existing* Chrome window and its Default-profile login cookies,
+    instead of a fresh, unauthenticated session.
     """
     candidates = [
         os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
@@ -608,6 +628,50 @@ def popup_pointer_inside(root) -> bool:
         return False
 
 
+def narrative_tooltip_position(
+    *,
+    card: tuple[int, int, int, int],
+    tooltip: tuple[int, int],
+    screen: tuple[int, int],
+    gap: int = 8,
+) -> tuple[int, int]:
+    """AI 叙事浮层该放哪儿：**先保证不压住卡片**。
+
+    旧写法是「贴着 ✦ 按钮正下方」—— 那个位置就在卡片里。卡片固定 374 宽，
+    浮层却有 340 宽，于是它一出来就把标题尾巴和正文尾巴整段盖住，看起来像
+    「KOL NΞO 买入」被截断了（用户 2026-10-22 截图问的就是这个）。
+
+    顺序：卡片右侧 → 卡片下方 → 卡片上方 → 实在放不下才退回贴边（宁可压住卡片，
+    也不能跑到屏幕外）。``card`` / ``tooltip`` / ``screen`` 都是 ``(x, y, w, h)``
+    或 ``(w, h)`` 的像素值。
+    """
+    card_x, card_y, card_w, card_h = card
+    tip_w, tip_h = tooltip
+    screen_w, screen_h = screen
+
+    def clamp_x(value: int) -> int:
+        return max(gap, min(int(value), max(gap, screen_w - tip_w - gap)))
+
+    def clamp_y(value: int) -> int:
+        return max(gap, min(int(value), max(gap, screen_h - tip_h - gap)))
+
+    # 1) 卡片右侧。
+    right_x = card_x + card_w + gap
+    if right_x + tip_w <= screen_w - gap:
+        return clamp_x(right_x), clamp_y(card_y)
+    # 2) 卡片下方（横向对齐卡片中线）。
+    center_x = clamp_x(card_x + (card_w - tip_w) // 2)
+    below_y = card_y + card_h + gap
+    if below_y + tip_h <= screen_h - gap:
+        return center_x, below_y
+    # 3) 卡片上方。
+    above_y = card_y - tip_h - gap
+    if above_y >= gap:
+        return center_x, above_y
+    # 4) 上下都塞不下（小屏 / 高 DPI）：贴边显示，至少别跑出屏幕。
+    return center_x, clamp_y(below_y)
+
+
 def show_popup(payload: dict, slot: int) -> int:
     try:
         import tkinter as tk
@@ -661,6 +725,10 @@ def show_popup(payload: dict, slot: int) -> int:
     image_path, temp_image_path = payload_image_path(payload)
     title_text = limited_lines(soft_wrap_text(title, 24), 2)
     body_text = soft_wrap_text(body, 42)
+    # 链展示标签。注意它和上面那个 chain 不是一回事：chain 是上游原始标识
+    # （"56" / "CT_501" / "sol"），只用来判 AI 按钮能不能点，直接显示会一会儿
+    # 数字一会儿 slug；chainLabel 才是归一后的展示值（BSC / Solana / ETH …）。
+    chain_label = chain_chip_label(payload, body_text=body_text, title_text=title_text)
 
     # Number of buttons sharing the header row with the brand.  Only used to
     # decide whether the fit-to-width shrink pass can be skipped entirely.
@@ -799,11 +867,15 @@ def show_popup(payload: dict, slot: int) -> int:
             )
             wrap.pack()
             tip.update_idletasks()
-            x = ai_btn.winfo_rootx() + ai_btn.winfo_width() // 2 - tip.winfo_width() // 2
-            y = ai_btn.winfo_rooty() + ai_btn.winfo_height() + 6
-            # Keep the tooltip on-screen near the card.
-            x = max(8, min(x, ai_btn.winfo_screenwidth() - tip.winfo_width() - 8))
-            tip.geometry(f"+{x}+{y}")
+            tip_x, tip_y = narrative_tooltip_position(
+                card=(
+                    root.winfo_rootx(), root.winfo_rooty(),
+                    root.winfo_width(), root.winfo_height(),
+                ),
+                tooltip=(tip.winfo_width(), tip.winfo_height()),
+                screen=(tip.winfo_screenwidth(), tip.winfo_screenheight()),
+            )
+            tip.geometry(f"+{tip_x}+{tip_y}")
             ai_narrative_state["tooltip"] = tip
 
         def hide_narrative_tooltip() -> None:
@@ -1003,7 +1075,20 @@ def show_popup(payload: dict, slot: int) -> int:
         spacing3=5,
     )
     text.tag_configure("body", foreground="#61707a", font=("Microsoft YaHei UI", 8), spacing1=1)
-    text.insert("end", f"{kind}\n", "kind")
+    text.tag_configure(
+        "chain",
+        foreground="#b42318" if is_red else "#0e7490",
+        font=("Microsoft YaHei UI", 9, "bold"),
+    )
+
+    def insert_kind_line() -> None:
+        """「类型 · 链」挤在同一行。212 高的弹窗正文本来就紧，不能为链单开一行。"""
+        text.insert("end", f"{kind}", "kind")
+        if chain_label:
+            text.insert("end", f"  ·  {chain_label}", "chain")
+        text.insert("end", "\n", "kind")
+
+    insert_kind_line()
     text.insert("end", f"{title_text}\n", "title")
     if body:
         text.insert("end", body_text, "body")
@@ -1024,7 +1109,7 @@ def show_popup(payload: dict, slot: int) -> int:
             result = "翻译失败：还没有配置可用的大模型 API Key。"
         text.configure(state="normal")
         text.delete("1.0", "end")
-        text.insert("end", f"{kind}\n", "kind")
+        insert_kind_line()
         text.insert("end", f"{'译文' if has_value else '翻译失败'}\n", "title")
         text.insert("end", limited_lines(soft_wrap_text(result, 38), 5), "body")
         text.configure(state="disabled")

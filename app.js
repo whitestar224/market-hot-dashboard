@@ -120,6 +120,23 @@ function trenchRowChain(row) {
   return String(row?.network || row?.chain || "").trim().toLowerCase();
 }
 
+// 桌面战壕悬浮窗是独立 pythonw 进程，读不到这里的 localStorage，只能靠服务端转达：
+// 把榜单当前选的链 POST 上去，面板轮询同一个值。失败只意味着面板继续显示上一次的链，
+// 所以静默吞掉，绝不拖累榜单本身的切链。
+function publishTrenchChain(chain) {
+  const value = normalizeTrenchChain(chain);
+  try {
+    fetch("/api/trench-overlay-preference", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chain: value }),
+      keepalive: true
+    }).catch(() => {});
+  } catch {
+    // 同步是锦上添花：这里出任何问题都不该影响榜单。
+  }
+}
+
 function readBinanceWalletPeriod() {
   try {
     return normalizeBinanceWalletPeriod(localStorage.getItem(BINANCE_WALLET_PERIOD_KEY));
@@ -1843,9 +1860,13 @@ function renderRow(row, source, rank) {
     : "";
   const liveKey = row.totalAssetKey
     || `${rowSource?.id || rowSource?.title || "source"}:${row.contractAddress || row.address || row.symbol || row.name || rank}`;
+  // 悬停浮层要的 CMC 基本面：只有加密标的、且 symbol 里真有字母数字才挂。
+  // A 股行（stockGroup）没有 CMC 条目，挂上去只会白问一次。
+  const cmcSymbol = stockGroup ? "" : String(row.symbol || "").trim();
+  const cmcAttr = /[A-Za-z0-9]/.test(cmcSymbol) ? ` data-cmc-symbol="${escapeHtml(cmcSymbol)}"` : "";
 
   return `
-    <a class="rank-row rank-row-link" data-live-key="row:${escapeHtml(liveKey)}" href="${escapeHtml(rowTargetUrl(row, rowSource) || "#")}" target="_blank" rel="noreferrer" title="打开 ${symbol} 交易/行情页面">
+    <a class="rank-row rank-row-link"${cmcAttr} data-live-key="row:${escapeHtml(liveKey)}" href="${escapeHtml(rowTargetUrl(row, rowSource) || "#")}" target="_blank" rel="noreferrer" title="打开 ${symbol} 交易/行情页面">
       <div class="rank-badge">${escapeHtml(row.rank ?? "")}</div>
       <div class="asset-cell">
         ${renderAssetIcon(row, rowSource)}
@@ -2136,6 +2157,8 @@ boardsEl.addEventListener("change", (event) => {
   if (trenchChainSelect) {
     state.trenchChain = normalizeTrenchChain(trenchChainSelect.value);
     saveLocalPreference(TRENCH_CHAIN_KEY, state.trenchChain);
+    // 桌面悬浮窗跟着这条链走（它没有 localStorage 可读，只能靠服务端转达）。
+    publishTrenchChain(state.trenchChain);
     // 换个链就是换一份列表，页码必须回到第一页（否则停在越界页会渲染空白）。
     state.trenchPage = 1;
     queueMicrotask(renderBoards);
@@ -2144,6 +2167,9 @@ boardsEl.addEventListener("change", (event) => {
 
 updateClock();
 setInterval(updateClock, 1000);
+// 打开页面即把本地记住的链同步给服务端：服务重启、或换了个浏览器之后，
+// 桌面悬浮窗也能立刻跟上这里看到的那条链。
+publishTrenchChain(state.trenchChain);
 hydrateMarketCache();
 loadBoardToggles();
 loadMarketData();

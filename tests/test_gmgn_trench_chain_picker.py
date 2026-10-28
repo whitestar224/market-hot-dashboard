@@ -4,8 +4,10 @@
 计数，客户端按 ``row.network`` 现筛。这里锁住那两块推导。
 """
 
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import server
 
@@ -95,6 +97,81 @@ class GmgnTrenchChainPickerWiringTests(unittest.TestCase):
         self.assertIn("chain_options, chain_counts = gmgn_trench_chain_picker(", source)
         self.assertIn('"chainOptions": chain_options,', source)
         self.assertIn('"chainCounts": chain_counts,', source)
+
+
+class TrenchOverlayChainPreferenceTests(unittest.TestCase):
+    """榜单页写的「当前查看链」。
+
+    桌面战壕悬浮窗是独立 pythonw 进程，读不到浏览器的 localStorage，所以两边唯一的
+    联动点就是这份共享偏好：前端 POST、面板轮询 GET。这里的收口失败会让面板带着脏链
+    去请求 /api/onchain-trenches，整条链一取不到数就变空面板。
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / "trench_overlay_chain.json"
+        for patcher in (
+            patch.object(server, "TRENCH_OVERLAY_CHAIN_PREFERENCE_PATH", self.path),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(
+            server.TRENCH_OVERLAY_CHAIN_PREFERENCE.update, {"loaded": False, "chain": "all"}
+        )
+        server.TRENCH_OVERLAY_CHAIN_PREFERENCE.update({"loaded": False, "chain": "all"})
+
+    def test_unknown_values_fall_back_to_all(self):
+        for bad in ("", None, "all", "ALL", "base", "sol", "../../etc/passwd", "a" * 40):
+            with self.subTest(bad=bad):
+                self.assertEqual(server.normalize_trench_overlay_chain(bad), "all")
+
+    def test_monitored_chains_survive_normalisation(self):
+        for chain in ("robinhood", "solana", "bsc", "eth", "arc"):
+            with self.subTest(chain=chain):
+                self.assertEqual(server.normalize_trench_overlay_chain(chain), chain)
+                self.assertEqual(server.normalize_trench_overlay_chain(chain.upper()), chain)
+
+    def test_defaults_to_all_before_anything_is_written(self):
+        self.assertEqual(server.trench_overlay_chain_preference(), "all")
+
+    def test_written_chain_is_read_back_and_persisted(self):
+        self.assertEqual(server.set_trench_overlay_chain_preference("robinhood"), "robinhood")
+        self.assertEqual(server.trench_overlay_chain_preference(), "robinhood")
+        self.assertTrue(self.path.exists())
+
+        # 模拟服务重启：内存态清空，磁盘上的选择必须还在，否则面板会悄悄跳回「综合」。
+        server.TRENCH_OVERLAY_CHAIN_PREFERENCE.update({"loaded": False, "chain": "all"})
+        self.assertEqual(server.trench_overlay_chain_preference(), "robinhood")
+
+    def test_an_unusable_chain_resets_the_shared_preference(self):
+        server.set_trench_overlay_chain_preference("robinhood")
+        self.assertEqual(server.set_trench_overlay_chain_preference("base"), "all")
+        self.assertEqual(server.trench_overlay_chain_preference(), "all")
+        self.assertEqual(
+            server.json.loads(self.path.read_text(encoding="utf-8"))["chain"], "all"
+        )
+
+    def test_a_corrupt_file_never_breaks_the_reader(self):
+        self.path.write_text("{ this is not json", encoding="utf-8")
+        self.assertEqual(server.trench_overlay_chain_preference(), "all")
+
+    def test_an_unwritable_path_only_loses_persistence(self):
+        # 指向一个目录：落盘必然失败，但当前进程内的选择必须照样生效。
+        with patch.object(server, "TRENCH_OVERLAY_CHAIN_PREFERENCE_PATH", Path(self.path.parent)):
+            self.assertEqual(server.set_trench_overlay_chain_preference("robinhood"), "robinhood")
+        self.assertEqual(server.trench_overlay_chain_preference(), "robinhood")
+
+
+class TrenchOverlayChainEndpointWiringTests(unittest.TestCase):
+    """读完一个写的端点必须都挂上，否则「榜单切链 → 面板跟随」整条链路断开。"""
+
+    def test_get_and_post_routes_are_wired(self):
+        source = Path(server.__file__).read_text(encoding="utf-8")
+        self.assertIn('parsed.path == "/api/trench-overlay-preference"', source)
+        self.assertIn('route == "/api/trench-overlay-preference"', source)
+        self.assertIn("trench_overlay_chain_preference()", source)
+        self.assertIn("set_trench_overlay_chain_preference(", source)
 
 
 if __name__ == "__main__":

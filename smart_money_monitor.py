@@ -63,6 +63,23 @@ DEFAULT_SMART_MONEY_SEEDS = (
         "alertThresholdUsd": 100.0,
     },
     {
+        "address": "0xe28601398a5448d1147e6e8b0e0c6d686f0d216d",
+        "nickname": "NΞO",
+        "sourceName": "用户提供 · Robinhood 链",
+        "sourceUrl": "https://robinhoodchain.blockscout.com/address/0xe28601398a5448d1147e6e8b0e0c6d686f0d216d",
+        "sourceEvidence": (
+            "NΞO 的 Robinhood 链钱包（用户指认）。链上核验为普通钱包（EOA：无合约代码、"
+            "3.64 ETH 余额、nonce 20253，交易高度活跃，非合约）。链上实测单笔买入在 "
+            "0.05~0.15 ETH（约 $120~$350）量级，沿用默认 10000U 阈值等于永不提醒，"
+            "故按实际规模下调；面板里仍可随时改。"
+        ),
+        # 该地址先以「身份待核验 · e286…216d」占位入池，之后用户才指认为 NΞO；
+        # 声明这对旧标签，重启时把它认领成真名（用户自己改过则不会被动）。
+        "legacyLabels": (("身份待核验 · e286…216d", "用户提供 · Robinhood 链"),),
+        # 与 CryptoCharming 同口径：该钱包买入以原生 ETH 支付，实测单笔数十到数百美元。
+        "alertThresholdUsd": 100.0,
+    },
+    {
         "address": "0x0a6ebed0155edb4b21d92ad02897a626cd90119e",
         "nickname": "Bonk Guy (Unipcs)",
         "sourceName": "Bonk Guy 公开钱包",
@@ -85,8 +102,88 @@ DEFAULT_SMART_MONEY_SEEDS = (
         "sourceEvidence": "Bonk Guy 本人公开过的 USELESS 持仓钱包；与当前 Solana 交易钱包分别保留",
         "chains": ("solana",),
     },
+    {
+        "address": "0xbf004bff64725914ee36d03b87d6965b0ced4903",
+        "nickname": "阿峰_Afeng",
+        "sourceName": "用户提供 · GMGN KOL",
+        "sourceUrl": "https://bscscan.com/address/0xbf004bff64725914ee36d03b87d6965b0ced4903",
+        "sourceEvidence": (
+            "用户 2026-10-22 指定要监控的 GMGN KOL「阿峰_Afeng」（GMGN 面板余额 15.27 BNB）。"
+            "链上核验：BSC 上该地址带 EIP-7702 委托代码（不是普通 EOA）、nonce 24.8 万、"
+            "余额 15.2714 BNB —— 与面板读数一致，确认是同一个人那个钱包；"
+            "ETH（nonce 1.7 万）与 Base（5.8 千）也有历史活动，但用户要求只盯 BSC。"
+            "GMGN 统计单笔买入均值约 $344，故阈值按用户拍板定 500U（只弹有分量的买单）。"
+        ),
+        # 用户 2026-10-22 拍板「只 BSC」：ETH/Base 上他也在动，但那两边的买单不提醒。
+        # 注意 BSC 走的是「按区块扫 from」的兜底路径（公共日志接口拒绝无 address 查询），
+        # 所以这里必须是一个真的会自己发交易的地址 —— EIP-7702 委托之后 from 仍是它本人。
+        "chains": ("bsc",),
+        "alertThresholdUsd": 500.0,
+    },
+    {
+        "address": "0xe1e3252b8b2f9bf2a8335389ba8ee62e6ea29407",
+        "nickname": "cowboy",
+        "sourceName": "用户提供 · KOL",
+        "sourceUrl": "https://bscscan.com/address/0xe1e3252b8b2f9bf2a8335389ba8ee62e6ea29407",
+        "sourceEvidence": (
+            "用户 2026-10-27 指定要监控的 KOL「cowboy」。链上核验（2026-10-27）："
+            "三条 EVM 链都是普通 EOA 且都有真实活动 —— BSC nonce 11,164 / 余额 83.41 BNB、"
+            "ETH nonce 298 / 1.78 ETH、Base nonce 162 / 1.34 ETH。"
+            "监控面给这三条链（没要 Robinhood，他不在那条链上活动）；"
+            "提醒门槛沿用阿峰的拍板：单笔 ≥500U 才弹。"
+        ),
+        # 用户没限定链，但核验显示他只在 BSC / ETH / Base 活动：明确给三条，
+        # 别让默认四链（含 robinhood）白占扫描窗口。
+        "chains": ("bsc", "ethereum", "base"),
+        "alertThresholdUsd": 500.0,
+    },
 )
 DEFAULT_SMART_MONEY_SEED_ADDRESSES = tuple(row["address"] for row in DEFAULT_SMART_MONEY_SEEDS)
+
+# ---------------------------------------------------------------------------
+# 「KOL 共振」单独提醒（用户 2026-10-27）
+#
+#   「@cryptocharming @feibo03 @afeng 这三个人如果同时上车了一个币的话，记得单独提醒」
+#
+# 语义：**同一条链上的同一个合约**，在 :data:`KOL_SYNC_WINDOW_SECONDS` 窗口内被这三
+# 个人都买过 → 除各自的买入弹窗外，再单独弹一条「三人同时上车」。这比单笔弹窗更有
+# 分量：三个人独立决策却撞到同一个标的上，通常意味着这个币有事。
+#
+# 几个边界：
+#
+# * **不看金额门槛**。单笔提醒有 500U/10,000U 的阈值，共振看的是「有没有上车」，一笔
+#   小额补仓也算上车。事件表本来就记录所有买单（不只弹窗的那批）。
+# * **只看同链同合约**。同名不同合约是两件事，跨链桥接版也不是「同一个币」。
+# * **一个币只提醒一次**，:data:`KOL_SYNC_REALERT_SECONDS` 之后才允许再提醒 ——
+#   否则第三人买完、第四笔又来，会连着炸好几条。
+# * 名单可扩展：`XINGYUN_KOL_SYNC_WALLETS="0xabc…:名字,0xdef…:名字"`（覆盖内置三条）。
+# ---------------------------------------------------------------------------
+KOL_SYNC_WALLET_LABELS: dict[str, str] = {
+    "0xcc291dcd83bd9f2600cca4d65ae3b724eaf4f5a9": "CryptoCharming",
+    "0xbf004bff64725914ee36d03b87d6965b0ced4903": "阿峰_Afeng",
+    # 用户 2026-10-27 澄清：feibo03 就是 cowboy（X 上 @feibo03 = Cowboy◆BNB 版本之牛），
+    # 所以这第三个人就是他本人那个钱包，不存在另一个地址。
+    "0xe1e3252b8b2f9bf2a8335389ba8ee62e6ea29407": "cowboy",
+}
+#: 三个人都到齐才算「同时上车」。想改成「任两人」就设 `XINGYUN_KOL_SYNC_MIN=2`。
+KOL_SYNC_MIN_WALLETS = 3
+KOL_SYNC_WINDOW_SECONDS = 24 * 3600
+KOL_SYNC_REALERT_SECONDS = 12 * 3600
+
+
+def active_kol_sync_wallets() -> dict[str, str]:
+    """共振观察名单（地址小写 → 展示名）。环境变量可整表覆盖，便于临时加人。"""
+    raw = str(os.getenv("XINGYUN_KOL_SYNC_WALLETS", "") or "").strip()
+    if not raw:
+        return {address.lower(): label for address, label in KOL_SYNC_WALLET_LABELS.items()}
+    wallets: dict[str, str] = {}
+    for piece in raw.split(","):
+        address, _, label = piece.strip().partition(":")
+        address = address.strip().lower()
+        if address:
+            wallets[address] = label.strip() or address[:10]
+    return wallets or {address.lower(): label for address, label in KOL_SYNC_WALLET_LABELS.items()}
+
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 EVM_CHAINS = ("ethereum", "bsc", "base", "robinhood")
 SUPPORTED_CHAINS = (*EVM_CHAINS, "solana")
@@ -112,7 +209,12 @@ EVM_MAX_BLOCKS_PER_POLL_CEILING = 30000
 # address-less ``eth_getLogs`` (publicnode: "Please specify an address";
 # bnbchain dataseeds: "limit exceeded"), so this fallback IS the BSC path.
 EVM_FALLBACK_BLOCKS_DEFAULT = 24
-EVM_FALLBACK_BLOCKS_BY_CHAIN = {"bsc": 120}
+#: BSC 的兜底窗口 = **240 块（≈108 秒）**。2026-10-22 实测：整个轮询要串行走完
+#: base→ethereum→bsc→solana，一轮约 75–80 秒（BSC 自己那趟全块扫描就占 ~10 秒），
+#: 而 120 块只覆盖 54 秒 —— 于是每轮稳稳丢掉 13~61 个块（跳过的那段永远不会回头补）。
+#: 用户 2026-10-22 要盯的 KOL 就在 BSC 上高频交易，按 120 块算大约 1/4 的买单会被漏掉。
+#: 240 块对 ~80 秒一轮留了约 25% 余量；再往上加只是线性拉长每次轮询的 RPC 次数。
+EVM_FALLBACK_BLOCKS_BY_CHAIN = {"bsc": 240}
 EVM_FALLBACK_BLOCKS_CEILING = 600
 
 
@@ -560,27 +662,44 @@ class SmartMoneyStore:
         return inserted
 
     def repair_legacy_seed_labels(self, rows: tuple[dict[str, Any], ...]) -> int:
-        """Apply verified per-wallet labels without touching user-edited records."""
+        """Apply verified per-wallet labels without touching user-edited records.
+
+        只会重命名「仍是旧占位标签」的种子行：``source_kind = 'seed'`` 且
+        ``(nickname, source_name)`` 恰好等于该地址登记过的旧标签之一。用户一旦
+        在面板里改过昵称，这对值就对不上，于是**不会被覆盖** —— 这正是本方法
+        存在的意义（``seed_wallets`` 用的是 ``INSERT OR IGNORE``，改代码里的
+        昵称对已入库的行无效）。
+
+        旧标签默认是两条通用的历史占位（Inq / 其他聪明钱）；个别地址（例如
+        先以「身份待核验 · …」入池、之后才由用户指认真实身份的）可在种子上用
+        ``legacyLabels`` 自己声明要认领的旧标签对。
+        """
+        default_legacy_labels = (("Inq5️⃣连杆", "Inq5️⃣连杆"), ("其他聪明钱", "用户预置"))
         updated = 0
         now = _now_ms()
         with self.lock:
             for row in rows:
+                legacy_labels = tuple(row.get("legacyLabels") or default_legacy_labels)
+                if not legacy_labels:
+                    continue
+                placeholders = " OR ".join(
+                    ["(nickname = ? AND source_name = ?)"] * len(legacy_labels)
+                )
+                params: list[Any] = [
+                    row["nickname"], row["sourceName"], row.get("sourceUrl", ""),
+                    row["sourceEvidence"], now, row["address"].casefold(),
+                ]
+                for nickname, source_name in legacy_labels:
+                    params += [nickname, source_name]
                 cursor = self.conn.execute(
-                    """
+                    f"""
                     UPDATE wallets
                     SET nickname = ?, source_name = ?, source_url = ?, source_evidence = ?, updated_at = ?
                     WHERE source_kind = 'seed'
                       AND lower(address) = ?
-                      AND (
-                          (nickname = ? AND source_name = ?)
-                          OR (nickname = ? AND source_name = ?)
-                      )
+                      AND ({placeholders})
                     """,
-                    (
-                        row["nickname"], row["sourceName"], row.get("sourceUrl", ""),
-                        row["sourceEvidence"], now, row["address"].casefold(),
-                        "Inq5️⃣连杆", "Inq5️⃣连杆", "其他聪明钱", "用户预置",
-                    ),
+                    params,
                 )
                 updated += max(0, int(cursor.rowcount or 0))
             self.conn.commit()
@@ -671,6 +790,34 @@ class SmartMoneyStore:
             rows = self.conn.execute(
                 "SELECT * FROM events ORDER BY observed_at DESC, id DESC LIMIT ?",
                 (max(1, min(500, int(limit))),),
+            ).fetchall()
+        return [_row_dict(row) for row in rows]
+
+    def buys_for_token(
+        self,
+        chain: Any,
+        token_address: Any,
+        *,
+        since_ms: int = 0,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """某个链上合约最近的买单（按时间正序）。给「KOL 共振」统计用。
+
+        ``token_address`` 大小写不敏感：EVM 地址在库里可能是校验和写法，Solana mint
+        则是大小写敏感的大小写混合串 —— EVM 走 ``lower()``、base58 原样。
+        """
+        normalized_chain = normalize_chain(chain)
+        token = str(token_address or "").strip()
+        if not normalized_chain or not token:
+            return []
+        is_evm = token.lower().startswith("0x")
+        column = "lower(token_address)" if is_evm else "token_address"
+        value = token.lower() if is_evm else token
+        with self.lock:
+            rows = self.conn.execute(
+                f"SELECT * FROM events WHERE chain = ? AND {column} = ? AND observed_at >= ? "
+                "ORDER BY observed_at ASC, id ASC LIMIT ?",
+                (normalized_chain, value, int(since_ms), max(1, min(2000, int(limit)))),
             ).fetchall()
         return [_row_dict(row) for row in rows]
 
@@ -883,6 +1030,12 @@ class SmartMoneyMonitor:
         self.thread: threading.Thread | None = None
         self.running = False
         self.alert_callback: Callable[[dict[str, Any]], Any] | None = None
+        # 「KOL 共振」单独提醒的回调（用户 2026-10-27）。只在三个人**都**买了同一个
+        # 代币时触发一次，见 :meth:`_maybe_emit_kol_sync`。
+        self.sync_alert_callback: Callable[[dict[str, Any]], Any] | None = None
+        self.kol_sync_wallets: dict[str, str] = active_kol_sync_wallets()
+        self._sync_sent: dict[str, float] = {}
+        self._sync_lock = threading.Lock()
         # Optional host-supplied gate.  When it returns False the monitor stops
         # taking NEW buys in (the board's intake switch); already recorded buys
         # stay untouched.
@@ -912,6 +1065,83 @@ class SmartMoneyMonitor:
 
     def set_alert_callback(self, callback: Callable[[dict[str, Any]], Any] | None) -> None:
         self.alert_callback = callback
+
+    def set_sync_alert_callback(
+        self, callback: Callable[[dict[str, Any]], Any] | None
+    ) -> None:
+        """「KOL 共振」弹窗回调；不设就只统计不提醒（测试/离线脚本默认不设）。"""
+        self.sync_alert_callback = callback
+
+    def _maybe_emit_kol_sync(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        """刚记录的一笔买入是否凑齐了「三人同时上车」。
+
+        只在凑齐时返回 context（并回调），否则 ``None``。判定全部基于**事件表里的
+        真实买入记录**，不看谁弹过窗 —— 三个人买的金额可能都不够自己的门槛，但
+        「都上车了」这件事本身才是信号。
+        """
+        callback = self.sync_alert_callback
+        watch = self.kol_sync_wallets
+        if callback is None or not watch:
+            return None
+        chain = normalize_chain(event.get("chain"))
+        token = str(event.get("tokenAddress") or "").strip()
+        if not chain or not token:
+            return None
+        token_key = f"{chain}:{token.lower() if token.lower().startswith('0x') else token}"
+        now_ms = _now_ms()
+        minimum = max(2, int(os.getenv("XINGYUN_KOL_SYNC_MIN", "") or KOL_SYNC_MIN_WALLETS))
+        with self._sync_lock:
+            last = self._sync_sent.get(token_key, 0.0)
+            if last and now_ms - last < KOL_SYNC_REALERT_SECONDS * 1000:
+                return None
+        window_ms = max(1, int(os.getenv(
+            "XINGYUN_KOL_SYNC_WINDOW_HOURS", "") or KOL_SYNC_WINDOW_SECONDS // 3600
+        )) * 3600 * 1000
+        rows = self.store.buys_for_token(chain, token, since_ms=now_ms - window_ms)
+        buyers: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            address = str(row.get("walletAddress") or "").strip().lower()
+            if address not in watch:
+                continue
+            usd = float(row.get("paymentUsd") or 0)
+            slot = buyers.get(address)
+            # 同一人买了多笔：金额相加，时间取最早那笔（「什么时候上车」）。
+            if slot is None:
+                buyers[address] = {
+                    "address": address,
+                    "label": watch[address],
+                    "usd": usd,
+                    "firstAt": int(row.get("observedAt") or 0),
+                    "count": 1,
+                }
+            else:
+                slot["usd"] += usd
+                slot["count"] += 1
+                slot["firstAt"] = min(slot["firstAt"], int(row.get("observedAt") or 0))
+        if len(buyers) < minimum:
+            return None
+        with self._sync_lock:
+            # 双闸：并发轮询下同一个币不能两条线程同时判定通过。
+            last = self._sync_sent.get(token_key, 0.0)
+            if last and now_ms - last < KOL_SYNC_REALERT_SECONDS * 1000:
+                return None
+            self._sync_sent[token_key] = now_ms
+        ordered = sorted(buyers.values(), key=lambda item: item["firstAt"])
+        context = {
+            "chain": chain,
+            "tokenAddress": token,
+            "symbol": str(event.get("symbol") or "").strip(),
+            "buyers": ordered,
+            "totalUsd": sum(item["usd"] for item in ordered),
+            "windowHours": window_ms // 3600000,
+            "minBuyers": minimum,
+            "observedAt": now_ms,
+        }
+        try:
+            callback(context)
+        except Exception:
+            pass
+        return context
 
     def set_intake_guard(self, guard: Callable[[], bool] | None) -> None:
         self.intake_guard = guard
@@ -965,6 +1195,9 @@ class SmartMoneyMonitor:
             self.alert_callback(stored)
             self.store.mark_alerted(stored["eventKey"])
             stored["alertedAt"] = _now_ms()
+        # 「三个人同时上车」是另一件事：金额可能都没过门槛，但要单独提醒一次。
+        if result["created"]:
+            self._maybe_emit_kol_sync(stored)
         return {"created": result["created"], "event": stored}
 
     def start(self, *, start_worker: bool = True) -> None:

@@ -159,7 +159,46 @@ test("the server publishes the chain picker on the trench source", () => {
   assert.match(server, /五链可按链筛选/);
 });
 
+// 桌面战壕悬浮窗是独立 pythonw 进程，看不到浏览器的 localStorage——「榜单切到
+// Robinhood，面板就显示 Robinhood」这条体验全靠榜页把选择 POST 给服务端。
+function loadPublisher(fetchImpl) {
+  const source = [extract("normalizeTrenchChain"), extract("publishTrenchChain")].join("\n");
+  return new Function("fetch", `${source}\nreturn { publishTrenchChain };`)(fetchImpl);
+}
+
+test("switching the chain publishes the selection to the server", () => {
+  const calls = [];
+  const api = loadPublisher((url, options) => {
+    calls.push({ url, options });
+    return Promise.resolve({ ok: true });
+  });
+
+  api.publishTrenchChain("Robinhood");
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "/api/trench-overlay-preference");
+  assert.equal(calls[0].options.method, "POST");
+  assert.equal(calls[0].options.headers["Content-Type"], "application/json");
+  // 归一化过的值才允许出去：面板会把它拼进 /api/onchain-trenches 的 query。
+  assert.deepEqual(JSON.parse(calls[0].options.body), { chain: "robinhood" });
+});
+
+test("a failing publish never breaks the board itself", () => {
+  const api = loadPublisher(() => {
+    throw new Error("offline");
+  });
+  assert.doesNotThrow(() => api.publishTrenchChain("bsc"));
+});
+
+test("the board publishes on load and on every chain switch", () => {
+  assert.match(js, /publishTrenchChain\(state\.trenchChain\);[\s\S]{0,40}hydrateMarketCache\(\)/);
+  assert.match(
+    js,
+    /state\.trenchChain = normalizeTrenchChain\(trenchChainSelect\.value\);[\s\S]{0,240}publishTrenchChain\(state\.trenchChain\)/
+  );
+});
+
 test("the static bundle is bumped for the new dropdown", () => {
-  assert.match(html, /app\.js\?v=46/);
-  assert.match(html, /styles\.css\?v=125/);
+  assert.match(html, /app\.js\?v=48/);
+  assert.match(html, /styles\.css\?v=126/);
 });

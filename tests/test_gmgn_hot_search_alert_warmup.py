@@ -196,6 +196,35 @@ class GmgnHotSearchAlertBoardTests(unittest.TestCase):
         # 这条事件必须能穿过 GMGN 热搜榜的静音闸门，否则弹不出来。
         self.assertFalse(server.desktop_alert_source_is_muted(event))
 
+    def test_popup_view_link_opens_the_gmgn_trade_page(self):
+        """弹窗「查看」跳 GMGN 站内交易页，不再跳币安钱包代币页。
+
+        打开动作由 desktop_alert.open_external_url 交给本机 Chrome 默认配置，
+        因此该链接天然带着浏览器已有的 GMGN 登录态。
+        """
+        snap = self.alert_rows(gmgn_source([board_row("VAUL", "0xabc", 1)]))[0]
+        event = server.rank_monitor_event("hot", snap, "new")
+        self.assertEqual(event["url"], "https://gmgn.ai/robinhood/token/0xabc")
+        self.assertNotIn("web3.binance.com", event["url"])
+
+    def test_board_row_url_is_reused_verbatim(self):
+        row = dict(
+            board_row("VAUL", "0xabc", 1),
+            url="https://gmgn.ai/robinhood/token/0x500e89cec6a0dfbd5ddc28b773d189ab3fc40cbb",
+        )
+        snap = self.alert_rows(gmgn_source([row]))[0]
+        event = server.rank_monitor_event("hot", snap, "new")
+        self.assertEqual(
+            event["url"],
+            "https://gmgn.ai/robinhood/token/0x500e89cec6a0dfbd5ddc28b773d189ab3fc40cbb",
+        )
+
+    def test_popup_falls_back_to_the_dashboard_when_no_link_can_be_built(self):
+        snap = self.alert_rows(gmgn_source([board_row("VAUL", "0xabc", 1)]))[0]
+        snapshot = dict(snap, chain="4663", contractAddress="", url="")
+        event = server.rank_monitor_event("hot", snapshot, "new")
+        self.assertEqual(event["url"], "./index.html")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12977,6 +12977,204 @@ body.admin-console-body {
   align-content: start;
 }
 
+/* 被夹检测：与聪明钱面板同族（单列满宽），只是结论卡自带颜色语义。 */
+.price-watch-grid.is-sandwich {
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+}
+
+.sandwich-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.sandwich-actions button {
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--paper);
+  background: rgba(241, 234, 215, 0.05);
+  font-size: 10px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.sandwich-actions button:hover {
+  border-color: var(--line-strong);
+}
+
+.sandwich-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.sandwich-cycle {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.sandwich-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 14px 0;
+}
+
+.sandwich-filter button {
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 9px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.sandwich-filter button.is-active {
+  border-color: var(--line-strong);
+  color: var(--paper);
+  background: rgba(241, 234, 215, 0.08);
+}
+
+.sandwich-result {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border-bottom: 1px solid rgba(241, 234, 215, 0.08);
+}
+
+.sandwich-result:last-child {
+  border-bottom: 0;
+}
+
+/* 只有「已确认」才配红、「疑似」配琥珀；正常与无法取证保持安静 —— 把「查不到」
+   画成告警，等于教用户忽略告警。 */
+.sandwich-result.is-confirmed {
+  border-left: 3px solid var(--down);
+  background: linear-gradient(90deg, rgba(255, 105, 93, 0.07), transparent 48%);
+}
+
+.sandwich-result.is-suspected {
+  border-left: 3px solid var(--amber);
+  background: linear-gradient(90deg, rgba(246, 187, 72, 0.05), transparent 48%);
+}
+
+.sandwich-result.is-normal,
+.sandwich-result.is-unknown {
+  border-left: 3px solid rgba(241, 234, 215, 0.12);
+}
+
+.sandwich-result > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.sandwich-result > header span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.sandwich-result > header b {
+  color: var(--paper);
+  font-size: 12px;
+}
+
+.sandwich-result > header em {
+  color: var(--muted);
+  font-size: 9px;
+  font-style: normal;
+}
+
+.sandwich-result > header > i {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 8px;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.sandwich-result.is-confirmed > header > i {
+  border-color: rgba(255, 105, 93, 0.4);
+  color: var(--down);
+}
+
+.sandwich-result.is-suspected > header > i {
+  border-color: rgba(246, 187, 72, 0.35);
+  color: var(--amber);
+}
+
+.sandwich-result-facts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.sandwich-result-facts > span {
+  display: grid;
+  gap: 3px;
+  padding: 7px 8px;
+  border: 1px solid rgba(241, 234, 215, 0.08);
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.16);
+}
+
+.sandwich-result-facts em {
+  color: var(--muted);
+  font-size: 8px;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.sandwich-result-facts b {
+  overflow: hidden;
+  color: var(--paper);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sandwich-result-reason {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.sandwich-result > footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.sandwich-result > footer time {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.sandwich-result > footer span {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sandwich-result > footer a {
+  color: var(--cyan);
+  font-size: 9px;
+  font-weight: 800;
+  text-decoration: none;
+}
+
 .smart-money-console {
   display: grid;
   gap: 12px;
@@ -19779,6 +19977,7 @@ div.onchain-trench-ai {
   }
 
   .smart-money-summary,
+  .sandwich-result-facts,
   .smart-money-event-trade {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -19882,6 +20081,7 @@ div.onchain-trench-ai {
 
 @media (max-width: 640px) {
   .smart-money-summary,
+  .sandwich-result-facts,
   .smart-money-add-form,
   .smart-money-event-trade,
   .smart-money-event-contract {
@@ -19891,6 +20091,20 @@ div.onchain-trench-ai {
   .smart-money-add-form .is-address,
   .smart-money-add-form > button {
     grid-column: auto;
+  }
+
+  .sandwich-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .sandwich-cycle {
+    margin-left: 0;
+  }
+
+  .sandwich-result > footer {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .smart-money-panel > header,
@@ -20331,3 +20545,1208 @@ div.onchain-trench-ai {
 @media(prefers-reduced-motion:reduce) { .monitor-buy-progress-meter .progress-spinner { animation:none; } .monitor-buy-progress-meter [data-progress-ring] { transition:none; } }
 .rotation-candidate-name a,.chain-rank-asset a,.chain-discovery-asset a,.aster-contract-name a { color:inherit; text-decoration:none; }
 @media(max-width:600px) { .monitor-buy-dialog { padding:16px; } .monitor-buy-dialog header { top:-16px; } .monitor-buy-target-fields,.monitor-buy-session-fields { grid-template-columns:1fr; gap:0; } .monitor-buy-session-fields label { grid-column:1; } .monitor-buy-session-title { flex-direction:column; gap:5px; } .monitor-buy-session-title span { text-align:left; } .monitor-buy-networks>div { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+
+/* ===== Dev 发币监控（监控页 / 子板块）=====
+   与被夹检测同族：单列满宽的控制台 + 左右两个面板。这里只补两样自己的东西 ——
+   级别徽章（四档配色）与「该链当前查不了」的提示。徽章选择器一律挂在
+   .dev-launch-console 下面，否则会被 .sandwich-result > header > i 的
+   圆角/字号/颜色压过去（那是被夹结论标签的样式）。 */
+.price-watch-grid.is-dev-launch {
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+}
+
+.dev-launch-console .dev-tier {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.dev-launch-console .dev-tier.is-legendary {
+  border-color: rgba(247, 197, 84, 0.45);
+  color: #f7c554;
+  background: rgba(247, 197, 84, 0.10);
+}
+
+.dev-launch-console .dev-tier.is-premium {
+  border-color: rgba(201, 166, 255, 0.45);
+  color: #c9a6ff;
+  background: rgba(201, 166, 255, 0.10);
+}
+
+.dev-launch-console .dev-tier.is-quality {
+  border-color: rgba(95, 220, 174, 0.45);
+  color: #5fdcae;
+  background: rgba(95, 220, 174, 0.10);
+}
+
+.dev-launch-console .dev-tier.is-flow {
+  border-color: rgba(241, 234, 215, 0.18);
+  color: var(--muted);
+  background: rgba(241, 234, 215, 0.04);
+}
+
+.dev-launch-console .dev-launch-tier-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dev-launch-console .dev-launch-tier-row em {
+  color: var(--muted);
+  font-size: 10px;
+  font-style: normal;
+}
+
+.dev-launch-console .dev-tier-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 18px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgba(241, 234, 215, 0.03);
+}
+
+.dev-launch-console .dev-tier-legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.dev-launch-console .dev-tier-legend em {
+  color: var(--muted);
+  font-size: 10px;
+  font-style: normal;
+}
+
+.dev-launch-console .dev-launch-warning {
+  margin: 0;
+  padding: 9px 12px;
+  border: 1px solid rgba(247, 197, 84, 0.32);
+  border-radius: 6px;
+  color: #e9c97f;
+  background: rgba(247, 197, 84, 0.07);
+  font-size: 11px;
+  line-height: 1.7;
+}
+
+/* 「刚发现」的发币记录加一道左侧金边：一眼能看出哪几条是这一轮新弹的窗。
+   用 inset 阴影而不是 border-left，避免改变盒宽导致卡片比邻卡窄 3px。 */
+.dev-launch-console .sandwich-result.dev-launch-token.is-fresh {
+  box-shadow: inset 3px 0 0 rgba(247, 197, 84, 0.75);
+  border-left: 3px solid transparent;
+}
+
+/* ===== 做市商监控（监控页 / 子板块）=====
+   与被夹检测同族：单列满宽控制台 + 左右两栏面板。自有样式只有三块 ——
+   ① 名册药丸（8 家做市商一眼扫完）② 控盘标的卡（五档状态色）
+   ③ 地址簿（按厂家 <details> 折叠，77 条地址默认全展开会把页面拉得很长）。 */
+.price-watch-grid.is-market-maker {
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+}
+
+.mm-console .mm-firm-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.mm-console .mm-firm-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 132px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgba(241, 234, 215, 0.03);
+  /* 药丸本身是 <button>（点一下即筛选），把按钮的默认样式全部清掉，
+     让它看起来仍是一张卡片；只留指针与 hover。 */
+  font: inherit;
+  text-align: left;
+  color: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, transform 0.15s ease;
+}
+
+.mm-console .mm-firm-chip:hover {
+  border-color: var(--line-strong);
+  background: rgba(241, 234, 215, 0.07);
+}
+
+.mm-console .mm-firm-chip:active {
+  transform: translateY(1px);
+}
+
+.mm-console .mm-firm-chip:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+
+/* 选中的那一家：琥珀边框 + 底色，和「回踩到位」同一套视觉语言。 */
+.mm-console .mm-firm-chip.is-selected {
+  border-color: rgba(246, 187, 72, 0.8);
+  background: rgba(246, 187, 72, 0.13);
+  box-shadow: inset 0 0 0 1px rgba(246, 187, 72, 0.28);
+}
+
+.mm-console .mm-firm-chip.is-selected b {
+  color: var(--amber);
+}
+
+.mm-console .mm-firm-chip.is-idle {
+  opacity: 0.55;
+}
+
+/* 选中一家之后要能看出「这是筛选后的」，所以 idle 的淡出也一起取消。 */
+.mm-console .mm-firm-chip.is-selected.is-idle {
+  opacity: 1;
+}
+
+/* 做市商下拉（自绘）：原生 <select> 的弹层是系统画的，深色主题下接近纯黑 + 系统蓝高亮，
+   用户直接说「太黑」。这里换成和卡片同一套暖深色，配色由页面自己说了算。 */
+.mm-console .mm-firm-picker {
+  position: relative;
+  display: inline-flex;
+}
+
+.mm-console .mm-firm-picker-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 240px;
+  padding: 6px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: rgba(241, 234, 215, 0.1);
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  color: var(--paper);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.mm-console .mm-firm-picker-toggle:hover {
+  border-color: rgba(246, 187, 72, 0.55);
+  background: rgba(241, 234, 215, 0.1);
+}
+
+.mm-console .mm-firm-picker-toggle:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+
+.mm-console .mm-firm-picker-toggle em {
+  font-style: normal;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.mm-console .mm-firm-picker-toggle b {
+  font-size: 11.5px;
+  letter-spacing: 0.02em;
+  color: var(--amber);
+}
+
+.mm-console .mm-firm-picker-toggle i {
+  font-style: normal;
+  font-size: 10px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.mm-console .mm-firm-picker-caret {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--muted);
+  transition: transform 0.15s ease;
+}
+
+.mm-console .mm-firm-picker-toggle[aria-expanded="true"] .mm-firm-picker-caret {
+  transform: rotate(180deg);
+  color: var(--amber);
+}
+
+/* 列表本体：一定要比页面底色**亮**一档，压在卡片上才看得出是浮层。
+   用 --bg-2 打底再叠一层暖色，别用纯黑（那正是用户嫌的那个颜色）。 */
+.mm-console .mm-firm-picker-menu {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 6px);
+  left: 0;
+  display: none;
+  width: 100%;
+  min-width: 280px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  background:
+    linear-gradient(180deg, rgba(246, 187, 72, 0.07), rgba(241, 234, 215, 0.035)),
+    #242a1e;
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.55), inset 0 0 0 1px rgba(241, 234, 215, 0.04);
+}
+
+.mm-console .mm-firm-picker-menu.is-open {
+  display: block;
+}
+
+.mm-console .mm-firm-option {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  color: var(--paper);
+  cursor: pointer;
+}
+
+.mm-console .mm-firm-option:hover,
+.mm-console .mm-firm-option:focus-visible {
+  outline: none;
+  background: rgba(241, 234, 215, 0.11);
+}
+
+.mm-console .mm-firm-option b {
+  font-size: 11.5px;
+  letter-spacing: 0.02em;
+}
+
+.mm-console .mm-firm-option i {
+  margin-left: auto;
+  font-style: normal;
+  font-size: 10px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* 当前选中项：琥珀底 + 左侧一条金边，和药丸的选中态同族。 */
+.mm-console .mm-firm-option.is-selected {
+  background: rgba(246, 187, 72, 0.16);
+  box-shadow: inset 2px 0 0 var(--amber);
+}
+
+.mm-console .mm-firm-option.is-selected b {
+  color: var(--amber);
+}
+
+/* 焦点卡：选中某家时在药丸下方把这家是谁、在哪条链、最近什么时候动过说清楚。 */
+.mm-console .mm-firm-focus {
+  display: grid;
+  gap: 3px;
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(246, 187, 72, 0.42);
+  border-left: 3px solid var(--amber);
+  border-radius: 7px;
+  background: rgba(246, 187, 72, 0.07);
+}
+
+.mm-console .mm-firm-focus b {
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: var(--amber);
+}
+
+.mm-console .mm-firm-focus span {
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--paper);
+}
+
+.mm-console .mm-firm-focus em {
+  font-style: normal;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.mm-console .mm-firm-chip b {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--paper);
+}
+
+.mm-console .mm-firm-chip em,
+.mm-console .mm-firm-chip i {
+  font-style: normal;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.mm-console .mm-control-rules {
+  margin: 0 0 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgba(241, 234, 215, 0.03);
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--muted);
+}
+
+.mm-console .mm-control-rules b {
+  color: var(--paper);
+}
+
+.mm-console .mm-control-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.mm-console .mm-control-counts > span {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 9px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 10px;
+}
+
+.mm-console .mm-control-counts em {
+  font-style: normal;
+  color: var(--muted);
+}
+
+.mm-console .mm-control-counts b {
+  font-size: 12px;
+  color: var(--paper);
+}
+
+.mm-console .mm-control-list,
+.mm-console .mm-firm-list,
+.mm-console .mm-address-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mm-console .mm-control {
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(241, 234, 215, 0.03);
+}
+
+.mm-console .mm-control > header,
+.mm-console .mm-position > header,
+.mm-console .mm-transfer > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.mm-console .mm-control > header span,
+.mm-console .mm-position > header span,
+.mm-console .mm-transfer > header span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.mm-console .mm-control > header b,
+.mm-console .mm-position > header b,
+.mm-console .mm-transfer > header b {
+  font-size: 12px;
+  color: var(--paper);
+}
+
+.mm-console .mm-control > header em,
+.mm-console .mm-position > header em,
+.mm-console .mm-transfer > header em {
+  font-style: normal;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.mm-console .mm-control > header i,
+.mm-console .mm-position > header i,
+.mm-console .mm-transfer > header i {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 800;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.mm-console .mm-control.is-buy > header i {
+  border-color: rgba(35, 201, 154, 0.5);
+  color: var(--up);
+  background: rgba(35, 201, 154, 0.12);
+}
+
+.mm-console .mm-control.is-wait > header i {
+  border-color: rgba(88, 199, 243, 0.45);
+  color: var(--cyan);
+  background: rgba(88, 199, 243, 0.10);
+}
+
+.mm-console .mm-control.is-broken > header i {
+  border-color: rgba(255, 105, 93, 0.5);
+  color: var(--down);
+  background: rgba(255, 105, 93, 0.10);
+}
+
+.mm-console .mm-control.is-buy {
+  border-color: rgba(35, 201, 154, 0.38);
+  box-shadow: inset 3px 0 0 rgba(35, 201, 154, 0.7);
+}
+
+.mm-console .mm-control.is-broken {
+  opacity: 0.72;
+}
+
+.mm-console .mm-position-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
+  gap: 6px;
+  margin: 9px 0 0;
+}
+
+.mm-console .mm-position-facts > span {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 5px 7px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: rgba(241, 234, 215, 0.02);
+}
+
+.mm-console .mm-position-facts em {
+  font-style: normal;
+  font-size: 9px;
+  color: var(--muted);
+}
+
+.mm-console .mm-position-facts b {
+  font-size: 11px;
+  color: var(--paper);
+}
+
+.mm-console .mm-control-origin {
+  margin: 8px 0 0;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.mm-console .mm-control > footer,
+.mm-console .mm-position > footer,
+.mm-console .mm-transfer > footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 9px;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.mm-console .mm-control > footer span,
+.mm-console .mm-position > footer span,
+.mm-console .mm-transfer > footer span {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.mm-console .mm-control > footer a,
+.mm-console .mm-position > footer a,
+.mm-console .mm-transfer > footer a {
+  color: var(--cyan);
+  text-decoration: none;
+}
+
+.mm-console .mm-firm {
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgba(241, 234, 215, 0.02);
+}
+
+.mm-console .mm-firm > summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--paper);
+}
+
+.mm-console .mm-firm > summary b {
+  letter-spacing: 0.04em;
+}
+
+.mm-console .mm-firm > summary span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.mm-console .mm-firm > summary em {
+  margin-left: auto;
+  font-style: normal;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.mm-console .mm-firm-brief {
+  margin: 6px 0 8px;
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.mm-console .mm-address {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 7px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font-size: 10px;
+}
+
+.mm-console .mm-address.is-paused {
+  opacity: 0.55;
+}
+
+.mm-console .mm-address > span:first-child {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.mm-console .mm-address b {
+  overflow: hidden;
+  color: var(--paper);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mm-console .mm-address em {
+  overflow: hidden;
+  font-style: normal;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mm-console .mm-address code {
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mm-console .mm-address-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.mm-console .mm-address-actions button {
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--paper);
+  background: rgba(241, 234, 215, 0.05);
+  font-size: 9px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.mm-console .mm-address-actions button.is-danger {
+  border-color: rgba(255, 105, 93, 0.4);
+  color: var(--down);
+}
+
+.mm-console .mm-excluded {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px dashed var(--line);
+  border-radius: 7px;
+}
+
+.mm-console .mm-excluded > summary {
+  cursor: pointer;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+/* ===== 价格异动（6 小时滚动 / 涨 ≥20%）=====
+   独立子板块 ?mode=pricemove。列表是「事件流」：每条一个卡片，左侧一道涨色边，
+   中间一条涨幅进度条（宽度 = 涨幅，封顶 100%），下面四个事实格。
+   涨跌配色沿用项目现有的 --up / --down（和涨幅榜等卡片保持一致，不另起一套）。 */
+.price-watch-grid.is-price-move {
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+}
+
+/* 五格摘要（采样中 / 覆盖标的 / 采样帧 / 当前命中 / 累计命中）必须在**一行**里。
+   沿用 .smart-money-summary 的 4 列会把它挤成 4+1，第五格单独掉到下一行的左边看着像缺了一块。 */
+.price-move-console .smart-money-summary {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.price-move-console .price-move-list {
+  display: grid;
+  gap: 8px;
+  max-height: 820px;
+  overflow-y: auto;
+}
+
+.price-move-item {
+  display: grid;
+  gap: 7px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--up);
+  border-radius: 7px;
+  background: rgba(241, 234, 215, 0.03);
+}
+
+.price-move-item > header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.price-move-item > header span {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.price-move-item > header b {
+  font-size: 13px;
+  letter-spacing: 0.03em;
+  color: var(--paper);
+}
+
+.price-move-item > header em {
+  font-style: normal;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+/* 涨幅本身是这张卡的主信息，字号压过币名。 */
+.price-move-item > header i {
+  font-style: normal;
+  font-size: 16px;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  color: var(--up);
+  white-space: nowrap;
+}
+
+.price-move-bar {
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(241, 234, 215, 0.08);
+  overflow: hidden;
+}
+
+.price-move-bar span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(35, 201, 154, 0.35), var(--up));
+}
+
+.price-move-facts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.price-move-facts > span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.price-move-facts em {
+  font-style: normal;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.price-move-facts b {
+  font-size: 11px;
+  color: var(--paper);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.price-move-item > footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.price-move-item > footer time {
+  font-size: 9px;
+  color: var(--muted);
+}
+
+.price-move-item > footer span {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.price-move-item > footer a {
+  font-size: 10px;
+  color: var(--cyan);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+/* 预热提示：这段必须在页面上显眼 —— 否则用户会把「还没有结果」误读成「没有异动」。 */
+.price-move-console .price-move-warming {
+  border: 1px solid rgba(246, 187, 72, 0.45);
+  border-left: 3px solid var(--amber);
+  border-radius: 7px;
+  background: rgba(246, 187, 72, 0.09);
+  color: var(--paper);
+}
+
+/* Alpha 身份角标：只要在币安 Alpha 清单里就标，与是否控盘无关。
+   控盘达标的改成实心红（is-hot），和弹窗那一侧的 alertTone=red 是同一个信号。 */
+.price-move-alpha {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border: 1px solid rgba(246, 187, 72, 0.5);
+  border-radius: 4px;
+  color: var(--amber);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  line-height: 1.5;
+  text-transform: uppercase;
+}
+
+.price-move-alpha.is-hot {
+  border-color: var(--down);
+  background: var(--down);
+  color: #1a0b0a;
+}
+
+/* 控盘爆红：控盘 ≥90% + Alpha 合约 + 流通市值 ≤3000 万。
+   整卡换红边 + 红底，涨幅与「控盘 97.4%」那一行同时压红 —— 这是这条异动最该看的地方。 */
+.price-move-item.is-alpha-hot {
+  border-color: rgba(255, 105, 93, 0.45);
+  border-left-color: var(--down);
+  background: linear-gradient(180deg, rgba(255, 105, 93, 0.1), rgba(241, 234, 215, 0.02));
+}
+
+.price-move-item.is-alpha-hot > header i {
+  color: var(--down);
+}
+
+.price-move-console .price-move-hot {
+  margin: 0;
+  padding: 5px 9px;
+  border-radius: 6px;
+  background: rgba(255, 105, 93, 0.12);
+  color: var(--paper);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+}
+
+.price-move-console .price-move-hot b {
+  color: var(--down);
+  font-size: 12px;
+}
+
+@media (max-width: 720px) {
+  .price-move-facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  /* 窄屏别硬塞五格，两列能看清数字。 */
+  .price-move-console .smart-money-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* ========================================================================== */
+/* 地址集群（Arkham）—— 2026-10-21                                         */
+/* 一个集群 = 一批同一实体（或有名/无名的同一批地址）的持仓。卡片要一眼看出 */
+/* 「谁」「同时在哪些标的」「各占多少」，所以标的做成可点的 chip 排在第二行。 */
+/* ========================================================================== */
+
+.price-watch-grid.is-arkham-clusters {
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+}
+
+/* 五格摘要（监控中 / 已取到持币人 / 已存集群 / 跨标的 / 已提醒）必须同一行。 */
+.arkham-cluster-console .smart-money-summary {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.arkham-cluster-console .arkham-cluster-broken {
+  border-left: 3px solid var(--up);
+  padding-left: 8px;
+  color: var(--up);
+}
+
+.arkham-cluster-list {
+  display: grid;
+  gap: 8px;
+  max-height: 720px;
+  overflow-y: auto;
+}
+
+.arkham-cluster-item {
+  display: grid;
+  gap: 7px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid rgba(241, 234, 215, 0.35);
+  border-radius: 7px;
+  background: rgba(241, 234, 215, 0.03);
+}
+
+/* 有名字的实体簇，左边给一条更实的边；匿名地址簇淡一点 —— 一眼分得出「是谁」和「一团地址」。 */
+.arkham-cluster-item.is-entity {
+  border-left-color: var(--up);
+}
+
+.arkham-cluster-item.is-address {
+  border-left-color: rgba(241, 234, 215, 0.22);
+}
+
+.arkham-cluster-item > header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.arkham-cluster-item > header span {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.arkham-cluster-item > header b {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 260px;
+}
+
+.arkham-cluster-kind {
+  font-style: normal;
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  color: rgba(241, 234, 215, 0.62);
+}
+
+.arkham-cluster-type {
+  font-style: normal;
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(241, 234, 215, 0.07);
+  color: rgba(241, 234, 215, 0.55);
+}
+
+.arkham-cluster-count {
+  font-style: normal;
+  font-size: 11px;
+  color: rgba(241, 234, 215, 0.62);
+  white-space: nowrap;
+}
+
+.arkham-cluster-tokens {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+/* 标的 chip：不要把一整串链接堆成一大坨字，占比用等宽数字单独突出。 */
+.arkham-token-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 2px 7px;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+  background: rgba(241, 234, 215, 0.04);
+  font-size: 11px;
+  color: inherit;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+a.arkham-token-chip:hover {
+  border-color: var(--up);
+  color: var(--up);
+}
+
+.arkham-token-chip b {
+  font-weight: 600;
+}
+
+.arkham-token-chip i {
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+  color: rgba(241, 234, 215, 0.66);
+}
+
+.arkham-cluster-address {
+  margin: 0;
+  font-size: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: rgba(241, 234, 215, 0.42);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.arkham-cluster-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 0;
+  font-size: 10px;
+  color: rgba(241, 234, 215, 0.5);
+}
+
+.arkham-cluster-meta b {
+  color: rgba(241, 234, 215, 0.78);
+  font-weight: 600;
+}
+
+.arkham-token-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 7px;
+  max-height: 460px;
+  overflow-y: auto;
+}
+
+.arkham-token-item {
+  display: grid;
+  gap: 5px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(241, 234, 215, 0.02);
+}
+
+/* 没取到的标的不隐藏 —— 隐藏会让人以为它没被监控过。 */
+.arkham-token-item.is-error {
+  border-style: dashed;
+  opacity: 0.72;
+}
+
+.arkham-token-item > header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.arkham-token-item > header span {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.arkham-token-item > header b {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.arkham-token-item > header em {
+  font-style: normal;
+  font-size: 10px;
+  color: rgba(241, 234, 215, 0.5);
+}
+
+.arkham-token-item > header i {
+  font-style: normal;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: rgba(241, 234, 215, 0.72);
+  white-space: nowrap;
+}
+
+.arkham-token-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  font-size: 10px;
+  color: rgba(241, 234, 215, 0.46);
+}
+
+.arkham-token-error {
+  color: rgba(255, 179, 166, 0.9);
+}
+
+.arkham-token-src {
+  padding: 0 4px;
+  border-radius: 3px;
+  background: rgba(241, 234, 215, 0.07);
+}
+
+.arkham-token-item > footer {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.arkham-token-item > footer a {
+  font-size: 10px;
+  color: rgba(241, 234, 215, 0.6);
+  text-decoration: none;
+}
+
+.arkham-token-item > footer a:hover {
+  color: var(--up);
+  text-decoration: underline;
+}
+
+@media (max-width: 720px) {
+  /* 窄屏别硬塞五格，两列能看清数字。 */
+  .arkham-cluster-console .smart-money-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .arkham-token-list {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .arkham-cluster-item > header b {
+    max-width: 150px;
+  }
+}
+
+/* ---------------------------------------------------------------
+   榜单行悬停浮层（cmc-hover.js）
+   首页 12 张榜 / 涨幅榜 / 成交榜 / 新币榜共用：行上带 data-cmc-symbol
+   才出现，内容是 CMC 的市值、FDV、流通量、流通率、总量。
+   --------------------------------------------------------------- */
+.cmc-hover-card {
+  position: fixed;
+  z-index: 9000;
+  min-width: 176px;
+  max-width: 268px;
+  padding: 9px 11px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-2) 94%, #000);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.55);
+  color: var(--paper);
+  font-size: 12px;
+  line-height: 1.3;
+  pointer-events: none;
+}
+
+.cmc-hover-card[hidden] {
+  display: none;
+}
+
+.cmc-hover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.cmc-hover-head b {
+  font-size: 12.5px;
+  letter-spacing: 0.04em;
+}
+
+.cmc-hover-rank {
+  padding: 1px 6px;
+  border: 1px solid color-mix(in srgb, var(--amber) 42%, transparent);
+  border-radius: 999px;
+  color: var(--amber);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.cmc-hover-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px 12px;
+  margin: 6px 0 0;
+}
+
+.cmc-hover-grid > div {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.cmc-hover-label {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+
+.cmc-hover-value {
+  overflow: hidden;
+  color: var(--paper);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cmc-hover-note {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+}

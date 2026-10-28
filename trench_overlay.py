@@ -21,6 +21,11 @@
   GET  /api/onchain-trenches        -> 战壕榜最新行（poolCreatedAt 倒序，最新的在最前）
   POST /api/exchange-ai-narratives  -> 币安 AI 中文叙事（按合约逐条缓存）
 
+**跟着榜单页的链走**：面板是独立进程，读不到浏览器里的链下拉（localStorage），
+所以由榜单页把当前选的链 POST 到 /api/trench-overlay-preference，面板每隔
+CHAIN_POLL_SECONDS 秒读一次 —— 榜单切到 Robinhood，面板就显示 Robinhood 链的
+新币与其叙事；读不到偏好时回落「综合」。
+
 GMGN 的战壕接口本身不返回任何叙事字段（实测 114 个字段里没有），所以叙事一律
 走币安 AI 通道，与前端 price-watch.js 的口径一致。
 
@@ -40,12 +45,14 @@ import atexit
 import ctypes
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -72,6 +79,25 @@ NARRATIVE_MAX_LINES = 4
 FEED_TTL_SECONDS = 45
 STATUS_TTL_SECONDS = 600
 HTTP_TIMEOUT = 25
+
+# 「当前查看链」是榜单页和这个面板之间唯一的联动点：榜是浏览器里的页面、面板是
+# 独立 pythonw 进程，两者不共享 localStorage，只能由服务端转达（榜单页写、面板读）。
+# 3 秒轮询对「切一下下拉」这类操作足够跟手，又不至于把 loopback 打热。
+CHAIN_POLL_SECONDS = 3.0
+CHAIN_POLL_TIMEOUT = 5
+CHAIN_ALL = "all"
+# 面板标题里显示的链名：写成用户在下拉里看到的样子，而不是 solana/eth 这种内部值。
+CHAIN_LABELS = {
+    "all": "综合",
+    "solana": "Solana",
+    "bsc": "BSC",
+    "robinhood": "Robinhood",
+    "base": "Base",
+    "eth": "ETH",
+    "arc": "ARC",
+}
+# 链名会被拼进 URL 的 query，收口一次：不认识的形状一律当「综合」，绝不带着脏值发请求。
+CHAIN_VALUE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,23}$")
 MUTEX_NAME = "Local\\xys-trench-overlay"
 PID_FILE = Path(tempfile.gettempdir()) / "xys-trench-overlay.pid"
 LOG_FILE = Path(tempfile.gettempdir()) / "xys-trench-overlay.log"
@@ -350,6 +376,17 @@ def compact_usd(value: object) -> str:
     return f"${number:.0f}"
 
 
+def trench_cmc_text(cmc: object) -> str:
+    """``流通 2.56亿 · 流通率 25.6% · 总量 10.00亿``；没有就返回空串。
+
+    CMC 没收录这只币（战壕里绝大多数上新币）→ 卡片少一行，不显示「—」，
+    因为「CMC 没有」和「流通率是 0」是两件事。
+    """
+    if not isinstance(cmc, dict):
+        return ""
+    return str(cmc.get("text") or "").strip()[:80]
+
+
 def format_percent(value: object) -> tuple[str, str]:
     """返回 ``(文本, 色调)``；色调取 up/down/""，涨幅按国内口径用红色。"""
     try:
@@ -485,6 +522,9 @@ def build_cards(rows: list[dict], narratives: dict[str, str]) -> list[dict]:
             "network": str(row.get("network") or row.get("chain") or ""),
             "ageText": format_age(row.get("ageMinutes")),
             "marketCap": compact_usd(metrics.get("marketCapUsd") or metrics.get("fdvUsd")),
+            # CMC 基本面（2026-10-25）：服务端已经把 `流通 x · 流通率 y% · 总量 z`
+            # 拼好放在 `cmc.text`；CMC 没收录的币这里就是空串，卡片少一行而已。
+            "cmcText": trench_cmc_text(row.get("cmc")),
             "changeText": change_text,
             "changeTone": change_tone,
             "narrative": narratives.get(key, ""),
@@ -507,9 +547,40 @@ def _read_json(request: urllib.request.Request, timeout: int) -> dict:
         return {}
 
 
-def fetch_trench_rows(port: int, *, page_size: int = ROWS_TO_FETCH) -> dict:
+def normalize_chain(value) -> str:
+    """把任意输入收敛成安全链名；不合法一律 ``all``（综合）。"""
+    chain = str(value or "").strip().lower()
+    if not chain or chain == CHAIN_ALL:
+        return CHAIN_ALL
+    return chain if CHAIN_VALUE_PATTERN.match(chain) else CHAIN_ALL
+
+
+def chain_label(chain: str) -> str:
+    """链的内部值 -> 面板上给人看的名字。"""
+    return CHAIN_LABELS.get(normalize_chain(chain), normalize_chain(chain).upper())
+
+
+def fetch_overlay_chain(port: int) -> str:
+    """读榜单页写下的「当前查看链」。
+
+    这是联动链条里唯一的读取点：榜单页 POST 选择、服务端持久化、面板 GET 回来。
+    读不到（服务没起、接口 404）就当「综合」，绝不能让面板因此不刷新。
+    """
     request = urllib.request.Request(
-        f"http://127.0.0.1:{port}/api/onchain-trenches?page=1&pageSize={max(12, int(page_size))}",
+        f"http://127.0.0.1:{port}/api/trench-overlay-preference",
+        headers={"Accept": "application/json", "User-Agent": "XingyunSociety/trench-overlay"},
+    )
+    payload = _read_json(request, CHAIN_POLL_TIMEOUT)
+    return normalize_chain(payload.get("chain"))
+
+
+def fetch_trench_rows(port: int, *, page_size: int = ROWS_TO_FETCH, network: str = "") -> dict:
+    chain = normalize_chain(network)
+    query = f"page=1&pageSize={max(12, int(page_size))}"
+    if chain != CHAIN_ALL:
+        query += f"&network={urllib.parse.quote(chain)}"
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/onchain-trenches?{query}",
         headers={"Accept": "application/json", "User-Agent": "XingyunSociety/trench-overlay"},
     )
     return _read_json(request, HTTP_TIMEOUT)
@@ -567,6 +638,41 @@ class TrenchFeed:
         self._fetched_at = 0.0
         self._refreshing = False
         self._narratives: dict[str, str] = {}
+        # 当前生效的链（面板里正显示的那条）与榜单页刚选中的链（还没取回来）。
+        # 两者不一致 = 有一次换链在路上：此时必须清掉旧卡片，否则新链暂时没数据时
+        # 面板会继续显示上一条链的币，用户会以为「切了没反应」。
+        self._chain = CHAIN_ALL
+        self._pending_chain = ""
+        self._watching = False
+
+    def chain(self) -> str:
+        with self._lock:
+            return self._chain or CHAIN_ALL
+
+    def pending_chain(self) -> str:
+        """下一次刷新会用的链：榜单刚选了新的就是它，否则等于当前生效的链。"""
+        with self._lock:
+            return self._pending_chain or self._chain or CHAIN_ALL
+
+    def needs_refresh(self) -> bool:
+        """榜单页换了链、但面板还没按新链取过数。"""
+        with self._lock:
+            return bool(self._pending_chain) and self._pending_chain != self._chain
+
+    def note_chain(self, chain: str) -> bool:
+        """记录榜单页当前选的链，返回「和上一次相比变了没」。
+
+        只登记不取数：真正发请求由 refresh() 负责，这样轮询线程永远不会和能力
+        （服务端限流、网络慢）纠缠在一起。
+        """
+        chain = normalize_chain(chain)
+        with self._lock:
+            if chain == self._pending_chain:
+                return False  # 这个变化已经在路上了
+            if not self._pending_chain and chain == self._chain:
+                return False  # 和面板正在显示的链一样
+            self._pending_chain = chain
+            return True
 
     def snapshot(self) -> tuple[list[dict], str, float]:
         with self._lock:
@@ -595,8 +701,11 @@ class TrenchFeed:
         def worker() -> None:
             error = ""
             cards: list[dict] = []
+            with self._lock:
+                # 换链时立刻按新链取：面板必须和榜单同一条链，不能等下一次 TTL 到期。
+                target_chain = self._pending_chain or self._chain or CHAIN_ALL
             try:
-                payload = fetch_trench_rows(self.port)
+                payload = fetch_trench_rows(self.port, network=target_chain)
                 rows = [row for row in (payload.get("items") or []) if isinstance(row, dict)]
                 if not rows:
                     statuses = payload.get("sourceStatus") or {}
@@ -626,8 +735,22 @@ class TrenchFeed:
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"[:120]
             with self._lock:
+                switching = target_chain != self._chain
+                if switching:
+                    # 换链了：旧链的卡片与叙事一条都不能留。留着的话，新链暂时没数据的
+                    # 那几十秒里面板会继续显示上一条链的币 —— 那是彻头彻尾的错数据。
+                    self._cards = []
+                    self._narratives = {}
+                    self._chain = target_chain
+                # 只清掉「本次取的就是它」的那个待办：取数期间用户又换了链的话，
+                # 新选择必须保留，否则会被这一句抹掉、白等一轮轮询。
+                if self._pending_chain == target_chain:
+                    self._pending_chain = ""
                 if cards:
                     self._cards = cards
+                    self._fetched_at = time.time()
+                elif switching:
+                    # 换链后没取到行：别再 5 秒一次地打接口，45 秒后再重试即可。
                     self._fetched_at = time.time()
                 self._error = error
                 self._refreshing = False
@@ -642,6 +765,56 @@ class TrenchFeed:
         except Exception:
             with self._lock:
                 self._refreshing = False
+            return False
+        return True
+
+    def poll_chain_once(self) -> bool:
+        """读一次榜单选的链，变了就返回 True；任何异常都吞掉（下一轮再说）。
+
+        单独抽出来是为了可测：``watch_preferences`` 是个死循环线程，而「读一次 +
+        比一下」才是真正值得断言的逻辑。
+        """
+        try:
+            chain = fetch_overlay_chain(self.port)
+        except Exception as exc:
+            log_line(f"读取榜单链偏好失败：{exc!r}")
+            return False
+        try:
+            return self.note_chain(chain)
+        except Exception as exc:
+            log_line(f"登记榜单链偏好失败：{exc!r}")
+            return False
+
+    def watch_preferences(self, on_change=None, interval: float = CHAIN_POLL_SECONDS) -> bool:
+        """后台盯着榜单页选的链，一有变化就叫醒 ``on_change``（只启动一次）。
+
+        为什么单独一条线程而不是塞进 Tk 的 40ms 轮询里：那是个 UI 线程，任何一次
+        loopback 卡顿都会变成面板卡住不动。这里只做「读一个字符串 + 比一下」，
+        出错就闭嘴等下一轮 —— 服务没起的时候面板照旧显示上一次的数据。
+        """
+        with self._lock:
+            if self._watching:
+                return False
+            self._watching = True
+
+        def worker() -> None:
+            while True:
+                time.sleep(max(0.5, float(interval)))
+                if not self.poll_chain_once():
+                    continue
+                log_line(f"榜单换了链：面板随后切到 {chain_label(self.pending_chain())}。")
+                if on_change is not None:
+                    try:
+                        on_change()
+                    except Exception as exc:
+                        log_line(f"链变化回调失败：{exc!r}")
+
+        try:
+            threading.Thread(target=worker, name="trench-overlay-chain", daemon=True).start()
+        except Exception as exc:
+            log_line(f"链偏好侦听线程启动失败：{exc!r}")
+            with self._lock:
+                self._watching = False
             return False
         return True
 
@@ -668,6 +841,7 @@ class TrenchOverlay:
         self.root = None
         self._cards_host = None
         self._header_note = None
+        self._header_chain = None
         self._footer_note = None
         self._visible = False
         self._held = False
@@ -698,6 +872,9 @@ class TrenchOverlay:
         self._build()
         # 启动就先取一次，让面板一出现就有内容。
         self.feed.refresh(on_done=self._on_feed_done)
+        # 面板是独立进程，读不到浏览器里的链下拉，只能盯服务端的共享偏好：榜单页
+        # 一换链，这里最多 CHAIN_POLL_SECONDS 秒就把面板切到同一条链的叙事上。
+        self.feed.watch_preferences(on_change=self._on_chain_changed)
         # 默认就显示：它是常驻小地图，不是「按需呼出」的浮层。
         self.show()
         position = self._position or (0, 0)
@@ -748,7 +925,13 @@ class TrenchOverlay:
         tk.Label(
             header, text="⚡ 战壕热榜", bg=BG_HEADER, fg=FG_ACCENT,
             font=("Microsoft YaHei UI", 11, "bold"),
-        ).pack(side="left", padx=(12, 8), pady=(8, 7))
+        ).pack(side="left", padx=(12, 6), pady=(8, 7))
+        # 当前链：和榜单页下拉同步，跟着 feed 变（见 _render）。
+        self._header_chain = tk.Label(
+            header, text=chain_label(CHAIN_ALL), bg=BG_HEADER, fg=FG_TEXT,
+            font=("Microsoft YaHei UI", 9),
+        )
+        self._header_chain.pack(side="left", pady=(10, 7))
         self._header_note = tk.Label(
             header, text="币安 AI 叙事", bg=BG_HEADER, fg=FG_MUTED,
             font=("Microsoft YaHei UI", 9),
@@ -1004,8 +1187,17 @@ class TrenchOverlay:
         if now - self._last_auto_refresh < interval:
             return
         self._last_auto_refresh = now
-        if not self.feed.is_fresh():
+        # needs_refresh()：榜单页刚换了链，这次必须按新链取，不能等 TTL 到期。
+        if self.feed.needs_refresh() or not self.feed.is_fresh():
             self.feed.refresh(on_done=self._on_feed_done)
+
+    def _on_chain_changed(self) -> None:
+        """榜单页换了链：立刻后台取一次新链的数据（取完由 on_done 重渲染）。
+
+        这条回调在链侦听线程里跑，不在 Tk 主线程 —— refresh() 自己会开工作线程，
+        所以这里不会阻塞 UI；真正碰 Tk 的只有 on_done 里的 after(0)。
+        """
+        self.feed.refresh(on_done=self._on_feed_done)
 
     def _on_feed_done(self) -> None:
         if self.root is None:
@@ -1029,6 +1221,9 @@ class TrenchOverlay:
         for child in list(self._cards_host.winfo_children()):
             child.destroy()
         cards, error, fetched_at = self.feed.snapshot()
+        if self._header_chain is not None:
+            # 面板标题里的链必须跟着数据走：用户看一眼就知道「现在这条是 Robinhood」。
+            self._header_chain.configure(text=chain_label(self.feed.chain()))
         if self._header_note is not None:
             stamp = time.strftime("%H:%M:%S", time.localtime(fetched_at)) if fetched_at else "--:--:--"
             note = f"币安 AI · {stamp}"
@@ -1037,10 +1232,16 @@ class TrenchOverlay:
             self._header_note.configure(text=note, fg=FG_UP if error else FG_MUTED)
 
         if not cards:
+            # 空面板要说得清「是哪条链空的」：切到 Robinhood 后没币，直接写「战壕榜
+            # 暂无数据」用户会以为是全局故障，下次就把链切回去了。
+            placeholder = error or (
+                "战壕榜暂无数据" if self.feed.chain() == CHAIN_ALL
+                else f"{chain_label(self.feed.chain())} 链暂无战壕新币"
+            )
             tk.Label(
                 self._cards_host,
                 text=wrap_display_text(
-                    "读取中…" if self.feed.refreshing() else (error or "战壕榜暂无数据"),
+                    "读取中…" if self.feed.refreshing() else placeholder,
                     max_lines=3,
                 ),
                 bg=BG_PANEL, fg=FG_MUTED, font=("Microsoft YaHei UI", 10),
@@ -1086,6 +1287,17 @@ class TrenchOverlay:
             head, text=card["marketCap"], bg=BG_CARD, fg=FG_TEXT,
             font=("Microsoft YaHei UI", 9),
         ).pack(side="right", padx=(0, 10), pady=(3, 0))
+
+        # CMC 基本面（2026-10-25）：市值之外，把流通量/流通率/总量也摆出来。
+        # CMC 没收录就不画这一行，卡片高度自动收回。
+        cmc_text = card.get("cmcText")
+        if cmc_text:
+            tk.Label(
+                block, text=cmc_text, bg=BG_CARD, fg=FG_MUTED,
+                font=("Microsoft YaHei UI", 8), anchor="w",
+                # 面板只有 396px：万亿级的数字不折行会把窗口撑宽。
+                justify="left", wraplength=TEXT_WRAP_PX,
+            ).pack(fill="x", padx=6, pady=(2, 0))
 
         narrative = card.get("narrative")
         if narrative:
@@ -1200,10 +1412,12 @@ def spawn_detached(*, root: Path | None = None, source: str = "server") -> dict:
 # CLI
 # --------------------------------------------------------------------------- #
 def print_status(port: int) -> int:
-    feed_rows = fetch_trench_rows(port)
+    # 按榜单页当前选的链取数：排查「面板和榜单对不上」时，这一行就是判据。
+    chain = fetch_overlay_chain(port)
+    feed_rows = fetch_trench_rows(port, network=chain)
     rows = [row for row in (feed_rows.get("items") or []) if isinstance(row, dict)]
-    print(f"服务端口 {port} · 战壕 {len(rows)} 行 · total={feed_rows.get('total')} "
-          f"· sourceStatus={feed_rows.get('sourceStatus')}")
+    print(f"服务端口 {port} · 榜单链 {chain_label(chain)}（{chain}） · 战壕 {len(rows)} 行 "
+          f"· total={feed_rows.get('total')} · sourceStatus={feed_rows.get('sourceStatus')}")
     if feed_rows.get("error"):
         print("接口错误：", feed_rows["error"])
     if not rows:
@@ -1257,6 +1471,12 @@ def selfcheck(port: int, hotkey: str, click_through: bool = False) -> int:
         print(f"key state   : Alt={'按下' if alt_down else '抬起'} Q={'按下' if q_down else '抬起'}（此刻实时值）")
         print(f"drag        : 光标 {'OK' if cursor_position() else '取不到'} · "
               f"左键 {'按下' if left_button_down() else '抬起'} · 虚拟桌面 {virtual_screen()}")
+
+    try:
+        chain = fetch_overlay_chain(port)
+        print(f"chain       : {chain_label(chain)}（{chain}）来自榜单页的共享偏好")
+    except Exception as exc:
+        print(f"chain       : 读取失败（{exc!r}）-> 面板会回落「综合」")
 
     started = time.monotonic()
     try:

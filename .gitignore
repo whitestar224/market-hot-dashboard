@@ -45,3 +45,9 @@ backtest-backup/*.db
 
 # WorkBuddy workspace memory (local only, not project code)
 .workbuddy/
+
+# 本地临时抓取快照（.tmp_ncr.json 这类，一次几百 KB，随时可重建）
+.tmp_*
+
+# tools/mm_leader_report.py 等生成的报告产物
+reports/

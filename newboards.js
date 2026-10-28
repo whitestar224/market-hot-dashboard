@@ -429,9 +429,12 @@ function renderCoinRow(row, rank, board) {
   const heat = rowHeatInfo(row, rank);
   const insight = renderInsight(row, board, rank);
   const liveKey = `${board?.id || "coin"}:${row.contractAddress || row.address || row.symbol || row.name || rank}`;
+  // 新币榜也挂 CMC 基本面；新币命中率天然低，查不到时浮层只写「CMC 未收录」。
+  const cmcSymbol = String(row.symbol || "").trim();
+  const cmcAttr = /[A-Za-z0-9]/.test(cmcSymbol) ? ` data-cmc-symbol="${escapeHtml(cmcSymbol)}"` : "";
 
   return `
-    <a class="rank-row newboard-row-link newcoin-rank-row ${heat.high ? "is-hot" : ""}" data-live-key="row:${escapeHtml(liveKey)}" href="${url}" target="_blank" rel="noreferrer">
+    <a class="rank-row newboard-row-link newcoin-rank-row ${heat.high ? "is-hot" : ""}"${cmcAttr} data-live-key="row:${escapeHtml(liveKey)}" href="${url}" target="_blank" rel="noreferrer">
       <div class="rank-badge">${rank}</div>
       <div class="asset-cell">
         ${renderAssetIcon(row, board)}

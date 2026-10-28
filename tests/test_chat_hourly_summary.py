@@ -232,7 +232,9 @@ class ChatHourlySummaryTests(unittest.TestCase):
         self.assertIn("chatHourlySummaryTemplate", source)
         self.assertIn("闲聊与非币种英文词已过滤", source)
         self.assertIn("chat-hourly-rank-row", styles)
-        self.assertIn("price-watch.js?v=106", html)
+        # 版本号只要求「带着 ?v= 数字」，不钉死具体数字：每改一次前端都要 bump，
+        # 钉死等于给每次改动加一条假红灯（2026-10-22 就是因为它常年比 html 落后）。
+        self.assertRegex(html, r"price-watch\.js\?v=\d+")
 
 
 if __name__ == "__main__":

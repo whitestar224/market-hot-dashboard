@@ -94,6 +94,52 @@
   let smartMoneyLoaded = false;
   let smartMoneyActionLoading = false;
   let lastSmartMoneyLoadAt = 0;
+  // 被夹检测：服务端每 90 秒拉一次 GMGN 成交再回链上取证，页面只读快照。
+  let sandwichPayload = { chains: [], wallets: [], results: [], counts: {}, summary: {} };
+  let sandwichLoaded = false;
+  let sandwichActionLoading = false;
+  let lastSandwichLoadAt = 0;
+  // 取证队列会把「正常」的交易也落库，默认只看被抓到的那两条结论。
+  let sandwichFilter = "flagged";
+  // Dev 发币：服务端每 2 分钟扫一次被监控 Dev 地址的出账交易，发现新合约就登记并弹窗；
+  // 页面只读快照，级别标签由「历史峰值市值」派生（顶级 / 精品 / 优质 / 普通·流水）。
+  let devLaunchPayload = { chains: [], tiers: [], wallets: [], results: [], summary: {} };
+  let devLaunchLoaded = false;
+  let devLaunchActionLoading = false;
+  let lastDevLaunchLoadAt = 0;
+  // 做市商监控：服务端按节奏轮询 8 家做市商的链上流水（Blockscout 标签地址簿），
+  // 页面只读快照；同一板块还并进「做市商控盘达标标的」（五条判据由 alpha_mm_monitor 判定）。
+  let marketMakerPayload = {
+    chains: [], firms: [], addresses: [], positions: [], crossToken: [],
+    transfers: [], largeTransfers: [], controlTargets: [], controlExcluded: [],
+    controlSummary: {}, summary: {}, entryGate: {}, resonance: {},
+  };
+  let marketMakerLoaded = false;
+  let marketMakerActionLoading = false;
+  let lastMarketMakerLoadAt = 0;
+  // 按做市商分开看：空串 = 全部。选择落在 ?mmFirm= 与 localStorage 里，
+  // 刷新页面 / 从榜单跳回来都还在同一家身上。
+  const mmFirmFromQuery = new URLSearchParams(window.location.search).get("mmFirm") || "";
+  let marketMakerFirm = mmFirmFromQuery
+    || (() => { try { return window.localStorage.getItem("xingyun.mmFirm") || ""; } catch (_) { return ""; } })();
+  // 下拉展开与否。原生 <select> 的弹层是系统画的，深色主题下几乎是纯黑（用户 2026-10-21
+  // 明确嫌它太黑），CSS 也改不动 option 的背景 —— 所以自己画一个列表。
+  let marketMakerFirmMenuOpen = false;
+  // 价格异动（6 小时内涨 ≥20%）：服务端每 5 分钟记一帧全市场价格，页面只读快照。
+  let priceMovePayload = {
+    moves: [], summary: {},
+  };
+  let priceMoveLoaded = false;
+  let priceMoveActionLoading = false;
+  let lastPriceMoveLoadAt = 0;
+  // 地址集群（Arkham 实体归因）：服务端按候选币抓持币人、聚成集群，
+  // 页面只读快照 —— 实体归因与跨标的判定全在后端，前端不重复算。
+  let arkhamClusterPayload = {
+    clusters: [], tokens: [], summary: {}, state: {},
+  };
+  let arkhamClusterLoaded = false;
+  let arkhamClusterActionLoading = false;
+  let lastArkhamClusterLoadAt = 0;
   let chainEcosystemPayload = {
     chains: [],
     selectedChain: null,
@@ -146,7 +192,7 @@
   let currentSummary = {};
   const rawRequestedMode = new URLSearchParams(window.location.search).get("mode");
   const requestedMode = rawRequestedMode === "events" ? "news" : rawRequestedMode;
-  const supportedModes = ["prior", "oversold", "structure", "newlow", "mapping", "aster", "news", "wechat", "personalx", "smartmoney", "chains"];
+  const supportedModes = ["prior", "oversold", "structure", "newlow", "mapping", "aster", "news", "wechat", "personalx", "smartmoney", "chains", "sandwich", "devlaunch", "marketmaker", "pricemove", "arkhamclusters"];
   let currentMode = supportedModes.includes(requestedMode) ? requestedMode : "prior";
 
   function escapeHtml(value) {
@@ -306,7 +352,7 @@
     const newLow = currentMode === "newlow";
     const visibleStructureItems = newLow ? newLowStructureItems : structureItems;
     grid.classList.add("is-structure");
-    grid.classList.remove("is-mapping", "is-aster", "is-events", "is-wechat", "is-smart-money", "is-chains");
+    grid.classList.remove("is-mapping", "is-aster", "is-events", "is-wechat", "is-smart-money", "is-sandwich", "is-dev-launch", "is-market-maker", "is-chains");
     if (!visibleStructureItems.length) {
       renderGrid(`
         <div class="price-watch-empty">
@@ -409,7 +455,7 @@
   }
 
   function renderMappings() {
-    grid.classList.remove("is-structure", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-chains");
+    grid.classList.remove("is-structure", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-sandwich", "is-dev-launch", "is-market-maker", "is-chains");
     grid.classList.add("is-mapping");
     if (!mappingLoaded) {
       renderGrid(`
@@ -467,7 +513,7 @@
   }
 
   function renderAsterContracts() {
-    grid.classList.remove("is-structure", "is-mapping", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-chains");
+    grid.classList.remove("is-structure", "is-mapping", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-sandwich", "is-dev-launch", "is-market-maker", "is-chains");
     grid.classList.add("is-aster");
     if (!asterItems.length) {
       renderGrid(`
@@ -931,7 +977,7 @@
     const subnav = newsTradeSubnavTemplate(view);
     const searchToolbar = newsTradeSearchTemplate();
     const executionNotice = newsTradeExecutionNoticeTemplate();
-    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-wechat", "is-personal-x", "is-smart-money", "is-chains");
+    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-wechat", "is-personal-x", "is-smart-money", "is-sandwich", "is-dev-launch", "is-market-maker", "is-chains");
     grid.classList.add("is-events");
     if (!eventLoaded) {
       renderGrid(`
@@ -1107,7 +1153,7 @@
       ? wechatMonitorPayload.hourlySummaries
       : [];
     const privacy = wechatMonitorPayload.collector?.privacy || "只在本机内存识别已打开的微信或 QQ 窗口，截图不保存、不上传";
-    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-personal-x", "is-smart-money", "is-chains");
+    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-personal-x", "is-smart-money", "is-sandwich", "is-dev-launch", "is-market-maker", "is-chains");
     grid.classList.add("is-wechat");
     const localOpportunities = opportunities;
     const localHourlySummaries = allHourlySummaries.filter((item) => ["wechat", "qq"].includes(item.platform));
@@ -1205,7 +1251,7 @@
     const avatarUrl = safeExternalUrl(account.avatar);
     const transport = personalXTransportLabel(payload.upstreamMode || summary.transport);
     const connected = personalXStreamReady || summary.connected;
-    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-chains");
+    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-sandwich", "is-dev-launch", "is-market-maker", "is-chains");
     grid.classList.add("is-personal-x");
     if (!personalXLoaded && payload.pending) {
       renderGrid(`<div class="price-watch-empty"><b>正在连接个人 X 实时流</b><span>复用现有秒级监控通道，不建立第二套抓取。</span></div>`);
@@ -1333,7 +1379,7 @@
     const wallets = Array.isArray(smartMoneyPayload.wallets) ? smartMoneyPayload.wallets : [];
     const events = Array.isArray(smartMoneyPayload.events) ? smartMoneyPayload.events : [];
     const summary = smartMoneyPayload.summary || {};
-    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-chains");
+    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-sandwich", "is-dev-launch", "is-market-maker", "is-chains");
     grid.classList.add("is-smart-money");
     if (!smartMoneyLoaded) {
       renderGrid(`<div class="price-watch-empty"><b>正在读取聪明钱地址</b><span>只建立最新链上基线，不追溯旧交易。</span></div>`);
@@ -1363,6 +1409,957 @@
     </section>`);
   }
 
+  // ---------------------------------------------------------------- 被夹检测 --
+  // 四档结论的呈现口径：只有前两档值得红/黄，正常与「无法取证」都必须是安静的颜色
+  // —— 把「查不到」画成告警，等于教用户忽略告警。
+  const SANDWICH_VERDICTS = {
+    confirmed: { label: "已确认被夹", cls: "is-confirmed" },
+    suspected: { label: "疑似夹击", cls: "is-suspected" },
+    normal: { label: "正常", cls: "is-normal" },
+    unknown: { label: "无法取证", cls: "is-unknown" },
+  };
+  const SANDWICH_FILTERS = {
+    flagged: { label: "只看到被夹", match: (row) => row.verdict === "confirmed" || row.verdict === "suspected" },
+    confirmed: { label: "仅已确认", match: (row) => row.verdict === "confirmed" },
+    all: { label: "全部", match: () => true },
+  };
+
+  function sandwichChainLabel(chain) {
+    return sandwichPayload.chains?.find((row) => row.id === chain)?.label || chain || "未知链";
+  }
+
+  // 被夹损失多半是几十美元级别：``compactUsd`` 对 ≥10 的数取整会把 $12.50 说成
+  // $13，损失金额不该丢这个精度，所以小额一律保留两位。
+  function sandwichUsd(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number) || number <= 0) return "--";
+    return number >= 1000 ? compactUsd(number) : `$${number.toFixed(2)}`;
+  }
+
+  function sandwichWalletKey(wallet) {
+    return `${wallet.chain}|${wallet.address}`;
+  }
+
+  function sandwichWalletTemplate(wallet) {
+    const enabled = Boolean(wallet.enabled);
+    const rows = sandwichPayload.results || [];
+    const checked = rows.filter((row) => row.chain === wallet.chain && row.wallet === wallet.address).length;
+    const hits = rows.filter((row) => row.chain === wallet.chain && row.wallet === wallet.address
+      && (row.verdict === "confirmed" || row.verdict === "suspected")).length;
+    return `<article class="smart-money-wallet ${enabled ? "is-enabled" : "is-paused"}">
+      <header><span><b>${escapeHtml(wallet.label || "监控钱包")}</b><em>${escapeHtml(sandwichChainLabel(wallet.chain))}</em></span><i>${enabled ? "检测中" : "已暂停"}</i></header>
+      <code title="${escapeHtml(wallet.address)}">${escapeHtml(smartMoneyShortAddress(wallet.address, 12, 10))}</code>
+      <dl>
+        <div><dt>在本页记录</dt><dd>${checked} 笔</dd></div>
+        <div><dt>命中被夹</dt><dd>${hits} 笔</dd></div>
+      </dl>
+      <footer>
+        <button type="button" data-sandwich-toggle="${escapeHtml(sandwichWalletKey(wallet))}" data-sandwich-enabled="${enabled ? "1" : "0"}">${enabled ? "暂停" : "恢复"}</button>
+        <button type="button" class="is-danger" data-sandwich-remove="${escapeHtml(sandwichWalletKey(wallet))}" data-sandwich-name="${escapeHtml(wallet.label || smartMoneyShortAddress(wallet.address))}">删除</button>
+      </footer>
+    </article>`;
+  }
+
+  function sandwichResultTemplate(row) {
+    const detail = row.detail && typeof row.detail === "object" ? row.detail : {};
+    const price = detail.price && typeof detail.price === "object" ? detail.price : {};
+    const meta = SANDWICH_VERDICTS[row.verdict] || SANDWICH_VERDICTS.unknown;
+    const loss = Number(price.lossUsd) || 0;
+    const impact = Number(price.impactPct) || 0;
+    const attacker = String(detail.attacker || "");
+    const explorerUrl = safeExternalUrl(row.explorerUrl);
+    const direction = String(row.event_type || "").toLowerCase() === "sell" ? "卖出" : "买入";
+    const tradeRow = {
+      ...row, contractAddress: row.contractAddress || row.token,
+      chain: row.chain, symbol: row.symbol || "未知代币",
+    };
+    const facts = [
+      ["多付", sandwichUsd(loss)],
+      ["价格冲击", impact > 0 ? `${impact.toFixed(1)}%` : "--"],
+      [direction, compactNative(row.token_amount, row.symbol)],
+      ["成交均价", compactPrice(row.price_usd)],
+    ];
+    return `<article class="sandwich-result ${meta.cls}">
+      <header>
+        <span><b>${escapeHtml(row.symbol || "未知代币")}</b><em>${escapeHtml(sandwichChainLabel(row.chain))} · 第 ${Number(detail.txIndex) || "--"} 笔</em></span>
+        <i>${escapeHtml(meta.label)}</i>
+      </header>
+      <div class="sandwich-result-facts">${facts.map(([term, value]) => `<span><em>${escapeHtml(term)}</em><b>${escapeHtml(value)}</b></span>`).join("")}</div>
+      <div class="smart-money-event-contract">
+        <span><em>CA</em><code title="${escapeHtml(row.contractAddress || "")}">${escapeHtml(smartMoneyShortAddress(row.contractAddress, 12, 10))}</code></span>
+        <span><em>夹子地址</em><code title="${escapeHtml(attacker)}">${attacker ? escapeHtml(smartMoneyShortAddress(attacker, 10, 8)) : "--"}</code></span>
+      </div>
+      <p class="sandwich-result-reason">${escapeHtml(String(detail.reason || "尚无判定说明"))}</p>
+      <footer>
+        <time>${escapeHtml(relativeTime(row.trade_at))}</time>
+        <span>${monitorBuyButton(tradeRow)}${explorerUrl ? `<a href="${escapeHtml(explorerUrl)}" target="_blank" rel="noreferrer noopener">查看链上交易</a>` : ""}</span>
+      </footer>
+    </article>`;
+  }
+
+  function renderSandwichDetector() {
+    const chains = Array.isArray(sandwichPayload.chains) && sandwichPayload.chains.length
+      ? sandwichPayload.chains
+      : [{ id: "bsc", label: "BSC" }, { id: "ethereum", label: "Ethereum" },
+         { id: "base", label: "Base" }, { id: "robinhood", label: "Robinhood" }];
+    const wallets = Array.isArray(sandwichPayload.wallets) ? sandwichPayload.wallets : [];
+    const summary = sandwichPayload.summary || {};
+    const rows = Array.isArray(sandwichPayload.results) ? sandwichPayload.results : [];
+    const filter = SANDWICH_FILTERS[sandwichFilter] || SANDWICH_FILTERS.flagged;
+    const visible = rows.filter(filter.match);
+    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-dev-launch", "is-market-maker", "is-chains");
+    grid.classList.add("is-sandwich");
+    if (!sandwichLoaded) {
+      renderGrid(`<div class="price-watch-empty"><b>正在读取被夹检测状态</b><span>检测在服务端后台运行，页面只读快照。</span></div>`);
+      return;
+    }
+    const busy = sandwichActionLoading;
+    renderGrid(`<section class="smart-money-console sandwich-console">
+      <div class="smart-money-summary">
+        <span><b>${summary.running ? "检测中" : "未运行"}</b><em>排队 ${Number(summary.pending || 0).toLocaleString("zh-CN")} 笔</em></span>
+        <span><b>${Number(summary.enabledWallets || 0).toLocaleString("zh-CN")}</b><em>监控钱包</em></span>
+        <span><b>${Number(summary.confirmed || 0).toLocaleString("zh-CN")}</b><em>已确认被夹</em></span>
+        <span><b>${Number(summary.suspected || 0).toLocaleString("zh-CN")}</b><em>疑似夹击</em></span>
+      </div>
+      <form class="smart-money-add-form" data-sandwich-wallet-form>
+        <label><span>链</span><select name="chain">${chains.map((chain) => `<option value="${escapeHtml(chain.id)}"${chain.id === "bsc" ? " selected" : ""}>${escapeHtml(chain.label)}</option>`).join("")}</select></label>
+        <label class="is-address"><span>钱包地址</span><input name="address" required maxlength="80" autocomplete="off" placeholder="0x…（仅 EVM 地址）" /></label>
+        <label><span>备注</span><input name="label" maxlength="40" autocomplete="off" placeholder="例如 主钱包" /></label>
+        <label><span>取证门槛（U）</span><input name="minTradeUsd" type="number" min="0" step="1" value="${escapeHtml(String(Number(summary.minTradeUsd) || 0))}" /></label>
+        <button type="submit" ${busy ? "disabled" : ""}>${busy ? "正在保存…" : "添加钱包"}</button>
+      </form>
+      <div class="sandwich-actions">
+        <button type="button" data-sandwich-alerts="${summary.alertsEnabled ? "1" : "0"}">桌面弹窗：${summary.alertsEnabled ? "已开启" : "已关闭"}</button>
+        <button type="button" data-sandwich-refresh ${busy ? "disabled" : ""}>立即检测一轮</button>
+        <span class="sandwich-cycle">${summary.lastCycleAt ? `上次检测 ${escapeHtml(relativeTime(summary.lastCycleAt))}` : "尚未跑过检测"}${summary.lastError ? ` · 上次出错：${escapeHtml(String(summary.lastError).slice(0, 80))}` : ""}</span>
+      </div>
+      <p class="smart-money-readonly"><b>判定口径</b>：同一区块内，受害者前一笔<b>同向</b>、后一笔<b>反向</b>且出自<b>同一地址</b>、筹码往返一致 → 「已确认」；只看到一侧或两侧不同源 → 「疑似」；同块内只有它自己 → 「正常」。价格与损失按 V2 Swap 事件还原，取不到就明确写「无法取证」，<b>绝不猜</b>。成交记录按 GMGN 的地址接口拉取（本机 API Key 未绑定钱包，所以地址只能手工填；<b>监控任意地址都可以</b>，不要求绑定在你自己的账号下），每笔交易只取一次证、结论<b>永久缓存</b>。</p>
+      <div class="smart-money-columns">
+        <section class="smart-money-panel"><header><span><p class="section-label">WATCHED WALLETS</p><h3>监控钱包</h3></span><em>${wallets.length} 个地址</em></header><div class="smart-money-wallet-list">${wallets.length ? wallets.map(sandwichWalletTemplate).join("") : `<div class="chain-section-empty"><b>还没有监控钱包</b><span>在上方填一个 EVM 地址即可开始；填谁就监控谁，不需要绑定到自己的 GMGN 账号。</span></div>`}</div></section>
+        <section class="smart-money-panel"><header><span><p class="section-label">SANDWICH EVIDENCE</p><h3>检测结果</h3></span><em>${visible.length} / ${rows.length} 笔</em></header><div class="sandwich-filter">${Object.entries(SANDWICH_FILTERS).map(([key, meta]) => `<button type="button" class="${key === sandwichFilter ? "is-active" : ""}" data-sandwich-filter="${key}">${escapeHtml(meta.label)}</button>`).join("")}</div><div class="smart-money-event-list">${visible.length ? visible.map(sandwichResultTemplate).join("") : `<div class="chain-section-empty"><b>暂时没有命中记录</b><span>已在队列里的成交会继续回链取证；结论一旦落库就永久保留。</span></div>`}</div></section>
+      </div>
+    </section>`);
+  }
+
+  async function getSandwichPayload(refresh = false) {
+    const response = await fetch(`/api/sandwich-detector${refresh ? "?refresh=1" : ""}`, { cache: "no-store" });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || "被夹检测读取失败");
+    return payload;
+  }
+
+  async function postSandwichAction(action, extra = {}) {
+    const response = await fetch("/api/sandwich-detector", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, ...extra }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || "被夹检测操作失败");
+    return payload;
+  }
+
+  async function loadSandwichDetector({ refresh = false, quiet = false } = {}) {
+    // 服务端每 90 秒才走一轮，页面刷太快只会重复拿同一个快照。
+    const cacheFresh = sandwichLoaded && Date.now() - lastSandwichLoadAt < 10_000;
+    if (!refresh && cacheFresh) {
+      renderSandwichDetector();
+      return;
+    }
+    if (!sandwichLoaded) renderSandwichDetector();
+    try {
+      sandwichPayload = await getSandwichPayload(refresh);
+      sandwichLoaded = true;
+      lastSandwichLoadAt = Date.now();
+      renderSandwichDetector();
+      const summary = sandwichPayload.summary || {};
+      statusNode.textContent = `${Number(summary.enabledWallets || 0)} 个钱包检测中 · 已确认 ${Number(summary.confirmed || 0)} 笔 / 疑似 ${Number(summary.suspected || 0)} 笔 · 排队 ${Number(summary.pending || 0)} 笔`;
+    } catch (error) {
+      if (!quiet) statusNode.textContent = error.message;
+      if (!sandwichLoaded) {
+        grid.classList.add("is-sandwich");
+        grid.innerHTML = `<div class="price-watch-empty"><b>被夹检测暂不可用</b><span>${escapeHtml(error.message)}</span></div>`;
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------------ //
+  // 做市商监控：8 家做市商的链上 ERC-20 流水（Blockscout 的标签地址簿），回答
+  // 「它们正在操作哪些标的」；同一板块还并进「做市商控盘达标标的」——热门榜 /
+  // 涨幅榜里满足五条判据的币（控盘 ≥90% / Alpha 合约 / 市值 ≤3000 万 / 没拉完就砸 /
+  // 上涨结构回踩支撑买点）。五条判据的判定只在 alpha_mm_monitor 里做，这里只读。
+  // ------------------------------------------------------------------------ //
+  const MM_CONTROL_META = {
+    buy: { cls: "is-buy", label: "回踩支撑到位" },
+    wait: { cls: "is-wait", label: "上涨结构·等回踩" },
+    pending: { cls: "is-pending", label: "待下轮复核" },
+    weak: { cls: "is-weak", label: "结构走弱" },
+    broken: { cls: "is-broken", label: "支撑破位" },
+  };
+
+  function mmFirmLabel(firm) {
+    const row = (marketMakerPayload.firms || []).find((item) => item.id === firm);
+    return row?.label || firm || "未知做市商";
+  }
+
+  function mmAddressKey(row) {
+    return `${row.chain}|${row.address}`;
+  }
+
+  function mmUsd(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number) || number === 0) return "--";
+    const text = compactUsd(Math.abs(number));
+    return `${number > 0 ? "+" : "-"}${text}`;
+  }
+
+  function mmPositionTemplate(row) {
+    const direction = Number(row.netUsd) >= 0 ? "净买入" : "净卖出";
+    const href = safeExternalUrl(row.gmgnUrl);
+    const tokenRow = {
+      ...row,
+      contractAddress: row.token,
+      chain: row.chain,
+      symbol: row.symbol,
+    };
+    return `<article class="mm-position ${row.active ? "is-active" : ""}">
+      <header>
+        <span><b>${escapeHtml(row.symbol || "未知代币")}</b><em>${escapeHtml(row.chainLabel)} · ${escapeHtml(row.firmLabel)}</em></span>
+        <i>${escapeHtml(row.isCash ? "资金" : direction)}</i>
+      </header>
+      <div class="mm-position-facts">
+        <span><em>净额</em><b>${escapeHtml(row.netText || "--")}</b></span>
+        <span><em>金额</em><b>${escapeHtml(mmUsd(row.netUsd))}</b></span>
+        <span><em>流水</em><b>${Number(row.transfers || 0)} 笔</b></span>
+        <span><em>最近</em><b>${escapeHtml(row.lastSeenAt ? relativeTime(row.lastSeenAt) : "--")}</b></span>
+      </div>
+      <footer>
+        <time>${escapeHtml(row.firstSeenAt ? `首次 ${relativeTime(row.firstSeenAt)}` : "")}</time>
+        <span>${monitorBuyButton(tokenRow)}${href ? `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener">GMGN 交易</a>` : ""}</span>
+      </footer>
+    </article>`;
+  }
+
+  function mmControlTemplate(row) {
+    const meta = MM_CONTROL_META[row.status] || MM_CONTROL_META.pending;
+    const href = safeExternalUrl(row.gmgnUrl) || safeExternalUrl(row.url);
+    const tokenRow = {
+      ...row, contractAddress: row.contract, chain: row.chain, symbol: row.symbol,
+    };
+    const facts = [
+      ["控盘", row.controlText || "--"],
+      ["流通市值", row.marketCapText || "--"],
+      ["ATH 回撤", `${Number(row.drawdownPct || 0).toFixed(0)}%`],
+      ["24h", row.changeText || "--"],
+      ["现价", row.priceText || "--"],
+      [`支撑${row.supportLabel ? `（${row.supportLabel}）` : ""}`, row.supportText || "--"],
+      ["距支撑", row.support > 0 ? `${Number(row.distancePct || 0).toFixed(2)}%` : "--"],
+    ];
+    return `<article class="mm-control ${meta.cls}">
+      <header>
+        <span><b>${escapeHtml(row.symbol || "")}</b><em>${escapeHtml(row.chainLabel || "链上")}${row.name && row.name !== row.symbol ? ` · ${escapeHtml(row.name)}` : ""}</em></span>
+        <i>${escapeHtml(meta.label)}</i>
+      </header>
+      <div class="mm-position-facts">${facts.map(([term, value]) => `<span><em>${escapeHtml(term)}</em><b>${escapeHtml(String(value))}</b></span>`).join("")}</div>
+      ${row.origin ? `<p class="mm-control-origin">出自 ${escapeHtml(row.origin)}${row.seeded ? ` · 已入选提醒 ${escapeHtml(relativeTime(row.seededAt))}` : ""}</p>` : ""}
+      <footer>
+        <time>${escapeHtml(row.watchedAt ? `观察中 · 自 ${relativeTime(row.watchedAt)}` : "")}</time>
+        <span>${monitorBuyButton(tokenRow)}${href ? `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener">GMGN 交易</a>` : ""}</span>
+      </footer>
+    </article>`;
+  }
+
+  function mmTransferTemplate(row) {
+    const href = safeExternalUrl(row.gmgnUrl);
+    const explorerUrl = safeExternalUrl(row.explorerUrl);
+    const tokenRow = { ...row, contractAddress: row.token, chain: row.chain, symbol: row.symbol };
+    return `<article class="mm-transfer">
+      <header><span><b>${escapeHtml(row.symbol || "未知代币")}</b><em>${escapeHtml(row.firmLabel)} · ${escapeHtml(row.chainLabel)}</em></span><i>${escapeHtml(row.directionLabel)}</i></header>
+      <div class="mm-position-facts">
+        <span><em>数量</em><b>${escapeHtml(row.amountText || "--")}</b></span>
+        <span><em>金额</em><b>${escapeHtml(row.usdText || "--")}</b></span>
+      </div>
+      <footer>
+        <time>${escapeHtml(relativeTime(row.occurredAt))}${row.baseline ? " · 基线" : ""}</time>
+        <span>${monitorBuyButton(tokenRow)}${href ? `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener">GMGN</a>` : ""}${explorerUrl ? `<a href="${escapeHtml(explorerUrl)}" target="_blank" rel="noreferrer noopener">链上</a>` : ""}</span>
+      </footer>
+    </article>`;
+  }
+
+  function mmAddressLine(row) {
+    const enabled = Boolean(row.enabled);
+    const evidence = row.evidenceLabel || row.evidence || "";
+    return `<div class="mm-address ${enabled ? "is-enabled" : "is-paused"}">
+      <span><b>${escapeHtml(row.tag || smartMoneyShortAddress(row.address, 8, 6))}</b><em>${escapeHtml(smartMoneyChainLabel(row.chain))} · ${escapeHtml(evidence)}</em></span>
+      <code title="${escapeHtml(row.address)}">${escapeHtml(smartMoneyShortAddress(row.address, 8, 6))}</code>
+      <span class="mm-address-actions">
+        <button type="button" data-mm-toggle="${escapeHtml(mmAddressKey(row))}" data-mm-enabled="${enabled ? "1" : "0"}">${enabled ? "暂停" : "恢复"}</button>
+        <button type="button" class="is-danger" data-mm-remove="${escapeHtml(mmAddressKey(row))}" data-mm-name="${escapeHtml(row.tag || row.address)}">删除</button>
+      </span>
+    </div>`;
+  }
+
+  function mmFirmBlock(firm, options = {}) {
+    const rows = (marketMakerPayload.addresses || []).filter((row) => row.firm === firm.id);
+    if (!rows.length) return "";
+    // 只看一家时地址簿自动展开 —— 收窄之后本来就只剩这一块，再让人多点一下是徒劳。
+    return `<details class="mm-firm"${options.open ? " open" : ""}>
+      <summary><b>${escapeHtml(firm.short || firm.label)}</b><span>${escapeHtml(firm.label)}</span><em>${rows.length} 个地址 · ${Number(firm.activeTokens || 0)} 个活跃标的${firm.polled ? "" : " · 尚未轮询"}</em></summary>
+      <p class="mm-firm-brief">${escapeHtml(firm.brief || "")}</p>
+      <div class="mm-address-list">${rows.map(mmAddressLine).join("")}</div>
+    </details>`;
+  }
+
+  // 自绘下拉：原生 <select> 的弹层由系统渲染，深色主题下是接近纯黑的底 + 系统蓝高亮，
+  // CSS 对 option 的背景支持极不稳定（用户 2026-10-21 直接截图说「太黑了」）。
+  // 这里改成同款暖深色的列表，配色和卡片一致，也能截到图验收。
+  function mmFirmPicker(firms, selectedFirm) {
+    const option = (id, label, sub, isCurrent) => `<button
+      type="button"
+      role="option"
+      aria-selected="${isCurrent ? "true" : "false"}"
+      class="mm-firm-option${isCurrent ? " is-selected" : ""}"
+      data-mm-option="${escapeHtml(id)}"><b>${escapeHtml(label)}</b><i>${escapeHtml(sub)}</i></button>`;
+    const allSub = `${firms.length} 家 · 回到全量视角`;
+    return `<div class="mm-firm-picker">
+      <button type="button" class="mm-firm-picker-toggle" data-mm-firm-toggle aria-haspopup="listbox" aria-expanded="${marketMakerFirmMenuOpen ? "true" : "false"}">
+        <em>做市商</em>
+        <b>${escapeHtml(selectedFirm ? selectedFirm.label : `全部 ${firms.length} 家`)}</b>
+        <i>${selectedFirm ? `${Number(selectedFirm.activeTokens || 0)} 标的 / ${Number(selectedFirm.addressCount || 0)} 地址` : "全量视角"}</i>
+        <span class="mm-firm-picker-caret" aria-hidden="true">▾</span>
+      </button>
+      <div class="mm-firm-picker-menu${marketMakerFirmMenuOpen ? " is-open" : ""}" role="listbox" aria-label="按做市商筛选">
+        ${option("", "全部做市商", allSub, !marketMakerFirm)}
+        ${firms.map((firm) => option(
+          firm.id,
+          firm.label,
+          `${Number(firm.activeTokens || 0)} 标的 / ${Number(firm.addressCount || 0)} 地址`,
+          firm.id === marketMakerFirm,
+        )).join("")}
+      </div>
+    </div>`;
+  }
+
+  function renderMarketMaker() {
+    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-sandwich", "is-dev-launch", "is-chains");
+    grid.classList.add("is-market-maker");
+    if (!marketMakerLoaded) {
+      renderGrid(`<div class="price-watch-empty"><b>正在读取做市商监控状态</b><span>流水的轮询在服务端后台运行，页面只读快照。</span></div>`);
+      return;
+    }
+    const summary = marketMakerPayload.summary || {};
+    const control = marketMakerPayload.controlSummary || {};
+    const thresholds = control.thresholds || {};
+    const gate = marketMakerPayload.entryGate || {};
+    const resonance = marketMakerPayload.resonance || {};
+    const targets = Array.isArray(marketMakerPayload.controlTargets) ? marketMakerPayload.controlTargets : [];
+    const excluded = Array.isArray(marketMakerPayload.controlExcluded) ? marketMakerPayload.controlExcluded : [];
+    const firms = Array.isArray(marketMakerPayload.firms) ? marketMakerPayload.firms : [];
+    // 按做市商分开看（用户 2026-10-21）：选中一家时，下面的持仓 / 共识 / 大额 / 流水
+    // 全部收窄到这家；控盘达标那一节是按**标的**算的，和厂家无关，保持全量并标注。
+    if (marketMakerFirm && !firms.some((firm) => firm.id === marketMakerFirm)) marketMakerFirm = "";
+    const byFirm = (row) => !marketMakerFirm || row.firm === marketMakerFirm;
+    const allPositions = (marketMakerPayload.positions || []).filter((row) => !row.isCash);
+    const positions = allPositions.filter(byFirm);
+    const cross = (Array.isArray(marketMakerPayload.crossToken) ? marketMakerPayload.crossToken : [])
+      .filter((row) => !marketMakerFirm || (row.firms || []).includes(marketMakerFirm));
+    const large = (Array.isArray(marketMakerPayload.largeTransfers) ? marketMakerPayload.largeTransfers : []).filter(byFirm);
+    const transfers = (Array.isArray(marketMakerPayload.transfers) ? marketMakerPayload.transfers : []).filter(byFirm);
+    const selectedFirm = marketMakerFirm ? firms.find((firm) => firm.id === marketMakerFirm) : null;
+    // 地址簿跟着筛选走：只看一家时不把另外 7 家折叠块也排上去。
+    const firmsForBook = selectedFirm ? [selectedFirm] : firms;
+    const busy = marketMakerActionLoading;
+    const controlFacts = [
+      ["回踩到位", Number(control.buyZone || 0)],
+      ["等回踩", Number(control.waiting || 0)],
+      ["待复核", Number(control.pending || 0)],
+      ["结构走弱", Number(control.weak || 0)],
+      ["支撑破位", Number(control.broken || 0)],
+      ["已排除", Number(control.excluded || 0)],
+    ];
+    const scopeNote = selectedFirm
+      ? `已收窄到 <b>${escapeHtml(selectedFirm.label)}</b> · ${Number(selectedFirm.addressCount || 0)} 个地址 · ${Number(selectedFirm.activeTokens || 0)} 个活跃标的 · ${Number(selectedFirm.polled || 0)} 个地址已轮询过`
+      : "全部 8 家";
+    const gateText = gate.enabled === false
+      ? "进场弹窗未设闸（全部新标的都会弹）"
+      : gate.note
+        ? `进场弹窗闸门暂不可用：${escapeHtml(gate.note)}（宁可不弹，也不假报）`
+        : `进场弹窗只在<b>涨幅榜 ∩ AIcoin 热门榜同振</b>时发 —— 当前共振 <b>${Number(gate.resonance || 0)}</b> 只（涨幅榜 ${Number(gate.gainers || 0)} / AIcoin ${Number(gate.aicoin || 0)}）${Number(gate.filtered || 0) ? ` · 已因未共振暂缓 ${Number(gate.filtered)} 次` : ""}`;
+    // 三方共振：大额异动 × 涨幅榜 × AIcoin。用户 2026-10-21 定：同标的 6 小时只提示一次。
+    const cooldownHours = Math.round(Number(resonance.cooldownSeconds || 0) / 3600) || 6;
+    const resonanceText = resonance.armed !== true
+      ? "三方共振查询未接线（大额调仓只按普通档提示）"
+      : `大额调仓的标的如果此刻<b>同时挂在涨幅榜与 AIcoin 热门榜</b>，弹窗会升级成<b>三方共振</b>（带榜单排名），同一标的 <b>${cooldownHours} 小时</b>内只提示一次${Number(resonance.blocked || 0) ? ` · 已静默 ${Number(resonance.blocked)} 次` : ""}${resonance.note ? ` · 当前读不到榜单：${escapeHtml(resonance.note)}` : ""}`;
+    renderGrid(`<section class="smart-money-console mm-console">
+      <div class="smart-money-summary">
+        <span><b>${summary.running ? "轮询中" : "未运行"}</b><em>每 ${Math.round(Number(summary.intervalSeconds || 0) / 60) || "--"} 分钟一轮 · 每轮 ${Number(marketMakerPayload.addressesPerCycle || summary.addressesPerCycle || 0)} 个地址</em></span>
+        <span><b>${Number(summary.enabledAddresses || 0).toLocaleString("zh-CN")}</b><em>监控地址 / ${Number(summary.addresses || 0)} 个</em></span>
+        <span><b>${positions.length.toLocaleString("zh-CN")}</b><em>${selectedFirm ? escapeHtml(selectedFirm.short || selectedFirm.label) + " 的标的" : "48h 内活跃标的"}</em></span>
+        <span><b>${Number(control.total || 0).toLocaleString("zh-CN")}</b><em>控盘达标标的</em></span>
+        <span><b>${Number(control.buyZone || 0).toLocaleString("zh-CN")}</b><em>回踩支撑到位</em></span>
+      </div>
+      <div class="sandwich-actions">
+        ${mmFirmPicker(firms, selectedFirm)}
+        <button type="button" data-mm-alerts="${summary.alertsEnabled ? "1" : "0"}">桌面弹窗：${summary.alertsEnabled ? "已开启" : "已关闭"}</button>
+        <button type="button" data-mm-refresh ${busy ? "disabled" : ""}>${busy ? "正在刷新…" : "立即刷新一轮"}</button>
+        <span class="sandwich-cycle">${summary.lastCycleAt ? `上次刷新 ${escapeHtml(relativeTime(summary.lastCycleAt))}` : "尚未跑过轮询"}${summary.lastError ? ` · 上次出错：${escapeHtml(String(summary.lastError).slice(0, 80))}` : ""}</span>
+      </div>
+      <p class="smart-money-readonly"><b>当前视角</b>：${scopeNote}。<b>数据来源</b>：地址簿来自 <b>Blockscout</b> 的公开标签（可逐条审计），流水走 <code>token-transfers</code>，金额用接口自带的美元单价折算 —— 全程不需要任何 Key。<b>弹窗只发两类</b>：某家开始操作一个新标的、单笔 <b>≥ ${escapeHtml(compactUsd(Number(summary.largeTransferUsd || 0)))}</b> 的调仓；其余只进列表，首次接线的历史流水一律记为「基线」不弹。</p>
+      <p class="smart-money-readonly mm-gate">${gateText}</p>
+      <p class="smart-money-readonly mm-gate">${resonanceText}</p>
+      <div class="mm-firm-chips">${firms.map((firm) => `<button type="button" class="mm-firm-chip${firm.id === marketMakerFirm ? " is-selected" : ""}${Number(firm.enabledCount || 0) ? "" : " is-idle"}" data-mm-pick="${escapeHtml(firm.id)}" title="${escapeHtml(firm.brief || "")}"><b>${escapeHtml(firm.short || firm.label)}</b><em>${escapeHtml(firm.label)}</em><i>${Number(firm.activeTokens || 0)} 标的 / ${Number(firm.addressCount || 0)} 地址</i></button>`).join("")}</div>
+      ${selectedFirm ? `<div class="mm-firm-focus"><b>${escapeHtml(selectedFirm.label)}</b><span>${escapeHtml(selectedFirm.brief || "")}</span><em>${escapeHtml((selectedFirm.chainLabels || []).join(" · "))}${selectedFirm.lastActivityAt ? ` · 最近动作 ${escapeHtml(relativeTime(selectedFirm.lastActivityAt))}` : ""}</em></div>` : ""}
+
+      <section class="smart-money-panel mm-control-panel">
+        <header><span><p class="section-label">CONTROL / ALPHA PERP / SUPPORT BUY</p><h3>做市商控盘达标标的</h3></span><em>${targets.length} 个在观察${selectedFirm ? " · 与所选做市商无关" : ""}</em></header>
+        <p class="mm-control-rules">热门榜 + 涨幅榜里同时满足：<b>控盘 ≥ ${escapeHtml(String(thresholds.minControlPct ?? 90))}%</b>（剔除 DEX 池 / 销毁 / 交易所托管）· <b>Alpha 已收录且有永续</b> · <b>流通市值 ≤ ${escapeHtml(compactUsd(Number(thresholds.maxMarketCapUsd || 0)))}</b> · <b>ATH 回撤 < ${escapeHtml(String(thresholds.maxDrawdownPct ?? 60))}%</b>（拉完就砸的永久排除）· 上涨结构里回踩支撑（距支撑 ≤ ${escapeHtml(String(thresholds.supportZonePct ?? 2))}% 算到位，跌破 ${escapeHtml(String(thresholds.supportBreakPct ?? 3))}% 算破位）</p>
+        <div class="mm-control-counts">${controlFacts.map(([label, value]) => `<span><em>${escapeHtml(label)}</em><b>${value}</b></span>`).join("")}</div>
+        <div class="mm-control-list">${targets.length ? targets.map(mmControlTemplate).join("") : `<div class="chain-section-empty"><b>暂时没有达标的控盘标的</b><span>候选来自涨幅榜与热门榜，五条判据任何一条不满足都不会出现在这里；被回撤闸拦下的会记入下方「已排除」。</span></div>`}</div>
+        ${excluded.length ? `<details class="mm-excluded"><summary>已排除 ${excluded.length} 个（拉盘后暴跌 / 回撤超阈值）</summary><div class="mm-address-list">${excluded.map((row) => `<div class="mm-address is-paused"><span><b>${escapeHtml(row.symbol)}</b><em>${escapeHtml(row.reason)}</em></span><time>${escapeHtml(row.at ? relativeTime(row.at) : "")}</time></div>`).join("")}</div></details>` : ""}
+      </section>
+
+      <div class="smart-money-columns">
+        <section class="smart-money-panel"><header><span><p class="section-label">FIRM POSITIONS</p><h3>${selectedFirm ? escapeHtml(selectedFirm.label) + " 正在操作的标的" : "它们正在操作的标的"}</h3></span><em>${positions.length}${selectedFirm ? ` / ${allPositions.length}` : ""} 个</em></header><div class="smart-money-event-list">${positions.length ? positions.slice(0, 40).map(mmPositionTemplate).join("") : `<div class="chain-section-empty"><b>${selectedFirm ? "这家最近 48 小时没有可读的持仓" : "还没有读到持仓"}</b><span>${selectedFirm ? "轮询是轮换制：每家每轮的地址子集不同，等一下轮刷新。" : "首次接线需要先跑一轮基线：30 个地址 × 1–2 页流水，约几分钟。"}</span></div>`}</div></section>
+        <section class="smart-money-panel"><header><span><p class="section-label">CROSS TOKEN / CONSENSUS</p><h3>${selectedFirm ? escapeHtml(selectedFirm.label) + " 参与的共识标的" : "几家同时在动的标的"}</h3></span><em>${cross.length} 个</em></header><div class="smart-money-event-list">${cross.length ? cross.slice(0, 30).map((row) => {
+          const href = safeExternalUrl(row.gmgnUrl);
+          const tokenRow = { ...row, contractAddress: row.token, chain: row.chain, symbol: row.symbol };
+          return `<article class="mm-transfer"><header><span><b>${escapeHtml(row.symbol)}</b><em>${escapeHtml(row.chainLabel)} · ${row.firmCount} 家在动</em></span><i>${escapeHtml(mmUsd(row.netUsd))}</i></header><div class="mm-position-facts"><span><em>合计净额</em><b>${escapeHtml(row.netUsdText || "--")}</b></span><span><em>动作</em><b>${Number(row.gestures || 0)} 笔</b></span><span><em>最近</em><b>${escapeHtml(row.lastSeenAt ? relativeTime(row.lastSeenAt) : "--")}</b></span></div><p class="mm-control-origin">${escapeHtml(row.firmText || "")}</p><footer><time></time><span>${monitorBuyButton(tokenRow)}${href ? `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener">GMGN 交易</a>` : ""}</span></footer></article>`;
+        }).join("") : `<div class="chain-section-empty"><b>还没有共识标的</b><span>同一个代币被两家以上同时在动时才会出现在这里 —— 比单家仓位更有信息量。</span></div>`}</div></section>
+      </div>
+
+      <div class="smart-money-columns">
+        <section class="smart-money-panel"><header><span><p class="section-label">LARGE REBALANCE</p><h3>大额调仓</h3></span><em>≥ ${escapeHtml(compactUsd(Number(summary.largeTransferUsd || 0)))}</em></header><div class="smart-money-event-list">${large.length ? large.slice(0, 20).map(mmTransferTemplate).join("") : `<div class="chain-section-empty"><b>最近没有大额调仓</b><span>达到门槛的单笔才会进这里，也会弹桌面提醒。</span></div>`}</div></section>
+        <section class="smart-money-panel"><header><span><p class="section-label">RECENT TRANSFERS</p><h3>最近流水</h3></span><em>${transfers.length} 笔</em></header><div class="smart-money-event-list">${transfers.length ? transfers.slice(0, 20).map(mmTransferTemplate).join("") : `<div class="chain-section-empty"><b>还没有流水</b><span>地址簿每轮轮换 30 个地址，一轮只取最新的 1 页。</span></div>`}</div></section>
+      </div>
+
+      <section class="smart-money-panel"><header><span><p class="section-label">ADDRESS BOOK</p><h3>做市商地址簿</h3></span><em>${selectedFirm ? `${Number(selectedFirm.addressCount || 0)} 个地址 · 只显示 ${escapeHtml(selectedFirm.short || selectedFirm.label)}` : `${Number(summary.addresses || 0)} 个地址 · 按厂家折叠`}</em></header><div class="mm-firm-list">${firmsForBook.length ? firmsForBook.map((firm) => mmFirmBlock(firm, { open: Boolean(selectedFirm) })).join("") : `<div class="chain-section-empty"><b>地址簿为空</b><span>内置地址簿在首次启动时自动灌入。</span></div>`}</div></section>
+    </section>`);
+  }
+
+  // 选了哪一家 = 视图状态，不进 payload。同时写 ?mmFirm= 与 localStorage：
+  // 前者让「复制链接发给别人」也带着筛选，后者让刷新页面 / 从别的 tab 切回来还在同一家。
+  function syncMarketMakerFirm() {
+    try {
+      const url = new URL(window.location.href);
+      if (marketMakerFirm) url.searchParams.set("mmFirm", marketMakerFirm);
+      else url.searchParams.delete("mmFirm");
+      window.history.replaceState(null, "", url.toString());
+    } catch (_) { /* file:// 或不支持 history 时忽略，localStorage 仍然生效 */ }
+    try {
+      if (marketMakerFirm) window.localStorage.setItem("xingyun.mmFirm", marketMakerFirm);
+      else window.localStorage.removeItem("xingyun.mmFirm");
+    } catch (_) { /* 隐私模式写不进去也不影响当前视图 */ }
+  }
+
+  async function getMarketMakerPayload(refresh = false) {
+    const response = await fetch(`/api/market-maker${refresh ? "?refresh=1" : ""}`, { cache: "no-store" });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || "做市商监控读取失败");
+    return payload;
+  }
+
+  async function postMarketMakerAction(action, extra = {}) {
+    const response = await fetch("/api/market-maker", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, ...extra }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || "做市商监控操作失败");
+    return payload;
+  }
+
+  async function loadMarketMaker({ refresh = false, quiet = false } = {}) {
+    // 服务端 5 分钟一轮、每轮几十个 Blockscout 请求；页面 30 秒拿一次快照足够。
+    const cacheFresh = marketMakerLoaded && Date.now() - lastMarketMakerLoadAt < 10_000;
+    if (!refresh && cacheFresh) {
+      renderMarketMaker();
+      return;
+    }
+    if (!marketMakerLoaded) renderMarketMaker();
+    try {
+      marketMakerPayload = await getMarketMakerPayload(refresh);
+      marketMakerLoaded = true;
+      lastMarketMakerLoadAt = Date.now();
+      renderMarketMaker();
+      const summary = marketMakerPayload.summary || {};
+      const control = marketMakerPayload.controlSummary || {};
+      statusNode.textContent = `${Number(summary.enabledAddresses || 0)} 个地址监控中 · ${Number(summary.activePositions || 0)} 个活跃标的 · 控盘达标 ${Number(control.total || 0)} 个（回踩到位 ${Number(control.buyZone || 0)}）`;
+    } catch (error) {
+      if (!quiet) statusNode.textContent = error.message;
+      if (!marketMakerLoaded) {
+        grid.classList.add("is-market-maker");
+        grid.innerHTML = `<div class="price-watch-empty"><b>做市商监控暂不可用</b><span>${escapeHtml(error.message)}</span></div>`;
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------------ //
+  // 价格异动：6 小时窗口内涨 ≥20% **立刻**提醒（用户 2026-10-21 二次拍板：触线即报）。
+  // 基准价是「窗口内最低价」，不是整 6 小时前那一帧 —— 所以窗口没走满也照报，
+  // 页面不能说「还在预热、不会提醒」，只能说清「已覆盖多久」。
+  // ------------------------------------------------------------------------ //
+  function priceMoveItemTemplate(row) {
+    const href = safeExternalUrl(row.url);
+    const tokenRow = { ...row, contractAddress: row.contract || "", chain: row.chain || "", symbol: row.symbol };
+    const width = Math.max(4, Math.min(100, Math.abs(Number(row.pct || 0))));
+    // 基准价的标签跟着窗口常量走：写死「6 小时前」的话，窗口一改页面就在说假话。
+    const baseLabel = `${Math.round(Number(priceMovePayload.windowSeconds || 0) / 3600) || 6} 小时内最低`;
+    // 控盘爆红：控盘 ≥90% + Alpha 合约 + 流通市值 ≤3000 万（服务端 alpha_mm 判定，前端只展示）。
+    const hot = Boolean(row.alphaHot);
+    const alphaChip = row.alphaPhase
+      ? `<span class="price-move-alpha${hot ? " is-hot" : ""}" title="${escapeHtml(row.alphaPhase)}">Alpha</span>`
+      : "";
+    const hotLine = hot
+      ? `<p class="price-move-hot">项目方控盘 <b>${escapeHtml(Number(row.alphaControlPct || 0).toFixed(1))}%</b> · Alpha 合约 · 流通市值 <b>${escapeHtml(row.alphaMarketCapText || "--")}</b></p>`
+      : "";
+    return `<article class="price-move-item${hot ? " is-alpha-hot" : ""}">
+      <header>
+        <span><b>${escapeHtml(row.symbol || "未知代币")}</b>${alphaChip}<em>${escapeHtml(row.chainLabel || row.source || "币安合约")}</em></span>
+        <i>${escapeHtml(row.pctText || "")}</i>
+      </header>
+      <div class="price-move-bar"><span style="width:${width}%"></span></div>
+      ${hotLine}
+      <div class="price-move-facts">
+        <span><em>${escapeHtml(baseLabel)}</em><b>${escapeHtml(priceMoveText(row.basePrice))}</b></span>
+        <span><em>现价</em><b>${escapeHtml(priceMoveText(row.price))}</b></span>
+        <span><em>实际窗口</em><b>${escapeHtml(row.windowText || "--")}</b></span>
+        <span><em>记录于</em><b>${escapeHtml(row.at ? relativeTime(row.at) : "--")}</b></span>
+      </div>
+      <footer>
+        <time>${escapeHtml(row.source || "")}</time>
+        <span>${monitorBuyButton(tokenRow)}${href ? `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener">${row.contract ? "GMGN 交易" : "币安合约"}</a>` : ""}</span>
+      </footer>
+    </article>`;
+  }
+
+  function priceMoveText(value) {
+    const price = Number(value || 0);
+    if (!(price > 0)) return "--";
+    if (price >= 1000) return `$${price.toLocaleString("zh-CN", { maximumFractionDigits: 2 })}`;
+    if (price >= 1) return `$${price.toPrecision(5).replace(/0+$/, "").replace(/\.$/, "")}`;
+    if (price >= 0.0001) return `$${price.toPrecision(4)}`;
+    return `$${price.toFixed(8)}`;
+  }
+
+  function renderPriceMove() {
+    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-sandwich", "is-dev-launch", "is-market-maker", "is-chains");
+    grid.classList.add("is-price-move");
+    if (!priceMoveLoaded) {
+      renderGrid(`<div class="price-watch-empty"><b>正在读取价格异动</b><span>采样在服务端后台按 5 分钟一帧进行，页面只读快照。</span></div>`);
+      return;
+    }
+    const summary = priceMovePayload.summary || {};
+    const moves = Array.isArray(priceMovePayload.moves) ? priceMovePayload.moves : [];
+    const threshold = Number(summary.thresholdPct || priceMovePayload.thresholdPct || 20);
+    const windowHours = Math.round(Number(summary.windowSeconds || priceMovePayload.windowSeconds || 0) / 3600) || 6;
+    const cooldownHours = Math.round(Number(summary.cooldownSeconds || priceMovePayload.cooldownSeconds || 0) / 3600) || 6;
+    const busy = priceMoveActionLoading;
+    const warming = Boolean(priceMovePayload.note);
+    const frames = Number(summary.frames || 0);
+    const coverageMinutes = Math.max(0, Math.round(Number(summary.coverageSeconds || 0) / 60));
+    renderGrid(`<section class="smart-money-console price-move-console">
+      <div class="smart-money-summary">
+        <span><b>${summary.running ? "采样中" : "未运行"}</b><em>每 ${Math.round(Number(summary.intervalSeconds || 0) / 60) || "--"} 分钟一帧</em></span>
+        <span><b>${Number(summary.symbols || 0).toLocaleString("zh-CN")}</b><em>覆盖标的</em></span>
+        <span><b>${frames.toLocaleString("zh-CN")}</b><em>采样帧（已覆盖 ${coverageMinutes} 分钟 / ${windowHours}h）</em></span>
+        <span><b>${Number(summary.current || 0).toLocaleString("zh-CN")}</b><em>当前 ≥${threshold}% 的标的</em></span>
+        <span><b>${Number(summary.total || 0).toLocaleString("zh-CN")}</b><em>累计命中记录</em></span>
+      </div>
+      <div class="sandwich-actions">
+        <button type="button" data-pm-alerts="${summary.alertsEnabled ? "1" : "0"}">桌面弹窗：${summary.alertsEnabled ? "已开启" : "已关闭"}</button>
+        <button type="button" data-pm-refresh ${busy ? "disabled" : ""}>${busy ? "正在采样…" : "立刻采样一帧"}</button>
+        <span class="sandwich-cycle">${summary.lastCycleAt ? `上一帧 ${escapeHtml(relativeTime(summary.lastCycleAt))}` : "尚未采过"}${summary.lastError ? ` · 上次出错：${escapeHtml(String(summary.lastError).slice(0, 80))}` : ""}</span>
+      </div>
+      <p class="smart-money-readonly"><b>口径</b>：全市场加密 —— 币安 U 本位<b>全部合约</b>（美股 / A 股没有合约，天然被排除）。<b>触线即报</b>：当前价 ÷ <b>最近 ${windowHours} 小时的最低价</b> − 1 ≥ <b>${threshold}%</b> 就<b>当场</b>记一条并弹窗，<b>不等窗口走满</b>；同一个币 <b>${cooldownHours} 小时</b>只提醒一次。同时满足 <b>控盘 ≥90%</b> · <b>Alpha 合约</b> · <b>流通市值 ≤3000 万</b> 的标的会<b>爆红</b>（判据来自做市商控盘名单，这里只读不重判）。价格由服务端每 ${Math.round(Number(summary.intervalSeconds || 0) / 60) || 5} 分钟记一帧（币安 <code>ticker/price</code> 一次给全市场），所以不依赖任何 K 线接口。</p>
+      ${warming ? `<p class="smart-money-readonly price-move-warming"><b>窗口未满</b>：${escapeHtml(priceMovePayload.note)}。基准价取现有帧的最低价，所以<b>已经可以报</b> —— 只是「${windowHours} 小时涨幅」这段跨度目前只覆盖了 ${coverageMinutes} 分钟。</p>` : ""}
+      <section class="smart-money-panel">
+        <header><span><p class="section-label">PRICE MOVE / ${windowHours}H ROLLING</p><h3>${windowHours} 小时窗口内涨超 ${threshold}% 的标的</h3></span><em>${moves.length} 条记录</em></header>
+        <div class="price-move-list">${moves.length ? moves.map(priceMoveItemTemplate).join("") : `<div class="chain-section-empty"><b>${warming ? "还在攒第一帧" : `当前没有涨幅超过 ${threshold}% 的标的`}</b><span>${warming ? "服务端刚启动，记下两帧就能开始比。" : "涨够阈值的那一刻就会弹窗；同一只币 6 小时只弹一次。"}</span></div>`}</div>
+      </section>
+    </section>`);
+  }
+
+  async function getPriceMovePayload(refresh = false) {
+    const response = await fetch(`/api/price-move${refresh ? "?refresh=1" : ""}`, { cache: "no-store" });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || "价格异动读取失败");
+    return payload;
+  }
+
+  async function postPriceMoveAction(action, extra = {}) {
+    const response = await fetch("/api/price-move", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, ...extra }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || "价格异动操作失败");
+    return payload;
+  }
+
+  async function loadPriceMove({ refresh = false, quiet = false } = {}) {
+    const cacheFresh = priceMoveLoaded && Date.now() - lastPriceMoveLoadAt < 10_000;
+    if (!refresh && cacheFresh) {
+      renderPriceMove();
+      return;
+    }
+    if (!priceMoveLoaded) renderPriceMove();
+    try {
+      priceMovePayload = await getPriceMovePayload(refresh);
+      priceMoveLoaded = true;
+      lastPriceMoveLoadAt = Date.now();
+      renderPriceMove();
+      const summary = priceMovePayload.summary || {};
+      statusNode.textContent = priceMovePayload.note
+        ? `价格异动 · ${priceMovePayload.note} · 当前 ≥${Number(summary.thresholdPct || 20)}% 的 ${Number(summary.current || 0)} 个`
+        : `${Number(summary.symbols || 0)} 个标的在采样 · 当前 ≥${Number(summary.thresholdPct || 20)}% 的 ${Number(summary.current || 0)} 个`;
+    } catch (error) {
+      if (!quiet) statusNode.textContent = error.message;
+      if (!priceMoveLoaded) {
+        grid.classList.add("is-price-move");
+        grid.innerHTML = `<div class="price-watch-empty"><b>价格异动暂不可用</b><span>${escapeHtml(error.message)}</span></div>`;
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------------ //
+  // 地址集群（Arkham）：同一个实体 / 同一批地址在多个标的里同时占流通 ≥5% → 提醒。
+  // 集群怎么聚（实体归因优先、无名大额地址按单地址成簇）、跨标的怎么判、什么时候
+  // 弹窗，全部在服务端 arkham_cluster_monitor.py；前端只负责把「这个集群命中了
+  // 哪些标的、各占多少」摆清楚，绝不在这里拿 5% 之类的阈值做判断。
+  // ------------------------------------------------------------------------ //
+  const ARKHAM_CLUSTER_KIND_LABEL = { entity: "实体", address: "匿名地址" };
+
+  function arkhamClusterTokenChip(token) {
+    const pct = Number(token.pct || 0);
+    const label = `<b>${escapeHtml(token.symbol || "--")}</b> <i>${pct.toFixed(1)}%</i>`;
+    const href = safeExternalUrl(token.url);
+    if (!href) return `<span class="arkham-token-chip">${label}</span>`;
+    return `<a class="arkham-token-chip" href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener" title="在 Arkham 查看 ${escapeHtml(token.symbol || "")}">${label}</a>`;
+  }
+
+  function arkhamClusterItemTemplate(cluster) {
+    const kind = ARKHAM_CLUSTER_KIND_LABEL[cluster.kind] || "集群";
+    const tokens = Array.isArray(cluster.tokens) ? cluster.tokens : [];
+    const typeText = cluster.clusterType
+      ? `<em class="arkham-cluster-type">${escapeHtml(cluster.clusterType)}</em>`
+      : "";
+    const addressLine = cluster.kind === "address" && cluster.address
+      ? `<p class="arkham-cluster-address">${escapeHtml(cluster.address)}${cluster.label ? ` · ${escapeHtml(cluster.label)}` : ""}</p>`
+      : "";
+    const peak = Number(cluster.peakPct || 0);
+    const peakText = peak > 0
+      ? `峰值 <b>${peak.toFixed(1)}%</b>${cluster.peakSymbol ? `（${escapeHtml(cluster.peakSymbol)}）` : ""}`
+      : "";
+    return `<article class="arkham-cluster-item is-${cluster.kind === "address" ? "address" : "entity"}">
+      <header>
+        <span>
+          <i class="arkham-cluster-kind">${escapeHtml(kind)}</i>
+          <b>${escapeHtml(cluster.name || cluster.clusterId || "未知集群")}</b>
+          ${typeText}
+        </span>
+        <i class="arkham-cluster-count">${escapeHtml(String(cluster.tokenCount || tokens.length))} 个标的</i>
+      </header>
+      <div class="arkham-cluster-tokens">${tokens.map(arkhamClusterTokenChip).join("")}</div>
+      ${addressLine}
+      <p class="arkham-cluster-meta">
+        <span>${peakText}</span>
+        <span>首次发现 ${escapeHtml(cluster.firstSeenAt ? relativeTime(cluster.firstSeenAt) : "--")}</span>
+        <span>最近更新 ${escapeHtml(cluster.lastSeenAt ? relativeTime(cluster.lastSeenAt) : "--")}</span>
+      </p>
+    </article>`;
+  }
+
+  function arkhamClusterTokenRow(row) {
+    const sources = String(row.sources || "")
+      .split(",")
+      .filter(Boolean)
+      .map((item) => ({ move: "异动", gainer: "涨幅榜", hot: "热门榜" }[item] || item));
+    const error = String(row.last_error || "");
+    const topPct = Number(row.top_pct || 0);
+    const url = safeExternalUrl(row.url);
+    return `<article class="arkham-token-item${error ? " is-error" : ""}">
+      <header>
+        <span><b>${escapeHtml(row.symbol || "--")}</b><em>${escapeHtml(row.chainLabel || "")}</em></span>
+        <i>${error ? "未取到" : `最大 ${topPct.toFixed(1)}%`}</i>
+      </header>
+      <p class="arkham-token-meta">
+        ${error
+          ? `<span class="arkham-token-error">${escapeHtml(error.slice(0, 60))}</span>`
+          : `<span>${escapeHtml(String(row.cluster_count || 0))} 个集群</span>
+             <span>${escapeHtml(row.last_ok_at ? `更新于 ${relativeTime(row.last_ok_at)}` : "")}</span>`}
+        ${sources.length ? `<span class="arkham-token-src">${escapeHtml(sources.join(" / "))}</span>` : ""}
+      </p>
+      ${url ? `<footer><a href="${escapeHtml(url)}" target="_blank" rel="noreferrer noopener">Arkham</a></footer>` : ""}
+    </article>`;
+  }
+
+  function renderArkhamClusters() {
+    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-sandwich", "is-dev-launch", "is-market-maker", "is-chains", "is-price-move");
+    grid.classList.add("is-arkham-clusters");
+    if (!arkhamClusterLoaded) {
+      renderGrid(`<div class="price-watch-empty"><b>正在读取地址集群</b><span>持币人与实体归因在服务端按轮抓取，页面只读快照。</span></div>`);
+      return;
+    }
+    const summary = arkhamClusterPayload.summary || {};
+    const state = arkhamClusterPayload.state || {};
+    const clusters = Array.isArray(arkhamClusterPayload.clusters) ? arkhamClusterPayload.clusters : [];
+    const tokens = Array.isArray(arkhamClusterPayload.tokens) ? arkhamClusterPayload.tokens : [];
+    const busy = arkhamClusterActionLoading;
+    const threshold = Number(summary.significantPct || 5);
+    const crossMin = Number(summary.crossMinTokens || 2);
+    const intervalMin = Math.round(Number(state.interval || 0) / 60) || 10;
+    const broken = Boolean(state.authBroken);
+    const errorLine = broken
+      ? `<p class="smart-money-readonly arkham-cluster-broken"><b>Arkham 接口不可用</b>：网页端签名被拒（口令可能已被轮换）。点位数据不会用空集群冒充 —— 需要时重启服务或更新 <code>XINGYUN_ARKHAM_CLIENT_KEY</code>。</p>`
+      : "";
+    renderGrid(`<section class="smart-money-console arkham-cluster-console">
+      <div class="smart-money-summary">
+        <span><b>${state.running ? "监控中" : "未运行"}</b><em>每 ${intervalMin} 分钟一轮</em></span>
+        <span><b>${Number(summary.tokenOk || 0).toLocaleString("zh-CN")}<small>/${Number(summary.tokenTotal || 0).toLocaleString("zh-CN")}</small></b><em>已取到持币人</em></span>
+        <span><b>${Number(summary.clusterTotal || 0).toLocaleString("zh-CN")}</b><em>已存集群</em></span>
+        <span><b>${Number(summary.crossTotal || 0).toLocaleString("zh-CN")}</b><em>跨标的集群</em></span>
+        <span><b>${Number(summary.alertedTotal || 0).toLocaleString("zh-CN")}</b><em>已提醒集群</em></span>
+      </div>
+      <div class="sandwich-actions">
+        <button type="button" data-ac-alerts="${state.alertsEnabled ? "1" : "0"}">桌面弹窗：${state.alertsEnabled ? "已开启" : "已关闭"}</button>
+        <button type="button" data-ac-refresh ${busy ? "disabled" : ""}>${busy ? "正在查询…" : "立刻查询一遍"}</button>
+        <span class="sandwich-cycle">${state.lastCycleAt ? `上一轮 ${escapeHtml(relativeTime(state.lastCycleAt))}` : "尚未跑过"}${state.lastNote ? ` · ${escapeHtml(String(state.lastNote).slice(0, 90))}` : ""}</span>
+      </div>
+      <p class="smart-money-readonly"><b>口径</b>：候选标的只取<b>榜上的</b>（行情榜各卡当前显示的行 ∪ 涨幅榜；GMGN 战壕新币榜这类<b>新币流不算榜</b>），且只取池里有链上合约的（没有合约的交易所标的查不到持币人）。数据取自 Arkham 网页端接口（<code>/token/holders/{链}/{合约}</code>），每链取前 100 个持币地址。<b>集群</b>按 Arkham 的实体归因合并（同一个实体的多个地址 / 多条链占比相加），没有归因但单地址占流通 ≥1% 的按<b>匿名地址簇</b>单独记。<b>交易所 / DEX / 托管 / 跨链桥 / 稳定币发行方</b>持有代币是业务需要，不算控盘，一律剔除。<b>提醒条件</b>：同一个集群在 <b>≥${crossMin} 个榜上标的</b>都占流通 <b>≥${threshold}%</b>，同一集群 <b>6 小时</b>只弹一次。掉出榜单的标的仍留在下面的「已查询的标的」里，但不再参与跨标的判定。</p>
+      ${errorLine}
+      <section class="smart-money-panel">
+        <header><span><p class="section-label">ADDRESS CLUSTERS / CROSS-TOKEN</p><h3>同时在多个标的占流通 ≥${threshold}% 的集群</h3></span><em>${clusters.length} 个</em></header>
+        <div class="arkham-cluster-list">${clusters.length
+          ? clusters.map(arkhamClusterItemTemplate).join("")
+          : `<div class="chain-section-empty"><b>还没有跨标的集群</b><span>同一批地址要同时在 ≥${crossMin} 个<b>榜上</b>标的里占流通 ≥${threshold}% 才会出现在这里（榜外标的即便也在库里也不计数）。当前榜上标的 ${Number(summary.boardTokenTotal || 0)} 个，已采样 ${Number(summary.tokenOk || 0)} 个，可以点「立刻查询一遍」加快。</span></div>`}</div>
+      </section>
+      <section class="smart-money-panel">
+        <header><span><p class="section-label">SAMPLED TOKENS</p><h3>已查询的标的</h3></span><em>${tokens.length} 个</em></header>
+        <div class="arkham-token-list">${tokens.length
+          ? tokens.map(arkhamClusterTokenRow).join("")
+          : `<div class="chain-section-empty"><b>还没有查询记录</b><span>监控线程启动后会按候选榜单一轮一轮地查。</span></div>`}</div>
+      </section>
+    </section>`);
+  }
+
+  async function getArkhamClusterPayload(refresh = false) {
+    const response = await fetch(`/api/arkham-clusters${refresh ? "?refresh=1" : ""}`, { cache: "no-store" });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || "地址集群读取失败");
+    return payload;
+  }
+
+  async function postArkhamClusterAction(action, extra = {}) {
+    const response = await fetch("/api/arkham-clusters", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, ...extra }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || "地址集群操作失败");
+    return payload;
+  }
+
+  async function loadArkhamClusters({ refresh = false, quiet = false } = {}) {
+    const cacheFresh = arkhamClusterLoaded && Date.now() - lastArkhamClusterLoadAt < 10_000;
+    if (!refresh && cacheFresh) {
+      renderArkhamClusters();
+      return;
+    }
+    if (!arkhamClusterLoaded) renderArkhamClusters();
+    try {
+      arkhamClusterPayload = await getArkhamClusterPayload(refresh);
+      arkhamClusterLoaded = true;
+      lastArkhamClusterLoadAt = Date.now();
+      renderArkhamClusters();
+      const summary = arkhamClusterPayload.summary || {};
+      statusNode.textContent = `${Number(summary.tokenOk || 0)} 个标的已取持币人 · ${Number(summary.clusterTotal || 0)} 个集群 · 跨标的 ${Number(summary.crossTotal || 0)} 个`;
+    } catch (error) {
+      if (!quiet) statusNode.textContent = error.message;
+      if (!arkhamClusterLoaded) {
+        grid.classList.add("is-arkham-clusters");
+        grid.innerHTML = `<div class="price-watch-empty"><b>地址集群暂不可用</b><span>${escapeHtml(error.message)}</span></div>`;
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------------ //
+  // Dev 发币：盯住给定的 Dev 地址，一有新币发出来就提醒；级别标签按该地址
+  // 历史发过的币的最高市值派生（顶级 / 精品 / 优质 / 普通·流水）。
+  // ------------------------------------------------------------------------ //
+  const DEV_TIER_META = {
+    legendary: { label: "顶级", cls: "is-legendary", range: "≥ $1 亿" },
+    premium: { label: "精品", cls: "is-premium", range: "$1000 万 ~ $1 亿" },
+    quality: { label: "优质", cls: "is-quality", range: "$100 万 ~ $1000 万" },
+    flow: { label: "普通 / 流水", cls: "is-flow", range: "低于 $100 万" },
+  };
+
+  function devLaunchChainLabel(chain) {
+    return devLaunchPayload.chains?.find((row) => row.id === chain)?.label || chain || "未知链";
+  }
+
+  function devTierBadge(tier) {
+    const meta = DEV_TIER_META[tier] || DEV_TIER_META.flow;
+    return `<i class="dev-tier ${meta.cls}" title="历史峰值市值 ${escapeHtml(meta.range)}">${escapeHtml(meta.label)}</i>`;
+  }
+
+  function devLaunchWalletKey(wallet) {
+    return `${wallet.chain}|${wallet.address}`;
+  }
+
+  function devLaunchWalletTemplate(wallet) {
+    const enabled = Boolean(wallet.enabled);
+    const tier = wallet.tier || {};
+    const rows = devLaunchPayload.results || [];
+    const own = rows.filter((row) => row.chain === wallet.chain && row.dev_address === wallet.address);
+    return `<article class="smart-money-wallet ${enabled ? "is-enabled" : "is-paused"}">
+      <header><span><b>${escapeHtml(wallet.label || "未命名 Dev")}</b><em>${escapeHtml(devLaunchChainLabel(wallet.chain))}</em></span><i>${enabled ? "监控中" : "已暂停"}</i></header>
+      <code title="${escapeHtml(wallet.address)}">${escapeHtml(smartMoneyShortAddress(wallet.address, 12, 10))}</code>
+      <div class="dev-launch-tier-row">${devTierBadge(tier.tier)}<em>历史峰值 ${escapeHtml(tier.peakMarketCapText || "$0")}</em></div>
+      <dl>
+        <div><dt>发过的币</dt><dd>${Number(tier.tokenCount || own.length)} 个</dd></div>
+        <div><dt>上次回扫</dt><dd>${wallet.scanned_at ? escapeHtml(relativeTime(wallet.scanned_at)) : "尚未回扫"}</dd></div>
+      </dl>
+      <footer>
+        <button type="button" data-dev-launch-rescan="${escapeHtml(devLaunchWalletKey(wallet))}">回扫</button>
+        <button type="button" data-dev-launch-toggle="${escapeHtml(devLaunchWalletKey(wallet))}" data-dev-launch-enabled="${enabled ? "1" : "0"}">${enabled ? "暂停" : "恢复"}</button>
+        <button type="button" class="is-danger" data-dev-launch-remove="${escapeHtml(devLaunchWalletKey(wallet))}" data-dev-launch-name="${escapeHtml(wallet.label || smartMoneyShortAddress(wallet.address))}">删除</button>
+      </footer>
+    </article>`;
+  }
+
+  function devLaunchTokenTemplate(row) {
+    const url = safeExternalUrl(row.url);
+    const explorer = safeExternalUrl(row.explorerUrl);
+    const launchTx = safeExternalUrl(row.launchTxUrl);
+    const tradeRow = {
+      ...row, contractAddress: row.token, chain: row.chain,
+      symbol: row.symbol || "未知代币",
+    };
+    const facts = [
+      ["当前市值", row.marketCapText || "--"],
+      ["历史峰值", row.peakMarketCapText || "$0"],
+      ["发现方式", row.via === "factory" ? "发射台代发" : "直接部署"],
+      ["级别", (DEV_TIER_META[row.tier] || DEV_TIER_META.flow).label],
+    ];
+    return `<article class="sandwich-result dev-launch-token ${row.fresh ? "is-fresh" : ""}">
+      <header>
+        <span><b>${escapeHtml(row.symbol || "未知代币")}</b><em>${escapeHtml(devLaunchChainLabel(row.chain))} · ${escapeHtml(row.devLabel || smartMoneyShortAddress(row.dev_address, 10, 8))}</em></span>
+        ${devTierBadge(row.tier)}
+      </header>
+      <div class="sandwich-result-facts">${facts.map(([term, value]) => `<span><em>${escapeHtml(term)}</em><b>${escapeHtml(value)}</b></span>`).join("")}</div>
+      <div class="smart-money-event-contract">
+        <span><em>CA</em><code title="${escapeHtml(row.token)}">${escapeHtml(smartMoneyShortAddress(row.token, 12, 10))}</code></span>
+        <span><em>发币时间</em><code>${row.launched_at ? escapeHtml(relativeTime(row.launched_at)) : "--"}</code></span>
+      </div>
+      <footer>
+        <time>${row.fresh ? "新发现" : `记录于 ${escapeHtml(relativeTime(row.first_seen_at))}`}</time>
+        <span>${monitorBuyButton(tradeRow)}${launchTx ? `<a href="${escapeHtml(launchTx)}" target="_blank" rel="noreferrer noopener">发币交易</a>` : ""}${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer noopener">GMGN 交易</a>` : explorer ? `<a href="${escapeHtml(explorer)}" target="_blank" rel="noreferrer noopener">区块浏览器</a>` : ""}</span>
+      </footer>
+    </article>`;
+  }
+
+  function renderDevLaunch() {
+    const chains = Array.isArray(devLaunchPayload.chains) && devLaunchPayload.chains.length
+      ? devLaunchPayload.chains
+      : [{ id: "bsc", label: "BSC", available: true, note: "" },
+         { id: "ethereum", label: "Ethereum", available: true, note: "" },
+         { id: "base", label: "Base", available: true, note: "" },
+         { id: "robinhood", label: "Robinhood", available: true, note: "" }];
+    const wallets = Array.isArray(devLaunchPayload.wallets) ? devLaunchPayload.wallets : [];
+    const summary = devLaunchPayload.summary || {};
+    const rows = Array.isArray(devLaunchPayload.results) ? devLaunchPayload.results : [];
+    const tiers = Array.isArray(devLaunchPayload.tiers) ? devLaunchPayload.tiers : [];
+    const unavailable = chains.filter((chain) => chain.available === false);
+    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-sandwich", "is-chains");
+    grid.classList.add("is-dev-launch");
+    if (!devLaunchLoaded) {
+      renderGrid(`<div class="price-watch-empty"><b>正在读取 Dev 发币监控状态</b><span>扫链在服务端后台运行，页面只读快照。</span></div>`);
+      return;
+    }
+    const busy = devLaunchActionLoading;
+    const intervalMinutes = Math.max(1, Math.round(Number(summary.intervalSeconds || 120) / 60));
+    // 默认选中第一条**可用**的链：列表第一条是 BSC，而 BSC 现在免费档查不了，
+    // 停在它上面等于让用户第一次点「添加并回扫」就撞墙。
+    const defaultChain = chains.find((chain) => chain.available !== false)?.id || chains[0]?.id || "";
+    renderGrid(`<section class="smart-money-console sandwich-console dev-launch-console">
+      <div class="smart-money-summary">
+        <span><b>${summary.running ? "扫描中" : "未运行"}</b><em>每 ${intervalMinutes} 分钟一轮</em></span>
+        <span><b>${Number(summary.enabledWallets || 0).toLocaleString("zh-CN")}</b><em>监控 Dev 地址</em></span>
+        <span><b>${Number(summary.tokens || 0).toLocaleString("zh-CN")}</b><em>发币记录</em></span>
+        <span><b>${Number(summary.peaksGrounded || 0).toLocaleString("zh-CN")}</b><em>峰值已回扫</em></span>
+      </div>
+      <form class="smart-money-add-form" data-dev-launch-wallet-form>
+        <label><span>链</span><select name="chain">${chains.map((chain) => `<option value="${escapeHtml(chain.id)}"${chain.id === defaultChain ? " selected" : ""}${chain.available === false ? ' data-unavailable="1"' : ""}>${escapeHtml(chain.label)}${chain.available === false ? "（不可用）" : ""}</option>`).join("")}</select></label>
+        <label class="is-address"><span>Dev 地址</span><input name="address" required maxlength="80" autocomplete="off" placeholder="0x…（仅 EVM 地址）" /></label>
+        <label><span>备注</span><input name="label" maxlength="40" autocomplete="off" placeholder="例如 某 Dev" /></label>
+        <button type="submit" ${busy ? "disabled" : ""}>${busy ? "正在添加…" : "添加并回扫"}</button>
+      </form>
+      <div class="sandwich-actions">
+        <button type="button" data-dev-launch-alerts="${summary.alertsEnabled ? "1" : "0"}">桌面弹窗：${summary.alertsEnabled ? "已开启" : "已关闭"}</button>
+        <button type="button" data-dev-launch-refresh ${busy ? "disabled" : ""}>立即扫描一轮</button>
+        <span class="sandwich-cycle">${summary.lastCycleAt ? `上次扫描 ${escapeHtml(relativeTime(summary.lastCycleAt))}` : "尚未跑过扫描"}${summary.lastError ? ` · 上次出错：${escapeHtml(String(summary.lastError).slice(0, 90))}` : ""}</span>
+      </div>
+      <div class="dev-tier-legend">${tiers.map((tier) => `<span>${devTierBadge(tier.id)}<em>${escapeHtml((DEV_TIER_META[tier.id] || DEV_TIER_META.flow).range)}</em></span>`).join("")}</div>
+      <p class="smart-money-readonly"><b>级别口径</b>：按该 Dev <b>历史发过的币里最高的一次市值</b>定档 —— 顶级 ≥ <b>1 亿美元</b>、精品 1000 万 ~ 1 亿、优质 100 万 ~ 1000 万、普通 / 流水 &lt; 100 万。峰值市值取 GeckoTerminal 日线最高价 × 流通量，取不到就退回当前市值（看上方"峰值已回扫"计数）。<b>添加地址时会立刻回扫一次</b>，第一次回扫只登记历史发币、<b>不弹窗</b>；之后每轮新发现的币才提醒。发射台一次调用会 create2 出代币与包装合约两个地址，已按 ERC-20 判据去噪，<b>一次发币只提醒一条</b>。</p>
+      ${unavailable.length ? `<p class="dev-launch-warning">⚠ ${unavailable.map((chain) => `${escapeHtml(chain.label)}：${escapeHtml(chain.note || "当前不可用")}`).join(" · ")}</p>` : ""}
+      <div class="smart-money-columns">
+        <section class="smart-money-panel"><header><span><p class="section-label">WATCHED DEVS</p><h3>监控 Dev 地址</h3></span><em>${wallets.length} 个地址</em></header><div class="smart-money-wallet-list">${wallets.length ? wallets.map(devLaunchWalletTemplate).join("") : `<div class="chain-section-empty"><b>还没有监控 Dev</b><span>在上方填一个 EVM 地址（Dev / 部署者钱包）即可；加进来会立刻回扫历史发币并给出级别。</span></div>`}</div></section>
+        <section class="smart-money-panel"><header><span><p class="section-label">LAUNCH RECORDS</p><h3>发币记录</h3></span><em>${rows.length} 个</em></header><div class="smart-money-event-list">${rows.length ? rows.map(devLaunchTokenTemplate).join("") : `<div class="chain-section-empty"><b>还没有发现新币</b><span>被监控的 Dev 一旦发出新币，这里会新增一条并弹出桌面提醒。</span></div>`}</div></section>
+      </div>
+    </section>`);
+  }
+
+  async function getDevLaunchPayload(refresh = false) {
+    const response = await fetch(`/api/dev-launch${refresh ? "?refresh=1" : ""}`, { cache: "no-store" });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || "Dev 发币监控读取失败");
+    return payload;
+  }
+
+  async function postDevLaunchAction(action, extra = {}) {
+    const response = await fetch("/api/dev-launch", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, ...extra }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || "Dev 发币操作失败");
+    return payload;
+  }
+
+  async function loadDevLaunch({ refresh = false, quiet = false } = {}) {
+    // 服务端每 2 分钟才走一轮（含 Blockscout / DexScreener / GeckoTerminal 三类外部请求），
+    // 页面刷太快只会重复拿同一个快照。
+    const cacheFresh = devLaunchLoaded && Date.now() - lastDevLaunchLoadAt < 10_000;
+    if (!refresh && cacheFresh) {
+      renderDevLaunch();
+      return;
+    }
+    if (!devLaunchLoaded) renderDevLaunch();
+    try {
+      devLaunchPayload = await getDevLaunchPayload(refresh);
+      devLaunchLoaded = true;
+      lastDevLaunchLoadAt = Date.now();
+      renderDevLaunch();
+      const summary = devLaunchPayload.summary || {};
+      statusNode.textContent = `${Number(summary.enabledWallets || 0)} 个 Dev 监控中 · 已登记 ${Number(summary.tokens || 0)} 个发币记录 · 其中 ${Number(summary.peaksGrounded || 0)} 个峰值已回扫`;
+    } catch (error) {
+      if (!quiet) statusNode.textContent = error.message;
+      if (!devLaunchLoaded) {
+        grid.classList.add("is-dev-launch");
+        grid.innerHTML = `<div class="price-watch-empty"><b>Dev 发币监控暂不可用</b><span>${escapeHtml(error.message)}</span></div>`;
+      }
+    }
+  }
+
   function safeExternalUrl(value) {
     try {
       const url = new URL(String(value || ""), window.location.href);
@@ -1370,9 +2367,7 @@
     } catch (_) {
       return "";
     }
-  }
-
-  function opportunityTradeAction(state = {}, symbol = "") {
+  }  function opportunityTradeAction(state = {}, symbol = "") {
     const action = state?.tradeAction && typeof state.tradeAction === "object" ? state.tradeAction : {};
     const kind = String(action.kind || "").trim().toLowerCase();
     if (kind === "exchange") {
@@ -2324,7 +3319,7 @@
     const sourceHealth = Array.isArray(payload.sourceHealth) ? payload.sourceHealth : [];
     const dailyResearch = payload.dailyResearch && typeof payload.dailyResearch === "object" ? payload.dailyResearch : {};
     const warnings = Array.isArray(payload.warnings) ? payload.warnings : [];
-    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-chains");
+    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-sandwich", "is-dev-launch", "is-market-maker", "is-chains");
     grid.classList.add("is-chains");
     if (!chainEcosystemLoaded) {
       renderGrid(`<div class="price-watch-empty"><b>正在读取链上投研图谱</b><span>加载生命周期、细分市场、潜在发行项目和 Top 5 快照。</span></div>`);
@@ -2629,7 +3624,12 @@
     const personalx = currentMode === "personalx";
     const smartmoney = currentMode === "smartmoney";
     const chains = currentMode === "chains";
-    form.hidden = wechat || personalx || smartmoney || chains;
+    const sandwich = currentMode === "sandwich";
+    const devlaunch = currentMode === "devlaunch";
+    const marketmaker = currentMode === "marketmaker";
+    const pricemove = currentMode === "pricemove";
+    const arkhamclusters = currentMode === "arkhamclusters";
+    form.hidden = wechat || personalx || smartmoney || chains || sandwich || devlaunch || marketmaker || pricemove || arkhamclusters;
     modeButtons.forEach((button) => {
       const active = button.dataset.watchMode === currentMode;
       button.classList.toggle("active", active);
@@ -2689,6 +3689,36 @@
       headingDescription.innerHTML = `<b>AI 全域研判</b> · 早期观察 → 主网重点 → 可交易生态 · 原始事实保留来源校验`;
       return;
     }
+    if (sandwich) {
+      headingLabel.textContent = "SANDWICH / SAME BLOCK / ONCHAIN PROOF";
+      headingTitle.textContent = "被夹检测（三明治夹）";
+      headingDescription.innerHTML = `<b>BSC · Ethereum · Base · Robinhood</b> · 把 GMGN 交易记录逐笔回链上还原<b>区块内顺序</b> · 同块内同地址先抬价、后落袋且筹码往返才判「已确认」 · 命中弹桌面提醒`;
+      return;
+    }
+    if (devlaunch) {
+      headingLabel.textContent = "DEV / NEW LAUNCH / TIER";
+      headingTitle.textContent = "Dev 发币监控";
+      headingDescription.innerHTML = `盯住给定的 Dev 地址，<b>一发新币就提醒</b> · 级别按该地址历史发过的币的<b>最高市值</b>定档（顶级 ≥ 1 亿 / 精品 1000 万 / 优质 100 万 / 普通·流水） · 发射台代发也能抓到 · 命中弹桌面提醒`;
+      return;
+    }
+    if (marketmaker) {
+      headingLabel.textContent = "MARKET MAKER / ONCHAIN FLOW / CONTROL";
+      headingTitle.textContent = "做市商监控";
+      headingDescription.innerHTML = `<b>Wintermute · Jump · GSR · DWF · Amber · B2C2 · Cumberland · Flow Traders</b> · 链上 ERC-20 流水（Ethereum · Robinhood）看它们在动哪些标的 · 另并热门榜 / 涨幅榜里<b>控盘达标</b>的 Alpha 永续标的`;
+      return;
+    }
+    if (pricemove) {
+      headingLabel.textContent = "PRICE MOVE / 6H ROLLING / +20%";
+      headingTitle.textContent = "价格异动";
+      headingDescription.innerHTML = `<b>全市场加密</b>（币安 U 本位全部合约，<b>不含美股 / A 股</b>）· <b>相对 6 小时内最低价</b>涨 ≥20% 就<b>当场</b>弹窗，不等窗口走满 · 同一个币 <b>6 小时</b>只提醒一次`;
+      return;
+    }
+    if (arkhamclusters) {
+      headingLabel.textContent = "ARKHAM / ADDRESS CLUSTERS";
+      headingTitle.textContent = "地址集群";
+      headingDescription.innerHTML = `按 <b>Arkham 实体归因</b>把持币地址聚成集群 · 同一集群在 <b>≥2 个标的</b>都占流通 <b>≥5%</b> 就提醒 · 交易所 / DEX / 托管 / 桥不计入控盘`;
+      return;
+    }
     headingLabel.textContent = oversold ? "OVERSOLD / LOW RANGE / REBOUND" : "ACTIVE WATCHLIST";
     headingTitle.textContent = oversold ? "热门币超跌反弹监控" : "主升浪阶段高点监控";
     headingDescription.innerHTML = oversold
@@ -2744,7 +3774,27 @@
       renderChainEcosystem();
       return;
     }
-    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-chains");
+    if (currentMode === "sandwich") {
+      renderSandwichDetector();
+      return;
+    }
+    if (currentMode === "devlaunch") {
+      renderDevLaunch();
+      return;
+    }
+    if (currentMode === "marketmaker") {
+      renderMarketMaker();
+      return;
+    }
+    if (currentMode === "pricemove") {
+      renderPriceMove();
+      return;
+    }
+    if (currentMode === "arkhamclusters") {
+      renderArkhamClusters();
+      return;
+    }
+    grid.classList.remove("is-structure", "is-mapping", "is-aster", "is-events", "is-wechat", "is-personal-x", "is-smart-money", "is-sandwich", "is-dev-launch", "is-market-maker", "is-price-move", "is-chains");
     const visibleItems = currentMode === "oversold"
       ? items.filter((item) => item.oversoldCandidate || item.fibCandidate)
       : items.filter((item) => item.priorHighEnabled !== false && item.status !== "unavailable");
@@ -3353,7 +4403,7 @@
   async function load({ refresh = false, quiet = false } = {}) {
     if (loading) return;
     setBusy(true, refresh
-      ? (["structure", "newlow"].includes(currentMode) ? (currentMode === "newlow" ? "后台推进近一年新币低位结构轮询…" : "后台运行龙头策略六周期扫描…") : currentMode === "mapping" ? "后台重建补涨映射…" : currentMode === "aster" ? "后台核对 Aster 合约上新公告…" : currentMode === "news" ? "后台更新 News Trade 并去重…" : currentMode === "wechat" ? "后台检查当前可见群聊…" : currentMode === "personalx" ? "后台唤醒个人 X 实时通道…" : currentMode === "smartmoney" ? "后台扫描聪明钱地址的新交易…" : currentMode === "chains" ? "后台重新扫描链上投研证据…" : "后台核对 7 日价格数据…")
+      ? (["structure", "newlow"].includes(currentMode) ? (currentMode === "newlow" ? "后台推进近一年新币低位结构轮询…" : "后台运行龙头策略六周期扫描…") : currentMode === "mapping" ? "后台重建补涨映射…" : currentMode === "aster" ? "后台核对 Aster 合约上新公告…" : currentMode === "news" ? "后台更新 News Trade 并去重…" : currentMode === "wechat" ? "后台检查当前可见群聊…" : currentMode === "personalx" ? "后台唤醒个人 X 实时通道…" : currentMode === "smartmoney" ? "后台扫描聪明钱地址的新交易…" : currentMode === "chains" ? "后台重新扫描链上投研证据…" : currentMode === "sandwich" ? "后台拉取成交并回链取证…" : currentMode === "devlaunch" ? "后台扫描被监控 Dev 的新发币…" : currentMode === "marketmaker" ? "后台拉取做市商链上流水…" : "后台核对 7 日价格数据…")
       : statusNode.textContent);
     try {
       if (currentMode === "wechat") {
@@ -3370,6 +4420,30 @@
       }
       if (currentMode === "chains") {
         await loadChainEcosystem({ refresh, quiet });
+        return;
+      }
+      if (currentMode === "sandwich") {
+        // 必须在这里也分流：直接用 ?mode=sandwich 打开（或在该模式刷新页面）时不走
+        // 模式按钮的点击分支，漏了这一处就会去拉价格监控列表。
+        await loadSandwichDetector({ refresh, quiet });
+        return;
+      }
+      if (currentMode === "devlaunch") {
+        // 同上：?mode=devlaunch 直达时不能落到价格监控列表那条路上。
+        await loadDevLaunch({ refresh, quiet });
+        return;
+      }
+      if (currentMode === "marketmaker") {
+        // ?mode=marketmaker 直达时同样必须在这里分流。
+        await loadMarketMaker({ refresh, quiet });
+        return;
+      }
+      if (currentMode === "pricemove") {
+        await loadPriceMove({ refresh, quiet });
+        return;
+      }
+      if (currentMode === "arkhamclusters") {
+        await loadArkhamClusters({ refresh, quiet });
         return;
       }
       const payload = await getPayload(refresh);
@@ -3440,6 +4514,82 @@
   });
 
   grid.addEventListener("submit", async (event) => {
+    const sandwichForm = event.target.closest("[data-sandwich-wallet-form]");
+    if (sandwichForm) {
+      event.preventDefault();
+      if (sandwichActionLoading) return;
+      const data = new FormData(sandwichForm);
+      const chain = data.get("chain")?.toString() || "";
+      const address = data.get("address")?.toString().trim() || "";
+      const label = data.get("label")?.toString().trim() || "";
+      const minTradeUsd = data.get("minTradeUsd")?.toString().trim() || "";
+      if (!chain || !address) {
+        statusNode.textContent = "请选择链并填写钱包地址";
+        return;
+      }
+      if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
+        statusNode.textContent = "被夹检测只支持 EVM 地址（0x 开头的 40 位十六进制）";
+        return;
+      }
+      sandwichActionLoading = true;
+      renderSandwichDetector();
+      statusNode.textContent = "正在写入监控钱包…";
+      try {
+        sandwichPayload = await postSandwichAction("add", { chain, address, label });
+        if (minTradeUsd !== "") {
+          sandwichPayload = await postSandwichAction("settings", { minTradeUsd });
+        }
+        sandwichLoaded = true;
+        lastSandwichLoadAt = Date.now();
+        statusNode.textContent = `${label || smartMoneyShortAddress(address)} 已加入被夹检测；后台开始拉取最近成交并回链取证`;
+      } catch (error) {
+        statusNode.textContent = `添加失败：${error.message}`;
+      } finally {
+        sandwichActionLoading = false;
+        renderSandwichDetector();
+      }
+      return;
+    }
+
+    const devLaunchForm = event.target.closest("[data-dev-launch-wallet-form]");
+    if (devLaunchForm) {
+      event.preventDefault();
+      if (devLaunchActionLoading) return;
+      const data = new FormData(devLaunchForm);
+      const chain = data.get("chain")?.toString() || "";
+      const address = data.get("address")?.toString().trim() || "";
+      const label = data.get("label")?.toString().trim() || "";
+      if (!chain || !address) {
+        statusNode.textContent = "请选择链并填写 Dev 地址";
+        return;
+      }
+      if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
+        statusNode.textContent = "Dev 发币监控只支持 EVM 地址（0x 开头的 40 位十六进制）";
+        return;
+      }
+      // 该链的索引器不可用时必须当场拦住：后端加进去了也扫不出东西，用户会一直等提醒。
+      const chainMeta = (devLaunchPayload.chains || []).find((row) => row.id === chain);
+      if (chainMeta && chainMeta.available === false) {
+        statusNode.textContent = `${chainMeta.label} 暂时查不了：${chainMeta.note || "索引器不可用"}`;
+        return;
+      }
+      devLaunchActionLoading = true;
+      renderDevLaunch();
+      statusNode.textContent = "正在加入监控并回扫历史发币…";
+      try {
+        devLaunchPayload = await postDevLaunchAction("add", { chain, address, label });
+        devLaunchLoaded = true;
+        lastDevLaunchLoadAt = Date.now();
+        statusNode.textContent = `${label || smartMoneyShortAddress(address)} 已加入；后台正在回扫历史发币，约 10 秒后刷新即可看到级别`;
+      } catch (error) {
+        statusNode.textContent = `添加失败：${error.message}`;
+      } finally {
+        devLaunchActionLoading = false;
+        renderDevLaunch();
+      }
+      return;
+    }
+
     const smartMoneyForm = event.target.closest("[data-smart-money-form]");
     if (smartMoneyForm) {
       event.preventDefault();
@@ -3620,6 +4770,410 @@
   });
 
   grid.addEventListener("click", async (event) => {
+    const sandwichFilterButton = event.target.closest("[data-sandwich-filter]");
+    if (sandwichFilterButton && currentMode === "sandwich") {
+      const next = sandwichFilterButton.dataset.sandwichFilter;
+      if (SANDWICH_FILTERS[next]) {
+        sandwichFilter = next;
+        renderSandwichDetector();
+      }
+      return;
+    }
+
+    const sandwichToggle = event.target.closest("[data-sandwich-toggle]");
+    if (sandwichToggle && currentMode === "sandwich" && !sandwichActionLoading) {
+      const [chain, address] = String(sandwichToggle.dataset.sandwichToggle || "").split("|");
+      const enabled = sandwichToggle.dataset.sandwichEnabled !== "1";
+      sandwichActionLoading = true;
+      sandwichToggle.disabled = true;
+      statusNode.textContent = enabled ? "正在恢复该钱包的检测…" : "正在暂停该钱包的检测…";
+      try {
+        sandwichPayload = await postSandwichAction("toggle", { chain, address, enabled });
+        sandwichLoaded = true;
+        lastSandwichLoadAt = Date.now();
+        statusNode.textContent = enabled ? "已恢复检测；新成交会继续排队取证" : "已暂停检测；已有结论仍然保留";
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        sandwichActionLoading = false;
+        renderSandwichDetector();
+      }
+      return;
+    }
+
+    const sandwichRemove = event.target.closest("[data-sandwich-remove]");
+    if (sandwichRemove && currentMode === "sandwich" && !sandwichActionLoading) {
+      const [chain, address] = String(sandwichRemove.dataset.sandwichRemove || "").split("|");
+      const name = sandwichRemove.dataset.sandwichName || "该钱包";
+      if (!window.confirm(`确认从被夹检测中删除 ${name}？已取证的结论会保留。`)) return;
+      sandwichActionLoading = true;
+      sandwichRemove.disabled = true;
+      statusNode.textContent = `正在删除 ${name}…`;
+      try {
+        sandwichPayload = await postSandwichAction("remove", { chain, address });
+        sandwichLoaded = true;
+        lastSandwichLoadAt = Date.now();
+        statusNode.textContent = `${name} 已删除；历史取证结论仍然保留`;
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        sandwichActionLoading = false;
+        renderSandwichDetector();
+      }
+      return;
+    }
+
+    const sandwichAlerts = event.target.closest("[data-sandwich-alerts]");
+    if (sandwichAlerts && currentMode === "sandwich" && !sandwichActionLoading) {
+      const enabled = sandwichAlerts.dataset.sandwichAlerts !== "1";
+      sandwichActionLoading = true;
+      sandwichAlerts.disabled = true;
+      try {
+        sandwichPayload = await postSandwichAction("settings", { alertsEnabled: enabled });
+        sandwichLoaded = true;
+        lastSandwichLoadAt = Date.now();
+        statusNode.textContent = enabled ? "被夹弹窗已开启" : "被夹弹窗已关闭（列表照常记录）";
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        sandwichActionLoading = false;
+        renderSandwichDetector();
+      }
+      return;
+    }
+
+    const sandwichRefresh = event.target.closest("[data-sandwich-refresh]");
+    if (sandwichRefresh && currentMode === "sandwich" && !sandwichActionLoading) {
+      sandwichActionLoading = true;
+      sandwichRefresh.disabled = true;
+      statusNode.textContent = "正在后台拉取成交并回链取证，一轮可能要几十秒…";
+      try {
+        sandwichPayload = await postSandwichAction("refresh");
+        sandwichLoaded = true;
+        lastSandwichLoadAt = Date.now();
+        statusNode.textContent = "已触发一轮检测；取证结果会陆续写入列表";
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        sandwichActionLoading = false;
+        renderSandwichDetector();
+      }
+      return;
+    }
+
+    const devLaunchAlerts = event.target.closest("[data-dev-launch-alerts]");
+    if (devLaunchAlerts && currentMode === "devlaunch" && !devLaunchActionLoading) {
+      const enabled = devLaunchAlerts.dataset.devLaunchAlerts !== "1";
+      devLaunchActionLoading = true;
+      devLaunchAlerts.disabled = true;
+      try {
+        devLaunchPayload = await postDevLaunchAction("settings", { alertsEnabled: enabled });
+        devLaunchLoaded = true;
+        lastDevLaunchLoadAt = Date.now();
+        statusNode.textContent = enabled ? "Dev 发币弹窗已开启" : "Dev 发币弹窗已关闭（列表照常记录）";
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        devLaunchActionLoading = false;
+        renderDevLaunch();
+      }
+      return;
+    }
+
+    const devLaunchRefresh = event.target.closest("[data-dev-launch-refresh]");
+    if (devLaunchRefresh && currentMode === "devlaunch" && !devLaunchActionLoading) {
+      devLaunchActionLoading = true;
+      devLaunchRefresh.disabled = true;
+      statusNode.textContent = "正在后台扫描被监控 Dev 的新发币，一轮可能要几十秒…";
+      try {
+        devLaunchPayload = await postDevLaunchAction("refresh");
+        devLaunchLoaded = true;
+        lastDevLaunchLoadAt = Date.now();
+        statusNode.textContent = "已触发一轮扫描；新发现的币会陆续写入列表";
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        devLaunchActionLoading = false;
+        renderDevLaunch();
+      }
+      return;
+    }
+
+    const devLaunchRescan = event.target.closest("[data-dev-launch-rescan]");
+    if (devLaunchRescan && currentMode === "devlaunch" && !devLaunchActionLoading) {
+      const [chain, address] = String(devLaunchRescan.dataset.devLaunchRescan || "").split("|");
+      devLaunchActionLoading = true;
+      devLaunchRescan.disabled = true;
+      statusNode.textContent = "正在回扫该地址的历史发币与峰值市值…";
+      try {
+        await postDevLaunchAction("scan", { chain, address });
+        devLaunchLoaded = true;
+        lastDevLaunchLoadAt = Date.now();
+        statusNode.textContent = "回扫已在后台执行；约 10 秒后刷新即可看到最新级别";
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        devLaunchActionLoading = false;
+        renderDevLaunch();
+      }
+      return;
+    }
+
+    const devLaunchToggle = event.target.closest("[data-dev-launch-toggle]");
+    if (devLaunchToggle && currentMode === "devlaunch" && !devLaunchActionLoading) {
+      const [chain, address] = String(devLaunchToggle.dataset.devLaunchToggle || "").split("|");
+      const enabled = devLaunchToggle.dataset.devLaunchEnabled !== "1";
+      devLaunchActionLoading = true;
+      devLaunchToggle.disabled = true;
+      statusNode.textContent = enabled ? "正在恢复该 Dev 的监控…" : "正在暂停该 Dev 的监控…";
+      try {
+        devLaunchPayload = await postDevLaunchAction("toggle", { chain, address, enabled });
+        devLaunchLoaded = true;
+        lastDevLaunchLoadAt = Date.now();
+        statusNode.textContent = enabled ? "已恢复监控；之后发出的新币会继续提醒" : "已暂停监控；已有发币记录仍然保留";
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        devLaunchActionLoading = false;
+        renderDevLaunch();
+      }
+      return;
+    }
+
+    const devLaunchRemove = event.target.closest("[data-dev-launch-remove]");
+    if (devLaunchRemove && currentMode === "devlaunch" && !devLaunchActionLoading) {
+      const [chain, address] = String(devLaunchRemove.dataset.devLaunchRemove || "").split("|");
+      const name = devLaunchRemove.dataset.devLaunchName || "该 Dev";
+      if (!window.confirm(`确认从 Dev 发币监控中删除 ${name}？它的发币记录会一并清掉（重新加回来会重新回扫）。`)) return;
+      devLaunchActionLoading = true;
+      devLaunchRemove.disabled = true;
+      statusNode.textContent = `正在删除 ${name}…`;
+      try {
+        devLaunchPayload = await postDevLaunchAction("remove", { chain, address });
+        devLaunchLoaded = true;
+        lastDevLaunchLoadAt = Date.now();
+        statusNode.textContent = `${name} 已删除`;
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        devLaunchActionLoading = false;
+        renderDevLaunch();
+      }
+      return;
+    }
+
+    // 按做市商分开看：自绘下拉 + 药丸，只改前端视图状态，不重新拉数据。
+    const mmFirmToggle = event.target.closest("[data-mm-firm-toggle]");
+    if (mmFirmToggle && currentMode === "marketmaker") {
+      marketMakerFirmMenuOpen = !marketMakerFirmMenuOpen;
+      // 只切菜单，不整块重绘 —— 重绘会让 226 个持仓卡闪一下。
+      const menu = mmFirmToggle.parentElement && mmFirmToggle.parentElement.querySelector(".mm-firm-picker-menu");
+      if (menu) {
+        menu.classList.toggle("is-open", marketMakerFirmMenuOpen);
+        mmFirmToggle.setAttribute("aria-expanded", marketMakerFirmMenuOpen ? "true" : "false");
+      }
+      return;
+    }
+
+    // 点了下拉以外的地方就收起来。这里不能 return，后面那些点击照常处理。
+    if (marketMakerFirmMenuOpen && !event.target.closest(".mm-firm-picker")) {
+      marketMakerFirmMenuOpen = false;
+      document.querySelectorAll(".mm-firm-picker-menu.is-open").forEach((node) => node.classList.remove("is-open"));
+      document.querySelectorAll('[data-mm-firm-toggle][aria-expanded="true"]')
+        .forEach((node) => node.setAttribute("aria-expanded", "false"));
+    }
+
+    // 下拉里的选项：选中即切（点当前这家不会取消，只有药丸才是「再点一次取消」）。
+    const mmFirmOption = event.target.closest("[data-mm-option]");
+    if (mmFirmOption && currentMode === "marketmaker") {
+      const next = String(mmFirmOption.dataset.mmOption || "");
+      marketMakerFirmMenuOpen = false;
+      if (next !== marketMakerFirm) {
+        marketMakerFirm = next;
+        syncMarketMakerFirm();
+        renderMarketMaker();
+      } else {
+        // 值没变也要重绘，否则刚打开的菜单留在屏幕上。
+        renderMarketMaker();
+      }
+      const firm = (marketMakerPayload.firms || []).find((row) => row.id === marketMakerFirm);
+      statusNode.textContent = firm
+        ? `已切到 ${firm.label}：${Number(firm.activeTokens || 0)} 个活跃标的 / ${Number(firm.addressCount || 0)} 个地址`
+        : "已恢复全部做市商视角";
+      return;
+    }
+
+    const mmFirmPick = event.target.closest("[data-mm-pick]");
+    if (mmFirmPick && currentMode === "marketmaker") {
+      const picked = String(mmFirmPick.dataset.mmPick || "");
+      // 再点一次同一家 = 取消筛选，回到全部（比强迫用户去点下拉框「全部」更顺手）。
+      marketMakerFirm = picked === marketMakerFirm ? "" : picked;
+      syncMarketMakerFirm();
+      renderMarketMaker();
+      const firm = (marketMakerPayload.firms || []).find((row) => row.id === marketMakerFirm);
+      statusNode.textContent = firm
+        ? `已切到 ${firm.label}：${Number(firm.activeTokens || 0)} 个活跃标的 / ${Number(firm.addressCount || 0)} 个地址`
+        : "已恢复全部做市商视角";
+      return;
+    }
+
+    const pmAlerts = event.target.closest("[data-pm-alerts]");
+    if (pmAlerts && currentMode === "pricemove" && !priceMoveActionLoading) {
+      const enabled = pmAlerts.dataset.pmAlerts !== "1";
+      priceMoveActionLoading = true;
+      pmAlerts.disabled = true;
+      try {
+        priceMovePayload = await postPriceMoveAction("settings", { alertsEnabled: enabled });
+        priceMoveLoaded = true;
+        lastPriceMoveLoadAt = Date.now();
+        statusNode.textContent = enabled ? "价格异动弹窗已开启（6 小时涨 ≥20%）" : "价格异动弹窗已关闭（列表照常记录）";
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        priceMoveActionLoading = false;
+        renderPriceMove();
+      }
+      return;
+    }
+
+    const pmRefresh = event.target.closest("[data-pm-refresh]");
+    if (pmRefresh && currentMode === "pricemove" && !priceMoveActionLoading) {
+      priceMoveActionLoading = true;
+      pmRefresh.disabled = true;
+      statusNode.textContent = "正在采样一帧全市场价格…";
+      try {
+        priceMovePayload = await postPriceMoveAction("refresh");
+        priceMoveLoaded = true;
+        lastPriceMoveLoadAt = Date.now();
+        statusNode.textContent = "已触发一帧采样；超过阈值的标的会出现在列表里";
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        priceMoveActionLoading = false;
+        renderPriceMove();
+      }
+      return;
+    }
+
+    const acAlerts = event.target.closest("[data-ac-alerts]");
+    if (acAlerts && currentMode === "arkhamclusters" && !arkhamClusterActionLoading) {
+      const enabled = acAlerts.dataset.acAlerts !== "1";
+      arkhamClusterActionLoading = true;
+      acAlerts.disabled = true;
+      try {
+        arkhamClusterPayload = await postArkhamClusterAction("settings", { alertsEnabled: enabled });
+        arkhamClusterLoaded = true;
+        lastArkhamClusterLoadAt = Date.now();
+        statusNode.textContent = enabled ? "地址集群弹窗已开启（同一集群跨 ≥2 标的各占 ≥5%）" : "地址集群弹窗已关闭（列表照常记录）";
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        arkhamClusterActionLoading = false;
+        renderArkhamClusters();
+      }
+      return;
+    }
+
+    const acRefresh = event.target.closest("[data-ac-refresh]");
+    if (acRefresh && currentMode === "arkhamclusters" && !arkhamClusterActionLoading) {
+      arkhamClusterActionLoading = true;
+      acRefresh.disabled = true;
+      statusNode.textContent = "正在向 Arkham 查询候选标的持币人…";
+      try {
+        arkhamClusterPayload = await postArkhamClusterAction("refresh");
+        arkhamClusterLoaded = true;
+        lastArkhamClusterLoadAt = Date.now();
+        statusNode.textContent = "已触发一轮查询；跨标的集群会在跑完后出现并弹窗";
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        arkhamClusterActionLoading = false;
+        renderArkhamClusters();
+      }
+      return;
+    }
+
+    const mmAlerts = event.target.closest("[data-mm-alerts]");
+    if (mmAlerts && currentMode === "marketmaker" && !marketMakerActionLoading) {
+      const enabled = mmAlerts.dataset.mmAlerts !== "1";
+      marketMakerActionLoading = true;
+      mmAlerts.disabled = true;
+      try {
+        marketMakerPayload = await postMarketMakerAction("settings", { alertsEnabled: enabled });
+        marketMakerLoaded = true;
+        lastMarketMakerLoadAt = Date.now();
+        statusNode.textContent = enabled ? "做市商弹窗已开启（新标的 / 大额调仓）" : "做市商弹窗已关闭（列表照常记录）";
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        marketMakerActionLoading = false;
+        renderMarketMaker();
+      }
+      return;
+    }
+
+    const mmRefresh = event.target.closest("[data-mm-refresh]");
+    if (mmRefresh && currentMode === "marketmaker" && !marketMakerActionLoading) {
+      marketMakerActionLoading = true;
+      mmRefresh.disabled = true;
+      statusNode.textContent = "正在后台轮询做市商地址的链上流水，一轮可能要几分钟…";
+      try {
+        marketMakerPayload = await postMarketMakerAction("refresh");
+        marketMakerLoaded = true;
+        lastMarketMakerLoadAt = Date.now();
+        statusNode.textContent = "已触发一轮轮询；新流水与新标的会陆续写入列表";
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        marketMakerActionLoading = false;
+        renderMarketMaker();
+      }
+      return;
+    }
+
+    const mmToggle = event.target.closest("[data-mm-toggle]");
+    if (mmToggle && currentMode === "marketmaker" && !marketMakerActionLoading) {
+      const [chain, address] = String(mmToggle.dataset.mmToggle || "").split("|");
+      const enabled = mmToggle.dataset.mmEnabled !== "1";
+      marketMakerActionLoading = true;
+      mmToggle.disabled = true;
+      statusNode.textContent = enabled ? "正在恢复该地址的轮询…" : "正在暂停该地址的轮询…";
+      try {
+        marketMakerPayload = await postMarketMakerAction("toggle", { chain, address, enabled });
+        marketMakerLoaded = true;
+        lastMarketMakerLoadAt = Date.now();
+        statusNode.textContent = enabled ? "已恢复轮询；下一轮就会重新拉它的流水" : "已暂停轮询；已有的持仓与流水仍然保留";
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        marketMakerActionLoading = false;
+        renderMarketMaker();
+      }
+      return;
+    }
+
+    const mmRemove = event.target.closest("[data-mm-remove]");
+    if (mmRemove && currentMode === "marketmaker" && !marketMakerActionLoading) {
+      const [chain, address] = String(mmRemove.dataset.mmRemove || "").split("|");
+      const name = mmRemove.dataset.mmName || "该地址";
+      if (!window.confirm(`确认从做市商监控中删除 ${name}？它的持仓与流水会一并清掉（内置地址簿下次启动会重新灌入）。`)) return;
+      marketMakerActionLoading = true;
+      mmRemove.disabled = true;
+      statusNode.textContent = `正在删除 ${name}…`;
+      try {
+        marketMakerPayload = await postMarketMakerAction("remove", { chain, address });
+        marketMakerLoaded = true;
+        lastMarketMakerLoadAt = Date.now();
+        statusNode.textContent = `${name} 已删除`;
+      } catch (error) {
+        statusNode.textContent = error.message;
+      } finally {
+        marketMakerActionLoading = false;
+        renderMarketMaker();
+      }
+      return;
+    }
+
     const smartMoneyToggle = event.target.closest("[data-smart-money-toggle]");
     if (smartMoneyToggle && currentMode === "smartmoney" && !smartMoneyActionLoading) {
       const id = Number(smartMoneyToggle.dataset.smartMoneyToggle) || 0;
@@ -4185,6 +5739,8 @@
     button.addEventListener("click", () => {
       const requested = button.dataset.watchMode;
       currentMode = supportedModes.includes(requested) ? requested : "prior";
+      // 换板块时把做市商下拉收起来，免得切回来时菜单已经自己敞着。
+      marketMakerFirmMenuOpen = false;
       const url = new URL(window.location.href);
       if (currentMode !== "prior") url.searchParams.set("mode", currentMode);
       else url.searchParams.delete("mode");
@@ -4217,6 +5773,15 @@
       } else if (currentMode === "chains") {
         statusNode.textContent = "正在读取公链生命周期与 L0-L3 生态市场";
         loadChainEcosystem();
+      } else if (currentMode === "sandwich") {
+        statusNode.textContent = "正在读取被夹检测队列与历史结论";
+        loadSandwichDetector();
+      } else if (currentMode === "devlaunch") {
+        statusNode.textContent = "正在读取被监控 Dev 的发币记录与级别";
+        loadDevLaunch();
+      } else if (currentMode === "marketmaker") {
+        statusNode.textContent = "正在读取做市商地址簿、链上流水与控盘达标标的";
+        loadMarketMaker();
       } else {
         statusNode.textContent = currentMode === "oversold"
           ? "接近低位阶段高点或主升浪 Fib 0.5 / 0.618 时提醒"
@@ -4243,6 +5808,30 @@
       return;
     }
     if (currentMode === "chains") return;
+    if (currentMode === "sandwich") {
+      loadSandwichDetector({ quiet: true });
+      return;
+    }
+    if (currentMode === "devlaunch") {
+      // 服务端每 2 分钟一轮，页面 30 秒拿一次快照即可（loadDevLaunch 内部还有 10 秒缓存）。
+      loadDevLaunch({ quiet: true });
+      return;
+    }
+    if (currentMode === "marketmaker") {
+      // 服务端 5 分钟一轮（每轮几十个 Blockscout 请求），页面 30 秒拿快照足够。
+      loadMarketMaker({ quiet: true });
+      return;
+    }
+    if (currentMode === "pricemove") {
+      // 采样也是 5 分钟一轮，30 秒取一次快照（服务端还有 20 秒缓存）。
+      loadPriceMove({ quiet: true });
+      return;
+    }
+    if (currentMode === "arkhamclusters") {
+      // 一轮 10 分钟，30 秒取一次快照（服务端还有 30 秒缓存）足够。
+      loadArkhamClusters({ quiet: true });
+      return;
+    }
     if (currentMode === "mapping") {
       loadMappings({ quiet: true });
       return;

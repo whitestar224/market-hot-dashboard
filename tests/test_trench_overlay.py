@@ -136,6 +136,21 @@ class CardTests(unittest.TestCase):
         row["ageMinutes"] = 7
         self.assertEqual(overlay.build_cards([row], {})[0]["ageText"], "7分钟前")
 
+    def test_cmc_fundamentals_are_rendered_when_the_server_attached_them(self):
+        """服务端在行上挂好 `cmc.text`，悬浮窗只负责显示（2026-10-25）。"""
+        row = make_row(0)
+        row["cmc"] = {"text": "流通 2.56亿 · 流通率 25.6% · 总量 10.00亿", "rank": 192}
+        self.assertEqual(
+            overlay.build_cards([row], {})[0]["cmcText"],
+            "流通 2.56亿 · 流通率 25.6% · 总量 10.00亿",
+        )
+
+    def test_a_coin_cmc_does_not_list_simply_omits_the_line(self):
+        """CMC 没收录 → 空串（少一行），绝不留「—」冒充数据。"""
+        self.assertEqual(overlay.build_cards([make_row(0)], {})[0]["cmcText"], "")
+        self.assertEqual(overlay.trench_cmc_text(None), "")
+        self.assertEqual(overlay.trench_cmc_text({"text": ""}), "")
+
 
 class AgeTests(unittest.TestCase):
     def test_formats_common_ranges(self):
@@ -852,6 +867,165 @@ class ClickThroughTests(unittest.TestCase):
         self.assertIn("点击穿透", text)
         self.assertIn("普通窗口", text)
 
+
+
+class ChainSyncTests(unittest.TestCase):
+    """面板跟着榜单页的链走。
+
+    面板是独立 pythonw 进程，**看不到浏览器的 localStorage**，所以「榜单切到 Robinhood、
+    面板就显示 Robinhood 链的新币与叙事」全靠这条链路：前端 POST 偏好 → 服务端持久化 →
+    面板轮询 GET → 按 network 取数。这里锁住后半段。
+    """
+
+    def fake_read(self, payload):
+        captured = []
+
+        def reader(request, timeout):
+            captured.append(request)
+            return payload
+
+        return captured, reader
+
+    def test_chain_values_are_sanitised_before_they_reach_a_url(self):
+        # 形状不合法的一律当「综合」：这个值会被拼进 URL 的 query，绝不能带脏值发请求。
+        for bad in ("", None, "all", "ALL", "../x", "a" * 30, "has space", "sol;rm"):
+            with self.subTest(bad=bad):
+                self.assertEqual(overlay.normalize_chain(bad), "all")
+        self.assertEqual(overlay.normalize_chain("robinhood"), "robinhood")
+        self.assertEqual(overlay.normalize_chain(" Robinhood "), "robinhood")
+
+    def test_unknown_but_well_formed_chains_pass_through(self):
+        # **故意不设链白名单**：服务端日后新增一条链时，面板必须能跟着取数，而不是
+        # 被自己的旧标签表困在「综合」。服务端才是链范围的唯一真源。
+        self.assertEqual(overlay.normalize_chain("sol"), "sol")
+        self.assertEqual(overlay.normalize_chain("monad"), "monad")
+
+    def test_chain_label_uses_the_dropdown_name(self):
+        self.assertEqual(overlay.chain_label("robinhood"), "Robinhood")
+        self.assertEqual(overlay.chain_label("all"), "综合")
+        self.assertEqual(overlay.chain_label(""), "综合")
+        self.assertEqual(overlay.chain_label("weird"), "WEIRD")
+
+    def test_preference_fetch_reads_the_shared_chain(self):
+        captured, reader = self.fake_read({"ok": True, "chain": "robinhood"})
+        with patch.object(overlay, "_read_json", reader):
+            self.assertEqual(overlay.fetch_overlay_chain(8765), "robinhood")
+        self.assertIn("/api/trench-overlay-preference", captured[0].full_url)
+
+    def test_preference_fetch_falls_back_to_all_when_the_service_is_silent(self):
+        # 服务没起 / 旧版本服务端没有这个接口时 _read_json 只会给 {}，面板必须照样能刷。
+        for payload in ({}, {"chain": ""}, {"error": "not found"}, {"chain": "../etc"}):
+            with self.subTest(payload=payload), \
+                    patch.object(overlay, "_read_json", return_value=payload):
+                self.assertEqual(overlay.fetch_overlay_chain(8765), "all")
+
+    def test_row_fetch_targets_the_selected_chain(self):
+        captured, reader = self.fake_read({"items": []})
+        with patch.object(overlay, "_read_json", reader):
+            overlay.fetch_trench_rows(8765, network="robinhood")
+        url = captured[0].full_url
+        self.assertIn("/api/onchain-trenches", url)
+        self.assertIn("network=robinhood", url)
+        self.assertIn("pageSize=12", url)
+
+    def test_row_fetch_omits_network_for_the_combined_board(self):
+        for chain in ("all", "", None):
+            with self.subTest(chain=chain):
+                captured, reader = self.fake_read({"items": []})
+                with patch.object(overlay, "_read_json", reader):
+                    overlay.fetch_trench_rows(8765, network=chain)
+                self.assertNotIn("network=", captured[0].full_url)
+
+    def test_note_chain_only_reports_real_changes(self):
+        feed = overlay.TrenchFeed(8765)
+        # 默认就是「综合」，所以这两次都不算「榜单换了链」。
+        self.assertFalse(feed.note_chain(""))
+        self.assertFalse(feed.note_chain("all"))
+        self.assertTrue(feed.note_chain("robinhood"))
+        self.assertFalse(feed.note_chain("robinhood"))   # 已经在路上了
+        self.assertTrue(feed.needs_refresh())
+
+    def test_pending_chain_wins_over_the_active_one(self):
+        feed = overlay.TrenchFeed(8765)
+        feed.note_chain("bsc")
+        self.assertEqual(feed.chain(), "all")            # 还没取回来
+        self.assertEqual(feed.pending_chain(), "bsc")    # 下一次刷新会用它
+
+    def test_refresh_follows_the_pending_chain_and_drops_the_old_cards(self):
+        feed = overlay.TrenchFeed(8765)
+        with patch.object(overlay, "fetch_trench_rows", return_value={"items": [make_row(0)]}), \
+                patch.object(overlay, "fetch_narratives",
+                             return_value={"solana:CA0": "第一条中文叙事内容足够长了。"}), \
+                patch.object(overlay.threading, "Thread", InlineThread):
+            feed.refresh()
+        self.assertEqual(feed.chain(), "all")
+        self.assertTrue(feed._narratives)
+
+        feed.note_chain("robinhood")
+        seen = {}
+
+        def rows(port, **kwargs):
+            seen.update(kwargs)
+            return {"items": []}                          # 这条链暂时没有新币
+
+        with patch.object(overlay, "fetch_trench_rows", side_effect=rows), \
+                patch.object(overlay.threading, "Thread", InlineThread):
+            feed.refresh()
+
+        self.assertEqual(seen.get("network"), "robinhood")
+        cards, _, _ = feed.snapshot()
+        # 换链后旧链的卡片与叙事一条都不能留：新链没数据时说「暂无」才对，
+        # 继续显示上一条链的币是彻头彻尾的错数据。
+        self.assertEqual(cards, [])
+        self.assertEqual(feed._narratives, {})
+        self.assertEqual(feed.chain(), "robinhood")
+        self.assertFalse(feed.needs_refresh())
+
+    def test_a_second_switch_during_a_fetch_is_not_lost(self):
+        feed = overlay.TrenchFeed(8765)
+        feed.note_chain("robinhood")
+
+        def rows(port, **kwargs):
+            feed.note_chain("bsc")   # 取数途中用户又切了一条链
+            return {"items": []}
+
+        with patch.object(overlay, "fetch_trench_rows", side_effect=rows), \
+                patch.object(overlay.threading, "Thread", InlineThread):
+            feed.refresh()
+
+        self.assertEqual(feed.chain(), "robinhood")
+        # 后一次选择必须留着：抹掉它用户会看到「切了没反应」，还要白等一轮 3 秒轮询。
+        self.assertTrue(feed.needs_refresh())
+        self.assertEqual(feed.pending_chain(), "bsc")
+
+    def test_poll_chain_once_swallows_fetch_errors(self):
+        feed = overlay.TrenchFeed(8765)
+        with patch.object(overlay, "log_line"), \
+                patch.object(overlay, "fetch_overlay_chain", side_effect=RuntimeError("down")):
+            self.assertFalse(feed.poll_chain_once())
+
+    def test_poll_chain_once_reports_each_change_once(self):
+        feed = overlay.TrenchFeed(8765)
+        with patch.object(overlay, "fetch_overlay_chain", return_value="robinhood"):
+            self.assertTrue(feed.poll_chain_once())
+            self.assertFalse(feed.poll_chain_once())
+
+    def test_watching_is_started_only_once(self):
+        feed = overlay.TrenchFeed(8765)
+        started = []
+
+        class CountingThread:
+            def __init__(self, target=None, name=None, daemon=None):
+                started.append(name)
+                self._target = target
+
+            def start(self):
+                pass  # 不真的跑循环
+
+        with patch.object(overlay.threading, "Thread", CountingThread):
+            self.assertTrue(feed.watch_preferences())
+            self.assertFalse(feed.watch_preferences())
+        self.assertEqual(started, ["trench-overlay-chain"])
 
 
 class ServerWiringTests(unittest.TestCase):
