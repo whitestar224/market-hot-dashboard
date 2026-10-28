@@ -30,6 +30,8 @@ CRYPTO_CHARMING_WALLET = "0xcc291dcd83bd9f2600cca4d65ae3b724eaf4f5a9"
 ROBINHOOD_PLAIN_WALLET = "0xe28601398a5448d1147e6e8b0e0c6d686f0d216d"
 AFENG_WALLET = "0xbf004bff64725914ee36d03b87d6965b0ced4903"
 COWBOY_WALLET = "0xe1e3252b8b2f9bf2a8335389ba8ee62e6ea29407"
+INQ_WALLET = EVM_WALLET
+BONK_GUY_NO_THRESHOLD_WALLET = BONK_GUY_EVM_WALLET
 SOL_TOKEN = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6JgB263QP6Bpump"
 SOL_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
@@ -308,8 +310,9 @@ class SmartMoneyMonitorTests(unittest.TestCase):
         seeded = SmartMoneyMonitor(Path(self.tmp.name) / "seeded.sqlite", seed_defaults=True)
         try:
             rows = seeded.store.list_wallets()
-            # cowboy 占三行（BSC/ETH/Base 各一），阿峰占一行（只 BSC）。
-            self.assertEqual(len(rows), 38)
+            # cowboy 占三行（BSC/ETH/Base 各一），阿峰占一行（只 BSC），
+            # 15 个「追踪钱包」各占三行（只记录不弹窗，见 test_kol_sync）。
+            self.assertEqual(len(rows), 83)
             self.assertEqual({row["chain"] for row in rows}, {"ethereum", "bsc", "base", "robinhood", "solana"})
             by_address = {}
             for row in rows:
@@ -425,6 +428,94 @@ class SmartMoneyMonitorTests(unittest.TestCase):
                     self.assertEqual(row["alertThresholdUsd"], 500)
         finally:
             seeded.close()
+
+    def test_inq_seed_now_clears_a_hundred_dollars_on_all_four_chains(self):
+        """用户 2026-10-28：「把这个地址的买入也监控上并弹窗提示」——Inq。
+
+        这个地址其实早就在库里，但阈值一直是默认的 10000U。实盘事件表里 1202 笔
+        真实买入，单笔 ≥10000U 的有 **0** 笔（中位 $46、最大 $581），所以从来没
+        弹过一次窗。按实测规模定 100U（与 CryptoCharming / NΞO 同档）。
+        """
+
+        seeded = SmartMoneyMonitor(Path(self.tmp.name) / "inq.sqlite", seed_defaults=True)
+        try:
+            rows = [
+                row for row in seeded.store.list_wallets()
+                if row["address"] == INQ_WALLET
+            ]
+            self.assertEqual(
+                sorted(row["chain"] for row in rows),
+                ["base", "bsc", "ethereum", "robinhood"],
+            )
+            for row in rows:
+                with self.subTest(chain=row["chain"]):
+                    self.assertEqual(row["nickname"], "Inq")
+                    self.assertTrue(row["enabled"])
+                    self.assertEqual(row["alertThresholdUsd"], 100)
+        finally:
+            seeded.close()
+
+    def test_seed_threshold_upgrade_only_touches_default_and_seed_rows(self):
+        """改代码里的阈值必须能落到**已入库**的种子行，但不能压掉用户的选择。
+
+        线上真实场景：Inq 的四行是 10000U 默认值（所以永远不弹）；如果只靠
+        ``INSERT OR IGNORE``，改 seed 完全无效。这里同时钉住三条边界：
+        默认值 → 升级、用户改过的值 → 不碰、没声明阈值的 seed → 保持默认。
+        """
+
+        database = Path(self.tmp.name) / "threshold-upgrade.sqlite"
+        untouched = SmartMoneyStore(database)
+        try:
+            for chain in ("ethereum", "bsc", "base", "robinhood"):
+                untouched.upsert_wallet(
+                    chain, INQ_WALLET, nickname="Inq", source_name="Inq5️⃣连杆提供",
+                    source_kind="seed",  # 不传阈值 = 默认 10000U，和线上一致
+                )
+            user_tuned = untouched.upsert_wallet(
+                "robinhood", CRYPTO_CHARMING_WALLET, nickname="CryptoCharming",
+                source_name="用户提供 · Robinhood 链", source_kind="seed",
+            )
+            untouched.save_wallet(user_tuned["id"], alert_threshold_usd=300.0)
+            manual = untouched.upsert_wallet(
+                "bsc", "0x3391a39a1b508e54a361924a26056c01c1c2c07d",
+                nickname="手工加的", source_name="手动添加", source_kind="manual",
+            )
+        finally:
+            untouched.close()
+
+        upgraded = SmartMoneyMonitor(database, seed_defaults=True)
+        try:
+            for chain in ("ethereum", "bsc", "base", "robinhood"):
+                with self.subTest(chain=chain):
+                    self.assertEqual(
+                        upgraded.store.wallet(chain, INQ_WALLET)["alertThresholdUsd"], 100
+                    )
+            # 用户手动调成 300 的不许被 seed 覆盖。
+            self.assertEqual(
+                upgraded.store.wallet("robinhood", CRYPTO_CHARMING_WALLET)["alertThresholdUsd"],
+                300,
+            )
+            # 手工添加（source_kind != seed）的脏数据不在升级范围里。
+            self.assertEqual(
+                upgraded.store.wallet("bsc", "0x3391a39a1b508e54a361924a26056c01c1c2c07d")[
+                    "alertThresholdUsd"
+                ],
+                10000,
+            )
+            # 没在种子里声明阈值的地址（Bonk Guy）保持默认，不自作主张。
+            self.assertEqual(
+                upgraded.store.wallet("robinhood", BONK_GUY_NO_THRESHOLD_WALLET)[
+                    "alertThresholdUsd"
+                ],
+                10000,
+            )
+            # 幂等：第二次不会再改任何行（阈值已不是默认值）。
+            self.assertEqual(upgraded.store.apply_seed_thresholds([
+                {"address": INQ_WALLET, "alertThresholdUsd": 100.0},
+            ]), 0)
+            self.assertEqual(manual["alertThresholdUsd"], 10000)
+        finally:
+            upgraded.close()
 
     def test_placeholder_seed_label_is_claimed_once_the_user_names_the_wallet(self):
         """线上真实序列：先以占位名入库，用户后来说出真名 → 重启时自愈成真名。"""

@@ -22,7 +22,17 @@ DEFAULT_SMART_MONEY_SEEDS = (
         "nickname": "Inq",
         "sourceName": "Inq5️⃣连杆提供",
         "sourceUrl": "https://web3.okx.com/portfolio/0x6078ee8a93697c6d67863fcbff77141d9ab358b2/analysis",
-        "sourceEvidence": "由 Inq5️⃣连杆提供；OKX 公开钱包标签为 Inq（@inquixit）",
+        "sourceEvidence": (
+            "由 Inq5️⃣连杆提供；OKX 公开钱包标签为 Inq（@inquixit）。"
+            "用户 2026-10-28 要求「把这个地址的买入也监控上并弹窗提示」——"
+            "该地址早就在库里，但阈值一直是默认的 10000U，实测 1202 笔真实买入里"
+            "单笔 ≥10000U 的有 0 笔（中位 $46、最大 $581），等于从未弹过窗。"
+            "按实测规模定为 100U：与 CryptoCharming / NΞO 同档，近 30 天日均 5~8 条。"
+        ),
+        # 四条链都留着：Robinhood 是主战场（175/200 笔），但 ETH / Base 也真在买。
+        # 用户在面板里随时可以改阈值（改过之后本 seed 不会再覆盖，见
+        # SmartMoneyStore.apply_seed_thresholds）。
+        "alertThresholdUsd": 100.0,
     },
     {
         "address": "0xa0ed47a5dc1017db87d3807ecd95750b3ea0ff85",
@@ -138,6 +148,64 @@ DEFAULT_SMART_MONEY_SEEDS = (
         "alertThresholdUsd": 500.0,
     },
 )
+
+# ---------------------------------------------------------------------------
+# 用户的「追踪钱包」清单（2026-10-27 提供，20 个 EVM 地址）
+#
+# 需求原话：「这是我的追踪钱包……之前做了一个 3 个 KOL 同车提醒，然后在这个基础上，
+# 如果在这个同车标的上还有其他的 KOL 再进来，继续做同车增加的提醒」。
+#
+# 这 20 个里有 5 个本来就在库里（NΞO / 阿峰 / cowboy / Inq / CryptoCharming），
+# 剩下 15 个纯粹为了「同车增加」接入：
+#
+# * **只记录买入、不对单笔弹窗** —— 阈值给 10 亿 U，等价于「永不弹单笔」，但事件表
+#   照样落每一笔，这正是判定「他有没有上这辆车」需要的原料。
+# * **扫描面 = BSC / ETH / Base**：15 个地址三条链 nonce 全部非零（BSC 从 135 到
+#   46.7 万不等，都是老手），给全三条才不漏。Robinhood 没给 —— 扫描窗口贵，且这批
+#   地址是 EVM meme 盘的口味。
+# * 提示：这些钱包一旦在面板里把阈值调低，就会开始按单笔弹窗了（面板行为，不是硬编码）。
+# ---------------------------------------------------------------------------
+KOL_TRACK_RECORD_ONLY_THRESHOLD_USD = 1e9
+
+TRACKED_KOL_AUX_WALLETS: tuple[str, ...] = (
+    "0x3391a39a1b508e54a361924a26056c01c1c2c07d",
+    "0x4d9644d05fe2123b4eafa8d7fd31b0ea430726f3",
+    "0xd59b6a5dc9126ea0ebacd2d8560584b3ce48f62f",
+    "0xa7d4ffc4eca3c71af150ce302560a9d04a1d2b9f",
+    "0x3472ccf6209925204b9cf352171ee150904fda7e",
+    "0x01db37579e55ce13f4504019025e36047bdad845",
+    "0x7e8fb0392542812476d9f2d0d71c01d1fa0776c5",
+    "0xeb89055e16ae1c1e42ad6770a7344ff5c7b4f31d",
+    "0x877af245c61289b24f0c619a4346cdbc68f1aaac",
+    "0x7a2363a401b2340c7941dd2eeff0196a5078d2e6",
+    "0xfe277aa25a4f65a182c0ec135854794eb7131e79",
+    "0xddac928a240bdace3994c2cc0783d4e29a002127",
+    "0xc2c6acd377458010713e733e1b21dd6f670d091c",
+    "0x2ce9d43d1cba6ae31d7f07bfe0098dfa2d833373",
+    "0xa83b73f5644cde337b61da79589f10ea15548811",
+)
+
+
+def _short_wallet(address: str) -> str:
+    return f"{address[:6]}…{address[-4:]}"
+
+
+DEFAULT_SMART_MONEY_SEEDS = DEFAULT_SMART_MONEY_SEEDS + tuple(
+    {
+        "address": address,
+        "nickname": f"追踪 · {_short_wallet(address)}",
+        "sourceName": "用户追踪钱包清单",
+        "sourceUrl": f"https://gmgn.ai/bsc/address/{address}",
+        "sourceEvidence": (
+            "用户 2026-10-27 提供的 20 个追踪钱包之一，专门用于「同车增加」提醒。"
+            "链上核验：BSC / ETH / Base 三条链 nonce 均非零（老手地址）。"
+            "该条 seed 的阈值故意设为 10 亿 U —— 只记录买入，不对单笔弹窗。"
+        ),
+        "chains": ("bsc", "ethereum", "base"),
+        "alertThresholdUsd": KOL_TRACK_RECORD_ONLY_THRESHOLD_USD,
+    }
+    for address in TRACKED_KOL_AUX_WALLETS
+)
 DEFAULT_SMART_MONEY_SEED_ADDRESSES = tuple(row["address"] for row in DEFAULT_SMART_MONEY_SEEDS)
 
 # ---------------------------------------------------------------------------
@@ -169,6 +237,20 @@ KOL_SYNC_WALLET_LABELS: dict[str, str] = {
 KOL_SYNC_MIN_WALLETS = 3
 KOL_SYNC_WINDOW_SECONDS = 24 * 3600
 KOL_SYNC_REALERT_SECONDS = 12 * 3600
+#: 「同车增加」的有效期：从三人齐那一刻算起，这个窗口内再有人上车就继续提醒。
+#: 过了窗口就不再骚扰 —— 一个币的同车故事讲 24 小时够了。
+KOL_SYNC_JOIN_WINDOW_SECONDS = 24 * 3600
+
+#: 「同车增加」看的人 = 用户的 20 个追踪钱包（含核心三人）。
+#: 名字对得上的写人名，其余用短地址 —— 用户没给昵称，编一个反而会认错人。
+KOL_SYNC_TRACK_LABELS: dict[str, str] = {
+    "0xcc291dcd83bd9f2600cca4d65ae3b724eaf4f5a9": "CryptoCharming",
+    "0xbf004bff64725914ee36d03b87d6965b0ced4903": "阿峰_Afeng",
+    "0xe1e3252b8b2f9bf2a8335389ba8ee62e6ea29407": "cowboy",
+    "0xe28601398a5448d1147e6e8b0e0c6d686f0d216d": "NΞO",
+    "0x6078ee8a93697c6d67863fcbff77141d9ab358b2": "Inq",
+    **{address: f"追踪 {_short_wallet(address)}" for address in TRACKED_KOL_AUX_WALLETS},
+}
 
 
 def active_kol_sync_wallets() -> dict[str, str]:
@@ -183,6 +265,27 @@ def active_kol_sync_wallets() -> dict[str, str]:
         if address:
             wallets[address] = label.strip() or address[:10]
     return wallets or {address.lower(): label for address, label in KOL_SYNC_WALLET_LABELS.items()}
+
+
+def active_kol_sync_track_wallets() -> dict[str, str]:
+    """「同车增加」的观察面：用户那 20 个追踪钱包。
+
+    比核心三人宽 —— 核心三人负责「判定同车成立」，其余追 17 个负责「还有谁上车」。
+    同样允许用 `XINGYUN_KOL_SYNC_TRACK_WALLETS`（格式同上）整表覆盖。
+    """
+    raw = str(os.getenv("XINGYUN_KOL_SYNC_TRACK_WALLETS", "") or "").strip()
+    if raw:
+        wallets: dict[str, str] = {}
+        for piece in raw.split(","):
+            address, _, label = piece.strip().partition(":")
+            address = address.strip().lower()
+            if address:
+                wallets[address] = label.strip() or _short_wallet(address)
+        if wallets:
+            return wallets
+    return {
+        address.lower(): label for address, label in KOL_SYNC_TRACK_LABELS.items()
+    }
 
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 EVM_CHAINS = ("ethereum", "bsc", "base", "robinhood")
@@ -513,6 +616,10 @@ class SmartMoneyStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_smart_money_events_observed
                     ON events(observed_at DESC);
+                -- 「同车」判定每笔新事件都要按 (链, 合约, 时间) 查这段窗口，
+                -- 追踪钱包扩到 20 人后事件表涨得快，没有复合索引会退化成全表扫。
+                CREATE INDEX IF NOT EXISTS idx_smart_money_events_token
+                    ON events(chain, token_address, observed_at);
                 CREATE TABLE IF NOT EXISTS cursors (
                     cursor_key TEXT PRIMARY KEY,
                     cursor_value TEXT NOT NULL,
@@ -660,6 +767,44 @@ class SmartMoneyStore:
                 inserted += int(bool(cursor.rowcount))
             self.conn.commit()
         return inserted
+
+    def apply_seed_thresholds(self, rows: tuple[dict[str, Any], ...]) -> int:
+        """把种子里**显式声明**的提醒门槛推到「还没被调过」的种子行。
+
+        ``seed_wallets`` 用的是 ``INSERT OR IGNORE``，所以改代码里的
+        ``alertThresholdUsd`` 对已入库的行完全无效（Inq 就是这样一直卡在默认
+        10000U 上，永远弹不出来）。直接 UPDATE 又会把用户在面板里手动调过的门槛
+        冲掉，于是折中：
+
+        * 只动 ``source_kind = 'seed'`` 的行（用户手工加的地址一律不碰）；
+        * 只动「阈值**仍等于**全局默认 :data:`DEFAULT_ALERT_THRESHOLD_USD`」的行 ——
+          用户把阈值调成任何别的值就不再匹配，改代码也不会覆盖他的选择；
+        * 种子里没写 ``alertThresholdUsd`` 的地址直接跳过（不替用户拍板）。
+
+        返回实际改动的行数。
+        """
+        now = _now_ms()
+        updated = 0
+        with self.lock:
+            for row in rows:
+                if row.get("alertThresholdUsd") is None:
+                    continue
+                target = max(0.0, float(row["alertThresholdUsd"]))
+                if target == DEFAULT_ALERT_THRESHOLD_USD:
+                    continue
+                cursor = self.conn.execute(
+                    """
+                    UPDATE wallets
+                    SET alert_threshold_usd = ?, updated_at = ?
+                    WHERE source_kind = 'seed'
+                      AND lower(address) = ?
+                      AND alert_threshold_usd = ?
+                    """,
+                    (target, now, str(row["address"]).casefold(), DEFAULT_ALERT_THRESHOLD_USD),
+                )
+                updated += max(0, int(cursor.rowcount or 0))
+            self.conn.commit()
+        return updated
 
     def repair_legacy_seed_labels(self, rows: tuple[dict[str, Any], ...]) -> int:
         """Apply verified per-wallet labels without touching user-edited records.
@@ -1034,7 +1179,11 @@ class SmartMoneyMonitor:
         # 代币时触发一次，见 :meth:`_maybe_emit_kol_sync`。
         self.sync_alert_callback: Callable[[dict[str, Any]], Any] | None = None
         self.kol_sync_wallets: dict[str, str] = active_kol_sync_wallets()
+        # 「同车增加」看的全量追踪钱包（含核心三人）。测试里可以替换。
+        self.kol_sync_track_wallets: dict[str, str] = active_kol_sync_track_wallets()
         self._sync_sent: dict[str, float] = {}
+        # 每个标的的同车「剧集」：{announced: set(已在车上并已播报过的地址), trioAt, episodeStart}
+        self._sync_episodes: dict[str, dict[str, Any]] = {}
         self._sync_lock = threading.Lock()
         # Optional host-supplied gate.  When it returns False the monitor stops
         # taking NEW buys in (the board's intake switch); already recorded buys
@@ -1061,7 +1210,11 @@ class SmartMoneyMonitor:
             for seed in DEFAULT_SMART_MONEY_SEEDS
             for chain in seed.get("chains", EVM_CHAINS)
         ]
-        return self.store.seed_wallets(rows)
+        inserted = self.store.seed_wallets(rows)
+        # 阈值不能靠 INSERT OR IGNORE 生效（已存在的行原样保留），单独推一次：
+        # 只改「还是默认 10000U」的种子行，用户调过的不动。
+        self.store.apply_seed_thresholds(rows)
+        return inserted
 
     def set_alert_callback(self, callback: Callable[[dict[str, Any]], Any] | None) -> None:
         self.alert_callback = callback
@@ -1073,15 +1226,21 @@ class SmartMoneyMonitor:
         self.sync_alert_callback = callback
 
     def _maybe_emit_kol_sync(self, event: dict[str, Any]) -> dict[str, Any] | None:
-        """刚记录的一笔买入是否凑齐了「三人同时上车」。
+        """刚记录的一笔买入，能不能触发「同车」提醒。两种模式：
 
-        只在凑齐时返回 context（并回调），否则 ``None``。判定全部基于**事件表里的
-        真实买入记录**，不看谁弹过窗 —— 三个人买的金额可能都不够自己的门槛，但
-        「都上车了」这件事本身才是信号。
+        * ``trio``：核心三人（CryptoCharming / 阿峰 / cowboy）凑齐 → 弹一次；
+        * ``join``：同车已成立后，**别的追踪钱包**又上了同一辆车 → 每次新上车都提醒一次
+          （用户 2026-10-27：「在这个基础上，如果在这个同车标的上还有其他的 KOL 再进来，
+          继续做同车增加的提醒」）。已经在车上的人不重复播报，靠
+          ``_sync_episodes[token_key]["announced"]`` 记账。
+
+        判定全部基于**事件表里的真实买入记录**，不看谁弹过窗 —— 金额可能都没过自己的
+        门槛，但「都上车了」这件事本身才是信号。
         """
         callback = self.sync_alert_callback
-        watch = self.kol_sync_wallets
-        if callback is None or not watch:
+        core = self.kol_sync_wallets
+        track = self.kol_sync_track_wallets or core
+        if callback is None or not core:
             return None
         chain = normalize_chain(event.get("chain"))
         token = str(event.get("tokenAddress") or "").strip()
@@ -1090,26 +1249,22 @@ class SmartMoneyMonitor:
         token_key = f"{chain}:{token.lower() if token.lower().startswith('0x') else token}"
         now_ms = _now_ms()
         minimum = max(2, int(os.getenv("XINGYUN_KOL_SYNC_MIN", "") or KOL_SYNC_MIN_WALLETS))
-        with self._sync_lock:
-            last = self._sync_sent.get(token_key, 0.0)
-            if last and now_ms - last < KOL_SYNC_REALERT_SECONDS * 1000:
-                return None
         window_ms = max(1, int(os.getenv(
             "XINGYUN_KOL_SYNC_WINDOW_HOURS", "") or KOL_SYNC_WINDOW_SECONDS // 3600
         )) * 3600 * 1000
         rows = self.store.buys_for_token(chain, token, since_ms=now_ms - window_ms)
-        buyers: dict[str, dict[str, Any]] = {}
+        on_board: dict[str, dict[str, Any]] = {}
         for row in rows:
             address = str(row.get("walletAddress") or "").strip().lower()
-            if address not in watch:
+            if address not in track:
                 continue
             usd = float(row.get("paymentUsd") or 0)
-            slot = buyers.get(address)
+            slot = on_board.get(address)
             # 同一人买了多笔：金额相加，时间取最早那笔（「什么时候上车」）。
             if slot is None:
-                buyers[address] = {
+                on_board[address] = {
                     "address": address,
-                    "label": watch[address],
+                    "label": track[address],
                     "usd": usd,
                     "firstAt": int(row.get("observedAt") or 0),
                     "count": 1,
@@ -1118,30 +1273,85 @@ class SmartMoneyMonitor:
                 slot["usd"] += usd
                 slot["count"] += 1
                 slot["firstAt"] = min(slot["firstAt"], int(row.get("observedAt") or 0))
-        if len(buyers) < minimum:
-            return None
-        with self._sync_lock:
-            # 双闸：并发轮询下同一个币不能两条线程同时判定通过。
-            last = self._sync_sent.get(token_key, 0.0)
-            if last and now_ms - last < KOL_SYNC_REALERT_SECONDS * 1000:
-                return None
-            self._sync_sent[token_key] = now_ms
-        ordered = sorted(buyers.values(), key=lambda item: item["firstAt"])
-        context = {
+        core_count = sum(1 for address in on_board if address in core)
+        episode = self._sync_episodes.get(token_key)
+        base_context = {
             "chain": chain,
             "tokenAddress": token,
             "symbol": str(event.get("symbol") or "").strip(),
-            "buyers": ordered,
-            "totalUsd": sum(item["usd"] for item in ordered),
             "windowHours": window_ms // 3600000,
             "minBuyers": minimum,
             "observedAt": now_ms,
+        }
+
+        # ---- 1) 三人齐：判定「同车成立」，并把当前所有在车上的人记为已播报 ----
+        if core_count >= minimum:
+            if episode is None:
+                episode = {
+                    "trioAt": now_ms,
+                    "episodeStart": min(item["firstAt"] for item in on_board.values()),
+                    "announced": set(on_board),
+                    "symbol": base_context["symbol"],
+                }
+                self._sync_episodes[token_key] = episode
+                self._prune_sync_episodes(now_ms)
+                with self._sync_lock:
+                    # 双闸：并发轮询下同一辆车不能两条线程同时判定通过。
+                    last = self._sync_sent.get(token_key, 0.0)
+                    if last and now_ms - last < KOL_SYNC_REALERT_SECONDS * 1000:
+                        return None
+                    self._sync_sent[token_key] = now_ms
+                ordered = sorted(on_board.values(), key=lambda item: item["firstAt"])
+                context = {
+                    **base_context,
+                    "mode": "trio",
+                    "buyers": ordered,
+                    "totalUsd": sum(item["usd"] for item in ordered),
+                }
+                try:
+                    callback(context)
+                except Exception:
+                    pass
+                return context
+            # 剧集已存在时**不要提前返回** —— 下面还要看有没有新人上车。
+
+        # ---- 2) 同车已成立：看有没有新的人上车 ----
+        if episode is None:
+            return None
+        join_deadline = episode["episodeStart"] + KOL_SYNC_JOIN_WINDOW_SECONDS * 1000
+        if now_ms > join_deadline:
+            self._sync_episodes.pop(token_key, None)
+            return None
+        newcomers = [
+            item for address, item in on_board.items()
+            if address not in episode["announced"]
+        ]
+        if not newcomers:
+            return None
+        episode["announced"].update(item["address"] for item in newcomers)
+        newcomers.sort(key=lambda item: item["firstAt"])
+        context = {
+            **base_context,
+            "mode": "join",
+            "symbol": base_context["symbol"] or episode.get("symbol") or "",
+            "buyers": sorted(on_board.values(), key=lambda item: item["firstAt"]),
+            "newcomers": newcomers,
+            "totalUsd": sum(item["usd"] for item in on_board.values()),
+            "onBoardCount": len(on_board),
+            "episodeStart": episode["episodeStart"],
         }
         try:
             callback(context)
         except Exception:
             pass
         return context
+
+    def _prune_sync_episodes(self, now_ms: int) -> None:
+        """清掉过了「同车增加」有效期的剧集，别让内存里的字典无限长。"""
+        cutoff = now_ms - (KOL_SYNC_JOIN_WINDOW_SECONDS + KOL_SYNC_WINDOW_SECONDS) * 1000
+        for key, episode in list(self._sync_episodes.items()):
+            if episode.get("episodeStart", 0) < cutoff:
+                self._sync_episodes.pop(key, None)
 
     def set_intake_guard(self, guard: Callable[[], bool] | None) -> None:
         self.intake_guard = guard

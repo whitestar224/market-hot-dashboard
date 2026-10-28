@@ -27073,6 +27073,53 @@ def send_kol_sync_desktop_alert(context: dict[str, Any]) -> dict[str, Any]:
         for buyer in sorted(buyers, key=lambda item: safe_float(item.get("firstAt")))
     ]
     first_at = min((safe_float(buyer.get("firstAt")) for buyer in buyers), default=0)
+    mode = alert_text(context.get("mode"), 12).casefold() or "trio"
+    chain_label = chain_meta.get("label") or chain
+    # 「查看」落在 GMGN 的该 CA 交易页（用户就在那儿下单）；拼不出就把按钮留空，
+    # 别给一个死链接。两条分支（trio / join）共用。
+    url = gmgn_token_trade_url(gmgn_chain_slug(chain), token) or (
+        (clean_feed_text(chain_meta.get("explorer"), 300) or "").format(quote(token, safe=""))
+    )
+    if mode == "join":
+        # 同车已成立后又有追踪钱包上车（用户 2026-10-27）：只报「新上车的这几个」，
+        # 车上原有的人都列出来会超过卡片正文的宽度。
+        newcomers = context.get("newcomers") if isinstance(context.get("newcomers"), list) else []
+        if not newcomers:
+            return {"ok": True, "skipped": True, "reason": "kol-sync join without newcomers"}
+        joined = "、".join(
+            f"{clean_feed_text(item.get('label'), 30) or clean_feed_text(item.get('address'), 12)} "
+            f"${safe_float(item.get('usd')):,.0f}"
+            for item in sorted(newcomers, key=lambda item: safe_float(item.get("firstAt")))
+        )
+        on_board = int(safe_float(context.get("onBoardCount"), len(buyers)))
+        address_key = "-".join(
+            clean_feed_text(item.get("address"), 42) for item in newcomers[:3]
+        )
+        return launch_desktop_alert({
+            "key": f"kol-join:{chain}:{token.lower()}:{address_key}"[:220],
+            "kind": "KOL 同车",
+            "source": "聪明钱买入监控",
+            "sourceLabel": "SM",
+            "sourceType": "kol-sync",
+            "sourceId": "smart-money-buy",
+            "title": f"同车增加：{symbol} · 车上 {on_board} 人",
+            "body": f"{chain_label} · 新上车 {joined} · 合计 ${total_usd:,.0f}",
+            "contractAddress": token,
+            "chain": chain,
+            "url": url,
+            "time": int(first_at) or int(time.time() * 1000),
+            "priority": f"{len(newcomers)} 人新上车",
+            "queuePriority": 130,
+            "speech": (
+                f"注意，又有 {len(newcomers)} 个追踪钱包上了 {symbol} 这辆车，"
+                f"现在车上共 {on_board} 人"
+            ),
+            "originalText": json.dumps(
+                {"mode": "join", "chain": chain, "tokenAddress": token, "symbol": symbol,
+                 "newcomers": newcomers, "onBoardCount": on_board},
+                ensure_ascii=False,
+            )[:1800],
+        })
     count_label = "三人" if len(buyers) == 3 else f"{len(buyers)} 人"
     url = gmgn_token_trade_url(gmgn_chain_slug(chain), token) or (
         (clean_feed_text(chain_meta.get("explorer"), 300) or "").format(quote(token, safe=""))
