@@ -135,6 +135,9 @@ from market_maker_monitor import (
 # 下游 collect_prices 还会再滤一次（纵深防御），但覆盖面统计只认第一次的结果。
 from price_move_monitor import is_tradable_symbol as price_move_is_tradable
 import alpha_mm_monitor as ALPHA_MM
+# 大幅异动（2026-11-01）：3 日跌 50%（流动性真空）/ 2 日涨 100%（反弹见顶）。
+# 规则、冷却、流水全在模块里；server 只喂标的清单与日线、拼弹窗文案。
+import big_move_monitor as BIG_MOVE
 # 地址集群：候选标的只取「热门榜 + 涨幅榜」**榜上的**标的（价格异动 2026-10-22 起
 # 不算候选 —— 那个板块现在是币安合约，本来也没有链上合约可查），集群与跨标的判定
 # 全在模块里，这里只负责喂候选、拼文案、开路由。
@@ -307,6 +310,8 @@ from app.core.state import (
     AVE_HOT_PERIODS,
     AVE_TOKEN_CACHE_PATH,
     BINANCE_AI_NARRATIVE_POOL,
+    # 大幅异动监控（3 日跌 50% / 2 日涨 100%）：单例在 state.py，server 不许再造一个。
+    BIG_MOVE_MONITOR,
     BINANCE_FUTURES_STATUS_CACHE,
     BINANCE_FUTURES_STATUS_LOCK,
     BINANCE_FUTURES_STATUS_TTL_SECONDS,
@@ -24800,6 +24805,9 @@ DESKTOP_ALERT_CHAIN_KEY_PREFIXES = (
     # 地址集群（2026-10-21）：key 形如 ``arkham-cluster:entity:<id>``，
     # 不在这里就会被作用域闸挡掉，链标签与 Alpha 身份全失效。
     "arkham-cluster:",
+    # 大幅异动（2026-11-01）：key 形如 ``big-move:drop:SYMBOL:<ms>``。链上币要标链，
+    # 顺带让 CMC 流通市值那段注解也生效（它同样走这个作用域闸）。
+    "big-move:",
 )
 
 
@@ -27673,6 +27681,344 @@ def price_move_payload(*, force_refresh: bool = False) -> dict[str, Any]:
             phase = alpha_phase_for_asset(symbol)
             if phase:
                 row["alphaPhase"] = phase
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# 大幅异动监控（2026-11-01）
+#
+# 用户原话：「做一个大幅异动监控，先做一个 3 日内跌超 50% 的用来提醒可能出现流动性
+# 真空，注意剧烈反弹，再做一个两天内涨超 100% 的，做注意反弹见顶的提醒」，随后又加
+# 一句范围：「对上过 AICOIN 热门榜的币做这个大幅异动监控弹窗提醒」。
+#
+# 所以这里只要两件事：
+# * **标的清单**：``price_watch_assets.aicoin_first_seen_at > 0`` —— 上过 AICOIN 热榜
+#   的币（历史累计，掉榜了也还算），这是用户点名的范围；
+# * **日线**：币安合约 → 币安现货 → OKX 永续 → 链上池子，谁通用谁。
+#
+# 判断与冷却全在 ``big_move_monitor``（一条规则一份实现），这里只做取数与文案。
+# 千万别把阈值判断写进这个文件 —— 两份口径改一次就分叉。
+# ---------------------------------------------------------------------------
+BIG_MOVE_ALERT_PRIORITY = 86
+#: 币安交易对映射（base → pair）缓存。1000PEPE 这类「乘过的」合约要靠它认领符号。
+BIG_MOVE_PAIR_CACHE: dict[str, tuple[float, dict[str, str]]] = {}
+BIG_MOVE_PAIR_CACHE_SECONDS = 1800.0
+#: exchangeInfo 拉失败之后的冷却。**这条很关键**：这台机器上 api.binance.com（现货）
+#: 是连不通的（2026-11-01 实测 4 个镜像全部 read timeout），不记失败的话每轮每个标的
+#: 都要白等 4 × 8 秒。失败也进缓存，10 分钟后才重试。
+BIG_MOVE_PAIR_RETRY_SECONDS = 600.0
+BIG_MOVE_PAIR_CACHE_LOCK = threading.Lock()
+BIG_MOVE_SPOT_HOSTS = (
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api4.binance.com",
+)
+
+
+def big_move_universe() -> list[dict[str, Any]]:
+    """上过 AICOIN 热门榜的币（用户 2026-11-01 圈定的范围）。
+
+    同一个 symbol 可能有多条行（不同链上的同名币），按 **(符号, 链)** 去重 ——
+    纯去符号会把「BSC 的 RICE」和「Solana 的 RICE」当成一个币。
+    纯读，不碰 ``AUTH_DB_LOCK``（这个函数跑在监控线程里）。
+    """
+    try:
+        with auth_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT symbol, name, onchain_chain, onchain_contract_address
+                FROM price_watch_assets
+                WHERE aicoin_first_seen_at > 0
+                  AND COALESCE(dead_at, 0) = 0
+                ORDER BY aicoin_last_seen_at DESC
+                LIMIT 400
+                """
+            ).fetchall()
+    except Exception as exc:
+        print(
+            "Big move universe read failed: " + safe_error_text(str(exc))[:160],
+            file=sys.stderr,
+        )
+        return []
+    assets: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        symbol = price_watch_symbol_without_quote(row["symbol"])
+        if not symbol or not price_move_is_tradable(symbol):
+            continue
+        chain = clean_feed_text(row["onchain_chain"], 24).lower()
+        contract = clean_feed_text(row["onchain_contract_address"], 180)
+        key = (symbol, chain)
+        if key in seen:
+            continue
+        seen.add(key)
+        assets.append({
+            "symbol": symbol,
+            "name": clean_feed_text(row["name"], 60),
+            "chain": chain,
+            "contract": contract,
+        })
+    return assets
+
+
+def big_move_binance_pair_map(*, futures: bool) -> dict[str, str]:
+    """USDT 交易对映射：``base → pair``。现货/合约各自一份，半小时缓存。
+
+    顺手补一层别名：交易所上叫 ``1000PEPEUSDT`` / ``1000000SATSUSDT``，而榜单和用户
+    嘴里都是 ``PEPE`` / ``SATS``。**不覆盖已存在的真符号**（真有 PEPEUSDT 时以它为准）。
+    """
+    cache_key = "futures" if futures else "spot"
+    now = time.time()
+    with BIG_MOVE_PAIR_CACHE_LOCK:
+        cached = BIG_MOVE_PAIR_CACHE.get(cache_key)
+    if cached:
+        ttl = BIG_MOVE_PAIR_CACHE_SECONDS if cached[1] else BIG_MOVE_PAIR_RETRY_SECONDS
+        if now - cached[0] < ttl:
+            return cached[1]
+    payload: Any = None
+    try:
+        if futures:
+            payload = binance_futures_json("/fapi/v1/exchangeInfo", timeout=20)
+        else:
+            for host in BIG_MOVE_SPOT_HOSTS:
+                try:
+                    response = requests.get(
+                        host + "/api/v3/exchangeInfo", headers=HEADERS, timeout=8
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    break
+                except Exception:
+                    continue
+    except Exception as exc:
+        print(
+            f"Big move exchangeInfo ({cache_key}) failed: " + safe_error_text(str(exc))[:120],
+            file=sys.stderr,
+        )
+    if not isinstance(payload, dict) or not payload.get("symbols"):
+        # 失败也落缓存（空表 + 短 TTL）：不许每轮每个标的都去重试一遍。
+        with BIG_MOVE_PAIR_CACHE_LOCK:
+            BIG_MOVE_PAIR_CACHE[cache_key] = (now, {})
+        return {}
+    symbols = [
+        str(item.get("symbol") or "").upper()
+        for item in (payload or {}).get("symbols", [])
+        if isinstance(item, dict)
+    ] if isinstance(payload, dict) else []
+    mapping: dict[str, str] = {}
+    for pair in symbols:
+        if pair.endswith("USDT") and len(pair) > 4:
+            mapping.setdefault(pair[:-4], pair)
+    for pair in symbols:
+        if not (pair.endswith("USDT") and len(pair) > 4):
+            continue
+        base = pair[:-4]
+        for prefix in ("1000000", "1000"):
+            if base.startswith(prefix) and len(base) > len(prefix):
+                mapping.setdefault(base[len(prefix):], pair)
+    if mapping:
+        with BIG_MOVE_PAIR_CACHE_LOCK:
+            BIG_MOVE_PAIR_CACHE[cache_key] = (now, mapping)
+    return mapping
+
+
+def big_move_binance_candles(pair: str, *, futures: bool, limit: int) -> list[tuple[Any, ...]]:
+    """币安日线。``(时间, 最高, 收盘, 开盘, 最低, 量)`` —— 与项目其它 K 线源同一约定。"""
+    if futures:
+        rows = binance_futures_json(
+            f"/fapi/v1/klines?symbol={quote(str(pair))}&interval=1d&limit={int(limit)}",
+            timeout=12,
+        )
+    else:
+        rows = None
+        errors: list[str] = []
+        for host in BIG_MOVE_SPOT_HOSTS:
+            try:
+                response = requests.get(
+                    host + "/api/v3/klines",
+                    params={"symbol": pair, "interval": "1d", "limit": int(limit)},
+                    headers=HEADERS,
+                    timeout=12,
+                )
+                response.raise_for_status()
+                rows = response.json()
+                break
+            except Exception as exc:
+                errors.append(safe_error_text(str(exc))[:60])
+                continue
+        if rows is None:
+            raise RuntimeError("币安现货日线不可用：" + " | ".join(errors[:2]))
+    if not isinstance(rows, list) or len(rows) < BIG_MOVE.MIN_CANDLES_FOR_WINDOW:
+        raise RuntimeError(f"币安日线不足（{len(rows) if isinstance(rows, list) else 0} 根）")
+    return [
+        (
+            int(row[0]), safe_float(row[2]), safe_float(row[4]),
+            safe_float(row[1]), safe_float(row[3]), safe_float(row[5]),
+        )
+        for row in rows if isinstance(row, list) and len(row) >= 6
+    ]
+
+
+def big_move_okx_candles(symbol: str, limit: int) -> list[tuple[Any, ...]]:
+    """OKX 永续日线（UTC 日界）。返回体是**倒序**的，这里翻回正序。"""
+    response = requests.get(
+        "https://www.okx.com/api/v5/market/candles",
+        params={"instId": f"{symbol}-USDT-SWAP", "bar": "1Dutc", "limit": str(int(limit))},
+        headers=HEADERS,
+        timeout=10,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload.get("data") if isinstance(payload, dict) else []
+    if not isinstance(rows, list) or len(rows) < BIG_MOVE.MIN_CANDLES_FOR_WINDOW:
+        raise RuntimeError(f"OKX 日线不足（{len(rows) if isinstance(rows, list) else 0} 根）")
+    out = []
+    for row in reversed(rows):
+        if not isinstance(row, list) or len(row) < 6:
+            continue
+        out.append(
+            (
+                int(row[0]), safe_float(row[2]), safe_float(row[4]),
+                safe_float(row[1]), safe_float(row[3]), safe_float(row[5]),
+            )
+        )
+    return out
+
+
+def big_move_candles(asset: dict[str, Any]) -> list[tuple[Any, ...]]:
+    """一个标的的日线：交易所（参考价）优先，最后才退链上池子。
+
+    顺序是刻意的 —— 上过 AICOIN 热榜的币大多在交易所交易，那边的一根日线就是全网
+    公认的那根；只有纯链上币（没上任何 CEX）才用 GeckoTerminal 的池子 K 线。
+    ``asset["source"]`` 会被就地写上取数来源，弹窗正文会显示它。
+    """
+    symbol = clean_price_watch_symbol(asset.get("symbol"))
+    chain = clean_feed_text(asset.get("chain"), 24).lower()
+    contract = clean_feed_text(asset.get("contract"), 180)
+    errors: list[str] = []
+    if symbol:
+        pair = big_move_binance_pair_map(futures=True).get(symbol)
+        if pair:
+            try:
+                candles = big_move_binance_candles(
+                    pair, futures=True, limit=BIG_MOVE.CANDLE_LIMIT
+                )
+                asset["source"] = "币安合约日线"
+                return candles
+            except Exception as exc:
+                errors.append(f"币安合约：{safe_error_text(str(exc))[:60]}")
+        pair = big_move_binance_pair_map(futures=False).get(symbol)
+        if pair:
+            try:
+                candles = big_move_binance_candles(
+                    pair, futures=False, limit=BIG_MOVE.CANDLE_LIMIT
+                )
+                asset["source"] = "币安现货日线"
+                return candles
+            except Exception as exc:
+                errors.append(f"币安现货：{safe_error_text(str(exc))[:60]}")
+        try:
+            candles = big_move_okx_candles(symbol, BIG_MOVE.CANDLE_LIMIT)
+            asset["source"] = "OKX 永续日线"
+            return candles
+        except Exception as exc:
+            errors.append(f"OKX：{safe_error_text(str(exc))[:60]}")
+    if contract:
+        try:
+            candles, label = price_structure_candles_from_geckoterminal(
+                symbol or contract[:8],
+                "1d",
+                contract_address=contract,
+                chain=chain,
+                limit=BIG_MOVE.CANDLE_LIMIT,
+                min_rows=BIG_MOVE.MIN_CANDLES_FOR_WINDOW,
+            )
+            asset["source"] = label or "链上日线"
+            return candles
+        except Exception as exc:
+            errors.append(f"链上：{safe_error_text(str(exc))[:60]}")
+    raise RuntimeError("；".join(errors)[:160] or "没有可用行情源")
+
+
+def send_big_move_desktop_alert(hit: dict[str, Any]) -> dict[str, Any]:
+    """大幅异动弹窗。两条规则两套文案 —— 它们要传达的动作是相反的。
+
+    * 跌：**疑似流动性真空，警惕剧烈反弹**（这种跌法之后常出现 V 型回抽，
+      提醒的是「别在真空里追空 / 准备接反抽」）；
+    * 涨：**注意反弹见顶**（两日翻倍多是这波反弹的尾声，冲高回落该减仓）。
+    """
+    if not BIG_MOVE_MONITOR.alerts_enabled():
+        return {"ok": True, "skipped": True, "reason": "big move popups disabled"}
+    symbol = clean_feed_text(hit.get("symbol"), 40)
+    if not symbol:
+        return {"ok": True, "skipped": True, "reason": "missing symbol"}
+    rule = clean_feed_text(hit.get("rule"), 20)
+    try:
+        spec = BIG_MOVE.rule_spec(rule)
+    except ValueError:
+        return {"ok": True, "skipped": True, "reason": "unknown rule"}
+    pct = safe_float(hit.get("pct"))
+    threshold = safe_float(hit.get("thresholdPct")) or safe_float(spec["thresholdPct"])
+    dropping = str(spec["direction"]) == "down"
+    # 边界二次把关：跌要 ≤ 阈值（负数），涨要 ≥ 阈值。监控层已经判过，这里防越界调用。
+    if dropping and pct > threshold + 1e-9:
+        return {"ok": True, "skipped": True, "reason": "below threshold"}
+    if not dropping and pct < threshold - 1e-9:
+        return {"ok": True, "skipped": True, "reason": "below threshold"}
+    price = safe_float(hit.get("price"))
+    base = safe_float(hit.get("basePrice"))
+    days = int(safe_float(hit.get("days")) or int(spec["days"]))
+    chain = clean_feed_text(hit.get("chain"), 30).lower()
+    contract = clean_feed_text(hit.get("contract"), 180)
+    source = clean_feed_text(hit.get("source"), 40)
+    body_bits = [
+        f"{mm_price_text(base)}（{days} 日区间{'最高' if dropping else '最低'}）→ {mm_price_text(price)}",
+        f"{days} 日 {pct:+.1f}%",
+        str(spec["advice"]),
+    ]
+    if chain:
+        body_bits.insert(2, mm_chain_label(chain))
+    elif source:
+        body_bits.insert(2, source)
+    payload = {
+        "key": f"big-move:{rule}:{symbol}:{int(safe_float(hit.get('at')) or time.time() * 1000)}",
+        "kind": "大幅异动",
+        "source": "大幅异动监控",
+        "sourceLabel": "BM",
+        "sourceType": "big-move",
+        "sourceId": "big-move",
+        "board": "big-move",
+        # 标链 / 认币都靠它（合约币没有合约地址时，desktop_alert_asset_symbol 用 symbol）。
+        "symbol": symbol,
+        "title": f"大幅异动：{symbol} {days} 日{'跌' if dropping else '涨'} {abs(pct):.1f}%",
+        "body": " · ".join(bit for bit in body_bits if bit),
+        "contractAddress": contract,
+        "chain": chain,
+        "url": price_move_trade_url(symbol, chain, contract),
+        "priceValue": price,
+        "time": int(safe_float(hit.get("at"))) or int(time.time() * 1000),
+        "priority": f"大幅异动 · {spec['headline']}",
+        # 比价格异动（82）、大额调仓（84）更靠前，但让三方共振（90）先走。
+        "queuePriority": BIG_MOVE_ALERT_PRIORITY,
+        "speech": (
+            f"大幅异动，{symbol} {days} 日{'跌' if dropping else '涨'} {abs(pct):.0f} 个百分点，"
+            + ("警惕剧烈反弹" if dropping else "注意反弹见顶")
+        ),
+        "originalText": json.dumps(hit, ensure_ascii=False)[:1800],
+    }
+    return launch_desktop_alert(payload)
+
+
+def big_move_payload(*, force_refresh: bool = False) -> dict[str, Any]:
+    """接口快照 + 每条的「查看」链接与链名（前端拼链接必然是死链）。"""
+    payload = BIG_MOVE_MONITOR.payload(force_refresh=force_refresh)
+    for row in payload.get("hits") or []:
+        row["url"] = price_move_trade_url(
+            row.get("symbol") or "", row.get("chain") or "", row.get("contract") or ""
+        )
+        row["chainLabel"] = mm_chain_label(row.get("chain") or "")
+        row["baseLabel"] = "最高" if safe_float(row.get("pct")) < 0 else "最低"
     return payload
 
 
@@ -56791,6 +57137,8 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/smart-money-monitor", "/api/sandwich-detector", "/api/dev-launch", "/api/chain-ecosystem", "/api/event-flow", "/api/ai/news-trade", "/api/news-trade/search",
             # 价格异动列表里的币也要能一键加入监控（identity 富化后才显示得对）。
             "/api/price-move",
+            # 大幅异动同构：命中的币也要能一键加监控。
+            "/api/big-move",
             # 地址集群列表里的标的同理。
             "/api/arkham-clusters",
         }:
@@ -57567,6 +57915,16 @@ class Handler(SimpleHTTPRequestHandler):
                     name="arkham-cluster-manual-cycle",
                 ).start()
             self.send_json(arkham_cluster_payload())
+            return
+        if parsed.path == "/api/big-move":
+            # 手动「立即扫描」= 一轮 ~200 个日线请求，丢后台线程，页面先拿当前快照。
+            if force_refresh and self.request_is_local_or_admin():
+                threading.Thread(
+                    target=BIG_MOVE_MONITOR.run_cycle,
+                    daemon=True,
+                    name="big-move-manual-cycle",
+                ).start()
+            self.send_json(big_move_payload())
             return
         if parsed.path == "/api/price-move":
             # 手动「立刻采样」= 一次全市场 ticker（很轻），但仍丢后台线程，页面先拿快照。
@@ -59152,6 +59510,38 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"ok": False, "error": safe_error_text(str(exc))}, status=502)
             return
+        if route == "/api/big-move" or route.endswith("/api/big-move"):
+            if not self.request_is_local_or_admin():
+                self.send_json({"ok": False, "error": "仅限本机或管理员配置大幅异动监控"}, status=403)
+                return
+            if self.headers.get("Origin") == "null" or not self.request_origin_allowed():
+                self.send_json({"ok": False, "error": "请求来源不合法"}, status=403)
+                return
+            try:
+                payload = self.read_json()
+                action = clean_feed_text(payload.get("action"), 30).lower()
+                changed: Any = None
+                if action == "settings":
+                    changed = {"alertsEnabled": BIG_MOVE_MONITOR.set_alerts_enabled(
+                        payload.get("alertsEnabled")
+                    )}
+                elif action == "refresh":
+                    # 一轮 ~200 个日线请求，丢后台线程，接口先返回当前快照。
+                    threading.Thread(
+                        target=BIG_MOVE_MONITOR.run_cycle,
+                        daemon=True,
+                        name="big-move-manual-cycle",
+                    ).start()
+                    changed = {"refreshing": True}
+                else:
+                    self.send_json({"ok": False, "error": "unsupported action"}, status=400)
+                    return
+                self.send_json({**big_move_payload(force_refresh=True), "changed": changed})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": safe_error_text(str(exc))}, status=502)
+            return
         if route == "/api/price-move" or route.endswith("/api/price-move"):
             if not self.request_is_local_or_admin():
                 self.send_json({"ok": False, "error": "仅限本机或管理员配置价格异动监控"}, status=403)
@@ -59645,6 +60035,13 @@ def main():
     PRICE_MOVE_MONITOR.set_alert_callback(send_price_move_desktop_alert)
     if args.port == primary_monitor_port:
         PRICE_MOVE_MONITOR.start()
+    # 大幅异动（2026-11-01）：3 日跌 50% / 2 日涨 100%，范围只取上过 AICOIN 热榜的币。
+    # 日线口径，15 分钟一轮；线程同样只在主端口起。
+    BIG_MOVE_MONITOR.set_universe_provider(big_move_universe)
+    BIG_MOVE_MONITOR.set_candle_provider(big_move_candles)
+    BIG_MOVE_MONITOR.set_alert_callback(send_big_move_desktop_alert)
+    if args.port == primary_monitor_port:
+        BIG_MOVE_MONITOR.start()
     # 地址集群：候选来自热门榜 + 涨幅榜 + 价格异动，数据走 Arkham 网页端签名通路。
     # 只在主端口起 —— 多端口并存时不该几条线一起去抓外网。
     if args.port == primary_monitor_port:

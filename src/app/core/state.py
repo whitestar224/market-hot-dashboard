@@ -38,6 +38,7 @@ from dev_launch_monitor import DevLaunchMonitor, DevLaunchStore
 from event_flow import EventFlowStore
 from arkham_cluster_monitor import ArkhamClusterMonitor, ArkhamClusterStore
 from market_maker_monitor import MarketMakerMonitor, MarketMakerStore
+from big_move_monitor import BigMoveMonitor, BigMoveStore
 from price_move_monitor import PriceMoveMonitor, PriceMoveStore
 from sandwich_detector import SandwichDetector, SandwichStore
 from smart_money_monitor import SmartMoneyMonitor
@@ -2223,6 +2224,13 @@ MARKET_MAKER_MONITOR = MarketMakerMonitor(
 # 独立库（帧序列每轮上百行，别和 auth_db 抢锁）；线程同样只在主端口起。
 PRICE_MOVE_MONITOR = PriceMoveMonitor(
     PriceMoveStore(PERSIST_CACHE_DIR / "price_move_monitor.sqlite")
+)
+
+# 大幅异动监控（2026-11-01）：**3 日跌超 50%**（流动性真空，警惕剧烈反弹）/
+# **2 日涨超 100%**（反弹见顶）。范围只取「上过 AICOIN 热门榜的币」，数据用日线。
+# 独立库 + 独立线程；一轮 200 来个请求，15 分钟一次，线程同样只在主端口起。
+BIG_MOVE_MONITOR = BigMoveMonitor(
+    BigMoveStore(PERSIST_CACHE_DIR / "big_move_monitor.sqlite")
 )
 
 
