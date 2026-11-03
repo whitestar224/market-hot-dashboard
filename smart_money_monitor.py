@@ -147,6 +147,29 @@ DEFAULT_SMART_MONEY_SEEDS = (
         "chains": ("bsc", "ethereum", "base"),
         "alertThresholdUsd": 500.0,
     },
+    {
+        "address": "0x7e3ba68c49561aae7c23c1d20fef0f1d7615a3ad",
+        "nickname": "pons榜5",
+        "sourceName": "用户提供 · Robinhood 链",
+        "sourceUrl": "https://robinhoodchain.blockscout.com/address/0x7e3ba68c49561aae7c23c1d20fef0f1d7615a3ad",
+        "sourceEvidence": (
+            "用户 2026-11-01 指定：「这个地址的买入记录也弹窗提示……是 robinhood 上的聪明钱」，"
+            "随后 2026-11-04 补正备注为「pons榜5」（Pons 聪明钱榜第 5 名）。"
+            "链上核验（2026-11-04）：带 EIP-7702 委托代码的智能账户"
+            "（0xef0100…dae32b，与阿峰同款），nonce 748、余额 0.52 ETH。"
+            "交易形态很特别：一笔交易里用 0xe9ae5c53 批量执行多笔兑换，"
+            "付款方是 DELTA（0xe8ffd7e2…a791，18 位精度）而不是稳定币或 ETH —— "
+            "实测 6 笔买入分别花 20~50 万 DELTA 换 11~42 亿个 meme；"
+            "最后一笔活动在 2026-10-17，属于「集中打一波就停」的打法。"
+            "因为付款方不是稳定币，默认逻辑认不出它买了什么（永远不弹），"
+            "故同时把该地址登记进 QUOTE_TOKEN_PAYMENT_WALLETS 走报价兜底。"
+        ),
+        # 只在 Robinhood 链活动，明确给一条链，别白占另外三条的扫描窗口。
+        "chains": ("robinhood",),
+        # DELTA 实测约 $0.009（USDG 池 slot0），他每笔花 20~50 万 DELTA ≈
+        # $1,800~$4,500。门槛定 1,000U：真实买单全都过、几十美元的试单不炸窗。
+        "alertThresholdUsd": 1000.0,
+    },
 )
 
 # ---------------------------------------------------------------------------
@@ -430,6 +453,36 @@ CHAIN_TEXT_PATTERNS = {
 # reads as "received two tokens, paid nothing" and classify_evm_buy returns None.
 STABLE_SYMBOLS = {"USDT", "USDC", "USDBC", "DAI", "FDUSD", "USDE", "USD1", "USDO", "USDG"}
 WRAPPED_NATIVE_SYMBOLS = {"WETH", "WBNB", "WSOL"}
+# 少数聪明钱**不用稳定币/原生币付款**：它们从一个「报价代币」出发去换目标币。
+# 典型是 Robinhood 链上的 pons榜5（0x7e3b…a3ad）—— 它每笔都用 DELTA 付款，
+# 净流水长成「花掉一个非稳定代币、收到目标代币」，而 :func:`classify_evm_buy`
+# 只把「稳定币 / 包装原生币 / 原生币」当付款方，于是这个地址**永远弹不出来**。
+#
+# 名单内的地址多给两级兜底（名单外的行为一个字都不变，避免 Inq/阿峰 这些
+# 「换仓」被误判成买入、把已经调好的弹窗节奏搞乱）：
+#
+# ① 花掉的那个代币有 DexScreener 报价 → 按它的美元价直接算这笔买入的规模；
+# ② 连报价都没有 → 用「收到的代币 × 它的美元价」反推这笔交易的名义规模
+#    （买入金额 ≈ 买到的市值，误差来自滑点与手续费，量级够用）。
+# 两级都拿不到价就照旧返回 None —— 宁可不弹，也不许写个 0 美元的假弹窗。
+QUOTE_TOKEN_PAYMENT_WALLETS: frozenset[str] = frozenset({
+    "0x7e3ba68c49561aae7c23c1d20fef0f1d7615a3ad",  # pons榜5 · Robinhood 链
+})
+# DexScreener 对 Robinhood Chain 基本没有覆盖（该链代币的 ``priceUsd`` 实测恒为 0），
+# 所以上面那两级兜底在这条链上会一起哑火。这张表补一个**链上定价**通道：池子一侧是
+# 1 美元的 USDG，读 Uniswap V3 的 ``slot0().sqrtPriceX96`` 就能换算出另一侧的美元价。
+#
+# 校验（2026-11-04）：DELTA/USDG 池 slot0 → $0.00891/DELTA；2026-10-17 该地址在同一个
+# 池子里的真实成交是 371.130578 USDG ↔ 30,000 DELTA（$0.01237/DELTA）—— 量级一致。
+ONCHAIN_QUOTE_POOLS: dict[tuple[str, str], dict[str, Any]] = {
+    ("robinhood", "0xe8ffd7e24187f72afb08d75b1bb13088a989a791"): {  # DELTA
+        "pool": "0xfee4638485d736bf7bf7222d2dcb11a298d44d41",  # USDG / DELTA
+        "tokenIndex": 1,      # DELTA 是 token1
+        "tokenDecimals": 18,
+        "quoteDecimals": 6,   # USDG
+        "quotePriceUsd": 1.0,
+    },
+}
 SOLANA_STABLE_MINTS = {
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": "USDT",
@@ -991,6 +1044,7 @@ def classify_evm_buy(
     *,
     native_price_usd: float = 0.0,
     threshold_usd: float = DEFAULT_ALERT_THRESHOLD_USD,
+    allow_quote_payment: bool = False,
 ) -> dict[str, Any] | None:
     normalized_chain = normalize_chain(chain)
     wallet = normalize_wallet_address(normalized_chain, wallet_address)
@@ -1043,7 +1097,37 @@ def classify_evm_buy(
     payment_options = [*stable_spends, *wrapped_spends]
     if native_amount > 0 and native_price_usd > 0:
         payment_options.append((CHAIN_META[normalized_chain]["native"], native_amount, native_amount * native_price_usd))
-    if not targets or not payment_options:
+    if not targets:
+        return None
+    payment_source = "stable-or-native"
+    if not payment_options and allow_quote_payment:
+        # 兜底①：花掉的是个「有报价的非稳定代币」（pons榜5 的 DELTA 就属于这类）。
+        quote_spends: list[tuple[str, float, float]] = []
+        for token, amount in normalized.items():
+            if amount >= 0:
+                continue
+            meta = metadata[token]
+            symbol = str(meta.get("symbol") or "").upper()
+            price = float(meta.get("priceUsd") or 0)
+            if price <= 0 or symbol in STABLE_SYMBOLS or symbol in WRAPPED_NATIVE_SYMBOLS:
+                continue
+            quote_spends.append((symbol or token[:10], abs(amount), abs(amount) * price))
+        if quote_spends:
+            payment_options = quote_spends
+            payment_source = "quote-token"
+    if not payment_options and allow_quote_payment:
+        # 兜底②：连付款方的价都没有，就用「买到的那部分市值」当这笔买入的名义规模。
+        priced = [
+            (token, amount, meta)
+            for token, amount, meta in targets
+            if float(meta.get("priceUsd") or 0) > 0
+        ]
+        if priced:
+            token, amount, meta = max(priced, key=lambda row: row[1] * float(row[2].get("priceUsd") or 0))
+            estimated = amount * float(meta["priceUsd"])
+            payment_options = [("按成交额估算", estimated, estimated)]
+            payment_source = "target-value"
+    if not payment_options:
         return None
     payment_asset, payment_amount, payment_usd = max(payment_options, key=lambda row: row[2])
     target_token, target_amount, target_meta = max(
@@ -1066,7 +1150,7 @@ def classify_evm_buy(
         "popupEligible": payment_usd >= float(threshold_usd),
         "observedAt": _now_ms(),
         "blockRef": str(receipt.get("blockNumber") or transaction.get("blockNumber") or ""),
-        "details": {"classification": "net-token-flow", "readOnly": True},
+        "details": {"classification": "net-token-flow", "readOnly": True, "paymentSource": payment_source},
     }
 
 
@@ -1496,6 +1580,33 @@ class SmartMoneyMonitor:
                 return data[offset + 32:offset + 32 + length].decode("utf-8", errors="ignore").strip("\x00")
         return data[:32].decode("utf-8", errors="ignore").strip("\x00")
 
+    def onchain_quote_price(self, chain: str, token: str) -> float:
+        """用 Uniswap V3 池子的 slot0 反推「报价代币」的美元价。
+
+        只在 DexScreener 查不到价时兜底（:data:`ONCHAIN_QUOTE_POOLS`）。池子一侧
+        必须是 1 美元的稳定币，否则算出来的不是美元价。任何一步失败都返回 0.0 ——
+        调用方把它当「没价」，绝不写一个编出来的金额。
+        """
+        spec = ONCHAIN_QUOTE_POOLS.get((normalize_chain(chain), str(token or "").lower()))
+        if not spec:
+            return 0.0
+        try:
+            slot0 = self.rpc(chain, "eth_call", [{"to": spec["pool"], "data": "0x3850c7bd"}, "latest"])
+            sqrt_price_x96 = _hex_int(str(slot0 or "")[:66])
+            if sqrt_price_x96 <= 0:
+                return 0.0
+            # sqrtPriceX96 = sqrt(token1_raw / token0_raw) * 2^96
+            ratio = (sqrt_price_x96 / float(2**96)) ** 2
+            # 换成人类单位：1 个 quote（token0）能换多少个本币（token1）
+            quote_to_token = ratio * 10 ** (int(spec["quoteDecimals"]) - int(spec["tokenDecimals"]))
+            if quote_to_token <= 0:
+                return 0.0
+            if int(spec["tokenIndex"]) == 1:
+                return float(spec["quotePriceUsd"]) / quote_to_token
+            return float(spec["quotePriceUsd"]) * quote_to_token
+        except Exception:
+            return 0.0
+
     def evm_token_metadata(self, chain: str, token: str) -> dict[str, Any]:
         key = (chain, token.lower())
         cached = self._metadata_cache.get(key)
@@ -1509,6 +1620,8 @@ class SmartMoneyMonitor:
         except Exception:
             pass
         price = self._token_price(chain, token)
+        if price <= 0:
+            price = self.onchain_quote_price(chain, token)
         result = {
             "symbol": symbol[:40] or "UNKNOWN", "decimals": decimals if 0 <= decimals <= 36 else 18,
             "priceUsd": price, "stable": symbol.upper() in STABLE_SYMBOLS and (price == 0 or 0.8 <= price <= 1.2),
@@ -1623,6 +1736,8 @@ class SmartMoneyMonitor:
                 lambda token: self.evm_token_metadata(chain, token),
                 native_price_usd=self.native_price_usd(chain),
                 threshold_usd=float(watched[sender].get("alertThresholdUsd") or DEFAULT_ALERT_THRESHOLD_USD),
+                # 名单内的地址允许「用非稳定报价代币付款」的兜底，名单外行为不变。
+                allow_quote_payment=sender in QUOTE_TOKEN_PAYMENT_WALLETS,
             )
             if event:
                 events.append(self.record_buy(event)["event"])

@@ -31,6 +31,16 @@ ROBINHOOD_PLAIN_WALLET = "0xe28601398a5448d1147e6e8b0e0c6d686f0d216d"
 AFENG_WALLET = "0xbf004bff64725914ee36d03b87d6965b0ced4903"
 COWBOY_WALLET = "0xe1e3252b8b2f9bf2a8335389ba8ee62e6ea29407"
 INQ_WALLET = EVM_WALLET
+#: pons榜5（用户 2026-11-04 补正备注）：Robinhood 链上**用 DELTA 付款**的那位聪明钱。
+PONS_WALLET = "0x7e3ba68c49561aae7c23c1d20fef0f1d7615a3ad"
+PONS_DELTA = "0xe8ffd7e24187f72afb08d75b1bb13088a989a791"
+PONS_DELTA_USDG_POOL = "0xfee4638485d736bf7bf7222d2dcb11a298d44d41"
+#: 该池 slot0 的 sqrtPriceX96（2026-11-04 实读），换算出来 DELTA ≈ $0.00891。
+PONS_SLOT0_SQRT_PRICE_X96 = "0x0000000000000000000000000000000000a19f1397f0ad450e32cf8b84ce6e85"
+PONS_BUY_TOKEN = "0x72fffb21d64c1177e29e9e2de532efb038d8061b"  # FLYWHEEL
+PONS_BUY_TOKEN_RAW = 1319628559603659063641233162
+PONS_DELTA_SPENT_RAW = 300000 * 10**18
+PONS_BUY_TX = "0x7599fd4b3340f9049541a4a3a48943b1d4a591cc5b4e68159374401864cd1337"
 BONK_GUY_NO_THRESHOLD_WALLET = BONK_GUY_EVM_WALLET
 SOL_TOKEN = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6JgB263QP6Bpump"
 SOL_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -311,8 +321,9 @@ class SmartMoneyMonitorTests(unittest.TestCase):
         try:
             rows = seeded.store.list_wallets()
             # cowboy 占三行（BSC/ETH/Base 各一），阿峰占一行（只 BSC），
-            # 15 个「追踪钱包」各占三行（只记录不弹窗，见 test_kol_sync）。
-            self.assertEqual(len(rows), 83)
+            # 15 个「追踪钱包」各占三行（只记录不弹窗，见 test_kol_sync），
+            # pons榜5 占一行（只 Robinhood）。
+            self.assertEqual(len(rows), 84)
             self.assertEqual({row["chain"] for row in rows}, {"ethereum", "bsc", "base", "robinhood", "solana"})
             by_address = {}
             for row in rows:
@@ -326,6 +337,7 @@ class SmartMoneyMonitorTests(unittest.TestCase):
             )
             self.assertEqual(by_address[BONK_GUY_EVM_WALLET], {("Bonk Guy (Unipcs)", "Bonk Guy 公开钱包")})
             self.assertEqual(by_address[BONK_GUY_SOL_WALLET], {("Bonk Guy (Unipcs)", "Bonk Guy 公开钱包")})
+            self.assertEqual(by_address[PONS_WALLET], {("pons榜5", "用户提供 · Robinhood 链")})
             self.assertEqual(by_address[BONK_GUY_USELESS_WALLET], {("Bonk Guy (Unipcs)", "Bonk Guy 公开钱包")})
             self.assertEqual(sum(row["address"] == BONK_GUY_EVM_WALLET for row in rows), 4)
             first = rows[0]
@@ -984,6 +996,147 @@ class RobinhoodNativePaymentBuyTests(unittest.TestCase):
             native_price_usd=0.0,
             threshold_usd=100.0,
         ))
+
+
+# Robinhood Chain 上的「用报价代币付款」买单（pons榜5，用户 2026-11-04）。
+#
+# 真实主网成交：block 90,954,692 / tx 0x7599fd4b…1337 —— 该地址用 300,000 DELTA
+# 买入 1,319,628,559.603659 FLYWHEEL，整笔交易 value=0（不碰原生币），
+# 付款方既不是稳定币也不是包装原生币，正是默认逻辑认不出来的那类。
+PONS_RECEIPT = {
+    "status": "0x1",
+    "transactionHash": PONS_BUY_TX,
+    "blockNumber": "0x56c1ef4",
+    "logs": [
+        transfer_log(PONS_DELTA, PONS_WALLET, PONS_DELTA_USDG_POOL, PONS_DELTA_SPENT_RAW),
+        transfer_log(PONS_BUY_TOKEN, PONS_DELTA_USDG_POOL, PONS_WALLET, PONS_BUY_TOKEN_RAW),
+    ],
+}
+PONS_TRANSACTION = {
+    "hash": PONS_BUY_TX,
+    "from": PONS_WALLET,
+    "to": PONS_WALLET,          # 智能账户自己执行（0xe9ae5c53 批量兑换）
+    "value": "0x0",
+}
+
+
+def pons_metadata(prices):
+    def lookup(token):
+        token = token.lower()
+        if token == PONS_DELTA:
+            return {"symbol": "DELTA", "decimals": 18, "priceUsd": prices.get("delta", 0.0)}
+        if token == PONS_BUY_TOKEN:
+            return {"symbol": "FLYWHEEL", "decimals": 18, "priceUsd": prices.get("target", 0.0)}
+        return {"symbol": "UNKNOWN", "decimals": 18, "priceUsd": 0.0}
+    return lookup
+
+
+class QuoteTokenPaymentBuyTests(unittest.TestCase):
+    """付款方是「非稳定报价代币」时的两级兜底。
+
+    这几条守的是**边界**，不是实现细节：
+
+    * 名单外的地址行为一个字都不能变（否则 Inq / 阿峰 那些换仓会被当成新买入，
+      把用户已经调好的弹窗节奏搞乱）；
+    * 名单内的地址要能把「花 300,000 DELTA」换算成美元并过阈值；
+    * 两边都拿不到价时宁可返回 None，也不许编一个 0 美元的弹窗。
+    """
+
+    def test_unlisted_wallet_still_ignores_quote_token_spends(self):
+        self.assertIsNone(classify_evm_buy(
+            "robinhood", PONS_WALLET, PONS_TRANSACTION, PONS_RECEIPT,
+            pons_metadata({"delta": 0.00891}), threshold_usd=1.0,
+        ))
+
+    def test_listed_wallet_prices_the_quote_token_spend(self):
+        event = classify_evm_buy(
+            "robinhood", PONS_WALLET, PONS_TRANSACTION, PONS_RECEIPT,
+            pons_metadata({"delta": 0.00891}),
+            threshold_usd=1000.0, allow_quote_payment=True,
+        )
+        self.assertIsNotNone(event)
+        self.assertEqual(event["symbol"], "FLYWHEEL")
+        self.assertEqual(event["paymentAsset"], "DELTA")
+        self.assertAlmostEqual(event["paymentAmount"], 300000.0, places=6)
+        self.assertAlmostEqual(event["paymentUsd"], 300000.0 * 0.00891, places=6)
+        self.assertTrue(event["popupEligible"])
+        self.assertEqual(event["details"]["paymentSource"], "quote-token")
+
+    def test_below_threshold_is_recorded_but_not_popup_eligible(self):
+        event = classify_evm_buy(
+            "robinhood", PONS_WALLET, PONS_TRANSACTION, PONS_RECEIPT,
+            pons_metadata({"delta": 0.00891}),
+            threshold_usd=5000.0, allow_quote_payment=True,
+        )
+        self.assertIsNotNone(event)
+        self.assertFalse(event["popupEligible"])
+
+    def test_falls_back_to_target_value_when_quote_token_has_no_price(self):
+        """DELTA 查不到价时，用「买到的代币市值」估这笔成交的名义规模。"""
+
+        event = classify_evm_buy(
+            "robinhood", PONS_WALLET, PONS_TRANSACTION, PONS_RECEIPT,
+            pons_metadata({"target": 0.000002}),
+            threshold_usd=1000.0, allow_quote_payment=True,
+        )
+        self.assertIsNotNone(event)
+        self.assertEqual(event["details"]["paymentSource"], "target-value")
+        self.assertAlmostEqual(event["paymentUsd"], 1319628559.603659 * 0.000002, places=2)
+
+    def test_no_price_anywhere_never_invents_a_signal(self):
+        self.assertIsNone(classify_evm_buy(
+            "robinhood", PONS_WALLET, PONS_TRANSACTION, PONS_RECEIPT,
+            pons_metadata({}), threshold_usd=1.0, allow_quote_payment=True,
+        ))
+
+
+class OnchainQuotePriceTests(unittest.TestCase):
+    """DexScreener 不覆盖 Robinhood Chain，DELTA 的美元价只能从 USDG 池的 slot0 读。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.monitor = SmartMoneyMonitor(Path(self.tmp.name) / "quote.sqlite")
+
+    def tearDown(self):
+        self.monitor.close()
+        self.tmp.cleanup()
+
+    def test_slot0_of_the_usdg_pool_prices_delta(self):
+        slot0 = PONS_SLOT0_SQRT_PRICE_X96 + "0" * 384  # 后面几列（tick/观测位）不用
+        with patch.object(SmartMoneyMonitor, "rpc", return_value=slot0):
+            self.assertAlmostEqual(
+                self.monitor.onchain_quote_price("robinhood", PONS_DELTA), 0.00891, places=4,
+            )
+
+    def test_unknown_token_is_not_priced(self):
+        with patch.object(SmartMoneyMonitor, "rpc", return_value="0x0" + "0" * 62):
+            self.assertEqual(self.monitor.onchain_quote_price("robinhood", PONS_BUY_TOKEN), 0.0)
+
+    def test_broken_pool_read_returns_zero_instead_of_raising(self):
+        with patch.object(SmartMoneyMonitor, "rpc", side_effect=RuntimeError("rpc down")):
+            self.assertEqual(self.monitor.onchain_quote_price("robinhood", PONS_DELTA), 0.0)
+
+
+class PonsSeedRegistrationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.monitor = SmartMoneyMonitor(Path(self.tmp.name) / "pons.sqlite", seed_defaults=True)
+
+    def tearDown(self):
+        self.monitor.close()
+        self.tmp.cleanup()
+
+    def test_pons_wallet_is_seeded_on_robinhood_only(self):
+        rows = [row for row in self.monitor.store.list_wallets() if row["address"] == PONS_WALLET]
+        self.assertEqual([row["chain"] for row in rows], ["robinhood"])
+        self.assertEqual(rows[0]["nickname"], "pons榜5")
+        self.assertEqual(rows[0]["alertThresholdUsd"], 1000)
+        self.assertTrue(rows[0]["enabled"])
+
+    def test_pons_wallet_is_whitelisted_for_quote_token_payment(self):
+        from smart_money_monitor import QUOTE_TOKEN_PAYMENT_WALLETS
+
+        self.assertIn(PONS_WALLET, QUOTE_TOKEN_PAYMENT_WALLETS)
 
 
 if __name__ == "__main__":
