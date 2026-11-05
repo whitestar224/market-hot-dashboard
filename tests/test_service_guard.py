@@ -2,7 +2,7 @@ import ast
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import service_guard as guard
 
@@ -61,11 +61,85 @@ class ServiceGuardTests(unittest.TestCase):
         child.terminate.assert_called_once()
 
     def test_port_binding_precedes_background_and_database_startup(self):
+        # main() binds the port through BoundedThreadingHTTPServer (a subclass of
+        # ThreadingHTTPServer), so assert on the name it actually calls.
         tree = ast.parse(Path("server.py").read_text(encoding="utf-8"))
         main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
         calls = {node.func.id: node.lineno for node in ast.walk(main) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
-        self.assertLess(calls["ThreadingHTTPServer"], calls["init_auth_db"])
-        self.assertLess(calls["ThreadingHTTPServer"], calls["start_chain_ecosystem_monitor"])
+        self.assertLess(calls["BoundedThreadingHTTPServer"], calls["init_auth_db"])
+        self.assertLess(calls["BoundedThreadingHTTPServer"], calls["start_chain_ecosystem_monitor"])
+
+
+class ServiceStatusReportTests(unittest.TestCase):
+    """status 是用户唯一的状态窗口，说人话比说 JSON 重要。"""
+
+    def test_flags_a_bare_server_that_the_supervisor_does_not_own(self):
+        # 手动裸跑的 python server.py：端口有响应，但不是守护的 child。
+        with patch.object(guard, "read_state", return_value={"status": "stopped"}), patch.object(
+            guard, "probe", return_value={"ok": True, "service": "market-hot-dashboard", "pid": 4321}
+        ):
+            text = guard.describe_service()
+        self.assertIn("4321", text)
+        self.assertIn("不是守护托管的进程", text)
+        self.assertIn("启动后台服务.cmd", text)
+
+    def test_reports_running_when_the_live_pid_is_the_supervised_child(self):
+        with patch.object(guard, "read_state", return_value={"status": "running", "pid": 99, "restarts": 2}), patch.object(
+            guard, "probe", return_value={"ok": True, "service": "market-hot-dashboard", "pid": 99}
+        ):
+            text = guard.describe_service()
+        self.assertIn("运行中", text)
+        self.assertIn("pid=99", text)
+        self.assertIn("已重启 2 次", text)
+
+    def test_stopped_state_points_at_the_autostart_and_manual_scripts(self):
+        with patch.object(guard, "read_state", return_value={"status": "stopped", "updatedAt": 0}), patch.object(
+            guard, "probe", return_value=None
+        ):
+            text = guard.describe_service()
+        self.assertIn("已停止", text)
+        self.assertIn("启动后台服务.cmd", text)
+
+    def test_never_started_state_explains_the_first_step(self):
+        with patch.object(guard, "read_state", return_value={}), patch.object(guard, "probe", return_value=None):
+            text = guard.describe_service()
+        self.assertIn("尚未启动", text)
+        self.assertIn("开机自启-安装.cmd", text)
+
+    def test_status_is_read_only_and_survives_a_missing_state_file(self):
+        with patch.object(guard, "read_state", return_value={}), patch.object(guard, "probe", return_value=None) as probe:
+            guard.describe_service()
+        probe.assert_called_once()
+
+
+class ServiceRestartTests(unittest.TestCase):
+    """restart 必须先让旧守护退场，否则会撞上端口占用而白跑一趟。"""
+
+    def test_restart_asks_the_old_supervisor_to_leave_then_takes_over(self):
+        stop = MagicMock()
+        with patch.object(guard, "STOP", stop), patch.object(guard, "wait_for_supervisor_exit", return_value=True) as wait, patch.object(
+            guard, "supervise", return_value=0
+        ) as supervise, patch.object(guard.sys, "argv", ["service_guard.py", "restart"]):
+            self.assertEqual(guard.main(), 0)
+        stop.touch.assert_called_once()
+        wait.assert_called_once()
+        supervise.assert_called_once_with("127.0.0.1", 8765)
+
+    def test_restart_refuses_to_start_when_the_old_supervisor_will_not_leave(self):
+        with patch.object(guard, "STOP", MagicMock()), patch.object(guard, "wait_for_supervisor_exit", return_value=False), patch.object(
+            guard, "supervise"
+        ) as supervise, patch.object(guard.sys, "argv", ["service_guard.py", "restart"]):
+            self.assertEqual(guard.main(), 3)
+        supervise.assert_not_called()
+
+    def test_status_json_flag_keeps_the_raw_payload_for_scripts(self):
+        state = Path(tempfile.gettempdir()) / "guard-status-test.json"
+        state.write_text('{"status":"running"}', encoding="utf-8")
+        try:
+            with patch.object(guard, "STATE", state), patch.object(guard.sys, "argv", ["service_guard.py", "status", "--json"]):
+                self.assertEqual(guard.main(), 0)
+        finally:
+            state.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
