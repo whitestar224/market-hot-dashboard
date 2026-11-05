@@ -16,6 +16,7 @@ import json
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import server
@@ -148,6 +149,63 @@ class AicoinUnavailableCardTests(unittest.TestCase):
         self.assertEqual(card["detail"], "rest: boom")
         self.assertIn("官方接口连不上", card["emptyMessage"])
 
+
+class AicoinNeverLaunchesTheDesktopAppTests(unittest.TestCase):
+    """用户 2026-11-05：不要在后台反复起 AiCoin 桌面端，要「无感」。
+
+    老实现会在调试口没开时「强杀 AiCoin → 带 --remote-debugging-port 重开 → 等 18 秒」，
+    现象是桌面上的 AiCoin 窗口隔一会儿自己弹出来。这一组守住「永不启动 GUI 进程」。
+    """
+
+    def test_ensure_never_spawns_a_process(self):
+        calls = []
+
+        def record(*args, **kwargs):
+            calls.append(args)
+            raise AssertionError("服务端不允许拉起 AiCoin 桌面端")
+
+        with unittest.mock.patch.object(server.subprocess, "Popen", record), \
+                unittest.mock.patch.object(server.subprocess, "run", record):
+            server.ensure_aicoin_cdp_ready("127.0.0.1", "9222")
+
+        self.assertEqual(calls, [])
+
+    def test_card_message_does_not_ask_the_service_to_relaunch_the_client(self):
+        message = server.aicoin_unavailable_message(
+            "官方接口连不上（本机直连被重置，需要代理）",
+            "AiCoin 客户端没开调试口（127.0.0.1:9222）",
+        )
+        self.assertIn("不会在后台启停客户端", message)
+        self.assertNotIn("让服务自动", message)
+        # 仍然告诉用户「想走客户端通道该怎么做」。
+        self.assertIn("--remote-debugging-port=9222", message)
+
+
+class AicoinDebugPortProbeCooldownTests(unittest.TestCase):
+    """客户端没开时，别每次刷新都去敲 9222 白等 2~4 秒。"""
+
+    def setUp(self):
+        server.AICOIN_CDP_PROBE["until"] = 0.0
+
+    def tearDown(self):
+        server.AICOIN_CDP_PROBE["until"] = 0.0
+
+    def test_probe_failure_is_remembered_for_a_minute(self):
+        probes = []
+
+        def boom(*args, **kwargs):
+            probes.append(args)
+            raise ConnectionError("[WinError 10061] 目标计算机积极拒绝")
+
+        with unittest.mock.patch.object(server.requests, "get", boom):
+            with self.assertRaises(Exception):
+                server.aicoin_client_hot_payload()
+            self.assertGreater(server.AICOIN_CDP_PROBE["until"], time.time())
+            # 第二次不再真的去敲调试口。
+            with self.assertRaises(RuntimeError):
+                server.aicoin_client_hot_payload()
+
+        self.assertEqual(len(probes), 1)
 
 if __name__ == "__main__":
     unittest.main()

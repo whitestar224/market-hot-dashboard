@@ -264,7 +264,6 @@ from app.api.login_rate import clear_login_failures, login_rate_limited, record_
 
 # ---- 由 tools/extract_module.py 区间抽取至 app/core/state.py ----
 from app.core.state import (
-    AICOIN_CDP_RELAUNCH_LOCK,
     AICOIN_PAYLOAD_TOKEN_PATH,
     AI_STARTUP_RECONNECT_LOCK,
     AI_STARTUP_RECONNECT_STATE,
@@ -16819,34 +16818,32 @@ AICOIN_DEFAULT_PUBLIC_KEY_VERSION = "1744770600"
 # 留下第一次失败的真实原因**，不会假装成功。
 AICOIN_REST_FAILURE: dict[str, Any] = {"until": 0.0, "reason": ""}
 AICOIN_REST_COOLDOWN_SECONDS = float(env_value("AICOIN_REST_COOLDOWN_SECONDS", "300") or 300)
-# 「带调试口重新拉起客户端」的冷却。自动拉起一次要强杀现有 AiCoin 再重开，如果它
-# 本身起不来（比如用户刚关了它），每一轮刷新都杀一次就成了反复骚扰，所以最多 10
-# 分钟试一次。
-AICOIN_CDP_RELAUNCH: dict[str, float] = {"until": 0.0}
-AICOIN_CDP_RELAUNCH_COOLDOWN_SECONDS = 600.0
+# 客户端调试口探测的「负缓存」。AiCoin 没开的时候，每次刷新都去敲一次 9222 会白等
+# 2~4 秒（有代理时更慢），一分钟内敲过失败就直接跳过，别把整块榜单拖慢。
+AICOIN_CDP_PROBE: dict[str, float] = {"until": 0.0}
+AICOIN_CDP_PROBE_COOLDOWN_SECONDS = 60.0
+
+
+#: loopback 一律绕开代理。本机 http_proxy 会把 127.0.0.1:9222 也代理出去，
+#: 拿回来的是代理的错误页（HTML）→ 调试口探测永远失败（2026-11-05 实测）。
+LOOPBACK_PROXY_BYPASS: dict[str, None] = {"http": None, "https": None}
 
 
 def aicoin_cdp_ready(host: str, port: str) -> bool:
     try:
-        response = requests.get(f"http://{host}:{port}/json/version", timeout=2)
+        response = requests.get(
+            f"http://{host}:{port}/json/version", timeout=2, proxies=LOOPBACK_PROXY_BYPASS,
+        )
         return response.ok and "webSocketDebuggerUrl" in response.text
     except Exception:
         return False
 
 
-def aicoin_exe_path() -> Path:
-    configured = env_value("AICOIN_EXE_PATH")
-    if configured:
-        return Path(configured)
-    return Path("D:/AICOIN/AiCoin.exe")
-
-
 def aicoin_client_running() -> bool:
-    """AiCoin 客户端进程在不在（不看调试口，只看进程）。
+    """AiCoin 桌面端进程在不在（只看进程，不碰调试口）。
 
-    用来决定「能不能动手强杀」：客户端已经开着只是没带调试口时，强杀等于把用户
-    正在看的盘面端掉。那种情况宁可让卡片提示「请带 --remote-debugging-port=9222
-    重启」，也不替他做决定。
+    只用来把失败提示写准（「没在运行」还是「开着但没开调试口」），
+    **不参与任何拉起/重启决策** —— 见 :func:`ensure_aicoin_cdp_ready`。
     """
     try:
         # 别用 text=True：中文 Windows 的 tasklist 输出是 GBK，硬按 UTF-8 解码会在
@@ -16862,56 +16859,18 @@ def aicoin_client_running() -> bool:
 
 
 def ensure_aicoin_cdp_ready(host: str, port: str) -> None:
-    if host not in {"127.0.0.1", "localhost"} or aicoin_cdp_ready(host, port):
-        return
-    if (env_value("AICOIN_AUTO_RELAUNCH_CDP", "0") or "").lower() not in {"1", "true", "yes"}:
-        return
-    # 拉起失败也要歇一会儿：否则每次刷新都会「强杀 AiCoin → 重开 → 还是没调试口」。
-    if time.time() < AICOIN_CDP_RELAUNCH["until"]:
-        return
-    # 客户端开着但没开调试口 → 不替用户强杀（会把他的盘面端掉），只留提示。
-    if aicoin_client_running():
-        return
+    """**永不拉起、永不重启 AiCoin 桌面端**（用户 2026-11-05 要求「后台无感」）。
 
-    exe_path = aicoin_exe_path()
-    if not exe_path.exists():
-        return
+    老实现会「强杀 AiCoin → 带 --remote-debugging-port 重开 → 等 18 秒」，
+    现象就是用户桌面上的 AiCoin 窗口隔一会儿自己弹出来一次。现在第二通道改成
+    **只搭顺风车**：客户端本来就开着且带调试口就用，没开就安静放弃 —— 绝不在后台
+    替用户启动 GUI 进程。
 
-    with AICOIN_CDP_RELAUNCH_LOCK:
-        if aicoin_cdp_ready(host, port):
-            return
-        AICOIN_CDP_RELAUNCH["until"] = time.time() + AICOIN_CDP_RELAUNCH_COOLDOWN_SECONDS
-        try:
-            subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-Command",
-                    "Get-Process | Where-Object { $_.ProcessName -eq 'AiCoin' } | Stop-Process -Force",
-                ],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=8,
-            )
-        except Exception:
-            pass
-        try:
-            subprocess.Popen(
-                [str(exe_path), f"--remote-debugging-port={port}"],
-                cwd=str(exe_path.parent),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except Exception:
-            return
-
-        deadline = time.time() + 18
-        while time.time() < deadline:
-            if aicoin_cdp_ready(host, port):
-                return
-            time.sleep(1)
+    取不到数据的兜底不在这里：``cached_or_fallback_source`` 会回落上一次真实榜单，
+    并标成 stale + 「X 分钟前」，页面不会空。客户端想接进来，用户自己带
+    ``--remote-debugging-port=9222`` 启动一次即可，只要它开着就一直能用。
+    """
+    return
 
 
 def aicoin_cookie_values() -> dict[str, str]:
@@ -17189,6 +17148,9 @@ def aicoin_rest_hint(exc: BaseException) -> str:
 def aicoin_client_hint(exc: BaseException) -> str:
     """桌面端 CDP 那条通道的失败原因。"""
     text = f"{type(exc).__name__}: {exc}".lower()
+    if "调试口未开启" in str(exc):
+        # 负缓存命中：刚才敲过一次 9222 是空的，一分钟内不再探测。
+        return "AiCoin 客户端没开调试口（127.0.0.1:9222）"
     if any(word in text for word in ("10061", "refused", "拒绝", "actively refused")):
         return "AiCoin 客户端没开调试口（127.0.0.1:9222）"
     if "websocket" in text:
@@ -17215,9 +17177,8 @@ def aicoin_unavailable_message(rest_hint: str, client_hint: str) -> str:
     """
     head = "；".join(part for part in (rest_hint, client_hint) if part) or "两条通道都不可用"
     return (
-        f"{head}。"
-        "关掉 AiCoin 让服务自动带 --remote-debugging-port=9222 拉起，"
-        "或手动用该参数重启客户端；官方接口要等代理恢复。"
+        f"{head}。服务不会在后台启停客户端 —— "
+        "等代理恢复即可自动取到；想走客户端通道，自己用 --remote-debugging-port=9222 启动一次 AiCoin。"
     )
 
 
@@ -17248,9 +17209,21 @@ def aicoin_client_hot_payload() -> dict[str, Any]:
 
     host = env_value("AICOIN_CDP_HOST", "127.0.0.1") or "127.0.0.1"
     port = env_value("AICOIN_CDP_PORT", "9222")
-    ensure_aicoin_cdp_ready(host, port)
+    # 只搭顺风车：客户端没开就安静返回，绝不替用户拉起 GUI（2026-11-05）。
+    if time.time() < AICOIN_CDP_PROBE["until"]:
+        raise RuntimeError(
+            f"{host}:{port} 调试口未开启（{max(0, int(AICOIN_CDP_PROBE['until'] - time.time()))} 秒内不再探测）"
+        )
+    try:
+        targets = requests.get(
+            f"http://{host}:{port}/json/list", timeout=3, proxies=LOOPBACK_PROXY_BYPASS,
+        ).json()
+    except Exception:
+        AICOIN_CDP_PROBE["until"] = time.time() + AICOIN_CDP_PROBE_COOLDOWN_SECONDS
+        raise
+    if not aicoin_cdp_ready(host, port):
+        AICOIN_CDP_PROBE["until"] = time.time() + AICOIN_CDP_PROBE_COOLDOWN_SECONDS
     target_hint = env_value("AICOIN_CDP_TARGET_HINT", "#/main/exchange")
-    targets = requests.get(f"http://{host}:{port}/json/list", timeout=3).json()
     pages = [item for item in targets if item.get("type") == "page" and item.get("webSocketDebuggerUrl")]
     target = next((item for item in pages if target_hint in item.get("url", "")), None) or (pages[0] if pages else None)
     if not target:
