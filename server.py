@@ -4179,23 +4179,70 @@ def source_cache_is_fresh(source: dict[str, Any], source_id: str) -> bool:
     return int(time.time() * 1000) - updated_at <= ttl_seconds * 1000
 
 
+def aicoin_cache_age_text(updated_at_ms: int) -> str:
+    """「X 分钟前 / X 小时前」—— 缓存榜单的年龄，必须写在卡片上给人看。"""
+    if updated_at_ms <= 0:
+        return "时间未知"
+    minutes = max(0, int((time.time() * 1000 - updated_at_ms) / 60_000))
+    if minutes < 1:
+        return "刚刚"
+    if minutes < 120:
+        return f"{minutes} 分钟前"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours} 小时前"
+    return f"{hours // 24} 天前"
+
+
+def mark_aicoin_stale_fallback(
+    raw_source: dict[str, Any], copied: dict[str, Any]
+) -> dict[str, Any]:
+    """把「回落到缓存」的 AIcoin 榜单明确标成过期，**绝不伪装成实时**。
+
+    2026-11-05 用户截图：实时源（官方加密接口 / 桌面端调试口）双双挂掉时，卡片
+    只剩一大段 requests 异常。以前的规则是「缓存超过 30 分钟就不许回落」，理由
+    是别把旧榜单当实时榜单骗人 —— 但代价是直接给一张纯报错的空卡。
+
+    正解不是二选一：**回落照回，但把年龄写在副标题上**（status=stale + 「展示
+    X 分钟前的缓存榜单」）。这样既不骗人，也不让页面空着。
+    """
+    updated_at = source_cache_updated_at_ms(raw_source)
+    age_text = aicoin_cache_age_text(updated_at)
+    rows = copied.get("rows") if isinstance(copied.get("rows"), list) else []
+    copied["status"] = "stale"
+    copied["staleAgeText"] = age_text
+    copied["staleMinutes"] = (
+        max(0, int((time.time() * 1000 - updated_at) / 60_000)) if updated_at else 0
+    )
+    if updated_at:
+        # 保留原始抓取时间，别让「读缓存」把时间戳刷新成现在。
+        copied["updatedAt"] = updated_at
+    copied["subtitle"] = f"实时源不可用，展示 {age_text}的缓存榜单（{len(rows)} 条）"
+    return copied
+
+
 def source_fallback_allowed(source_id: str, cache_path: Path) -> bool:
-    if source_id != "aicoin":
-        return True
-    return source_cache_is_fresh(read_json_cache(cache_path), source_id)
+    # 2026-11-05：aicoin 不再用「缓存必须新鲜」来否决回落 —— 实时源断了就展示
+    # 上一次真实榜单，但由 mark_aicoin_stale_fallback 标成 status=stale 并写明
+    # 「X 分钟前」。原来那条「新鲜度闸」的本意（别把旧榜当实时）由这个标记负责，
+    # 而不再靠「干脆不显示」实现。
+    return True
 
 
 def cached_source_fallback(source_id: str, source_cache_path: Path, *, api_key: str = "market-hot") -> dict[str, Any]:
-    cached_source = cached_source_copy(read_json_cache(source_cache_path), "本地缓存")
-    if cached_source:
-        return cached_source
-    payload = read_json_cache(api_cache_path(api_key))
-    for source in payload.get("sources") if isinstance(payload.get("sources"), list) else []:
-        if isinstance(source, dict) and source.get("id") == source_id:
-            cached_source = cached_source_copy(source, "市场缓存")
-            if cached_source:
-                return cached_source
-    return {}
+    raw_source = read_json_cache(source_cache_path)
+    cached_source = cached_source_copy(raw_source, "本地缓存")
+    if not cached_source:
+        payload = read_json_cache(api_cache_path(api_key))
+        for source in payload.get("sources") if isinstance(payload.get("sources"), list) else []:
+            if isinstance(source, dict) and source.get("id") == source_id:
+                raw_source = source
+                cached_source = cached_source_copy(source, "市场缓存")
+                if cached_source:
+                    break
+    if cached_source and source_id == "aicoin":
+        cached_source = mark_aicoin_stale_fallback(raw_source, cached_source)
+    return cached_source
 
 
 def source_cache_path(source_id: str, api_key: str = "market-hot") -> Path:
@@ -16766,6 +16813,18 @@ N/I1TUNII7cvdjyk8OtDWX4qMzFoArFNeN6Ob11Ee6f0i2lmLkyi17yP4t6RB+4s
 -----END PUBLIC KEY-----"""
 AICOIN_DEFAULT_PUBLIC_KEY_VERSION = "1744770600"
 
+# 官方加密接口这条通道的「失败冷却」（2026-11-05）。本机直连 vip-pcapi.aicoin.com
+# 会被网络层重置（SSL EOF / errno 113），每次刷新都要白等 18 秒超时才落到桌面端
+# 通道。失败一次先歇 5 分钟，冷却期内直接走第二通道 —— 但**每次仍会在 detail 里
+# 留下第一次失败的真实原因**，不会假装成功。
+AICOIN_REST_FAILURE: dict[str, Any] = {"until": 0.0, "reason": ""}
+AICOIN_REST_COOLDOWN_SECONDS = float(env_value("AICOIN_REST_COOLDOWN_SECONDS", "300") or 300)
+# 「带调试口重新拉起客户端」的冷却。自动拉起一次要强杀现有 AiCoin 再重开，如果它
+# 本身起不来（比如用户刚关了它），每一轮刷新都杀一次就成了反复骚扰，所以最多 10
+# 分钟试一次。
+AICOIN_CDP_RELAUNCH: dict[str, float] = {"until": 0.0}
+AICOIN_CDP_RELAUNCH_COOLDOWN_SECONDS = 600.0
+
 
 def aicoin_cdp_ready(host: str, port: str) -> bool:
     try:
@@ -16782,10 +16841,36 @@ def aicoin_exe_path() -> Path:
     return Path("D:/AICOIN/AiCoin.exe")
 
 
+def aicoin_client_running() -> bool:
+    """AiCoin 客户端进程在不在（不看调试口，只看进程）。
+
+    用来决定「能不能动手强杀」：客户端已经开着只是没带调试口时，强杀等于把用户
+    正在看的盘面端掉。那种情况宁可让卡片提示「请带 --remote-debugging-port=9222
+    重启」，也不替他做决定。
+    """
+    try:
+        # 别用 text=True：中文 Windows 的 tasklist 输出是 GBK，硬按 UTF-8 解码会在
+        # reader 线程里抛 UnicodeDecodeError（2026-11-05 实测）。比字节更稳。
+        output = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq AiCoin.exe", "/NH"],
+            capture_output=True, timeout=6,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return b"aicoin.exe" in (output.stdout or b"").lower()
+    except Exception:
+        return False
+
+
 def ensure_aicoin_cdp_ready(host: str, port: str) -> None:
     if host not in {"127.0.0.1", "localhost"} or aicoin_cdp_ready(host, port):
         return
     if (env_value("AICOIN_AUTO_RELAUNCH_CDP", "0") or "").lower() not in {"1", "true", "yes"}:
+        return
+    # 拉起失败也要歇一会儿：否则每次刷新都会「强杀 AiCoin → 重开 → 还是没调试口」。
+    if time.time() < AICOIN_CDP_RELAUNCH["until"]:
+        return
+    # 客户端开着但没开调试口 → 不替用户强杀（会把他的盘面端掉），只留提示。
+    if aicoin_client_running():
         return
 
     exe_path = aicoin_exe_path()
@@ -16795,6 +16880,7 @@ def ensure_aicoin_cdp_ready(host: str, port: str) -> None:
     with AICOIN_CDP_RELAUNCH_LOCK:
         if aicoin_cdp_ready(host, port):
             return
+        AICOIN_CDP_RELAUNCH["until"] = time.time() + AICOIN_CDP_RELAUNCH_COOLDOWN_SECONDS
         try:
             subprocess.run(
                 [
@@ -17056,6 +17142,9 @@ def aicoin_rest_hot_payload() -> dict[str, Any]:
 
     cookies = {key: value for key, value in aicoin_cookie_values().items() if key in {"aicoin_token", "aicoin_session", "access_token"}}
     last_message = ""
+    # 连接超时别给太久：这条通道在本机可能被网络层直接重置，正常可达时响应 <1s。
+    # 18 秒会把整块榜单的构建时间拖长（2026-11-05 调到 10 秒，可用环境变量覆盖）。
+    rest_timeout = float(env_value("AICOIN_REST_TIMEOUT_SECONDS", "10") or 10)
     for token in tokens[: int(safe_float(env_value("AICOIN_TOKEN_TRY_LIMIT", "8"), 8))]:
         body = {**base_body, "token": token}
         request_body, aes_key, aes_iv = aicoin_encrypt_body(body)
@@ -17064,7 +17153,7 @@ def aicoin_rest_hot_payload() -> dict[str, Any]:
             json=request_body,
             headers=aicoin_encrypted_headers(),
             cookies=cookies,
-            timeout=18,
+            timeout=rest_timeout,
         )
         response.raise_for_status()
         root = aicoin_decrypt_response(response, aes_key, aes_iv)
@@ -17083,20 +17172,72 @@ def aicoin_rest_hot_payload() -> dict[str, Any]:
     raise RuntimeError(f"AICoin encrypted API returned no hot rows ({last_message or 'empty response'})")
 
 
-def aicoin_unavailable(message: str) -> dict[str, Any]:
-    return source_template(
+def aicoin_rest_hint(exc: BaseException) -> str:
+    """把 requests 的整段异常压成一句人话（官方加密接口那条通道）。"""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if "timed out" in text or "timeout" in text:
+        return "官方接口超时"
+    if any(word in text for word in ("ssl", "unexpected_eof", "connection was reset", "connection aborted", "10054", "10065", "errno 113")):
+        return "官方接口连不上（本机直连被重置，需要代理）"
+    if "local authorized state was not found" in text or "授权" in text:
+        return "本机没有有效的 AICoin 授权态"
+    if "returned no hot rows" in text:
+        return "官方接口返回了空榜单"
+    return f"官方接口异常（{type(exc).__name__}）"
+
+
+def aicoin_client_hint(exc: BaseException) -> str:
+    """桌面端 CDP 那条通道的失败原因。"""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if any(word in text for word in ("10061", "refused", "拒绝", "actively refused")):
+        return "AiCoin 客户端没开调试口（127.0.0.1:9222）"
+    if "websocket" in text:
+        return "缺少 websocket-client 依赖"
+    if "renderer page" in text:
+        return "客户端里没有可用的热门榜页面"
+    if "timed out" in text or "timeout" in text:
+        return "客户端调试口响应超时"
+    if isinstance(exc, ValueError):
+        # /json/list 回的不是 JSON —— 多半是请求被代理半路截走了（本机 http_proxy
+        # 会把 127.0.0.1 也代理出去，NO_PROXY 里必须带 127.0.0.1）。
+        return "客户端调试口返回的不是调试协议（检查 http_proxy 是否把 127.0.0.1 也代理了）"
+    return f"客户端通道异常（{type(exc).__name__}）"
+
+
+def aicoin_unavailable_message(rest_hint: str, client_hint: str) -> str:
+    """空卡上只放一句「哪条断了 + 该怎么办」，完整堆栈留在 payload 的 detail 里。
+
+    2026-11-05 用户截图反馈：原来把两条 requests 异常的全文（URL、端口、WinError
+    编号全带上）直接糊在卡片中间，既看不懂也不知道该做什么。
+
+    入参是**已经归类好的短句**而不是异常对象 —— 官方接口那条在冷却期内没有新异常可
+    分类，只能把上次的原因原样带过来。
+    """
+    head = "；".join(part for part in (rest_hint, client_hint) if part) or "两条通道都不可用"
+    return (
+        f"{head}。"
+        "关掉 AiCoin 让服务自动带 --remote-debugging-port=9222 拉起，"
+        "或手动用该参数重启客户端；官方接口要等代理恢复。"
+    )
+
+
+def aicoin_unavailable(message: str, *, detail: str = "") -> dict[str, Any]:
+    source = source_template(
         id="aicoin",
         group="aicoin",
         title="AIcoin 热门榜",
-        subtitle="等待本地 AiCoin 客户端 DevTools 调试口返回真实热门榜",
+        subtitle="实时源不可用：官方加密接口与桌面端调试口都没取到榜单",
         accent="#57c7ff",
         source_label="AI",
         source_name="AICoin desktop CDP",
         rows=[],
         status="unavailable",
-        empty_title="AIcoin 桌面端热榜暂不可用",
+        empty_title="AIcoin 热门榜暂时取不到",
         empty_message=message,
     )
+    if detail:
+        source["detail"] = detail
+    return source
 
 
 def aicoin_client_hot_payload() -> dict[str, Any]:
@@ -17271,63 +17412,39 @@ def aicoin_source_from_payload(payload: dict[str, Any], source_detail: str) -> d
 
 
 def fetch_aicoin() -> dict[str, Any]:
-    try:
-        payload = aicoin_rest_hot_payload()
-        return aicoin_source_from_payload(payload, "AICoin encrypted getHotCoinHour")
-    except Exception as rest_exc:
+    """AIcoin 热门榜：官方加密接口 → 桌面端调试口，两条都不通时给出**短**原因。
+
+    2026-11-05 加的冷却：官方接口这条通道在本机被网络层重置（SSL EOF / EHOSTUNREACH），
+    每次刷新都要白等 18 秒超时才落到第二通道。连接级失败记一次冷却
+    （:data:`AICOIN_REST_COOLDOWN_SECONDS`），冷却期内直接跳过第一通道。
+
+    注意：这里**不返回缓存**。缓存回落统一由 ``cached_or_fallback_source`` 负责，
+    那边会把缓存标成 status=stale 并写明「X 分钟前」——放在这里回填会污染
+    缓存文件的时间戳，把一次失败伪装成一次成功的刷新。
+    """
+    rest_exc: BaseException | None = None
+    rest_hint = ""
+    if time.time() >= AICOIN_REST_FAILURE["until"]:
         try:
-            payload = aicoin_client_hot_payload()
-            return aicoin_source_from_payload(payload, "AICoin desktop CDP getHotCoinHour")
-        except Exception as client_exc:
-            return aicoin_unavailable(
-                f"official encrypted API: {rest_exc}; desktop fallback: {client_exc}. "
-                "Please keep the local authorized AICoin state valid, or start AiCoin with --remote-debugging-port=9222."
-            )
+            payload = aicoin_rest_hot_payload()
+            return aicoin_source_from_payload(payload, "AICoin encrypted getHotCoinHour")
+        except Exception as exc:
+            rest_exc = exc
+            rest_hint = aicoin_rest_hint(exc)
+            AICOIN_REST_FAILURE["until"] = time.time() + AICOIN_REST_COOLDOWN_SECONDS
+            AICOIN_REST_FAILURE["reason"] = rest_hint
+    else:
+        remaining = max(0, int(AICOIN_REST_FAILURE["until"] - time.time()))
+        rest_hint = f"{AICOIN_REST_FAILURE['reason'] or '官方接口刚失败过'}（冷却中，{remaining} 秒后重试）"
 
     try:
         payload = aicoin_client_hot_payload()
-    except Exception as exc:
+        return aicoin_source_from_payload(payload, "AICoin desktop CDP getHotCoinHour")
+    except Exception as client_exc:
         return aicoin_unavailable(
-            f"{exc} 请确认 AiCoin 已用 --remote-debugging-port=9222 启动，并保持桌面端已登录/已加载热门榜页面。"
+            aicoin_unavailable_message(rest_hint, aicoin_client_hint(client_exc)),
+            detail=f"rest: {rest_exc!r} | client: {client_exc!r}",
         )
-
-    rows = []
-    items = payload.get("list") or []
-    for item in items:
-        symbol = item.get("coinShow") or item.get("coinKey") or ""
-        if not symbol or is_excluded_crypto_asset(symbol):
-            continue
-        rows.append(
-            {
-                "rank": len(rows) + 1,
-                "symbol": symbol,
-                "name": item.get("coinName") or item.get("coinKey") or item.get("defaultTpKey") or symbol,
-                "icon": item.get("icon") or crypto_icon_url(symbol),
-                "price": aicoin_price(item.get("price")),
-                "change": pct(safe_float(item.get("degree24H"))),
-                "heat": max(1, round((len(items) - len(rows)) / max(len(items), 1) * 100)),
-                "amount": 0,
-                "turnover": aicoin_price(item.get("price")),
-                "tags": ["桌面端热榜", "AIcoin"],
-                "note": item.get("defaultTpKey") or "客户端解密数据",
-            }
-        )
-        if len(rows) >= 10:
-            break
-
-    return source_template(
-        id="aicoin",
-        group="aicoin",
-        title="AIcoin 热门榜",
-        subtitle=f"本地客户端 getHotCoinHour，count={payload.get('count', len(items))}，计价 {env_value('AICOIN_CURRENCY', 'usd').upper()}",
-        accent="#57c7ff",
-        source_label="AI",
-        source_name="AICoin desktop CDP getHotCoinHour",
-        rows=rows,
-        status="ok" if rows else "unavailable",
-        empty_title="AIcoin 热门榜当前为空",
-        empty_message="已连接 AiCoin 客户端并调用 getHotCoinHour，但没有返回可展示数据。",
-    )
 
 
 def futu_text(node) -> str:
