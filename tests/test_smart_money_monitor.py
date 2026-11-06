@@ -41,6 +41,8 @@ PONS_BUY_TOKEN = "0x72fffb21d64c1177e29e9e2de532efb038d8061b"  # FLYWHEEL
 PONS_BUY_TOKEN_RAW = 1319628559603659063641233162
 PONS_DELTA_SPENT_RAW = 300000 * 10**18
 PONS_BUY_TX = "0x7599fd4b3340f9049541a4a3a48943b1d4a591cc5b4e68159374401864cd1337"
+#: THEO（用户 2026-11-06 提供的 Solana 聪明钱，base58 地址，只接 solana 单链）。
+THEO_WALLET = "Bi4rd5FH5bYEN8scZ7wevxNZyNmKHdaBcvewdPFxYdLt"
 BONK_GUY_NO_THRESHOLD_WALLET = BONK_GUY_EVM_WALLET
 SOL_TOKEN = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6JgB263QP6Bpump"
 SOL_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -322,8 +324,8 @@ class SmartMoneyMonitorTests(unittest.TestCase):
             rows = seeded.store.list_wallets()
             # cowboy 占三行（BSC/ETH/Base 各一），阿峰占一行（只 BSC），
             # 15 个「追踪钱包」各占三行（只记录不弹窗，见 test_kol_sync），
-            # pons榜5 占一行（只 Robinhood）。
-            self.assertEqual(len(rows), 84)
+            # pons榜5 占一行（只 Robinhood），THEO 占一行（只 Solana）。
+            self.assertEqual(len(rows), 85)
             self.assertEqual({row["chain"] for row in rows}, {"ethereum", "bsc", "base", "robinhood", "solana"})
             by_address = {}
             for row in rows:
@@ -337,6 +339,9 @@ class SmartMoneyMonitorTests(unittest.TestCase):
             )
             self.assertEqual(by_address[BONK_GUY_EVM_WALLET], {("Bonk Guy (Unipcs)", "Bonk Guy 公开钱包")})
             self.assertEqual(by_address[BONK_GUY_SOL_WALLET], {("Bonk Guy (Unipcs)", "Bonk Guy 公开钱包")})
+            self.assertEqual(by_address[THEO_WALLET], {("THEO", "用户提供 · Solana")})
+            # base58 地址在 EVM 上不存在：漏写 chains 会白铺四条 EVM 链。
+            self.assertEqual([row["chain"] for row in rows if row["address"] == THEO_WALLET], ["solana"])
             self.assertEqual(by_address[PONS_WALLET], {("pons榜5", "用户提供 · Robinhood 链")})
             self.assertEqual(by_address[BONK_GUY_USELESS_WALLET], {("Bonk Guy (Unipcs)", "Bonk Guy 公开钱包")})
             self.assertEqual(sum(row["address"] == BONK_GUY_EVM_WALLET for row in rows), 4)

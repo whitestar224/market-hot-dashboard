@@ -170,6 +170,26 @@ DEFAULT_SMART_MONEY_SEEDS = (
         # $1,800~$4,500。门槛定 1,000U：真实买单全都过、几十美元的试单不炸窗。
         "alertThresholdUsd": 1000.0,
     },
+    {
+        "address": "Bi4rd5FH5bYEN8scZ7wevxNZyNmKHdaBcvewdPFxYdLt",
+        "nickname": "THEO",
+        "sourceName": "用户提供 · Solana",
+        "sourceUrl": "https://solscan.io/account/Bi4rd5FH5bYEN8scZ7wevxNZyNmKHdaBcvewdPFxYdLt",
+        "sourceEvidence": (
+            "用户 2026-11-06 指定：「这个是SOL链上的一个聪明钱…帮我也做一个买入监控弹窗」，"
+            "随后补正名称为 THEO。只接 solana 一条链（地址是 base58，不是 EVM）。"
+            "接入时本机网络整体不通（连 www.baidu.com 直连都 ConnectTimeout），"
+            "所以还没做链上核验（余额 / 历史买单 / 单笔规模）。阈值 500U 是参照"
+            "阿峰、cowboy 的档次暂定的，等网络恢复后按他的实测中位金额校准。"
+            "另注：库里原有 8 条 solana 钱包阈值全是默认 10000U，等于从未弹过窗。"
+        ),
+        # 不写 chains 会默认铺 4 条 EVM 链，而 base58 地址在 EVM 上根本不存在 ——
+        # 只会白白烧掉扫描窗口，还污染健康度统计。
+        "chains": ("solana",),
+        # 与阿峰 / cowboy 同档。Solana meme 盘上的聪明钱常见 1~3 SOL 一单，
+        # 500U 能滤掉几十美元的试单，又不会把时间线刷满。
+        "alertThresholdUsd": 500.0,
+    },
 )
 
 # ---------------------------------------------------------------------------
