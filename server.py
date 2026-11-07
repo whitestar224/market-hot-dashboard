@@ -10123,6 +10123,34 @@ def gmgn_token_trade_url(chain: Any, contract_address: Any) -> str:
     return f"https://gmgn.ai/{quote(chain_code, safe='')}/token/{quote(contract, safe='')}"
 
 
+def onchain_token_view_url(chain_id: Any, contract_address: Any) -> str:
+    """链上代币「查看」的落地页：优先 GMGN 站内交易页，其次币安钱包代币页。
+
+    2026-11-07 用户要求：价格监控/结构观察弹窗的「查看」不要再跳币安，直接落
+    GMGN 交易页（他就在 GMGN 上做单，多绕一次 web3.binance.com 纯属浪费一步）。
+
+    price_watch 的链多数存的是币安钱包 chainId（``56`` / ``CT_501`` / ``4663``
+    / ``8453``），GMGN 只认自己的 slug，所以先用 ``BINANCE_WALLET_CHAIN_META``
+    折成 ``bsc`` / ``sol`` / ``robinhood`` / ``base`` / ``eth`` 再拼。认不出的链
+    仍回落币安钱包页，绝不吐半截死链。
+    """
+    contract = clean_feed_text(contract_address, 180)
+    if not contract:
+        return ""
+    slug = gmgn_chain_slug(chain_id)
+    if not slug:
+        _, route_chain = BINANCE_WALLET_CHAIN_META.get(
+            clean_feed_text(chain_id, 40).strip(), ("", "")
+        )
+        slug = gmgn_chain_slug(route_chain)
+    if slug:
+        gmgn_url = gmgn_token_trade_url(slug, contract)
+        if gmgn_url:
+            return gmgn_url
+    wallet_url = binance_wallet_token_url(chain_id, contract)
+    return wallet_url if "/token/" in wallet_url else ""
+
+
 def binance_wallet_ai_narrative_available(raw: dict[str, Any]) -> bool:
     meta_info = raw.get("metaInfo") if isinstance(raw.get("metaInfo"), dict) else {}
     if int(safe_float(meta_info.get("aiNarrativeFlag"), 0)) == 1:
@@ -20559,16 +20587,17 @@ def price_watch_trade_url(
     centralized exchange is a different instrument (Binance's PUMP perpetual is not the
     Solana PUMP token, its ZEC perpetual is not a Solana ZEC). Those rows therefore never
     open a CEX contract page — otherwise 「查看」 sends the user to a perpetual contract
-    for a token they never clicked. Wallet-origin assets keep their Wallet route too.
+    for a token they never clicked. On-chain rows land on the GMGN trade page (the user
+    trades there); a chain GMGN cannot address falls back to the Binance Wallet token
+    page, then to the monitor page.
     """
     asset = price_watch_symbol_without_quote(symbol)
     provider_name = str(provider or "").strip().lower()
     contract = clean_feed_text(contract_address, 180)
-    wallet_url = binance_wallet_token_url(chain_id, contract) if contract else ""
     if contract or prefer_wallet:
-        # 带合约地址或币安钱包来源 = 链上资产：只走链上代币页，链未知时回落监控页，
+        # 带合约地址或币安钱包来源 = 链上资产：只走链上代币页（GMGN 优先），链未知时回落监控页，
         # 绝不退化成同 ticker 的中心化合约页。
-        return wallet_url if "/token/" in wallet_url else fallback
+        return onchain_token_view_url(chain_id, contract) or fallback
     exchange = (
         "Binance Futures" if "binance" in provider_name
         else "OKX SWAP" if "okx" in provider_name

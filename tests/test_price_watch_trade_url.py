@@ -29,7 +29,8 @@ class PriceWatchTradeUrlTests(unittest.TestCase):
             "./price-watch.html",
         )
 
-    def test_onchain_contract_opens_matching_binance_wallet_token(self):
+    def test_onchain_contract_opens_matching_gmgn_trade_page(self):
+        """链上代币的「查看」落 GMGN 交易页（2026-11-07 用户要求，不再跳到币安）。"""
         self.assertEqual(
             server.price_watch_trade_url(
                 "INDEX",
@@ -37,8 +38,33 @@ class PriceWatchTradeUrlTests(unittest.TestCase):
                 chain_id="4663",
                 contract_address="0x56910d4409f3a0c78c64dd8d0545ff0705389870",
             ),
-            "https://web3.binance.com/zh-CN/token/robinhood/0x56910d4409f3a0c78c64dd8d0545ff0705389870?ref=MQ6JD2X4",
+            "https://gmgn.ai/robinhood/token/0x56910d4409f3a0c78c64dd8d0545ff0705389870",
         )
+
+    def test_binance_wallet_chain_ids_fold_into_gmgn_slugs(self):
+        """price_watch 多数存的是币安钱包 chainId，必须折成 GMGN 的 slug 才能拼链接。"""
+        cases = {
+            "56": "bsc",
+            "1": "eth",
+            "8453": "base",
+            "4663": "robinhood",
+            "CT_501": "sol",
+        }
+        for chain_id, slug in cases.items():
+            with self.subTest(chain_id=chain_id):
+                url = server.onchain_token_view_url(chain_id, "0xabc7777")
+                self.assertEqual(url, f"https://gmgn.ai/{slug}/token/0xabc7777")
+
+    def test_unknown_chain_still_falls_back_to_binance_wallet(self):
+        """GMGN 认不出的链不许吐死链，回落币安钱包页。"""
+        self.assertEqual(
+            server.onchain_token_view_url("", "0xabc7777"),
+            "",
+        )
+        url = server.price_watch_trade_url(
+            "SOMECOIN", "链上多源 K线", chain_id="", contract_address="0xabc7777"
+        )
+        self.assertEqual(url, "./price-watch.html")
 
     def test_wallet_origin_overrides_secondary_contract_provider(self):
         self.assertEqual(
@@ -49,7 +75,7 @@ class PriceWatchTradeUrlTests(unittest.TestCase):
                 contract_address="6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx",
                 prefer_wallet=True,
             ),
-            "https://web3.binance.com/zh-CN/token/sol/6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx?ref=MQ6JD2X4",
+            "https://gmgn.ai/sol/token/6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx",
         )
 
     def test_price_alert_view_uses_signal_provider_trade_page(self):
@@ -84,7 +110,7 @@ class PriceWatchTradeUrlTests(unittest.TestCase):
 
         self.assertEqual(payload["url"], "https://www.okx.com/zh-hans/trade-swap/test-usdt-swap")
 
-    def test_onchain_price_alert_view_prefers_binance_wallet(self):
+    def test_onchain_price_alert_view_opens_gmgn_trade_page(self):
         event = {
             "symbol": "INDEX",
             "distancePct": 1.2,
@@ -98,7 +124,11 @@ class PriceWatchTradeUrlTests(unittest.TestCase):
         with patch.object(server, "launch_desktop_alert", side_effect=lambda payload: payload):
             payload = server.launch_price_watch_alert(event)
 
-        self.assertIn("/token/robinhood/0x56910d4409f3a0c78c64dd8d0545ff0705389870", payload["url"])
+        self.assertEqual(
+            payload["url"],
+            "https://gmgn.ai/robinhood/token/0x56910d4409f3a0c78c64dd8d0545ff0705389870",
+        )
+        self.assertNotIn("web3.binance.com", payload["url"])
 
     def test_wallet_origin_alert_ignores_secondary_provider_page(self):
         event = {
@@ -115,9 +145,9 @@ class PriceWatchTradeUrlTests(unittest.TestCase):
         with patch.object(server, "launch_desktop_alert", side_effect=lambda payload: payload):
             payload = server.launch_price_watch_alert(event)
 
-        self.assertIn(
-            "/token/sol/6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx",
+        self.assertEqual(
             payload["url"],
+            "https://gmgn.ai/sol/token/6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx",
         )
         self.assertNotIn("/futures/", payload["url"])
 
@@ -130,7 +160,7 @@ class PriceWatchTradeUrlTests(unittest.TestCase):
             chain_id="CT_501",
             contract_address="pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn",
         )
-        self.assertIn("/token/sol/pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn", url)
+        self.assertIn("gmgn.ai/sol/token/pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn", url)
         self.assertNotIn("/futures/", url)
 
     def test_onchain_asset_with_unknown_chain_falls_back_instead_of_futures(self):
@@ -160,7 +190,10 @@ class PriceWatchTradeUrlTests(unittest.TestCase):
         with patch.object(server, "launch_desktop_alert", side_effect=lambda payload: payload):
             payload = server.launch_price_watch_alert(event)
 
-        self.assertIn("/token/sol/A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS", payload["url"])
+        self.assertEqual(
+            payload["url"],
+            "https://gmgn.ai/sol/token/A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS",
+        )
         self.assertNotIn("/futures/", payload["url"])
 
 
