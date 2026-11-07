@@ -35,6 +35,7 @@ import server
 ALL_BOARDS = (
     "binance-wallet-hot", "aicoin", "gmgn-trenches", "binance", "gmgn-hot-search",
     "bitget", "futu-hk", "ave", "okx", "okx-dex", "ths-cn", "futu-us",
+    "rootdata-projects",
 )
 # Only these three really admit into the price monitor pool.
 INTAKE_BOARDS = {"binance-wallet-hot", "aicoin", "gmgn-hot-search"}

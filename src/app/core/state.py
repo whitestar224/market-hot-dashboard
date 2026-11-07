@@ -1340,6 +1340,15 @@ PRICE_WATCH_BOARDS = (
         "description": "美股热门榜（股票永不进币池，仅控制弹窗）",
         "intakeApplies": False,
     },
+    {
+        # 2026-11-07 用户要求：加一个 RootData 项目热门榜（按 RD 热度指数倒排、
+        # 去掉 CEX/稳定币这些老大哥）。取数靠专用 Chrome 快照，不进价格池。
+        "id": "rootdata-projects",
+        "label": "RootData 项目热门榜",
+        "short": "RD 项目榜",
+        "description": "RootData 项目热度榜（不进价池，仅控制弹窗）",
+        "intakeApplies": False,
+    },
 )
 
 

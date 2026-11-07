@@ -150,6 +150,9 @@ import top10_holders as TOP10
 # 出闸时统一补一句「流通市值 $…（CMC #rank）」。拿不到就沉默，绝不写 0。
 import cmc_market_cap as CMC_MC
 from smart_money_monitor import CHAIN_META as SMART_MONEY_CHAIN_META, SmartMoneyMonitor
+# RootData 项目热门榜（2026-11-07）：页面挂在腾讯云 WAF 后面，服务器直连只会拿到
+# 滑块验证码页，所以取数走「专用 Chrome 抓一次 → 落快照」，榜单只读快照。
+import rootdata_projects as ROOTDATA_PROJECTS
 from trench_person_signals import (
     EXCHANGE_OFFICIAL_HANDLES,
     EXCLUDED_IMPORTANT_HANDLES,
@@ -20190,6 +20193,66 @@ def recover_market_sources_from_independent_caches(payload: dict[str, Any]) -> d
     return {**payload, "sources": repaired} if changed else payload
 
 
+def fetch_rootdata_projects() -> dict[str, Any]:
+    """RootData 项目热门榜：按 RD 热度指数倒排，滤掉交易所/稳定币这些老大哥。
+
+    页面（``/projects?evalSort=2``）在腾讯云 WAF 后面，服务器直接抓只能拿到滑块
+    验证码页；取数由专用 Chrome 完成并落快照（见 ``rootdata_projects``），这里只读
+    快照，热路径不碰网络。快照过期就在后台拉一次，失败保留旧数据但**明说年龄**。
+    """
+    snapshot = ROOTDATA_PROJECTS.read_snapshot()
+    rows = ROOTDATA_PROJECTS.project_rows(limit=20)
+    age = ROOTDATA_PROJECTS.snapshot_age_seconds(snapshot)
+    if snapshot and age > ROOTDATA_PROJECTS.SNAPSHOT_TTL_SECONDS:
+        ROOTDATA_PROJECTS.refresh_async()
+    if not snapshot:
+        return source_template(
+            id="rootdata-projects",
+            group="crypto",
+            title="RootData 项目热门榜",
+            subtitle="按 RD 热度指数倒排 · 已滤掉交易所/稳定币",
+            accent="#6c8cff",
+            source_label="RD",
+            source_name="RootData · 尚未初始化",
+            rows=[],
+            status="unavailable",
+            empty_title="RootData 还没授权",
+            empty_message="双击「刷新RootData登录态.cmd」过一次验证码，之后服务会自己刷新。",
+        )
+    if not rows:
+        return source_template(
+            id="rootdata-projects",
+            group="crypto",
+            title="RootData 项目热门榜",
+            subtitle="按 RD 热度指数倒排 · 已滤掉交易所/稳定币",
+            accent="#6c8cff",
+            source_label="RD",
+            source_name="RootData · 快照里没有可用项目",
+            rows=[],
+            status="unavailable",
+            empty_title="RootData 榜单当前为空",
+            empty_message="快照存在但没有解析出项目，检查页面结构是否变化。",
+        )
+    minutes = int(age // 60) if age != float("inf") else 0
+    stale = age > ROOTDATA_PROJECTS.SNAPSHOT_TTL_SECONDS
+    return source_template(
+        id="rootdata-projects",
+        group="crypto",
+        title="RootData 项目热门榜",
+        subtitle="按 RD 热度指数倒排 · 已滤掉交易所/稳定币",
+        accent="#6c8cff",
+        source_label="RD",
+        source_name=(
+            f"RootData projects · 抓取于 {minutes} 分钟前" if stale
+            else "RootData projects · 浏览器快照"
+        ),
+        rows=rows,
+        status="stale" if stale else "ok",
+        empty_title="RootData 榜单当前为空",
+        empty_message="页面结构变化或验证码过期，双击「刷新RootData登录态.cmd」重抓。",
+    )
+
+
 def market_payload() -> dict[str, Any]:
     sources = []
     # 卡片顺序 = 本列表顺序：结果按原序收集，前端 renderBoards() 只做
@@ -20209,6 +20272,7 @@ def market_payload() -> dict[str, Any]:
         ("okx-dex", fetch_okx_dex_hot),
         ("ths-cn", fetch_ths_hot),
         ("futu-us", lambda: fetch_futu_hot("us")),
+        ("rootdata-projects", fetch_rootdata_projects),
     ]
 
     def fetch_one(key: str, fetcher) -> dict[str, Any]:
