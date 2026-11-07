@@ -416,25 +416,30 @@ def fetch_foresight_html(url: str, timeout: float = 12.0) -> str:
 
     567 不是限流而是 WAF 按 TLS 指纹判定：同一条路 `requests` 回 567、`curl_cffi`
     伪装 chrome 回 200。所以这里不走 `http_get_race`（它绑死 requests）。
+
+    整轮 race 失败时再补一轮：WAF 偶发抽风、或某个代理端口正好在重连，单轮 5 条路由
+    全挂过一次（2026-11-07 重启后实测 foresight 计数掉到 0），重试一次就恢复了。
     """
     wait = max(6.0, min(float(timeout or 12.0), 25.0))
-    routes = _candidate_routes()
-    futures = [
-        NEWSFLASH_ROUTE_POOL.submit(_foresight_get_via, url, wait, proxy)
-        for proxy in routes
-    ]
-    first_error: Exception | None = None
-    try:
-        for future in as_completed(futures):
-            try:
-                return future.result().text
-            except Exception as exc:  # 该路失败，等下一个
-                first_error = first_error or exc
-                continue
-        raise first_error or RuntimeError(f"all routes failed for {url}")
-    finally:
-        for future in futures:
-            future.cancel()
+    last_error: Exception | None = None
+    for attempt in range(2):
+        futures = [
+            NEWSFLASH_ROUTE_POOL.submit(_foresight_get_via, url, wait, proxy)
+            for proxy in _candidate_routes()
+        ]
+        try:
+            for future in as_completed(futures):
+                try:
+                    return future.result().text
+                except Exception as exc:  # 该路失败，等下一个
+                    last_error = last_error or exc
+                    continue
+        finally:
+            for future in futures:
+                future.cancel()
+        if attempt == 0:
+            time.sleep(0.6)
+    raise last_error or RuntimeError(f"all routes failed for {url}")
 
 
 def _fetch_feed(source: dict[str, Any], headers: dict[str, str], timeout: float) -> list[dict[str, Any]]:
