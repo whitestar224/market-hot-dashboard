@@ -467,7 +467,11 @@ CHAIN_META = {
         "label": "Solana", "vm": "solana", "native": "SOL", "dex": "solana",
         "explorer": "https://solscan.io/tx/{}",
         "rpcEnv": "SMART_MONEY_SOLANA_RPC_URLS",
-        "rpcs": ("https://api.mainnet-beta.solana.com",),
+        # The official endpoint throttles getTransaction hard under load (2026-11-07:
+        # repeated 10054 resets and read timeouts), so a second endpoint is kept as a
+        # fallback. publicnode answered both getSignaturesForAddress and getTransaction
+        # reliably during the same outage.
+        "rpcs": ("https://api.mainnet-beta.solana.com", "https://solana-rpc.publicnode.com"),
     },
 }
 CHAIN_ALIASES = {
@@ -1833,7 +1837,10 @@ class SmartMoneyMonitor:
                 if not signature or row.get("err") is not None:
                     continue
                 payload = self.rpc("solana", "getTransaction", [signature, {
-                    "encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0,
+                    "encoding": "jsonParsed", "commitment": "confirmed",
+                    # v1 covers v0 as well; asking for 0 makes every address-lookup-table
+                    # transaction fail with -32015 and silently vanish from monitoring.
+                    "maxSupportedTransactionVersion": 1,
                 }]) or {}
                 payload["signature"] = signature
                 event = classify_solana_buy(
