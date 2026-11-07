@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from newsflash_sources import (
@@ -7,8 +8,39 @@ from newsflash_sources import (
     deduplicate_news_items,
     http_get_race,
     parse_feed_xml,
+    parse_foresight_html,
     stories_match,
 )
+
+
+FORESIGHT_HTML = """
+<div class="news-list">
+  <div class="news-item">
+    <div class="news-time"><span class="time-detail">2026.11.05</span></div>
+    <a href="/news/detail/116956" class="news-card">
+      <div class="news-content"><div class="content-main"><div class="content-text">
+        <h3>Soneium 将发售 50 枚 NFT</h3>
+        <p><p>Foresight News 消息，索尼旗下 Soneium 宣布发售。</p><p><br></p></p>
+        <div class="news-meta"><span class="publish-time">2026.11.05 21:38</span></div>
+      </div></div></div>
+    </a>
+  </div>
+  <div class="news-item">
+    <div class="news-time"><span class="time-detail">2026.11.04</span></div>
+    <a href="/article/detail/101389" class="news-card">
+      <div class="content-text">
+        <h3>深度：Slop Cash 公售</h3>
+        <p>Slop Cash 让开源项目为 AI 辅助完成的工作付费。</p>
+      </div>
+    </a>
+  </div>
+  <div class="news-item">
+    <a href="/news/detail/116956" class="news-card">
+      <div class="content-text"><h3>同 id 的重复条目</h3></div>
+    </a>
+  </div>
+</div>
+"""
 
 
 def item(source_id, source, title, *, content="", add_time=1_700_000_000, priority=50, url=""):
@@ -234,5 +266,52 @@ class NewsflashSourcesTests(unittest.TestCase):
 
     def test_direct_route_bypasses_env_proxy(self):
         test_direct_route_ignores_proxy_environment()
+
+    def test_foresight_list_page_is_parsed_like_a_feed(self):
+        """Foresight 没有 RSS，靠 SSR 的 div.news-item 解析（2026-11-07 接入）。"""
+        source = {"id": "foresight", "name": "Foresight 空投线报", "label": "FN", "priority": 60}
+        rows = parse_foresight_html(FORESIGHT_HTML, source)
+        # 第三条与第一条同 id（/news/detail/116956），必须被丢掉
+        self.assertEqual(len(rows), 2)
+        first = rows[0]
+        self.assertEqual(first["id"], "foresight:116956")
+        self.assertEqual(first["title"], "Soneium 将发售 50 枚 NFT")
+        # 正文里不能重复标题、不能带时间尾巴
+        self.assertEqual(first["content"], "Foresight News 消息，索尼旗下 Soneium 宣布发售。")
+        self.assertEqual(first["url"], "https://foresightnews.pro/news/detail/116956")
+        self.assertEqual(first["sourceLabel"], "FN")
+        self.assertEqual(
+            first["add_time"],
+            int(datetime(2026, 11, 5, 21, 38, tzinfo=timezone(timedelta(hours=8))).timestamp()),
+        )
+        # 深度文章（/article/detail）也收，只有日期时按当天中午排
+        second = rows[1]
+        self.assertEqual(second["url"], "https://foresightnews.pro/article/detail/101389")
+        self.assertEqual(
+            second["add_time"],
+            int(datetime(2026, 11, 4, 12, 0, tzinfo=timezone(timedelta(hours=8))).timestamp()),
+        )
+
+    def test_foresight_source_uses_html_fetch_not_rss(self):
+        """kind=html-foresight 必须走 curl_cffi 那条路，不能落到 requests（会被 567）。"""
+        source = {"id": "foresight", "name": "Foresight 空投线报", "label": "FN",
+                  "url": "https://foresightnews.pro/airdropnews", "priority": 60,
+                  "kind": "html-foresight"}
+        from newsflash_sources import _fetch_feed
+
+        with patch("newsflash_sources.fetch_foresight_html", return_value=FORESIGHT_HTML) as html_fetch, \
+                patch("newsflash_sources.http_get_race", side_effect=AssertionError("不该走 RSS/requests 路径")):
+            rows = _fetch_feed(source, {"User-Agent": "test"}, 8)
+        self.assertEqual(len(rows), 2)
+        html_fetch.assert_called_once()
+
+    def test_foresight_is_a_public_direct_source(self):
+        from newsflash_sources import DIRECT_SOURCE_FAMILIES, SOURCE_PRIORITY, configured_feed_sources, source_family
+
+        ids = {str(row.get("id")) for row in configured_feed_sources()}
+        self.assertIn("foresight", ids)
+        self.assertEqual(source_family("Foresight News"), "foresight")
+        self.assertIn("foresight", DIRECT_SOURCE_FAMILIES)
+        self.assertEqual(SOURCE_PRIORITY["foresight"], 60)
 
 

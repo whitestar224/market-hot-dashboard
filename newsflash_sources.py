@@ -11,7 +11,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -36,17 +36,29 @@ PUBLIC_FEEDS = (
         "url": "https://www.wublock123.com/feed",
         "priority": 70,
     },
+    {
+        # 用户 2026-11-07：「https://foresightnews.pro/airdropnews 把这个集成一下到聚合快讯里」。
+        # 它没有 RSS（/rss 一律 302 回首页），但列表页是 Nuxt SSR，`div.news-item` 里
+        # 标题/正文/时间全在 HTML 上，所以 kind 走 HTML 解析而不是 parse_feed_xml。
+        "id": "foresight",
+        "name": "Foresight 空投线报",
+        "label": "FN",
+        "url": "https://foresightnews.pro/airdropnews",
+        "priority": 60,
+        "kind": "html-foresight",
+    },
 )
 
 SOURCE_PRIORITY = {
     "blockbeats": 100,
     "bwenews": 80,
     "wublock": 70,
+    "foresight": 60,
 }
 
 # These publishers already have a direct source above. User-added copies must
 # not be fetched as a second source.
-DIRECT_SOURCE_FAMILIES = {"blockbeats", "bwenews", "wublock"}
+DIRECT_SOURCE_FAMILIES = {"blockbeats", "bwenews", "wublock", "foresight"}
 
 
 def _clean_text(value: Any, limit: int = 5000) -> str:
@@ -65,6 +77,8 @@ def source_family(value: Any) -> str:
         return "wublock"
     if "bwenews" in normalized or "方程式新闻" in normalized:
         return "bwenews"
+    if "foresight" in normalized or "远见" in normalized:
+        return "foresight"
     return normalized
 
 
@@ -165,6 +179,83 @@ def parse_feed_xml(xml_text: str, source: dict[str, Any]) -> list[dict[str, Any]
             }
         )
     return items
+
+
+FORESIGHT_ORIGIN = "https://foresightnews.pro"
+FORESIGHT_DETAIL_ID = re.compile(r"/(?:news|article)/detail/(\d+)")
+FORESIGHT_STAMP = re.compile(r"(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?")
+_CST = timezone(timedelta(hours=8))
+
+
+def _foresight_add_time(node: Any) -> int:
+    """`2026.11.05 21:38`（北京时间）→ epoch 秒；只有日期时按当天中午排。"""
+    for selector in (".publish-time", ".time-detail"):
+        stamp = node.select_one(selector)
+        text = _clean_text(stamp.get_text(" ", strip=True), 40) if stamp else ""
+        match = FORESIGHT_STAMP.search(text)
+        if not match:
+            continue
+        year, month, day = (int(match.group(index)) for index in (1, 2, 3))
+        hour = int(match.group(4) or 12)
+        minute = int(match.group(5) or 0)
+        try:
+            return int(datetime(year, month, day, hour, minute, tzinfo=_CST).timestamp())
+        except ValueError:
+            continue
+    return int(time.time())
+
+
+def parse_foresight_html(html_text: str, source: dict[str, Any]) -> list[dict[str, Any]]:
+    """Foresight News 列表页（Nuxt SSR）→ 聚合快讯 items。
+
+    页面结构与 RSS 无关：每条是 ``div.news-item``，里面
+    ``a[href=/news/detail/<id>]`` + ``h3`` 标题 + ``.content-text`` 正文 +
+    ``.publish-time`` 时间。**正文容器里包含 h3 和时间**，所以正文只取叶子 ``<p>``
+    （外层 ``<p><p>…</p></p>`` 会被跳过），否则每条摘要都会以标题重复开头。
+    深度文章走 ``/article/detail/<id>``，同样收。
+    """
+    soup = BeautifulSoup(html_text, "lxml")
+    source_id = str(source.get("id") or "foresight")
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for node in soup.select("div.news-item"):
+        link = node.select_one("a[href*='/news/detail/'], a[href*='/article/detail/']")
+        href = str(link.get("href") or "") if link else ""
+        heading = node.select_one(".content-text h3") or node.select_one("h3")
+        title = _clean_text(heading.get_text(" ", strip=True), 240) if heading else ""
+        if not title:
+            continue
+        detail = FORESIGHT_DETAIL_ID.search(href)
+        item_id = f"{source_id}:{detail.group(1)}" if detail else _stable_id(source_id, href, title)
+        if item_id in seen:
+            continue
+        seen.add(item_id)
+        container = node.select_one(".content-text") or node
+        paragraphs: list[str] = []
+        for paragraph in container.find_all("p"):
+            if paragraph.find("p"):  # 外层 <p> 只是容器，取叶子才不会重复
+                continue
+            text = _clean_text(paragraph.get_text(" ", strip=True), 1000)
+            if text and text != title:
+                paragraphs.append(text)
+        url = FORESIGHT_ORIGIN + href if href.startswith("/") else href
+        items.append(
+            {
+                "id": item_id,
+                "title": title,
+                "content": "\n".join(paragraphs)[:4000],
+                "url": url,
+                "image": "",
+                "links": [url] if url else [],
+                "add_time": _foresight_add_time(node),
+                "sourceId": source_id,
+                "source": str(source.get("name") or "Foresight News"),
+                "sourceLabel": str(source.get("label") or "FN")[:8],
+                "sourcePriority": int(source.get("priority") or 60),
+            }
+        )
+    items.sort(key=lambda item: item.get("add_time") or 0, reverse=True)
+    return items[:60]
 
 
 def _load_json_env(name: str) -> Any:
@@ -299,7 +390,57 @@ def http_get_race(url: str, *, headers: dict[str, str] | None = None, timeout: f
             future.cancel()
 
 
+FORESIGHT_IMPERSONATE = os.getenv("NEWSFLASH_FORESIGHT_IMPERSONATE", "chrome").strip() or "chrome"
+
+
+def _foresight_get_via(url: str, timeout: float, proxy: str):
+    """Foresight 专用：requests/urllib3 一律被回 567，必须伪装 Chrome 的 TLS 指纹。"""
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError as exc:  # 缺库只影响这一个源，别带崩整轮聚合
+        raise RuntimeError("缺少 curl_cffi，无法抓取 Foresight（pip install curl_cffi）") from exc
+    kwargs: dict[str, Any] = {"impersonate": FORESIGHT_IMPERSONATE, "timeout": timeout}
+    if proxy:
+        kwargs["proxies"] = {"http": proxy, "https": proxy}
+    else:
+        # 直连路线：显式 Ban 掉 env 代理，否则半死的 57568 会把直连也代理走。
+        kwargs["proxies"] = {"http": "", "https": ""}
+    response = curl_requests.get(url, **kwargs)
+    if int(response.status_code) != 200:
+        raise RuntimeError(f"HTTP {response.status_code}")
+    return response
+
+
+def fetch_foresight_html(url: str, timeout: float = 12.0) -> str:
+    """抓 Foresight 列表页 HTML（多路由并发，谁先拿到 200 用谁）。
+
+    567 不是限流而是 WAF 按 TLS 指纹判定：同一条路 `requests` 回 567、`curl_cffi`
+    伪装 chrome 回 200。所以这里不走 `http_get_race`（它绑死 requests）。
+    """
+    wait = max(6.0, min(float(timeout or 12.0), 25.0))
+    routes = _candidate_routes()
+    futures = [
+        NEWSFLASH_ROUTE_POOL.submit(_foresight_get_via, url, wait, proxy)
+        for proxy in routes
+    ]
+    first_error: Exception | None = None
+    try:
+        for future in as_completed(futures):
+            try:
+                return future.result().text
+            except Exception as exc:  # 该路失败，等下一个
+                first_error = first_error or exc
+                continue
+        raise first_error or RuntimeError(f"all routes failed for {url}")
+    finally:
+        for future in futures:
+            future.cancel()
+
+
 def _fetch_feed(source: dict[str, Any], headers: dict[str, str], timeout: float) -> list[dict[str, Any]]:
+    # 站点没有 RSS 的源（Foresight）按 kind 走 HTML 抓取 + 解析，其余仍当订阅源。
+    if str(source.get("kind") or "") == "html-foresight":
+        return parse_foresight_html(fetch_foresight_html(str(source["url"]), timeout), source)
     response = http_get_race(str(source["url"]), headers=headers, timeout=timeout)
     if len(response.content) > 2_000_000:
         raise ValueError("feed response is too large")
