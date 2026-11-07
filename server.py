@@ -58788,18 +58788,20 @@ class Handler(SimpleHTTPRequestHandler):
                 else:
                     payload = cached_api_payload("newsflash", fetch_aggregated_newsflash, newsflash_ttl)
                 if isinstance(payload.get("items"), list):
-                    # `?source=foresight` → 只留该源的条目（空投线报单独页面用）。
-                    # 用合并后的 `sources` 列表判，跨源重复被并掉的条目也不会漏。
+                    # `?source=foresight,foresight-tag-airdrop` → 只留这些源的条目
+                    # （空投线报页把官方线报与空投标签页合并展示）。用合并后的
+                    # `sources` 列表判，跨源重复被并掉的条目也不会漏。
                     try:
-                        source_filter = str((parse_qs(parsed.query or "").get("source") or [""])[0]).strip().casefold()
+                        raw_sources = str((parse_qs(parsed.query or "").get("source") or [""])[0]).strip().casefold()
                     except Exception:
-                        source_filter = ""
+                        raw_sources = ""
+                    wanted_sources = {part for part in re.split(r"[,\s]+", raw_sources) if part}
                     items = payload["items"]
-                    if source_filter:
+                    if wanted_sources:
                         items = [
                             item for item in items
-                            if str(item.get("sourceId") or "").casefold() == source_filter
-                            or source_filter in {
+                            if str(item.get("sourceId") or "").casefold() in wanted_sources
+                            or wanted_sources & {
                                 str(entry.get("id") or "").casefold()
                                 for entry in (item.get("sources") or [])
                             }

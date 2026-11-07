@@ -149,7 +149,8 @@ async function loadFlash(options = {}) {
     const deduplicatedCount = Number(payload.deduplicatedCount || 0);
     setFlashStatus(
       FLASH_SOURCE
-        ? `${flashState.items.length} 条 · 已去重 ${deduplicatedCount} 条`
+        // 单源页面别报「已去重 N 条」——那是整站去重总数，跟这一页无关。
+        ? `${flashState.items.length} 条线报`
         : `${sourceCount} 个来源 · 已去重 ${deduplicatedCount} 条`,
       "ok"
     );

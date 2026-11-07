@@ -47,6 +47,16 @@ PUBLIC_FEEDS = (
         "priority": 60,
         "kind": "html-foresight",
     },
+    {
+        # 用户 2026-11-07 追加：「再把这个页面也集成一下」——空投标签页（搜索「空投」的结果，
+        # 混着快讯/文章/专栏，结构和空投线报页完全不同，见 parse_foresight_tag_html）。
+        "id": "foresight-tag-airdrop",
+        "name": "Foresight 空投标签",
+        "label": "FN·标签",
+        "url": "https://foresightnews.pro/tag?tagId=55&tagName=%E7%A9%BA%E6%8A%95",
+        "priority": 55,
+        "kind": "html-foresight-tag",
+    },
 )
 
 SOURCE_PRIORITY = {
@@ -54,6 +64,7 @@ SOURCE_PRIORITY = {
     "bwenews": 80,
     "wublock": 70,
     "foresight": 60,
+    "foresight-tag-airdrop": 55,
 }
 
 # These publishers already have a direct source above. User-added copies must
@@ -187,9 +198,9 @@ FORESIGHT_STAMP = re.compile(r"(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})(?:\s+(\d{1,
 _CST = timezone(timedelta(hours=8))
 
 
-def _foresight_add_time(node: Any) -> int:
-    """`2026.11.05 21:38`（北京时间）→ epoch 秒；只有日期时按当天中午排。"""
-    for selector in (".publish-time", ".time-detail"):
+def _foresight_add_time(node: Any, selectors: tuple[str, ...] = (".publish-time", ".time-detail")) -> int:
+    """`2026.11.05 21:38` / `2026-11-06 15:37`（北京时间）→ epoch 秒；只有日期时按当天中午排。"""
+    for selector in selectors:
         stamp = node.select_one(selector)
         text = _clean_text(stamp.get_text(" ", strip=True), 40) if stamp else ""
         match = FORESIGHT_STAMP.search(text)
@@ -252,6 +263,59 @@ def parse_foresight_html(html_text: str, source: dict[str, Any]) -> list[dict[st
                 "source": str(source.get("name") or "Foresight News"),
                 "sourceLabel": str(source.get("label") or "FN")[:8],
                 "sourcePriority": int(source.get("priority") or 60),
+            }
+        )
+    items.sort(key=lambda item: item.get("add_time") or 0, reverse=True)
+    return items[:60]
+
+
+def parse_foresight_tag_html(html_text: str, source: dict[str, Any]) -> list[dict[str, Any]]:
+    """Foresight「标签 / 搜索结果」页（``/tag?tagId=…``）→ items。
+
+    用户 2026-11-07 追加：「再把这个页面也集成一下」。
+    结构与空投线报页完全不同，**不要复用 `parse_foresight_html`**：
+      - 每条是 ``div.item_news``（空投线报页是 ``div.news-item``）
+      - 标题在 ``a.news_body_title``（已在 a 标签文本里）
+      - 正文在 ``.news_body_content``（一段，可能套 ``<span style=…>``）
+      - 时间在 ``.foot_tag_time``，形如 ``2026-11-06 15:37``（横线，不是点号）
+      - 同一页混着「快讯 / 文章 / 专栏」，标题级别都当快讯处理
+    """
+    soup = BeautifulSoup(html_text, "lxml")
+    source_id = str(source.get("id") or "foresight-tag")
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for node in soup.select("div.item_news"):
+        link = node.select_one("a.news_body_title[href*='/news/detail/'], a.news_body_title[href*='/article/detail/']")
+        if link is None:
+            link = node.select_one("a[href*='/news/detail/'], a[href*='/article/detail/']")
+        href = str(link.get("href") or "") if link else ""
+        title = _clean_text(link.get_text(" ", strip=True), 240) if link else ""
+        if not title:
+            heading = node.select_one(".news_body_title")
+            title = _clean_text(heading.get_text(" ", strip=True), 240) if heading else ""
+        if not title:
+            continue
+        detail = FORESIGHT_DETAIL_ID.search(href)
+        item_id = f"{source_id}:{detail.group(1)}" if detail else _stable_id(source_id, href, title)
+        if item_id in seen:
+            continue
+        seen.add(item_id)
+        body = node.select_one(".news_body_content")
+        content = _clean_text(body.get_text(" ", strip=True), 4000) if body else ""
+        url = FORESIGHT_ORIGIN + href if href.startswith("/") else href
+        items.append(
+            {
+                "id": item_id,
+                "title": title,
+                "content": content,
+                "url": url,
+                "image": "",
+                "links": [url] if url else [],
+                "add_time": _foresight_add_time(node, (".foot_tag_time", ".publish-time")),
+                "sourceId": source_id,
+                "source": str(source.get("name") or "Foresight 空投标签"),
+                "sourceLabel": str(source.get("label") or "FN")[:8],
+                "sourcePriority": int(source.get("priority") or 55),
             }
         )
     items.sort(key=lambda item: item.get("add_time") or 0, reverse=True)
@@ -444,8 +508,12 @@ def fetch_foresight_html(url: str, timeout: float = 12.0) -> str:
 
 def _fetch_feed(source: dict[str, Any], headers: dict[str, str], timeout: float) -> list[dict[str, Any]]:
     # 站点没有 RSS 的源（Foresight）按 kind 走 HTML 抓取 + 解析，其余仍当订阅源。
-    if str(source.get("kind") or "") == "html-foresight":
-        return parse_foresight_html(fetch_foresight_html(str(source["url"]), timeout), source)
+    kind = str(source.get("kind") or "")
+    if kind.startswith("html-foresight"):
+        html_text = fetch_foresight_html(str(source["url"]), timeout)
+        if kind == "html-foresight-tag":
+            return parse_foresight_tag_html(html_text, source)
+        return parse_foresight_html(html_text, source)
     response = http_get_race(str(source["url"]), headers=headers, timeout=timeout)
     if len(response.content) > 2_000_000:
         raise ValueError("feed response is too large")

@@ -9,6 +9,7 @@ from newsflash_sources import (
     http_get_race,
     parse_feed_xml,
     parse_foresight_html,
+    parse_foresight_tag_html,
     stories_match,
 )
 
@@ -38,6 +39,26 @@ FORESIGHT_HTML = """
     <a href="/news/detail/116956" class="news-card">
       <div class="content-text"><h3>同 id 的重复条目</h3></div>
     </a>
+  </div>
+</div>
+"""
+
+
+FORESIGHT_TAG_HTML = """
+<div class="search_result">
+  <div class="item_news news_content">
+    <div class="news_content_left">
+      <a href="/news/detail/117029" target="_blank" class="news_body_title redcolor">币安 Alpha 推出 35 万美元感谢空投</a>
+      <div class="news_body_content"><span style="font-family:'OPPO Sans'">Foresight News 消息，币安钱包发推表示，空投与交易竞赛活动将很快恢复。</span></div>
+      <div class="foot_tag"><span class="foot_tag_title">快讯</span> <span class="foot_tag_time">2026-11-06 15:37</span></div>
+    </div>
+  </div>
+  <div class="item_news news_content">
+    <div class="news_content_left">
+      <a href="/article/detail/101389" target="_blank" class="news_body_title">深度：怎么撸空投才不被反撸</a>
+      <div class="news_body_content">空投赛道的三条铁律。</div>
+      <div class="foot_tag"><span class="foot_tag_title">文章</span> <span class="foot_tag_time">2026-11-06 09:00</span></div>
+    </div>
   </div>
 </div>
 """
@@ -310,8 +331,32 @@ class NewsflashSourcesTests(unittest.TestCase):
 
         ids = {str(row.get("id")) for row in configured_feed_sources()}
         self.assertIn("foresight", ids)
+        self.assertIn("foresight-tag-airdrop", ids)
         self.assertEqual(source_family("Foresight News"), "foresight")
+        self.assertEqual(source_family("foresight-tag-airdrop"), "foresight")
         self.assertIn("foresight", DIRECT_SOURCE_FAMILIES)
         self.assertEqual(SOURCE_PRIORITY["foresight"], 60)
+        self.assertEqual(SOURCE_PRIORITY["foresight-tag-airdrop"], 55)
+
+    def test_foresight_tag_page_uses_its_own_parser(self):
+        """标签页结构（div.item_news）和空投线报页（div.news-item）完全不同。"""
+        source = {"id": "foresight-tag-airdrop", "name": "Foresight 空投标签",
+                  "label": "FN·标签", "priority": 55}
+        rows = parse_foresight_tag_html(FORESIGHT_TAG_HTML, source)
+        self.assertEqual(len(rows), 2)
+        first = rows[0]
+        self.assertEqual(first["id"], "foresight-tag-airdrop:117029")
+        self.assertEqual(first["title"], "币安 Alpha 推出 35 万美元感谢空投")
+        self.assertIn("空投与交易竞赛活动", first["content"])
+        self.assertEqual(first["url"], "https://foresightnews.pro/news/detail/117029")
+        self.assertEqual(
+            first["add_time"],
+            int(datetime(2026, 11, 6, 15, 37, tzinfo=timezone(timedelta(hours=8))).timestamp()),
+        )
+        # 深度文章（/article/detail）同样收
+        self.assertEqual(rows[1]["url"], "https://foresightnews.pro/article/detail/101389")
+        # 两页解析器不能互相吃：空投线报的解析器在这个 HTML 上应该颗粒无收
+        legacy = {"id": "foresight", "name": "Foresight 空投线报", "label": "FN", "priority": 60}
+        self.assertEqual(parse_foresight_html(FORESIGHT_TAG_HTML, legacy), [])
 
 
