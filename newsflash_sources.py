@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import html
 import json
@@ -9,6 +10,7 @@ import threading
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -455,15 +457,46 @@ def http_get_race(url: str, *, headers: dict[str, str] | None = None, timeout: f
 
 
 FORESIGHT_IMPERSONATE = os.getenv("NEWSFLASH_FORESIGHT_IMPERSONATE", "chrome").strip() or "chrome"
+# 标签页 SSR 只渲染首屏 10 条，往下要靠站内接口翻页（2026-11-07 用户：「怎么只有20几条」）。
+FORESIGHT_API_ORIGIN = "https://api.foresightnews.pro"
+FORESIGHT_TAG_FEED_PATH = "/v2/feed/tag"
+FORESIGHT_TAG_PAGES = max(1, min(int(os.getenv("NEWSFLASH_FORESIGHT_TAG_PAGES", "4") or 4), 12))
+FORESIGHT_TAG_PAGE_SIZE = max(10, min(int(os.getenv("NEWSFLASH_FORESIGHT_TAG_PAGE_SIZE", "20") or 20), 50))
+# 空投线报页（/airdropnews）就是这两条时间线的事件流，页面上也是靠接口往下翻。
+FORESIGHT_AIRDROP_EVENT_IDS = os.getenv("NEWSFLASH_FORESIGHT_AIRDROP_EVENTS", "235,53").strip() or "235,53"
+FORESIGHT_AIRDROP_PAGES = max(1, min(int(os.getenv("NEWSFLASH_FORESIGHT_AIRDROP_PAGES", "3") or 3), 10))
+FORESIGHT_AIRDROP_PAGE_SIZE = max(10, min(int(os.getenv("NEWSFLASH_FORESIGHT_AIRDROP_PAGE_SIZE", "20") or 20), 50))
+FORESIGHT_TAG_ID = re.compile(r"[?&]tagId=(\d+)", re.I)
+FORESIGHT_ROUTE_TTL = 300.0
+_FORESIGHT_ROUTE_LOCK = threading.Lock()
+_FORESIGHT_ROUTE: dict[str, Any] = {"proxy": None, "at": 0.0}
 
 
-def _foresight_get_via(url: str, timeout: float, proxy: str):
+def _remember_foresight_route(proxy: str) -> None:
+    with _FORESIGHT_ROUTE_LOCK:
+        _FORESIGHT_ROUTE["proxy"] = proxy
+        _FORESIGHT_ROUTE["at"] = time.time()
+
+
+def _preferred_foresight_route() -> str | None:
+    with _FORESIGHT_ROUTE_LOCK:
+        proxy = _FORESIGHT_ROUTE.get("proxy")
+        at = float(_FORESIGHT_ROUTE.get("at") or 0.0)
+    if proxy is None or time.time() - at > FORESIGHT_ROUTE_TTL:
+        return None
+    return str(proxy)
+
+
+
+def _foresight_get_via(url: str, timeout: float, proxy: str, headers: dict[str, str] | None = None):
     """Foresight 专用：requests/urllib3 一律被回 567，必须伪装 Chrome 的 TLS 指纹。"""
     try:
         from curl_cffi import requests as curl_requests
     except ImportError as exc:  # 缺库只影响这一个源，别带崩整轮聚合
         raise RuntimeError("缺少 curl_cffi，无法抓取 Foresight（pip install curl_cffi）") from exc
     kwargs: dict[str, Any] = {"impersonate": FORESIGHT_IMPERSONATE, "timeout": timeout}
+    if headers:
+        kwargs["headers"] = headers
     if proxy:
         kwargs["proxies"] = {"http": proxy, "https": proxy}
     else:
@@ -506,14 +539,194 @@ def fetch_foresight_html(url: str, timeout: float = 12.0) -> str:
     raise last_error or RuntimeError(f"all routes failed for {url}")
 
 
+def _foresight_unpack(payload: Any) -> tuple[list[dict[str, Any]], bool]:
+    """解出条目列表 + ``has_more``。
+
+    站内接口两种形状都有：``data`` 直接是 ``{items|list, has_more}``，或者整包被压成
+    ``base64(zlib(json))``（解出来仍是同样的 dict）。别假设只有一种。
+    """
+    data = payload.get("data") if isinstance(payload, dict) else payload
+    if isinstance(data, str) and data.strip():
+        try:
+            data = json.loads(zlib.decompress(base64.b64decode(data)))
+        except Exception as exc:  # 解不开就是接口换了压缩方式，别静默当空榜
+            raise RuntimeError(f"Foresight 接口返回无法解压：{exc}") from exc
+    if isinstance(data, list):
+        return [row for row in data if isinstance(row, dict)], False
+    if not isinstance(data, dict):
+        return [], False
+    rows = data.get("items")
+    if not isinstance(rows, list):
+        rows = data.get("list")
+    if isinstance(rows, str) and rows.strip():
+        try:
+            rows = json.loads(zlib.decompress(base64.b64decode(rows)))
+        except Exception as exc:
+            raise RuntimeError(f"Foresight 接口 list 无法解压：{exc}") from exc
+    if not isinstance(rows, list):
+        rows = []
+    return [row for row in rows if isinstance(row, dict)], data.get("has_more") is not False
+
+
+def fetch_foresight_json(url: str, timeout: float = 12.0) -> Any:
+    """接口请求：多路由并发取第一个成功，并把赢的那条路由记下来（省掉后续超时）。
+
+    翻页要连打 4 次，若每次都从头 race，直连那条死路由会白等一个超时。
+    """
+    wait = max(6.0, min(float(timeout or 12.0), 25.0))
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Referer": FORESIGHT_ORIGIN + "/",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    preferred = _preferred_foresight_route()
+    if preferred is not None:
+        try:
+            payload = _foresight_get_via(url, wait, preferred, headers).json()
+            _remember_foresight_route(preferred)
+            return payload
+        except Exception:
+            pass
+    futures = {
+        NEWSFLASH_ROUTE_POOL.submit(_foresight_get_via, url, wait, proxy, headers): proxy
+        for proxy in _candidate_routes()
+        if proxy != preferred
+    }
+    last_error: Exception | None = None
+    try:
+        for future in as_completed(futures):
+            try:
+                payload = future.result().json()
+            except Exception as exc:  # 该路失败，等下一个
+                last_error = last_error or exc
+                continue
+            _remember_foresight_route(futures[future])
+            return payload
+    finally:
+        for future in futures:
+            future.cancel()
+    raise last_error or RuntimeError(f"all routes failed for {url}")
+
+
+def parse_foresight_feed_json(batches: list[list[dict[str, Any]]], source: dict[str, Any]) -> list[dict[str, Any]]:
+    """``/v2/feed/tag`` 与 ``/v1/eventItems`` 的条目 → items。
+
+    两条接口的条目形状一样：``{source_type, source_id, published_at, news|article|…}``，
+    同一个 feed 里文章/专题/快讯混排；标签页与空投线报页都只看「快讯」，
+    所以只收带 ``news`` 字段的条目。
+    """
+    source_id = str(source.get("id") or "foresight")
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for rows in batches:
+        for entry in rows:
+            news = entry.get("news")
+            if not isinstance(news, dict):
+                continue  # 文章 / 专题 / 事件，快讯流里不要
+            news_id = str(news.get("id") or entry.get("source_id") or "").strip()
+            title = _clean_text(news.get("title"), 240)
+            if not news_id or not title:
+                continue
+            item_id = f"{source_id}:{news_id}"
+            if item_id in seen:
+                continue
+            seen.add(item_id)
+            content = _clean_text(news.get("brief"), 4000) or _clean_text(news.get("content"), 4000)
+            url = f"{FORESIGHT_ORIGIN}/news/detail/{news_id}"
+            published = news.get("published_at") or entry.get("published_at") or 0
+            try:
+                add_time = int(published) or int(time.time())
+            except (TypeError, ValueError):
+                add_time = int(time.time())
+            items.append(
+                {
+                    "id": item_id,
+                    "title": title,
+                    "content": content,
+                    "url": url,
+                    "image": str(news.get("img") or entry.get("img") or ""),
+                    "links": [url],
+                    "add_time": add_time,
+                    "sourceId": source_id,
+                    "source": str(source.get("name") or "Foresight News"),
+                    "sourceLabel": str(source.get("label") or "FN")[:8],
+                    "sourcePriority": int(source.get("priority") or 55),
+                }
+            )
+    items.sort(key=lambda item: item.get("add_time") or 0, reverse=True)
+    return items[:120]
+
+
+def _fetch_foresight_pages(base_url: str, pages: int, source: dict[str, Any], timeout: float) -> list[dict[str, Any]]:
+    """按页拉接口，某一页失败就用手上已有的（不要整源归零）。"""
+    batches: list[list[dict[str, Any]]] = []
+    for page in range(1, max(1, pages) + 1):
+        try:
+            payload = fetch_foresight_json(f"{base_url}&page={page}", timeout)
+        except Exception:
+            if batches:
+                break
+            raise
+        if not isinstance(payload, dict) or int(payload.get("code") or 0) != 1:
+            if batches:
+                break
+            message = payload.get("msg") if isinstance(payload, dict) else "unexpected payload"
+            raise RuntimeError(f"Foresight 接口失败：{message}")
+        rows, has_more = _foresight_unpack(payload)
+        batches.append(rows)
+        if not has_more or not rows:
+            break
+    return parse_foresight_feed_json(batches, source)
+
+
+def fetch_foresight_tag_news(tag_id: str, source: dict[str, Any], timeout: float = 12.0) -> list[dict[str, Any]]:
+    """标签页：SSR 只给首屏 10 条，往下是前端无限滚动。
+
+    接口一次 20 条、约一半是文章，所以默认翻 4 页（≈两周、40~50 条快讯）。
+    """
+    base = (
+        f"{FORESIGHT_API_ORIGIN}{FORESIGHT_TAG_FEED_PATH}"
+        f"?tag_ids={tag_id}&size={FORESIGHT_TAG_PAGE_SIZE}&search_type=news"
+    )
+    return _fetch_foresight_pages(base, FORESIGHT_TAG_PAGES, source, timeout)
+
+
+def fetch_foresight_airdrop_news(source: dict[str, Any], timeout: float = 12.0) -> list[dict[str, Any]]:
+    """空投线报页（``/airdropnews``）：页面本身只渲染 20 条，同样靠接口翻页。
+
+    `airdrop_timeline_ids` = 235（Web3 改命指南）+ 53（空投早知道），页面就是这两条
+    时间线的事件流；id 变了可用 NEWSFLASH_FORESIGHT_AIRDROP_EVENTS 覆盖。
+    """
+    base = (
+        f"{FORESIGHT_API_ORIGIN}/v1/eventItems"
+        f"?event_ids={FORESIGHT_AIRDROP_EVENT_IDS}&size={FORESIGHT_AIRDROP_PAGE_SIZE}&sort_by=desc"
+    )
+    return _fetch_foresight_pages(base, FORESIGHT_AIRDROP_PAGES, source, timeout)
+
+
 def _fetch_feed(source: dict[str, Any], headers: dict[str, str], timeout: float) -> list[dict[str, Any]]:
-    # 站点没有 RSS 的源（Foresight）按 kind 走 HTML 抓取 + 解析，其余仍当订阅源。
+    # 站点没有 RSS 的源（Foresight）按 kind 走抓取 + 解析，其余仍当订阅源。
     kind = str(source.get("kind") or "")
     if kind.startswith("html-foresight"):
-        html_text = fetch_foresight_html(str(source["url"]), timeout)
+        # 两个页面都只有首屏十几二十条，往下是前端无限滚动；先走站内接口翻页，
+        # 接口挂了再退回 SSR HTML（条数少但不断流）。
         if kind == "html-foresight-tag":
-            return parse_foresight_tag_html(html_text, source)
-        return parse_foresight_html(html_text, source)
+            tag_id = FORESIGHT_TAG_ID.search(str(source.get("url") or ""))
+            if tag_id:
+                try:
+                    items = fetch_foresight_tag_news(tag_id.group(1), source, timeout)
+                    if items:
+                        return items
+                except Exception:
+                    pass
+            return parse_foresight_tag_html(fetch_foresight_html(str(source["url"]), timeout), source)
+        try:
+            items = fetch_foresight_airdrop_news(source, timeout)
+            if items:
+                return items
+        except Exception:
+            pass
+        return parse_foresight_html(fetch_foresight_html(str(source["url"]), timeout), source)
     response = http_get_race(str(source["url"]), headers=headers, timeout=timeout)
     if len(response.content) > 2_000_000:
         raise ValueError("feed response is too large")
@@ -831,7 +1044,9 @@ def aggregate_newsflash(blockbeats_payload: dict[str, Any], headers: dict[str, s
             except Exception as exc:
                 source_status.append({"id": source["id"], "name": source["name"], "status": "error", "count": 0, "error": str(exc)[:180]})
 
-    unique = deduplicate_news_items(all_items)[:120]
+    # 上限放到 240：主快讯页仍只要最新 120 条（服务端按请求再裁），
+    # 但空投线报页要的是「Foresight 两个源的全量」，卡在 120 会把它们挤掉。
+    unique = deduplicate_news_items(all_items)[:240]
     removed = max(0, len(all_items) - len(unique))
     return {
         "updatedAt": int(time.time() * 1000),

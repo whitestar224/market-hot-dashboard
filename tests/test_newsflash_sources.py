@@ -64,6 +64,35 @@ FORESIGHT_TAG_HTML = """
 """
 
 
+def _feed_payload(rows, has_more=True):
+    """站内接口的返回形状：data 里 items + has_more（真实返回还可能整包 zlib+base64）。"""
+    return {"code": 1, "data": {"items": rows, "has_more": has_more}}
+
+
+def _news_row(news_id, title, published=1793950632):
+    return {
+        "source_type": "news",
+        "source_id": news_id,
+        "published_at": published,
+        "news": {
+            "id": news_id,
+            "title": title,
+            "brief": f"{title} 的摘要",
+            "content": f"<p>{title} 的正文</p>",
+            "published_at": published,
+        },
+    }
+
+
+def _article_row(article_id):
+    return {
+        "source_type": "article",
+        "source_id": article_id,
+        "published_at": 1793900000,
+        "article": {"id": article_id, "title": "一篇深度文章"},
+    }
+
+
 def item(source_id, source, title, *, content="", add_time=1_700_000_000, priority=50, url=""):
     return {
         "id": f"{source_id}:{title}",
@@ -313,18 +342,58 @@ class NewsflashSourcesTests(unittest.TestCase):
             int(datetime(2026, 11, 4, 12, 0, tzinfo=timezone(timedelta(hours=8))).timestamp()),
         )
 
-    def test_foresight_source_uses_html_fetch_not_rss(self):
-        """kind=html-foresight 必须走 curl_cffi 那条路，不能落到 requests（会被 567）。"""
+    def test_foresight_source_falls_back_to_html_when_api_dies(self):
+        """kind=html-foresight：接口挂了要退回 SSR HTML，而且两条路都不能落到 requests（会被 567）。"""
         source = {"id": "foresight", "name": "Foresight 空投线报", "label": "FN",
                   "url": "https://foresightnews.pro/airdropnews", "priority": 60,
                   "kind": "html-foresight"}
         from newsflash_sources import _fetch_feed
 
-        with patch("newsflash_sources.fetch_foresight_html", return_value=FORESIGHT_HTML) as html_fetch, \
+        with patch("newsflash_sources.fetch_foresight_airdrop_news", side_effect=RuntimeError("api down")), \
+                patch("newsflash_sources.fetch_foresight_html", return_value=FORESIGHT_HTML) as html_fetch, \
                 patch("newsflash_sources.http_get_race", side_effect=AssertionError("不该走 RSS/requests 路径")):
             rows = _fetch_feed(source, {"User-Agent": "test"}, 8)
         self.assertEqual(len(rows), 2)
         html_fetch.assert_called_once()
+
+    def test_foresight_airdrop_feed_comes_from_site_api(self):
+        """接口能用时不准再抓 HTML：SSR 只有 20 条，接口翻页才能拿到全量。"""
+        source = {"id": "foresight", "name": "Foresight 空投线报", "label": "FN",
+                  "url": "https://foresightnews.pro/airdropnews", "priority": 60,
+                  "kind": "html-foresight"}
+        from newsflash_sources import _fetch_feed
+
+        with patch("newsflash_sources.fetch_foresight_json",
+                   return_value=_feed_payload([_news_row(116956, "Soneium 空投"), _article_row(1)],
+                                              has_more=False)) as api, \
+                patch("newsflash_sources.fetch_foresight_html",
+                      side_effect=AssertionError("接口正常时不该抓 HTML")):
+            rows = _fetch_feed(source, {"User-Agent": "test"}, 8)
+        self.assertEqual([row["id"] for row in rows], ["foresight:116956"])
+        self.assertEqual(rows[0]["url"], "https://foresightnews.pro/news/detail/116956")
+        self.assertIn("event_ids=235,53", api.call_args.args[0])
+
+    def test_foresight_tag_feed_paginates_and_keeps_news_only(self):
+        """标签页接口混排文章/快讯，只收快讯；has_more 为真才继续翻页。"""
+        source = {"id": "foresight-tag-airdrop", "name": "Foresight 空投标签",
+                  "label": "FN·标签", "url": "https://foresightnews.pro/tag?tagId=55",
+                  "priority": 55, "kind": "html-foresight-tag"}
+        from newsflash_sources import _fetch_feed
+
+        pages = [
+            _feed_payload([_news_row(117029, "币安 Alpha 空投"), _article_row(9)], has_more=True),
+            _feed_payload([_news_row(116950, "Bitget PoolX 空投"), _news_row(117029, "重复条目")],
+                          has_more=False),
+        ]
+        with patch("newsflash_sources.fetch_foresight_json", side_effect=pages) as api:
+            rows = _fetch_feed(source, {"User-Agent": "test"}, 8)
+        # 两页都翻了，文章被丢掉，跨页重复 id 去重
+        self.assertEqual(api.call_count, 2)
+        self.assertIn("tag_ids=55", api.call_args_list[0].args[0])
+        self.assertIn("page=2", api.call_args_list[1].args[0])
+        self.assertEqual([row["id"] for row in rows],
+                         ["foresight-tag-airdrop:117029", "foresight-tag-airdrop:116950"])
+        self.assertEqual(rows[0]["sourceLabel"], "FN·标签")
 
     def test_foresight_is_a_public_direct_source(self):
         from newsflash_sources import DIRECT_SOURCE_FAMILIES, SOURCE_PRIORITY, configured_feed_sources, source_family

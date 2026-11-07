@@ -18536,7 +18536,7 @@ def fetch_aggregated_newsflash() -> dict[str, Any]:
     payload = aggregate_newsflash(blockbeats_payload, headers=HEADERS)
     source_items = payload.get("items") if isinstance(payload.get("items"), list) else []
     semantic_items, semantic_removed = newsflash_ai_semantic_dedupe(source_items)
-    payload["items"] = [enrich_newsflash_explanation_item(item) for item in semantic_items[:120]]
+    payload["items"] = [enrich_newsflash_explanation_item(item) for item in semantic_items[:240]]
     payload["semanticDeduplicatedCount"] = semantic_removed
     payload["deduplicatedCount"] = int(safe_float(payload.get("deduplicatedCount"), 0)) + semantic_removed
     spawn_background_news_ingest(payload.get("items"))
@@ -51522,7 +51522,9 @@ def prepare_news_trade_execution(
 def event_monitor_source_rows() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     news_payload = read_json_cache(api_cache_path("newsflash"))
-    news_items = news_payload.get("items") if isinstance(news_payload.get("items"), list) else []
+    # 快讯缓存已放宽到 240 条（给空投线报页留全量），事件流仍只取最新 120，
+    # 免得这个板块的行数跟着翻倍。
+    news_items = (news_payload.get("items") if isinstance(news_payload.get("items"), list) else [])[:120]
     for item in news_items:
         if not isinstance(item, dict):
             continue
@@ -58806,7 +58808,12 @@ class Handler(SimpleHTTPRequestHandler):
                                 for entry in (item.get("sources") or [])
                             }
                         ]
-                    payload["items"] = [enrich_newsflash_explanation_item(item) for item in items]
+                    # 主快讯页维持 120 条不变；带 ?source= 的空投线报页放宽到 240，
+                    # 否则 Foresight 的旧条目会被别的源挤到 120 之外。
+                    payload["items"] = [
+                        enrich_newsflash_explanation_item(item)
+                        for item in items[: 240 if wanted_sources else 120]
+                    ]
                 self.send_json(payload)
             except Exception as exc:
                 self.send_json({"items": [], "error": str(exc)}, status=502)
