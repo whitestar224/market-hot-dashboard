@@ -374,6 +374,17 @@ EVM_MAX_BLOCKS_PER_POLL_CEILING = 30000
 SOLANA_SIGNATURE_LIMIT_DEFAULT = 200
 SOLANA_SIGNATURE_LIMIT_CEILING = 1000
 
+# ``getTransaction`` costs one RPC round-trip per signature and Solana has no
+# batch variant for jsonParsed payloads.  A spammed wallet can hand us hundreds
+# of *successful* signatures in a single window, and fetching them all in a row
+# makes one poll round outlast every other chain: the shared worker thread sits
+# inside Solana for minutes, so EVM chains stop being polled and health goes
+# stale on all five.  Bound the work per round and checkpoint the cursor at the
+# newest signature actually processed, so the rest is picked up next round
+# instead of being skipped.
+SOLANA_TX_BUDGET_PER_ROUND = 12
+
+
 # Blocks scanned per poll when the fast log path is unavailable.  This is a
 # CATCH-UP budget: while the monitor keeps up, ``start`` is ``previous + 1`` and
 # only the new blocks are fetched, so a larger budget costs nothing in steady
@@ -1809,6 +1820,8 @@ class SmartMoneyMonitor:
     def _poll_solana(self, wallets: list[dict[str, Any]]) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
         failed_total = 0
+        backlog_total = 0
+        truncated_total = 0
         for wallet in wallets:
             address = wallet["address"]
             key = f"solana:{address}:signature"
@@ -1817,6 +1830,7 @@ class SmartMoneyMonitor:
             if previous:
                 params["until"] = previous
             signatures = self.rpc("solana", "getSignaturesForAddress", [address, params]) or []
+            limit_used = SOLANA_SIGNATURE_LIMIT_DEFAULT
             # Hitting the cap means the window was truncated — on a wallet that
             # bots spam with failing transactions, that silently drops real buys.
             # Retry once with the ceiling so the window still reaches back to the
@@ -1826,15 +1840,40 @@ class SmartMoneyMonitor:
                                    [address, {**params, "limit": SOLANA_SIGNATURE_LIMIT_CEILING}]) or []
                 if len(widened) > len(signatures):
                     signatures = widened
+                    limit_used = SOLANA_SIGNATURE_LIMIT_CEILING
             if not previous:
                 if signatures:
                     self.store.set_cursor(key, signatures[0].get("signature") or "")
                 continue
             failed = sum(1 for row in signatures if row.get("err") is not None)
             failed_total += failed
-            for row in reversed(signatures):
+            # Still at the cap even after widening = the flood outran the window
+            # and the hole between the old cursor and the oldest row we can see is
+            # unrecoverable.  Crawling it oldest-first would replay stale trades
+            # while fresh buys go unnoticed for hours, so walk newest-first and
+            # jump the cursor forward, reporting the loss instead of hiding it.
+            truncated = len(signatures) >= limit_used
+            if truncated:
+                truncated_total += 1
+            ordered = list(signatures) if truncated else list(reversed(signatures))
+            # Oldest-first leaves a clean checkpoint: the cursor advances to the
+            # newest signature we actually looked at and never jumps past work we
+            # skipped.  Failed transactions cost no RPC call (they can never be a
+            # buy) but the cursor may still move past them, which is what lets a
+            # spam flood drain quickly.
+            cursor = str(signatures[0].get("signature") or previous) if truncated else previous
+            watched_total = 0
+            backlog = 0
+            for row in ordered:
                 signature = str(row.get("signature") or "")
-                if not signature or row.get("err") is not None:
+                if not signature:
+                    continue
+                if row.get("err") is not None:
+                    if not truncated:
+                        cursor = signature
+                    continue
+                if watched_total >= SOLANA_TX_BUDGET_PER_ROUND:
+                    backlog += 1
                     continue
                 payload = self.rpc("solana", "getTransaction", [signature, {
                     "encoding": "jsonParsed", "commitment": "confirmed",
@@ -1842,6 +1881,9 @@ class SmartMoneyMonitor:
                     # transaction fail with -32015 and silently vanish from monitoring.
                     "maxSupportedTransactionVersion": 1,
                 }]) or {}
+                watched_total += 1
+                if not truncated:
+                    cursor = signature
                 payload["signature"] = signature
                 event = classify_solana_buy(
                     address, payload, self.solana_token_metadata,
@@ -1850,11 +1892,20 @@ class SmartMoneyMonitor:
                 )
                 if event:
                     events.append(self.record_buy(event)["event"])
-            if signatures:
-                self.store.set_cursor(key, signatures[0].get("signature") or previous)
+            if cursor and cursor != previous:
+                self.store.set_cursor(key, cursor)
+            if backlog:
+                backlog_total += backlog
+        notes = []
+        if failed_total:
+            notes.append(f"跳过 {failed_total} 笔失败交易")
+        if backlog_total:
+            notes.append(f"还有 {backlog_total} 笔待回追")
+        if truncated_total:
+            notes.append(f"{truncated_total} 个钱包的签名窗口被灌满，已取最新一段")
         self.store.update_health(
             "solana", "ok",
-            f"只读签名监控正常（本轮跳过 {failed_total} 笔失败交易）" if failed_total else "只读签名监控正常",
+            "只读签名监控正常" + ("（" + "，".join(notes) + "）" if notes else ""),
             str(len(wallets)),
         )
         return events

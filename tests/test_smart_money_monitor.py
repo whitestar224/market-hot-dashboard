@@ -7,6 +7,7 @@ from unittest.mock import patch
 from smart_money_monitor import (
     SOLANA_SIGNATURE_LIMIT_CEILING,
     SOLANA_SIGNATURE_LIMIT_DEFAULT,
+    SOLANA_TX_BUDGET_PER_ROUND,
     SmartMoneyMonitor,
     SmartMoneyStore,
     classify_evm_buy,
@@ -324,6 +325,86 @@ class SolanaSignatureWindowTests(unittest.TestCase):
         ]
         self.assertEqual(self.monitor._poll_solana([{"address": LIMFORK_WALLET, "chain": "solana",
                                                      "alertThresholdUsd": 500.0}]), [])
+
+
+class SolanaPollBudgetTests(unittest.TestCase):
+    """一轮里的 getTransaction 必须有上限。
+
+    一个被灌垃圾交易、同时又真的在买币的地址，一页签名里可能上百笔成功交易；
+    jsonParsed 的 getTransaction 没有批量接口，逐笔取一轮就要几分钟。整个监控只有
+    一个 worker 线程，卡在 Solana 上等于 EVM 四条链一起停摆（实测 health 五条全
+    停在 5 分钟前）。所以按预算取、把游标停在真正处理过的那一笔上，剩下的下一轮接着做。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.monitor = SmartMoneyMonitor(Path(self.tmp.name) / "budget.sqlite")
+        self.monitor.native_price_usd = lambda chain: 0.0
+        self.key = f"solana:{LIMFORK_WALLET}:signature"
+        self.monitor.store.set_cursor(self.key, "cursor-1")
+
+    def tearDown(self):
+        self.monitor.close()
+        self.tmp.cleanup()
+
+    def _wallet(self):
+        return [{"address": LIMFORK_WALLET, "chain": "solana", "alertThresholdUsd": 500.0}]
+
+    def _fake_rpc(self, rows, fetched, page=None):
+        page = page if page is not None else rows
+
+        def fake_rpc(chain, method, params):
+            if method == "getSignaturesForAddress":
+                return page[: params[1].get("limit") or len(page)]
+            fetched.append(params[0])
+            return {}
+
+        return fake_rpc
+
+    def test_one_round_fetches_at_most_the_budget(self):
+        # RPC 按最新在前返回；30 笔都在 200 行窗口内，不会触发放大。
+        rows = [{"signature": f"sig{i}", "err": None} for i in range(30)]
+        fetched: list[str] = []
+        self.monitor.rpc = self._fake_rpc(rows, fetched)
+
+        self.monitor._poll_solana(self._wallet())
+
+        self.assertEqual(len(fetched), SOLANA_TX_BUDGET_PER_ROUND)
+
+    def test_cursor_stops_at_the_last_processed_signature(self):
+        rows = [{"signature": f"sig{i}", "err": None} for i in range(30)]
+        fetched: list[str] = []
+        self.monitor.rpc = self._fake_rpc(rows, fetched)
+
+        self.monitor._poll_solana(self._wallet())
+
+        # 从最旧往前推：先处理 sig29…sig18，游标停在 sig18，下一轮 until 从这里接。
+        self.assertEqual(fetched[0], "sig29")
+        self.assertEqual(self.monitor.store.cursor(self.key), "sig18")
+
+    def test_backlog_is_reported_instead_of_hidden(self):
+        rows = [{"signature": f"sig{i}", "err": None} for i in range(30)]
+        fetched: list[str] = []
+        self.monitor.rpc = self._fake_rpc(rows, fetched)
+
+        self.monitor._poll_solana(self._wallet())
+
+        message = [row for row in self.monitor.store.health() if row["chain"] == "solana"][0]["message"]
+        self.assertIn(f"还有 {30 - SOLANA_TX_BUDGET_PER_ROUND} 笔待回追", message)
+
+    def test_flood_jumps_the_cursor_to_the_newest_and_says_so(self):
+        # 放大到上限仍然打满 = 窗口被灌满，中间那段回不来了：取最新、跳过空洞。
+        rows = [{"signature": f"flood{i}", "err": {"InstructionError": [0, 7]}}
+                for i in range(SOLANA_SIGNATURE_LIMIT_CEILING)]
+        fetched: list[str] = []
+        self.monitor.rpc = self._fake_rpc(rows, fetched)
+
+        self.monitor._poll_solana(self._wallet())
+
+        self.assertEqual(fetched, [])  # 全是失败交易，一笔 getTransaction 都不该烧
+        self.assertEqual(self.monitor.store.cursor(self.key), "flood0")
+        message = [row for row in self.monitor.store.health() if row["chain"] == "solana"][0]["message"]
+        self.assertIn("被灌满", message)
 
 
 class SmartMoneyMonitorTests(unittest.TestCase):
