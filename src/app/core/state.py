@@ -1346,7 +1346,7 @@ PRICE_WATCH_BOARDS = (
         "id": "rootdata-projects",
         "label": "RootData 项目热门榜",
         "short": "RD 项目榜",
-        "description": "RootData 项目热度榜（不进价池，仅控制弹窗）",
+        "description": "RootData 项目热度榜（显示前 10 · 监控前 20 新进提醒，不进价池）",
         "intakeApplies": False,
     },
 )

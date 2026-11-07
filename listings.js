@@ -216,7 +216,14 @@ function allRows() {
 }
 
 function rowMatches(row) {
-  if (listingState.filter !== "all" && row.group !== listingState.filter) return false;
+  const filter = listingState.filter;
+  if (filter === "rootdata") {
+    // RootData 一级融资有专属页签（用户 2026-11-07：「专门开一个板块放 RootData 的」），
+    // 但它同时仍算 IPO 事件，所以用独立标记过滤、不占用 row.group。
+    if (!row.rootdata) return false;
+  } else if (filter !== "all" && row.group !== filter) {
+    return false;
+  }
   if (!listingState.query) return true;
   const query = listingState.query.toLowerCase();
   const target = [

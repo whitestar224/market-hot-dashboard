@@ -1576,6 +1576,21 @@ select option {
   display: block;
 }
 
+/* 没有 logo 也没有兜底缩写（RootData 项目榜）：留位置但保持安静，别画假字母。 */
+.asset-icon.is-plain {
+  border-style: dashed;
+  border-color: rgba(241, 234, 215, 0.28);
+  background: rgba(241, 234, 215, 0.05);
+}
+
+.asset-icon.is-plain::after {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: rgba(241, 234, 215, 0.35);
+}
+
 .asset-icon.is-stock {
   border-radius: 6px;
 }

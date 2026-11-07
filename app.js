@@ -278,6 +278,9 @@ function hydrateMarketCache() {
 }
 
 function iconFallbackText(row, source) {
+  // 后端明确说「这条没有图标」时不要画首字母（用户 2026-11-07：RootData 项目榜上
+  // 那两枚字母不是币名缩写，是项目名前两个字母，纯噪音）。
+  if (row.iconFallback === "none") return "";
   const group = source?.group || "";
   const rawName = String(row.name || row.symbol || source?.sourceLabel || "").trim();
   const symbol = String(row.symbol || "").trim();
@@ -348,7 +351,9 @@ function renderAssetIcon(row, source) {
   const image = src
     ? `<img src="${escapeHtml(src)}" alt="${alt}" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="window.advanceAssetIcon(this)">`
     : "";
-  return `<span class="asset-icon ${assetIconClass(source)} ${src ? "" : "is-fallback"}" data-icons="${dataset}" data-icon-index="0">${image}<em>${label}</em></span>`;
+  // 没图又没有兜底文字 → 画一个空的虚线圆圈，别让版面塌陷，也别塞假字母。
+  const plain = !src && !label ? " is-plain" : "";
+  return `<span class="asset-icon ${assetIconClass(source)} ${src ? "" : "is-fallback"}${plain}" data-icons="${dataset}" data-icon-index="0">${image}<em>${label}</em></span>`;
 }
 
 function normalizeMarketSymbol(value) {

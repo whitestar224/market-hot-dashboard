@@ -19807,6 +19807,9 @@ def listing_events_payload() -> dict[str, Any]:
     fetchers = [
         ("exchange-listings", crypto_listing_section),
         ("ipo-calendar", nasdaq_ipo_section),
+        # 一级融资（2026-11-07 用户要求）挂在 IPO 段之后：同一类「还没上二级市场」的
+        # 事件放一起看；行内 group="ipo"，所以在 IPO 页签里也能筛到。
+        ("rootdata-fundraising", rootdata_fundraising_section),
         ("cn-new-stocks", a_share_new_stock_section),
         ("hk-us-listings", hk_us_listing_section),
     ]
@@ -20196,14 +20199,18 @@ def recover_market_sources_from_independent_caches(payload: dict[str, Any]) -> d
 def fetch_rootdata_projects() -> dict[str, Any]:
     """RootData 项目热门榜：按 RD 热度指数倒排，滤掉交易所/稳定币这些老大哥。
 
-    页面（``/projects?evalSort=2``）在腾讯云 WAF 后面，服务器直接抓只能拿到滑块
-    验证码页；取数由专用 Chrome 完成并落快照（见 ``rootdata_projects``），这里只读
-    快照，热路径不碰网络。快照过期就在后台拉一次，失败保留旧数据但**明说年龄**。
+    2026-11-07 实测：``www.rootdata.com`` 挂在腾讯云 WAF 后面，但 ``cn.rootdata.com``
+    是纯服务端渲染（项目页 615KB、表格 30 行），只要走一个能出网的代理就能直接抓，
+    **不需要浏览器，也不需要登录**。取数全部在 ``rootdata_projects``，这里只读快照，
+    热路径不碰网络；快照过期就在后台拉一次，失败保留旧数据但**明说年龄**。
     """
     snapshot = ROOTDATA_PROJECTS.read_snapshot()
-    rows = ROOTDATA_PROJECTS.project_rows(limit=20)
+    # 卡片只显示前 10（用户 2026-11-07）；弹窗监控的是前 20，见 rootdata_projects.ProjectWatch。
+    rows = ROOTDATA_PROJECTS.project_rows(limit=ROOTDATA_PROJECTS.PROJECT_DISPLAY_LIMIT)
     age = ROOTDATA_PROJECTS.snapshot_age_seconds(snapshot)
-    if snapshot and age > ROOTDATA_PROJECTS.SNAPSHOT_TTL_SECONDS:
+    # 快照过期或根本没有快照 → 后台拉一次（两个数据集一起拉，融资那边也靠它续命）。
+    # ``refresh_async`` 自带「正在跑 / 刚失败过」的闸门，不会堆线程。
+    if not snapshot or age > ROOTDATA_PROJECTS.PROJECTS_TTL_SECONDS:
         ROOTDATA_PROJECTS.refresh_async()
     if not snapshot:
         return source_template(
@@ -20216,8 +20223,8 @@ def fetch_rootdata_projects() -> dict[str, Any]:
             source_name="RootData · 尚未初始化",
             rows=[],
             status="unavailable",
-            empty_title="RootData 还没授权",
-            empty_message="双击「刷新RootData登录态.cmd」过一次验证码，之后服务会自己刷新。",
+            empty_title="RootData 还没取到数据",
+            empty_message="服务启动后 15 分钟内会自动抓一次（走本地代理直连 cn.rootdata.com），也可手动跑 tools/rootdata_login.py --pull。",
         )
     if not rows:
         return source_template(
@@ -20234,22 +20241,76 @@ def fetch_rootdata_projects() -> dict[str, Any]:
             empty_message="快照存在但没有解析出项目，检查页面结构是否变化。",
         )
     minutes = int(age // 60) if age != float("inf") else 0
-    stale = age > ROOTDATA_PROJECTS.SNAPSHOT_TTL_SECONDS
+    stale = age > ROOTDATA_PROJECTS.PROJECTS_TTL_SECONDS
     return source_template(
         id="rootdata-projects",
         group="crypto",
         title="RootData 项目热门榜",
-        subtitle="按 RD 热度指数倒排 · 已滤掉交易所/稳定币",
+        subtitle=f"按 RD 热度指数倒排 · 显示前 {ROOTDATA_PROJECTS.PROJECT_DISPLAY_LIMIT} · 监控前 {ROOTDATA_PROJECTS.PROJECT_WATCH_LIMIT}",
         accent="#6c8cff",
         source_label="RD",
         source_name=(
             f"RootData projects · 抓取于 {minutes} 分钟前" if stale
-            else "RootData projects · 浏览器快照"
+            else "RootData projects · 实时快照"
         ),
         rows=rows,
         status="stale" if stale else "ok",
         empty_title="RootData 榜单当前为空",
-        empty_message="页面结构变化或验证码过期，双击「刷新RootData登录态.cmd」重抓。",
+        empty_message="页面结构变化或代理不通，等一下服务会自动重抓（15 分钟一轮）。",
+    )
+
+
+def rootdata_fundraising_section() -> dict[str, Any]:
+    """RootData 一级融资 → 「上新 IPO」板块里的一段。
+
+    用户 2026-11-07 原话：「把这个页面里的融资情况加入到上新IPO板块里，UI 风格还是
+    以前那样，然后有新的融资情况，就弹窗提醒我」。所以这里是**板块的一段**（走
+    ``listing_section`` 那套字段、``group="ipo"`` 让它落到 IPO 筛选页签），弹窗则是另一
+    条独立链路（``send_rootdata_funding_desktop_alert``）。
+
+    只读快照，热路径不碰网络；快照过期就后台拉一次，但**保留旧数据并明说年龄**——
+    抓取失败不许伪装成空板块。
+    """
+    snapshot = ROOTDATA_PROJECTS.read_fundraising_snapshot()
+    rows = ROOTDATA_PROJECTS.fundraising_rows(limit=18)
+    age = ROOTDATA_PROJECTS.fundraising_age_seconds(snapshot)
+    if not snapshot or age > ROOTDATA_PROJECTS.FUNDRAISING_TTL_SECONDS:
+        ROOTDATA_PROJECTS.refresh_async()
+    if not snapshot:
+        return listing_section(
+            id="rootdata-fundraising",
+            title="RootData 一级融资",
+            subtitle="cn.rootdata.com/fundraising · 按日期倒排",
+            accent="#f0a63c",
+            source_name="RootData · 尚未初始化",
+            rows=[],
+            status="unavailable",
+            empty_message="融资页还没抓过：服务启动后 15 分钟内会自动抓一次，也可手动跑 tools/rootdata_login.py --pull。",
+        )
+    if not rows:
+        return listing_section(
+            id="rootdata-fundraising",
+            title="RootData 一级融资",
+            subtitle="cn.rootdata.com/fundraising · 按日期倒排",
+            accent="#f0a63c",
+            source_name="RootData · 快照里没有可用事件",
+            rows=[],
+            status="unavailable",
+            empty_message="快照存在但没有解析出融资事件，检查页面结构是否变化。",
+        )
+    minutes = int(age // 60) if age != float("inf") else 0
+    stale = age > ROOTDATA_PROJECTS.FUNDRAISING_TTL_SECONDS
+    return listing_section(
+        id="rootdata-fundraising",
+        title="RootData 一级融资",
+        subtitle="cn.rootdata.com/fundraising · 按日期倒排",
+        accent="#f0a63c",
+        source_name=(
+            f"RootData 融资 · 抓取于 {minutes} 分钟前" if stale else "RootData 融资 · 实时快照"
+        ),
+        rows=rows,
+        status="stale" if stale else "ok",
+        empty_message="页面结构变化或代理不通，等一下服务会自动重抓。",
     )
 
 
@@ -26354,6 +26415,11 @@ def desktop_alert_political_military_reason(item: dict[str, Any]) -> str:
         return ""  # Verified buys are not the muted whale position-change news category.
     if kind == "价格监控" or source == "币种价格监控" or key.startswith("price-watch:"):
         return ""
+    # 一级融资 / 项目榜新进（2026-11-07）：项目名里可能真带政治词（"Trump"、"Israel"
+    # 之类），但这两条消息讲的是「谁融了多少钱」「谁挤进了热度榜」，不是政治军事动态。
+    # 跟聪明钱一样按 key 前缀白名单放行，否则用户点名要的弹窗会被静默规则悄悄吃掉。
+    if key.startswith(("rootdata-funding:", "rootdata-project:")):
+        return ""
     text = " ".join(
         part for part in (
             alert_text(item.get("title"), 240),
@@ -27232,6 +27298,113 @@ def send_smart_money_buy_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
         "speech": f"聪明钱 {nickname} 买入 {symbol}，金额约 {payment_usd:,.0f} 美元",
         "originalText": json.dumps(event, ensure_ascii=False)[:1800],
     })
+
+
+def send_rootdata_project_desktop_alert(project: dict[str, Any]) -> dict[str, Any]:
+    """RootData 项目榜「有新项目挤进监控前 20」时弹一条（用户 2026-11-07）。
+
+    用户原话：「只展示前10个，但是弹窗监控监控20个，有新进的就做弹窗提示」。判定与
+    基线全在 ``rootdata_projects``（快照里的 ``watched``），这里只排版。
+
+    去重靠 key（项目名）+ 投递层的 TTL，所以同一个项目 20 名开外晃进晃出不会连着弹。
+    """
+    if not isinstance(project, dict):
+        return {"ok": False, "error": "invalid project"}
+    name = clean_feed_text(project.get("name") or "未知项目", 60)
+    if not name:
+        return {"ok": False, "error": "project has no name"}
+    intro = clean_feed_text(project.get("intro"), 90)
+    tags = [clean_feed_text(tag, 24) for tag in (project.get("tags") or [])]
+    tags = [tag for tag in tags if tag]
+    popularity = int(safe_float(project.get("popularity")))
+    growth = int(safe_float(project.get("growth")))
+    rank = int(safe_float(project.get("rank")))
+    bits = []
+    if popularity:
+        bits.append(f"热度 {popularity}")
+    if growth:
+        bits.append(f"成长 +{growth}%")
+    body = " · ".join(bits) or "RootData 项目热度榜新进"
+    if intro:
+        body = f"{intro} · {body}"
+    if tags:
+        body = f"{body} · {' '.join(tags[:3])}"
+    return launch_desktop_alert({
+        "key": f"rootdata-project:new:{name.casefold()}",
+        "kind": "项目热度新进",
+        "source": "RootData 项目榜",
+        "sourceLabel": "RD",
+        "sourceType": "rootdata-project",
+        "board": "rootdata-projects",
+        "title": f"RD 项目榜新进 · {name}" + (f" · 第 {rank} 名" if rank else ""),
+        "body": body,
+        "url": clean_feed_text(project.get("url"), 600) or ROOTDATA_PROJECTS.PROJECTS_URL,
+        "priority": f"第 {rank} 名" if rank else "新进",
+        "queuePriority": 90,
+        "speech": f"RootData 项目榜新进：{name}" + (f"，热度 {popularity}" if popularity else ""),
+        "originalText": json.dumps(project, ensure_ascii=False)[:1200],
+    })
+
+
+def send_rootdata_funding_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
+    """RootData 出现「新的一级融资」时弹一条（用户 2026-11-07）。
+
+    去重账本在 ``rootdata_projects``（``seenKeys``），这里只负责排版：首跑只建账本、
+    绝不一次弹 30 条；之后每轮只弹新出现的 ``name + round + date`` 组合。
+
+    排版纪律：卡片恒 374 宽、标题单行 —— 项目名 + 轮次 + 金额，估值与投资方进正文。
+    优先级 90：低于聪明钱买单（120）与价格监控（100），融资是「该看一眼」不是「该抢」。
+    """
+    if not isinstance(event, dict):
+        return {"ok": False, "error": "invalid funding event"}
+    name = clean_feed_text(event.get("name") or "未知项目", 60)
+    round_name = clean_feed_text(event.get("round") or "融资", 30)
+    ticker = clean_feed_text(event.get("symbol"), 30)
+    amount = clean_feed_text(event.get("amount"), 30)
+    valuation = clean_feed_text(event.get("valuation"), 30)
+    investors = [
+        clean_feed_text(item, 40)
+        for item in (event.get("investors") or [])
+        if clean_feed_text(item, 40)
+    ]
+    extra = int(safe_float(event.get("investorExtra")))
+    if extra > 0:
+        investors.append(f"+{extra}")
+    body_parts = []
+    if valuation:
+        body_parts.append(f"估值 {valuation}")
+    if investors:
+        body_parts.append("投资方 " + " / ".join(investors[:3]))
+    body = " · ".join(body_parts) or "RootData 融资页新收录一条一级市场事件"
+    event_key = ROOTDATA_PROJECTS.fundraising_event_key(event)
+    title = f"{name} {round_name}" + (f" ${ticker}" if ticker else "")
+    if amount:
+        title = f"{title} · {amount}"
+    return launch_desktop_alert({
+        "key": f"rootdata-funding:{event_key}",
+        "kind": "一级融资",
+        "source": "RootData 融资",
+        "sourceLabel": "RD",
+        "sourceType": "rootdata-funding",
+        # 显式指定板块：这个板块的「弹窗」开关必须能一把关掉融资提醒（默认开）。
+        "board": "rootdata-projects",
+        "title": title,
+        "body": body,
+        "url": clean_feed_text(event.get("url"), 600) or ROOTDATA_PROJECTS.FUNDRAISING_URL,
+        "time": int(safe_float(event.get("date"))) or int(time.time() * 1000),
+        "priority": amount or "一级融资",
+        "queuePriority": 90,
+        "speech": f"RootData 融资：{name} {round_name}" + (f"，{amount}" if amount else ""),
+        "originalText": json.dumps(event, ensure_ascii=False)[:1200],
+    })
+
+
+# 模块级注册（不是 main()）：RootData 的刷新会被 ``/api/listing-events``（HTTP 进程）
+# 和 ``--worker-market``（市场 worker，不走 main()）同时触发，谁先抢到锁谁抓谁弹——
+# 两个进程都得有回调，否则抢到锁的那个「没人听」就白抓了。跨进程重复弹窗由
+# ``rootdata_projects`` 里的锁文件 + 快照里的基线名单挡住。
+ROOTDATA_PROJECTS.set_project_alert_callback(send_rootdata_project_desktop_alert)
+ROOTDATA_PROJECTS.set_fundraising_alert_callback(send_rootdata_funding_desktop_alert)
 
 
 def send_kol_sync_desktop_alert(context: dict[str, Any]) -> dict[str, Any]:
@@ -60188,6 +60361,8 @@ def main():
     start_price_watch_monitor(enable_workers=args.port == primary_monitor_port)
     start_chat_hourly_summary_monitor()
     SMART_MONEY_MONITOR.set_alert_callback(send_smart_money_buy_desktop_alert)
+    # RootData 融资的弹窗回调不在这里注册 —— 见 send_rootdata_funding_desktop_alert
+    # 定义处的模块级注册（--worker-market 进程不走 main()，却同样会触发刷新）。
     # 三个人同时上车同一个币 → 另一条独立弹窗（用户 2026-10-27 点名要的）。
     SMART_MONEY_MONITOR.set_sync_alert_callback(send_kol_sync_desktop_alert)
     # The smart-money board's intake switch stops new buys at the poll layer.
