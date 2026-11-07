@@ -190,6 +190,27 @@ DEFAULT_SMART_MONEY_SEEDS = (
         # 500U 能滤掉几十美元的试单，又不会把时间线刷满。
         "alertThresholdUsd": 500.0,
     },
+    {
+        "address": "BQVz7fQ1WsQmSTMY3umdPEPPTm1sdcBcX9sP7o6kPRmB",
+        "nickname": "Limfork",
+        "sourceName": "用户提供 · Solana",
+        "sourceUrl": "https://solscan.io/account/BQVz7fQ1WsQmSTMY3umdPEPPTm1sdcBcX9sP7o6kPRmB",
+        "sourceEvidence": (
+            "用户 2026-11-07 指定：「SOL链的这个聪明钱也做追踪和弹窗提示……KOL是 Limfork」。"
+            "链上核验（2026-11-07 08:xx，走 Clash 7890，publicnode/official 双端点）："
+            "余额 264.7 SOL、1036 个有余额的代币账户，2026-08-02 起有历史，"
+            "2026-11-06 23:32 有它**自己签名**的成功交易 —— 是真实交易钱包。"
+            "**但它被机器人灌垃圾交易**：2026-11-07 02:34~08:11 之间，"
+            "它的签名列表被 25000 笔/4 分钟（≈100 笔/秒）的**全部失败**交易占据，"
+            "其中它只是被当作只读账户引用（蹭标签）。因此 limit=20 的窗口只覆盖 ~0.2 秒，"
+            "真实买入会被挤掉 —— 所以配套把 SOLANA_SIGNATURE_LIMIT_DEFAULT 提到 200 并"
+            "在命中上限时放大到 1000（见该常量注释）。"
+            "它自己签名的交易极少（抽样 25000 笔里成功 6 笔），阈值暂定 500U，"
+            "待积累到足够真实买单后按中位金额校准。"
+        ),
+        "chains": ("solana",),
+        "alertThresholdUsd": 500.0,
+    },
 )
 
 # ---------------------------------------------------------------------------
@@ -344,6 +365,14 @@ SUPPORTED_CHAINS = (*EVM_CHAINS, "solana")
 EVM_MAX_BLOCKS_PER_POLL_DEFAULT = 120
 EVM_MAX_BLOCKS_PER_POLL_BY_CHAIN = {"robinhood": 3000}
 EVM_MAX_BLOCKS_PER_POLL_CEILING = 30000
+
+# Signatures fetched per poll, per Solana wallet.  ``getSignaturesForAddress``
+# has no server-side filter, so a busy address buries real trades under spam:
+# BQVz7fQ1… took 25000 *failed* transactions in four minutes (~100/second) from
+# bots that merely referenced it.  A 20-row window covers ~0.2s of that flood
+# and the actual buy gets pushed out, so the window widens on demand.
+SOLANA_SIGNATURE_LIMIT_DEFAULT = 200
+SOLANA_SIGNATURE_LIMIT_CEILING = 1000
 
 # Blocks scanned per poll when the fast log path is unavailable.  This is a
 # CATCH-UP budget: while the monitor keeps up, ``start`` is ``previous + 1`` and
@@ -1775,18 +1804,30 @@ class SmartMoneyMonitor:
 
     def _poll_solana(self, wallets: list[dict[str, Any]]) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
+        failed_total = 0
         for wallet in wallets:
             address = wallet["address"]
             key = f"solana:{address}:signature"
             previous = self.store.cursor(key)
-            params: dict[str, Any] = {"limit": 20, "commitment": "confirmed"}
+            params: dict[str, Any] = {"limit": SOLANA_SIGNATURE_LIMIT_DEFAULT, "commitment": "confirmed"}
             if previous:
                 params["until"] = previous
             signatures = self.rpc("solana", "getSignaturesForAddress", [address, params]) or []
+            # Hitting the cap means the window was truncated — on a wallet that
+            # bots spam with failing transactions, that silently drops real buys.
+            # Retry once with the ceiling so the window still reaches back to the
+            # previous cursor.
+            if previous and len(signatures) >= SOLANA_SIGNATURE_LIMIT_DEFAULT:
+                widened = self.rpc("solana", "getSignaturesForAddress",
+                                   [address, {**params, "limit": SOLANA_SIGNATURE_LIMIT_CEILING}]) or []
+                if len(widened) > len(signatures):
+                    signatures = widened
             if not previous:
                 if signatures:
                     self.store.set_cursor(key, signatures[0].get("signature") or "")
                 continue
+            failed = sum(1 for row in signatures if row.get("err") is not None)
+            failed_total += failed
             for row in reversed(signatures):
                 signature = str(row.get("signature") or "")
                 if not signature or row.get("err") is not None:
@@ -1804,7 +1845,11 @@ class SmartMoneyMonitor:
                     events.append(self.record_buy(event)["event"])
             if signatures:
                 self.store.set_cursor(key, signatures[0].get("signature") or previous)
-        self.store.update_health("solana", "ok", "只读签名监控正常", str(len(wallets)))
+        self.store.update_health(
+            "solana", "ok",
+            f"只读签名监控正常（本轮跳过 {failed_total} 笔失败交易）" if failed_total else "只读签名监控正常",
+            str(len(wallets)),
+        )
         return events
 
     def poll_once(self) -> list[dict[str, Any]]:

@@ -5,6 +5,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from smart_money_monitor import (
+    SOLANA_SIGNATURE_LIMIT_CEILING,
+    SOLANA_SIGNATURE_LIMIT_DEFAULT,
     SmartMoneyMonitor,
     SmartMoneyStore,
     classify_evm_buy,
@@ -43,6 +45,8 @@ PONS_DELTA_SPENT_RAW = 300000 * 10**18
 PONS_BUY_TX = "0x7599fd4b3340f9049541a4a3a48943b1d4a591cc5b4e68159374401864cd1337"
 #: THEO（用户 2026-11-06 提供的 Solana 聪明钱，base58 地址，只接 solana 单链）。
 THEO_WALLET = "Bi4rd5FH5bYEN8scZ7wevxNZyNmKHdaBcvewdPFxYdLt"
+#: Limfork（用户 2026-11-07 提供）：真实交易钱包，但长期被机器人灌失败交易。
+LIMFORK_WALLET = "BQVz7fQ1WsQmSTMY3umdPEPPTm1sdcBcX9sP7o6kPRmB"
 BONK_GUY_NO_THRESHOLD_WALLET = BONK_GUY_EVM_WALLET
 SOL_TOKEN = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6JgB263QP6Bpump"
 SOL_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -273,6 +277,55 @@ class SmartMoneyClassificationTests(unittest.TestCase):
         self.assertFalse(event["popupEligible"])
 
 
+class SolanaSignatureWindowTests(unittest.TestCase):
+    """被机器人灌垃圾交易的地址，签名窗口必须自动放大，否则真实买入被挤掉。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.monitor = SmartMoneyMonitor(Path(self.tmp.name) / "window.sqlite")
+
+    def tearDown(self):
+        self.monitor.close()
+        self.tmp.cleanup()
+
+    def _run(self, first_page_rows, second_page_rows=None):
+        key = f"solana:{LIMFORK_WALLET}:signature"
+        self.monitor.store.set_cursor(key, "cursor-1")
+        asked = []
+
+        def fake_rpc(chain, method, params):
+            limit = params[1].get("limit")
+            asked.append(limit)
+            if limit == SOLANA_SIGNATURE_LIMIT_DEFAULT:
+                return [{"signature": f"a{i}", "err": {"InstructionError": [0, 7]}}
+                        for i in range(first_page_rows)]
+            return [{"signature": f"b{i}", "err": {"InstructionError": [0, 7]}}
+                    for i in range(second_page_rows or 0)]
+
+        self.monitor.rpc = fake_rpc
+        self.monitor._poll_solana([{"address": LIMFORK_WALLET, "chain": "solana",
+                                    "alertThresholdUsd": 500.0}])
+        return asked
+
+    def test_window_widens_to_the_ceiling_when_the_first_page_fills_up(self):
+        asked = self._run(SOLANA_SIGNATURE_LIMIT_DEFAULT, SOLANA_SIGNATURE_LIMIT_CEILING)
+        self.assertEqual(asked, [SOLANA_SIGNATURE_LIMIT_DEFAULT, SOLANA_SIGNATURE_LIMIT_CEILING])
+
+    def test_quiet_wallet_only_costs_one_call(self):
+        asked = self._run(3)
+        self.assertEqual(asked, [SOLANA_SIGNATURE_LIMIT_DEFAULT])
+
+    def test_failed_transactions_never_become_events(self):
+        key = f"solana:{LIMFORK_WALLET}:signature"
+        self.monitor.store.set_cursor(key, "cursor-1")
+        self.monitor.rpc = lambda chain, method, params: [
+            {"signature": "noise1", "err": {"InstructionError": [0, 7]}},
+            {"signature": "noise2", "err": {"InstructionError": [1, 13]}},
+        ]
+        self.assertEqual(self.monitor._poll_solana([{"address": LIMFORK_WALLET, "chain": "solana",
+                                                     "alertThresholdUsd": 500.0}]), [])
+
+
 class SmartMoneyMonitorTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -324,8 +377,8 @@ class SmartMoneyMonitorTests(unittest.TestCase):
             rows = seeded.store.list_wallets()
             # cowboy 占三行（BSC/ETH/Base 各一），阿峰占一行（只 BSC），
             # 15 个「追踪钱包」各占三行（只记录不弹窗，见 test_kol_sync），
-            # pons榜5 占一行（只 Robinhood），THEO 占一行（只 Solana）。
-            self.assertEqual(len(rows), 85)
+            # pons榜5 占一行（只 Robinhood），THEO 与 Limfork 各占一行（只 Solana）。
+            self.assertEqual(len(rows), 86)
             self.assertEqual({row["chain"] for row in rows}, {"ethereum", "bsc", "base", "robinhood", "solana"})
             by_address = {}
             for row in rows:
@@ -340,8 +393,10 @@ class SmartMoneyMonitorTests(unittest.TestCase):
             self.assertEqual(by_address[BONK_GUY_EVM_WALLET], {("Bonk Guy (Unipcs)", "Bonk Guy 公开钱包")})
             self.assertEqual(by_address[BONK_GUY_SOL_WALLET], {("Bonk Guy (Unipcs)", "Bonk Guy 公开钱包")})
             self.assertEqual(by_address[THEO_WALLET], {("THEO", "用户提供 · Solana")})
+            self.assertEqual(by_address[LIMFORK_WALLET], {("Limfork", "用户提供 · Solana")})
             # base58 地址在 EVM 上不存在：漏写 chains 会白铺四条 EVM 链。
             self.assertEqual([row["chain"] for row in rows if row["address"] == THEO_WALLET], ["solana"])
+            self.assertEqual([row["chain"] for row in rows if row["address"] == LIMFORK_WALLET], ["solana"])
             self.assertEqual(by_address[PONS_WALLET], {("pons榜5", "用户提供 · Robinhood 链")})
             self.assertEqual(by_address[BONK_GUY_USELESS_WALLET], {("Bonk Guy (Unipcs)", "Bonk Guy 公开钱包")})
             self.assertEqual(sum(row["address"] == BONK_GUY_EVM_WALLET for row in rows), 4)
