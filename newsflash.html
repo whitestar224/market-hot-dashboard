@@ -9,7 +9,7 @@
     <link rel="apple-touch-icon" sizes="180x180" href="./assets/apple-touch-icon.png?v=2" />
     <link rel="manifest" href="./site.webmanifest" />
     <script src="./desktop_adapter.js?v=1"></script>
-    <link rel="stylesheet" href="./styles.css?v=104" />
+    <link rel="stylesheet" href="./styles.css?v=105" />
   </head>
   <body>
     <main class="app-shell flash-shell">
@@ -59,21 +59,11 @@
           <input id="flashSearch" type="search" placeholder="ETF / 非农 / LayerZero / Binance" />
         </label>
         <button id="refreshFlash" class="action-button" type="button">刷新快讯</button>
-        <span id="flashSourceSummary" class="flash-source-summary">公共源已接入 BB · BWE · 吴说 · FN</span>
-      </section>
-
-      <section class="flash-airdrop" id="flashAirdropSection" aria-label="空投线报板块">
-        <div class="flash-airdrop-head">
-          <div class="flash-airdrop-title">
-            <p class="section-label">AIRDROP INTEL</p>
-            <h2>空投线报</h2>
-          </div>
-          <span id="flashAirdropCount" class="flash-airdrop-count">暂无</span>
-          <button id="flashAirdropToggle" class="action-button flash-airdrop-toggle" type="button" hidden>展开全部</button>
-        </div>
-        <div id="flashAirdropList" class="flash-airdrop-list">
-          <div class="loading-panel">暂无空投线报。</div>
-        </div>
+        <a id="flashAirdropEntry" class="action-button flash-airdrop-entry" href="./airdrop.html"
+           title="打开空投线报页（Foresight 空投线报 + 空投标签）">
+          空投线报<span id="flashAirdropCount" class="flash-airdrop-count" hidden>0</span>
+        </a>
+        <span id="flashSourceSummary" class="flash-source-summary">公共源已接入 BB · BWE · 吴说</span>
       </section>
 
       <section id="flashList" class="flash-list" aria-label="聚合快讯列表">
@@ -83,7 +73,7 @@
 
     <script src="./wallets.js?v=6"></script>
     <script src="./auth.js?v=19"></script>
-    <script src="./newsflash.js?v=11"></script>
+    <script src="./newsflash.js?v=12"></script>
     <script src="./notifier.js?v=12"></script>
     <script src="./todo_reminder.js?v=1"></script>
   </body>
