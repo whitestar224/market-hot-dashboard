@@ -2,7 +2,17 @@ const flashState = {
   items: [],
   query: ""
 };
-const FLASH_CACHE_KEY = "xingyunshe:newsflash:payload:v2";
+
+// 同一份脚本服务两个页面：聚合快讯（不设）和「空投线报」（页面里写
+// `window.FLASH_SOURCE = "foresight"`）。设了之后接口只回该来源的条目，
+// 本地缓存也分开存，免得两个页面互相覆盖。
+const FLASH_SOURCE = String(window.FLASH_SOURCE || "").trim().toLowerCase();
+const FLASH_API_URL = FLASH_SOURCE
+  ? `/api/newsflash?source=${encodeURIComponent(FLASH_SOURCE)}`
+  : "/api/newsflash";
+const FLASH_CACHE_KEY = FLASH_SOURCE
+  ? `xingyunshe:newsflash:payload:${FLASH_SOURCE}`
+  : "xingyunshe:newsflash:payload:v2";
 
 const flashList = document.querySelector("#flashList");
 const flashSearch = document.querySelector("#flashSearch");
@@ -129,19 +139,27 @@ function renderFlash() {
 async function loadFlash(options = {}) {
   const hasData = flashState.items.length > 0 || hydrateFlashCache();
   try {
-    const response = await fetch(`/api/newsflash${options.refresh ? "?refresh=1" : ""}`, { cache: "no-store" });
+    const refreshSuffix = options.refresh ? (FLASH_API_URL.includes("?") ? "&refresh=1" : "?refresh=1") : "";
+    const response = await fetch(`${FLASH_API_URL}${refreshSuffix}`, { cache: "no-store" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const payload = await response.json();
     flashState.items = payload.items || [];
     writeCachedPayload(FLASH_CACHE_KEY, payload);
     const sourceCount = Number(payload.sourceCount || 1);
     const deduplicatedCount = Number(payload.deduplicatedCount || 0);
-    setFlashStatus(`${sourceCount} 个来源 · 已去重 ${deduplicatedCount} 条`, "ok");
+    setFlashStatus(
+      FLASH_SOURCE
+        ? `${flashState.items.length} 条 · 已去重 ${deduplicatedCount} 条`
+        : `${sourceCount} 个来源 · 已去重 ${deduplicatedCount} 条`,
+      "ok"
+    );
     const activeSources = (Array.isArray(payload.sources) ? payload.sources : [])
       .filter((source) => source?.status === "ok" && Number(source?.count || 0) > 0)
       .map((source) => source.name)
       .filter(Boolean);
-    if (flashSourceSummary && activeSources.length) {
+    if (flashSourceSummary && activeSources.length && !FLASH_SOURCE) {
+      // 单源页面（空投线报）保留页面自己的「来源 Foresight 空投线报」，
+      // 否则这里会把整站的 4 个源都列出来，看着像是混了别的源。
       flashSourceSummary.textContent = `已接入 ${activeSources.join(" · ")}`;
       flashSourceSummary.title = activeSources.join("、");
     }

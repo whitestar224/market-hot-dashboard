@@ -1,0 +1,78 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>星云社 · 空投线报</title>
+    <link rel="icon" href="./favicon.ico?v=2" sizes="any" />
+    <link rel="icon" type="image/png" sizes="32x32" href="./assets/favicon-32.png?v=2" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./assets/apple-touch-icon.png?v=2" />
+    <link rel="manifest" href="./site.webmanifest" />
+    <script src="./desktop_adapter.js?v=1"></script>
+    <link rel="stylesheet" href="./styles.css?v=103" />
+  </head>
+  <body>
+    <main class="app-shell flash-shell">
+      <header class="command-deck flash-deck">
+        <div class="topbar">
+          <div class="brand">
+            <span class="brand-mark brand-logo">
+              <img src="./assets/xingyunshe-logo.png?v=2" alt="星云社 logo" />
+            </span>
+            <div>
+              <p class="eyebrow">XINGYUN SOCIETY</p>
+              <h1>星云社</h1>
+              <span class="brand-subtitle">空投线报</span>
+            </div>
+          </div>
+          <nav class="page-nav" aria-label="页面导航">
+            <a class="nav-link" href="./index.html">热门榜</a>
+            <a class="nav-link" href="./gainers.html">涨幅榜</a>
+            <a class="nav-link" href="./turnover.html">成交额榜</a>
+            <a class="nav-link" href="./newboards.html">新币新股</a>
+            <a class="nav-link" href="./listings.html">上新IPO</a>
+            <a class="nav-link" href="./newsflash.html">聚合快讯</a>
+            <a class="nav-link active" href="./airdrop.html">空投线报</a>
+            <a class="nav-link" href="./briefs.html">自动简报</a>
+            <a class="nav-link" href="./rss.html">RSS订阅</a>
+            <a class="nav-link" href="./xwatch.html">X追踪</a>
+            <a class="nav-link" href="./price-watch.html">监控</a>
+            <a class="nav-link" href="./event-flow.html">事件流</a>
+            <a class="nav-link" href="./strategy.html">策略看盘</a>
+            <a class="nav-link" href="./todo.html">TodoList</a>
+           <a class="nav-link nav-discord" href="https://discord.gg/mKyCwtHW" target="_blank" rel="noreferrer noopener" aria-label="打开星云社 Discord 社区">Discord</a>
+          </nav>
+          <div class="status-cluster" aria-label="数据状态">
+            <span class="live-dot"></span>
+            <span id="clock">--:--:--</span>
+            <span id="flashStatus" class="status-pill">空投线报就绪</span>
+          </div>
+        </div>
+
+        <section class="flash-hero flash-hero-compact">
+          <p class="section-label">FORESIGHT NEWS · AIRDROP INTEL · 单一来源不再混进快讯流</p>
+        </section>
+      </header>
+
+      <section class="control-dock flash-controls" aria-label="空投线报控制">
+        <label class="search-box">
+          <span>搜索</span>
+          <input id="flashSearch" type="search" placeholder="空投 / 领取 / TGE / 积分 / Soneium" />
+        </label>
+        <button id="refreshFlash" class="action-button" type="button">刷新线报</button>
+        <span id="flashSourceSummary" class="flash-source-summary">来源 Foresight 空投线报</span>
+      </section>
+
+      <section id="flashList" class="flash-list" aria-label="空投线报列表">
+        <div class="loading-panel">暂无空投线报。</div>
+      </section>
+    </main>
+
+    <script>window.FLASH_SOURCE = "foresight";</script>
+    <script src="./wallets.js?v=6"></script>
+    <script src="./auth.js?v=19"></script>
+    <script src="./newsflash.js?v=8"></script>
+    <script src="./notifier.js?v=12"></script>
+    <script src="./todo_reminder.js?v=1"></script>
+  </body>
+</html>

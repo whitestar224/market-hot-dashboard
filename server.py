@@ -58788,7 +58788,23 @@ class Handler(SimpleHTTPRequestHandler):
                 else:
                     payload = cached_api_payload("newsflash", fetch_aggregated_newsflash, newsflash_ttl)
                 if isinstance(payload.get("items"), list):
-                    payload["items"] = [enrich_newsflash_explanation_item(item) for item in payload["items"]]
+                    # `?source=foresight` → 只留该源的条目（空投线报单独页面用）。
+                    # 用合并后的 `sources` 列表判，跨源重复被并掉的条目也不会漏。
+                    try:
+                        source_filter = str((parse_qs(parsed.query or "").get("source") or [""])[0]).strip().casefold()
+                    except Exception:
+                        source_filter = ""
+                    items = payload["items"]
+                    if source_filter:
+                        items = [
+                            item for item in items
+                            if str(item.get("sourceId") or "").casefold() == source_filter
+                            or source_filter in {
+                                str(entry.get("id") or "").casefold()
+                                for entry in (item.get("sources") or [])
+                            }
+                        ]
+                    payload["items"] = [enrich_newsflash_explanation_item(item) for item in items]
                 self.send_json(payload)
             except Exception as exc:
                 self.send_json({"items": [], "error": str(exc)}, status=502)
