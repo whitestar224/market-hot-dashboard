@@ -55,22 +55,60 @@ def cmdline_of(pid):
     return out.decode("utf-8", "replace").strip()
 
 
-def is_bare_server(cmdline):
+def parent_pid_of(pid):
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').ParentProcessId"],
+            capture_output=True, timeout=15,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    try:
+        return int(out.decode("ascii", "replace").strip() or 0)
+    except ValueError:
+        return 0
+
+
+def supervised_pids():
+    """PIDs the supervisor owns, so a normal restart is never mistaken for a takeover.
+
+    The supervisor launches its child as ``server.py --host … --port …`` — the
+    same shape as a hand-started process — so the child must be recognised by
+    its *parent* (and by status.json), never by the absence of ``--worker-market``.
+    """
+    owned = set()
+    try:
+        state = guard.read_state()
+        if str(state.get("status") or "") in {"running", "starting", "recovering"} and state.get("pid"):
+            owned.add(int(state["pid"]))
+    except (TypeError, ValueError):
+        pass
+    for pid in listener_pids():
+        if "service_guard.py" in cmdline_of(parent_pid_of(pid)):
+            owned.add(pid)
+    return owned
+
+
+def is_bare_server(cmdline, pid=None, owned=frozenset()):
     text = (cmdline or "").lower()
     if "server.py" not in text:
         return False
     if "--worker-market" in text:
-        return False  # that one belongs to the supervisor; leave it alone
+        return False  # the market worker belongs to the supervisor
+    if pid is not None and int(pid) in owned:
+        return False  # supervised child: leave it to the supervisor
     return True
 
 
 def main():
     if guard.probe(HOST, PORT):
+        owned = supervised_pids()
         pids = listener_pids()
-        victims = [pid for pid in pids if is_bare_server(cmdline_of(pid))]
+        victims = [pid for pid in pids if is_bare_server(cmdline_of(pid), pid, owned)]
         if not victims:
             print("Port 8765 is served by a supervisor-managed process already.")
-            print("Nothing to take over.")
+            print("Nothing to take over. Use 查看服务状态.cmd / restart instead.")
             return 0
         print(f"Found a hand-started server.py on port {PORT}: pid(s) {victims}")
         for pid in victims:
