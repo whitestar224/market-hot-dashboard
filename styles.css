@@ -21765,3 +21765,90 @@ a.arkham-token-chip:hover {
   color: var(--muted);
   font-size: 11px;
 }
+
+/* ── 聚合快讯里的「空投线报」板块（2026-11-07）─────────────────────────
+   用户原话：「在聚合快讯里开一个板块放空投线报，不是专门开一个栏目」。
+   卡片沿用 .flash-card 的 DOM，只在板块内改成两列紧凑版；空投条目不再进主列表。 */
+.flash-airdrop {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 14px 16px 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background:
+    linear-gradient(120deg, rgba(240, 166, 60, 0.12), transparent 46%),
+    rgba(13, 15, 11, 0.86);
+}
+
+.flash-airdrop-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.flash-airdrop-title {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.flash-airdrop-title h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 1000;
+  letter-spacing: 0.02em;
+}
+
+.flash-airdrop-count {
+  padding: 3px 9px;
+  border: 1px solid rgba(240, 166, 60, 0.4);
+  border-radius: 999px;
+  color: var(--amber);
+  font-size: 11px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.flash-airdrop-toggle {
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+
+.flash-airdrop-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.flash-airdrop-list .flash-card {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  padding: 12px 14px;
+}
+
+.flash-airdrop-list .flash-card-meta {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.flash-airdrop-list .flash-card h2 {
+  font-size: 13.5px;
+  line-height: 1.45;
+}
+
+.flash-airdrop-list .flash-card p {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+@media (max-width: 900px) {
+  .flash-airdrop-list {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

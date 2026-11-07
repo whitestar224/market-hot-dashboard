@@ -9,7 +9,7 @@
     <link rel="apple-touch-icon" sizes="180x180" href="./assets/apple-touch-icon.png?v=2" />
     <link rel="manifest" href="./site.webmanifest" />
     <script src="./desktop_adapter.js?v=1"></script>
-    <link rel="stylesheet" href="./styles.css?v=103" />
+    <link rel="stylesheet" href="./styles.css?v=104" />
   </head>
   <body>
     <main class="app-shell flash-shell">
@@ -32,7 +32,6 @@
             <a class="nav-link" href="./newboards.html">新币新股</a>
             <a class="nav-link" href="./listings.html">上新IPO</a>
             <a class="nav-link active" href="./newsflash.html">聚合快讯</a>
-            <a class="nav-link" href="./airdrop.html">空投线报</a>
             <a class="nav-link" href="./briefs.html">自动简报</a>
             <a class="nav-link" href="./rss.html">RSS订阅</a>
             <a class="nav-link" href="./xwatch.html">X追踪</a>
@@ -63,6 +62,20 @@
         <span id="flashSourceSummary" class="flash-source-summary">公共源已接入 BB · BWE · 吴说 · FN</span>
       </section>
 
+      <section class="flash-airdrop" id="flashAirdropSection" aria-label="空投线报板块">
+        <div class="flash-airdrop-head">
+          <div class="flash-airdrop-title">
+            <p class="section-label">AIRDROP INTEL</p>
+            <h2>空投线报</h2>
+          </div>
+          <span id="flashAirdropCount" class="flash-airdrop-count">暂无</span>
+          <button id="flashAirdropToggle" class="action-button flash-airdrop-toggle" type="button" hidden>展开全部</button>
+        </div>
+        <div id="flashAirdropList" class="flash-airdrop-list">
+          <div class="loading-panel">暂无空投线报。</div>
+        </div>
+      </section>
+
       <section id="flashList" class="flash-list" aria-label="聚合快讯列表">
         <div class="loading-panel">暂无快讯。</div>
       </section>
@@ -70,7 +83,7 @@
 
     <script src="./wallets.js?v=6"></script>
     <script src="./auth.js?v=19"></script>
-    <script src="./newsflash.js?v=10"></script>
+    <script src="./newsflash.js?v=11"></script>
     <script src="./notifier.js?v=12"></script>
     <script src="./todo_reminder.js?v=1"></script>
   </body>

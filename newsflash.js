@@ -2,17 +2,14 @@ const flashState = {
   items: [],
   query: ""
 };
+const FLASH_CACHE_KEY = "xingyunshe:newsflash:payload:v2";
 
-// 同一份脚本服务两个页面：聚合快讯（不设）和「空投线报」（页面里写
-// `window.FLASH_SOURCE = "foresight"`）。设了之后接口只回该来源的条目，
-// 本地缓存也分开存，免得两个页面互相覆盖。
-const FLASH_SOURCE = String(window.FLASH_SOURCE || "").trim().toLowerCase();
-const FLASH_API_URL = FLASH_SOURCE
-  ? `/api/newsflash?source=${encodeURIComponent(FLASH_SOURCE)}`
-  : "/api/newsflash";
-const FLASH_CACHE_KEY = FLASH_SOURCE
-  ? `xingyunshe:newsflash:payload:${FLASH_SOURCE}`
-  : "xingyunshe:newsflash:payload:v2";
+// 空投线报是聚合快讯页里的一块板块（用户 2026-11-07：「在聚合快讯里开一个板块放
+// 空投线报，不是专门开一个栏目」）。这两个来源的条目只进板块，不再出现在下方主列表，
+// 否则同一条会在同一页出现两次。
+const AIRDROP_SOURCE_IDS = new Set(["foresight", "foresight-tag-airdrop"]);
+const AIRDROP_PREVIEW_LIMIT = 6;
+let airdropExpanded = false;
 
 const flashList = document.querySelector("#flashList");
 const flashSearch = document.querySelector("#flashSearch");
@@ -20,6 +17,9 @@ const refreshFlash = document.querySelector("#refreshFlash");
 const flashStatus = document.querySelector("#flashStatus");
 const clockEl = document.querySelector("#clock");
 const flashSourceSummary = document.querySelector("#flashSourceSummary");
+const flashAirdropList = document.querySelector("#flashAirdropList");
+const flashAirdropCount = document.querySelector("#flashAirdropCount");
+const flashAirdropToggle = document.querySelector("#flashAirdropToggle");
 
 function setFlashStatus(text, mode = "normal") {
   flashStatus.textContent = text;
@@ -88,79 +88,95 @@ function formatFlashTime(ts) {
   }).format(new Date(milliseconds));
 }
 
+function flashCardHtml(item) {
+  const source = escapeHtml(item.source || "市场快讯");
+  const sourceCount = Math.max(1, Array.isArray(item.sources) ? item.sources.length : 1);
+  const sourceTitle = escapeHtml(
+    Array.isArray(item.sources) ? item.sources.map((entry) => entry.name).filter(Boolean).join("、") : source
+  );
+  const url = safeHttpUrl(item.url);
+  return `
+    <article class="flash-card">
+      <div class="flash-card-meta">
+        <time>${formatFlashTime(item.add_time)}</time>
+        <span class="flash-source" title="${sourceTitle}">${source}</span>
+        ${sourceCount > 1 ? `<span class="flash-duplicate">${sourceCount} 个来源已合并</span>` : ""}
+      </div>
+      <div class="flash-card-body">
+        <h2>${escapeHtml(item.title)}</h2>
+        <p>${escapeHtml(stripToPreview(item.content))}</p>
+        <div class="flash-card-actions">
+          ${url ? `<a class="flash-source-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">查看来源</a>` : ""}
+          ${item.explanationEligible && item.explanationKey ? `
+            <button class="flash-explain-button" type="button"
+              data-explanation-id="${escapeHtml(item.explanationKey)}"
+              title="${escapeHtml(item.explanationReason || "热点事件")}">解释推文</button>
+          ` : ""}
+        </div>
+      </div>
+    </article>
+  `;
+}
+
+function isAirdropItem(item) {
+  const ids = new Set(
+    (Array.isArray(item.sources) ? item.sources : [])
+      .map((entry) => String(entry?.id || "").trim().toLowerCase())
+      .filter(Boolean)
+  );
+  ids.add(String(item.sourceId || "").trim().toLowerCase());
+  return [...ids].some((id) => AIRDROP_SOURCE_IDS.has(id));
+}
+
+function renderAirdropBoard(items) {
+  if (!flashAirdropList) return;
+  const total = items.length;
+  if (flashAirdropCount) flashAirdropCount.textContent = total ? `共 ${total} 条` : "暂无";
+  const shown = airdropExpanded ? items : items.slice(0, AIRDROP_PREVIEW_LIMIT);
+  flashAirdropList.innerHTML = shown.length
+    ? shown.map(flashCardHtml).join("")
+    : '<div class="loading-panel">暂无空投线报。</div>';
+  if (flashAirdropToggle) {
+    flashAirdropToggle.hidden = total <= AIRDROP_PREVIEW_LIMIT;
+    flashAirdropToggle.textContent = airdropExpanded ? "收起" : `展开全部 ${total} 条`;
+  }
+}
+
 function renderFlash() {
   const query = flashState.query.toLowerCase();
-  const items = flashState.items.filter((item) => {
+  const matched = flashState.items.filter((item) => {
     if (!query) return true;
     const sourceNames = Array.isArray(item.sources) ? item.sources.map((source) => source.name).join(" ") : "";
     return [item.title, item.content, item.source, sourceNames].join(" ").toLowerCase().includes(query);
   });
 
+  // 空投线报进顶部板块，主列表不再重复同一条。
+  renderAirdropBoard(matched.filter(isAirdropItem));
+  const items = matched.filter((item) => !isAirdropItem(item));
+
   if (!items.length) {
     flashList.innerHTML = '<div class="loading-panel">没有匹配的快讯。</div>';
     return;
   }
-
-  flashList.innerHTML = items
-    .map(
-      (item) => {
-        const source = escapeHtml(item.source || "市场快讯");
-        const sourceCount = Math.max(1, Array.isArray(item.sources) ? item.sources.length : 1);
-        const sourceTitle = escapeHtml(
-          Array.isArray(item.sources) ? item.sources.map((entry) => entry.name).filter(Boolean).join("、") : source
-        );
-        const url = safeHttpUrl(item.url);
-        return `
-        <article class="flash-card">
-          <div class="flash-card-meta">
-            <time>${formatFlashTime(item.add_time)}</time>
-            <span class="flash-source" title="${sourceTitle}">${source}</span>
-            ${sourceCount > 1 ? `<span class="flash-duplicate">${sourceCount} 个来源已合并</span>` : ""}
-          </div>
-          <div class="flash-card-body">
-            <h2>${escapeHtml(item.title)}</h2>
-            <p>${escapeHtml(stripToPreview(item.content))}</p>
-            <div class="flash-card-actions">
-              ${url ? `<a class="flash-source-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">查看来源</a>` : ""}
-              ${item.explanationEligible && item.explanationKey ? `
-                <button class="flash-explain-button" type="button"
-                  data-explanation-id="${escapeHtml(item.explanationKey)}"
-                  title="${escapeHtml(item.explanationReason || "热点事件")}">解释推文</button>
-              ` : ""}
-            </div>
-          </div>
-        </article>
-      `;
-      }
-    )
-    .join("");
+  flashList.innerHTML = items.map(flashCardHtml).join("");
 }
 
 async function loadFlash(options = {}) {
   const hasData = flashState.items.length > 0 || hydrateFlashCache();
   try {
-    const refreshSuffix = options.refresh ? (FLASH_API_URL.includes("?") ? "&refresh=1" : "?refresh=1") : "";
-    const response = await fetch(`${FLASH_API_URL}${refreshSuffix}`, { cache: "no-store" });
+    const response = await fetch(`/api/newsflash${options.refresh ? "?refresh=1" : ""}`, { cache: "no-store" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const payload = await response.json();
     flashState.items = payload.items || [];
     writeCachedPayload(FLASH_CACHE_KEY, payload);
     const sourceCount = Number(payload.sourceCount || 1);
     const deduplicatedCount = Number(payload.deduplicatedCount || 0);
-    setFlashStatus(
-      FLASH_SOURCE
-        // 单源页面别报「已去重 N 条」——那是整站去重总数，跟这一页无关。
-        ? `${flashState.items.length} 条线报`
-        : `${sourceCount} 个来源 · 已去重 ${deduplicatedCount} 条`,
-      "ok"
-    );
+    setFlashStatus(`${sourceCount} 个来源 · 已去重 ${deduplicatedCount} 条`, "ok");
     const activeSources = (Array.isArray(payload.sources) ? payload.sources : [])
       .filter((source) => source?.status === "ok" && Number(source?.count || 0) > 0)
       .map((source) => source.name)
       .filter(Boolean);
-    if (flashSourceSummary && activeSources.length && !FLASH_SOURCE) {
-      // 单源页面（空投线报）保留页面自己的「来源 Foresight 空投线报」，
-      // 否则这里会把整站的 4 个源都列出来，看着像是混了别的源。
+    if (flashSourceSummary && activeSources.length) {
       flashSourceSummary.textContent = `已接入 ${activeSources.join(" · ")}`;
       flashSourceSummary.title = activeSources.join("、");
     }
@@ -195,9 +211,16 @@ flashSearch.addEventListener("input", (event) => {
 
 refreshFlash.addEventListener("click", () => loadFlash({ refresh: true }));
 
-flashList.addEventListener("click", async (event) => {
+flashAirdropToggle?.addEventListener("click", () => {
+  airdropExpanded = !airdropExpanded;
+  renderFlash();
+});
+
+// 事件委托挂 document：主列表和顶部「空投线报」板块是两棵子树，
+// 绑在 flashList 上会让板块里的「解释推文」按钮点不动。
+document.addEventListener("click", async (event) => {
   const button = event.target.closest(".flash-explain-button");
-  if (!button || !flashList.contains(button) || button.disabled) return;
+  if (!button || button.disabled) return;
   const id = String(button.dataset.explanationId || "");
   if (!/^[a-f0-9]{40}$/.test(id)) return;
   const originalText = button.textContent;
