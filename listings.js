@@ -269,6 +269,8 @@ function sourceInitial(source) {
   if (/nasdaq/i.test(value)) return "NQ";
   if (/东方财富|eastmoney|a股/i.test(value)) return "CN";
   if (/富途/.test(value)) return "FT";
+  // 「链上融资」是中文源名，默认取前两字会挤爆 28px 的方块，给一个单字徽章。
+  if (/链上融资|一级融资/.test(value)) return "融";
   return value.slice(0, 2).toUpperCase();
 }
 

@@ -585,8 +585,10 @@ def fundraising_rows(limit: int = 18) -> list[dict[str, Any]]:
             # 这样「上新 IPO」页签里照样能看到它 —— 用户 2026-11-07 先要求「加进 IPO」，
             # 后要求「专门开一个板块」，两次都要满足。
             "rootdata": True,
-            "source": "RootData",
-            "sourceLabel": "RD",
+            # 对外一律叫「链上融资」（用户 2026-11-07：「改名，不要叫 rootdata，改成链上融资」）。
+            # 注意这里只是展示文案，`rootdata` 这个标记与 id 前缀是内部标识，不能跟着改。
+            "source": "链上融资",
+            "sourceLabel": "融资",
             "title": f"{name} {round_name}" + (f" ${ticker}" if ticker else ""),
             "symbol": ticker or name,
             "status": round_name,

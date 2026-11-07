@@ -20220,7 +20220,7 @@ def fetch_rootdata_projects() -> dict[str, Any]:
             subtitle="按 RD 热度指数倒排 · 已滤掉交易所/稳定币",
             accent="#6c8cff",
             source_label="RD",
-            source_name="RootData · 尚未初始化",
+            source_name="链上融资 · 尚未初始化",
             rows=[],
             status="unavailable",
             empty_title="RootData 还没取到数据",
@@ -20261,12 +20261,16 @@ def fetch_rootdata_projects() -> dict[str, Any]:
 
 
 def rootdata_fundraising_section() -> dict[str, Any]:
-    """RootData 一级融资 → 「上新 IPO」板块里的一段。
+    """链上融资（数据源 cn.rootdata.com/fundraising）→ 「上新 IPO」板块里的一段。
 
     用户 2026-11-07 原话：「把这个页面里的融资情况加入到上新IPO板块里，UI 风格还是
     以前那样，然后有新的融资情况，就弹窗提醒我」。所以这里是**板块的一段**（走
     ``listing_section`` 那套字段、``group="ipo"`` 让它落到 IPO 筛选页签），弹窗则是另一
     条独立链路（``send_rootdata_funding_desktop_alert``）。
+
+    **对外名称是「链上融资」**（用户当天第二次要求：「改名，不要叫 rootdata，改成链上
+    融资」）—— 标题、副标题、来源、弹窗一律不出现 RootData 字样；标识符（``rootdata``
+    标记、``rootdata-funding`` 前缀、快照文件名）保持不动，动了会打断去重账本与白名单。
 
     只读快照，热路径不碰网络；快照过期就后台拉一次，但**保留旧数据并明说年龄**——
     抓取失败不许伪装成空板块。
@@ -20279,10 +20283,10 @@ def rootdata_fundraising_section() -> dict[str, Any]:
     if not snapshot:
         return listing_section(
             id="rootdata-fundraising",
-            title="RootData 一级融资",
-            subtitle="cn.rootdata.com/fundraising · 按日期倒排",
+            title="链上融资",
+            subtitle="一级市场融资事件 · 按日期倒排",
             accent="#f0a63c",
-            source_name="RootData · 尚未初始化",
+            source_name="链上融资 · 尚未初始化",
             rows=[],
             status="unavailable",
             empty_message="融资页还没抓过：服务启动后 15 分钟内会自动抓一次，也可手动跑 tools/rootdata_login.py --pull。",
@@ -20290,10 +20294,10 @@ def rootdata_fundraising_section() -> dict[str, Any]:
     if not rows:
         return listing_section(
             id="rootdata-fundraising",
-            title="RootData 一级融资",
-            subtitle="cn.rootdata.com/fundraising · 按日期倒排",
+            title="链上融资",
+            subtitle="一级市场融资事件 · 按日期倒排",
             accent="#f0a63c",
-            source_name="RootData · 快照里没有可用事件",
+            source_name="链上融资 · 快照里没有可用事件",
             rows=[],
             status="unavailable",
             empty_message="快照存在但没有解析出融资事件，检查页面结构是否变化。",
@@ -20302,11 +20306,11 @@ def rootdata_fundraising_section() -> dict[str, Any]:
     stale = age > ROOTDATA_PROJECTS.FUNDRAISING_TTL_SECONDS
     return listing_section(
         id="rootdata-fundraising",
-        title="RootData 一级融资",
-        subtitle="cn.rootdata.com/fundraising · 按日期倒排",
+        title="链上融资",
+        subtitle="一级市场融资事件 · 按日期倒排",
         accent="#f0a63c",
         source_name=(
-            f"RootData 融资 · 抓取于 {minutes} 分钟前" if stale else "RootData 融资 · 实时快照"
+            f"链上融资 · 抓取于 {minutes} 分钟前" if stale else "链上融资 · 实时快照"
         ),
         rows=rows,
         status="stale" if stale else "ok",
@@ -27375,7 +27379,7 @@ def send_rootdata_funding_desktop_alert(event: dict[str, Any]) -> dict[str, Any]
         body_parts.append(f"估值 {valuation}")
     if investors:
         body_parts.append("投资方 " + " / ".join(investors[:3]))
-    body = " · ".join(body_parts) or "RootData 融资页新收录一条一级市场事件"
+    body = " · ".join(body_parts) or "链上融资新收录一条一级市场事件"
     event_key = ROOTDATA_PROJECTS.fundraising_event_key(event)
     title = f"{name} {round_name}" + (f" ${ticker}" if ticker else "")
     if amount:
@@ -27383,8 +27387,8 @@ def send_rootdata_funding_desktop_alert(event: dict[str, Any]) -> dict[str, Any]
     return launch_desktop_alert({
         "key": f"rootdata-funding:{event_key}",
         "kind": "一级融资",
-        "source": "RootData 融资",
-        "sourceLabel": "RD",
+        "source": "链上融资",
+        "sourceLabel": "融资",
         "sourceType": "rootdata-funding",
         # 显式指定板块：这个板块的「弹窗」开关必须能一把关掉融资提醒（默认开）。
         "board": "rootdata-projects",
@@ -27394,7 +27398,7 @@ def send_rootdata_funding_desktop_alert(event: dict[str, Any]) -> dict[str, Any]
         "time": int(safe_float(event.get("date"))) or int(time.time() * 1000),
         "priority": amount or "一级融资",
         "queuePriority": 90,
-        "speech": f"RootData 融资：{name} {round_name}" + (f"，{amount}" if amount else ""),
+        "speech": f"链上融资：{name} {round_name}" + (f"，{amount}" if amount else ""),
         "originalText": json.dumps(event, ensure_ascii=False)[:1200],
     })
 

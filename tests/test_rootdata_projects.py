@@ -181,7 +181,11 @@ class RootdataParseTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         row = rows[0]
         self.assertEqual(row["group"], "ipo")
-        self.assertEqual(row["sourceLabel"], "RD")
+        # 对外叫「链上融资」，不再出现 RootData 字样（用户 2026-11-07 改名）；
+        # 但内部标记 rootdata 必须保留，页签过滤与去重账本都靠它。
+        self.assertEqual(row["source"], "链上融资")
+        self.assertEqual(row["sourceLabel"], "融资")
+        self.assertTrue(row["rootdata"])
         self.assertEqual(row["title"], "Lombard 种子轮 $BARD")
         self.assertEqual(row["metric"], "400万美元")
         self.assertIn("投资方 Ethereal Ventures", row["note"])
