@@ -151,7 +151,20 @@ def stop_child(child, grace=20):
 
 def save_state(**fields):
     tmp = STATE.with_suffix(".tmp")
-    payload = json.dumps({"supervisorPid": os.getpid(), "updatedAt": int(time.time()*1000), **fields})
+    payload_dict = {"supervisorPid": os.getpid(), "updatedAt": int(time.time() * 1000), **fields}
+    # 保住 worker 的心跳段：``worker_runner._write_status`` 往 ``workers.<name>``
+    # 里写，而守护每次探活/重启都整份重写状态文件 —— 不合并的话心跳刚写就被擦掉，
+    # 「worker 还活着吗」永远查不到证据（2026-11-07 实测 workers 段一直是 None，
+    # 但数据确实是新鲜的）。
+    if "workers" not in payload_dict:
+        try:
+            previous = json.loads(STATE.read_text(encoding="utf-8"))
+            workers = previous.get("workers") if isinstance(previous, dict) else None
+            if workers:
+                payload_dict["workers"] = workers
+        except (OSError, ValueError):
+            pass
+    payload = json.dumps(payload_dict)
     # Windows readers/antivirus may temporarily deny rename. Status is telemetry,
     # never a reason to terminate supervision and close the child's log pipe.
     for attempt in range(3):
