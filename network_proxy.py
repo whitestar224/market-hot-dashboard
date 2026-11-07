@@ -14,8 +14,12 @@ import requests
 
 
 DEFAULT_PROBE_URLS = (
+    # 交易所公开时间接口：又小又稳、无鉴权，且**正是出口最需要打通的目标**——
+    # 只探 gmgn/deepseek 时曾出现「直连 1/3、代理 1/3」并列，平局按规则归直连，
+    # 结果币安/OKX 全不可达而路由显示"已选中"。带上交易所，选路才有区分度。
+    "https://api.binance.com/api/v3/time",
+    "https://www.okx.com/api/v5/public/time",
     "https://openapi.gmgn.ai",
-    "https://web3.binance.com",
     "https://api.deepseek.com",
 )
 DEFAULT_LOCAL_PROXY_PORTS = (

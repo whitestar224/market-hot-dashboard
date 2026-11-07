@@ -31678,18 +31678,268 @@ def price_watch_chain_intake_enabled(chain: Any) -> bool:
 def price_watch_row_chain_blocked(row: sqlite3.Row | dict[str, Any] | None) -> bool:
     """True when a pool row is an on-chain asset on a switched-off chain.
 
-    Exchange-listed rows (``new_contract_listed_at`` > 0, i.e. 二级标的) always
-    pass — the whole point of the switch is to stop unfamiliar on-chain noise,
-    not to hide coins the user tracks through exchange listings.
+    **二级标的永远放行**：用户 2026-11-08 澄清「二级标的 = 在交易所二级市场有现货或者
+    合约的标的」，所以判定不只看「最近上过新合约」，还要看交易所到底有没有这个币
+    （见 ``price_watch_row_has_secondary_market``）。关链只该挡掉那些只在链上、交易所
+    压根没有的票，不该把用户在交易所盯的币一起藏了。
     """
 
     item = row_dict(row)
     if not item:
         return False
-    if int(safe_float(item.get("new_contract_listed_at"), 0)) > 0:
+    if price_watch_row_has_secondary_market(item):
         return False
-    source_chain = item.get("onchain_chain") or item.get("chain")
-    return not price_watch_chain_intake_enabled(source_chain)
+    return not price_watch_chain_intake_enabled(item.get("onchain_chain") or item.get("chain"))
+
+
+# ── 「交易所有现货/合约」判定（2026-11-08）───────────────────────────────
+# 口径来自用户：「二级标的 = 在交易所二级市场有现货或者合约的标的」。
+# 数据只读已有缓存：币安现货/合约交易对表（big_move 的 30 分钟缓存）+ 各所合约
+# 24h 行情（NEW_COIN_LOW_ACTIVITY_CACHE，OKX/Gate/HTX/Bitget/Aster/Hyperliquid）。
+# **热路径绝不等网络**：过期就走后台线程重建，当下先用手上这一版（冷启动=空集，
+# 空集只会「多挡」不会「漏挡」，方向是安全的）。
+PRICE_WATCH_SECONDARY_SYMBOLS_CACHE: tuple[float, frozenset[str]] | None = None
+PRICE_WATCH_SECONDARY_SYMBOLS_REFRESHING = False
+PRICE_WATCH_SECONDARY_SYMBOLS_LOCK = threading.Lock()
+PRICE_WATCH_SECONDARY_SYMBOLS_SECONDS = max(
+    30.0,
+    float(os.getenv("PRICE_WATCH_SECONDARY_SYMBOLS_SECONDS", "300") or "300"),
+)
+
+
+def _secondary_symbol_variants(base: str) -> set[str]:
+    """交易所叫 ``1000PEPE`` / ``1000000SATS``，榜单和用户嘴里叫 ``PEPE`` / ``SATS``。"""
+
+    value = str(base or "").strip().upper()
+    if not value:
+        return set()
+    variants = {value}
+    stripped = re.sub(r"^(?:1000000|1000)(?=[A-Z])", "", value)
+    if stripped and stripped != value:
+        variants.add(stripped)
+    return variants
+
+
+def _fetch_exchange_symbol_universe(*, timeout: float = 8.0) -> set[str]:
+    """并发抓各所公开「有哪些交易对」，**只取符号**（不要成交额）。
+
+    刻意不走 ``big_move_binance_pair_map`` / ``fetch_new_coin_low_market_activity``：
+    两者都握着进程内的全局缓存锁，而币安那两条路在出口不稳时会各卡十几秒（py-spy 实测
+    本线程停在 ``big_move_binance_pair_map`` 的 ``BIG_MOVE_PAIR_CACHE_LOCK`` 上），
+    把「二级标的」清单一起拖死。这里每个源独立超时、并发跑，谁回来算谁的；任一个源
+    回来就足以给出「这币在交易所有合约」的答案。
+    """
+
+    def binance_futures() -> set[str]:
+        symbols: set[str] = set()
+        for host in ("https://fapi.binance.com",) + tuple(
+            f"https://fapi{i}.binance.com" for i in range(1, 5)
+        ):
+            try:
+                response = requests.get(
+                    host + "/fapi/v1/exchangeInfo", headers=HEADERS, timeout=(4, timeout)
+                )
+                response.raise_for_status()
+                pairs = [
+                    str((item or {}).get("symbol") or "").upper()
+                    for item in (response.json() or {}).get("symbols") or []
+                ]
+            except Exception:
+                continue
+            for pair in pairs:
+                if pair.endswith("USDT") and len(pair) > 4:
+                    symbols.update(_secondary_symbol_variants(pair[:-4]))
+            return symbols
+        raise RuntimeError("binance futures exchangeInfo unreachable")
+
+    def binance_spot() -> set[str]:
+        for host in BIG_MOVE_SPOT_HOSTS:
+            try:
+                response = requests.get(
+                    host + "/api/v3/exchangeInfo", headers=HEADERS, timeout=(4, timeout)
+                )
+                response.raise_for_status()
+                pairs = [
+                    str((item or {}).get("symbol") or "").upper()
+                    for item in (response.json() or {}).get("symbols") or []
+                ]
+            except Exception:
+                continue
+            symbols: set[str] = set()
+            for pair in pairs:
+                if pair.endswith("USDT") and len(pair) > 4:
+                    symbols.update(_secondary_symbol_variants(pair[:-4]))
+            return symbols
+        raise RuntimeError("binance spot exchangeInfo unreachable")
+
+    def okx() -> set[str]:
+        response = requests.get(
+            "https://www.okx.com/api/v5/market/tickers",
+            params={"instType": "SWAP"},
+            headers=HEADERS,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        symbols: set[str] = set()
+        for item in payload.get("data") or []:
+            match = re.fullmatch(r"(.+)-USDT-SWAP", str((item or {}).get("instId") or ""))
+            if match:
+                symbols.update(_secondary_symbol_variants(match.group(1)))
+        return symbols
+
+    def gate() -> set[str]:
+        response = requests.get(
+            "https://api.gateio.ws/api/v4/futures/usdt/tickers",
+            headers=HEADERS,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        symbols: set[str] = set()
+        for item in response.json() or []:
+            base = str((item or {}).get("contract") or "").split("_", 1)[0]
+            symbols.update(_secondary_symbol_variants(base))
+        return symbols
+
+    def bitget() -> set[str]:
+        response = requests.get(
+            "https://api.bitget.com/api/v2/mix/market/contracts",
+            params={"productType": "usdt-futures"},
+            headers=HEADERS,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        symbols: set[str] = set()
+        for item in payload.get("data") or []:
+            symbol = str((item or {}).get("symbol") or "")
+            for suffix in ("USDT", "USDC"):
+                if symbol.endswith(suffix) and len(symbol) > len(suffix):
+                    symbols.update(_secondary_symbol_variants(symbol[: -len(suffix)]))
+                    break
+        return symbols
+
+    def htx() -> set[str]:
+        response = requests.get(
+            "https://api.hbdm.com/linear-swap-api/v1/swap_contract_info",
+            headers=HEADERS,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        symbols: set[str] = set()
+        for item in payload.get("data") or []:
+            code = str((item or {}).get("contract_code") or "")
+            for suffix in ("-USDT", "-USD"):
+                if code.endswith(suffix) and len(code) > len(suffix):
+                    symbols.update(_secondary_symbol_variants(code[: -len(suffix)]))
+                    break
+        return symbols
+
+    sources = {
+        "binance-futures": binance_futures,
+        "binance-spot": binance_spot,
+        "okx": okx,
+        "gate": gate,
+        "bitget": bitget,
+        "htx": htx,
+    }
+    symbols: set[str] = set()
+    with ThreadPoolExecutor(max_workers=len(sources), thread_name_prefix="pw-universe") as pool:
+        futures = {pool.submit(fetch): name for name, fetch in sources.items()}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                symbols.update(future.result())
+            except Exception as exc:
+                print(
+                    f"Secondary-market universe {name} failed: " + safe_error_text(str(exc))[:120],
+                    file=sys.stderr,
+                    flush=True,
+                )
+    return symbols
+
+
+def _build_price_watch_secondary_symbols() -> frozenset[str]:
+    """各所「交易所有现货/合约」的标的集合（自持网络 + 自持缓存，不抢别人的锁）。"""
+
+    try:
+        symbols = _fetch_exchange_symbol_universe()
+    except Exception as exc:
+        print(
+            "Secondary-market universe fetch failed: " + safe_error_text(str(exc))[:160],
+            file=sys.stderr,
+            flush=True,
+        )
+        symbols = set()
+    try:
+        # 已有缓存就顺手并进来（Aster/Hyperliquid 这些只在那边有），纯内存读、不抓网络。
+        cached_activity = NEW_COIN_LOW_ACTIVITY_CACHE
+        if cached_activity:
+            symbols.update(cached_activity[1].keys())
+    except Exception:
+        pass
+    return frozenset(
+        cleaned for cleaned in (clean_price_watch_symbol(symbol) for symbol in symbols) if cleaned
+    )
+
+
+def price_watch_secondary_market_symbols() -> frozenset[str]:
+    """交易所有现货/合约的标的集合（后台刷新，读路径零阻塞）。"""
+
+    global PRICE_WATCH_SECONDARY_SYMBOLS_CACHE, PRICE_WATCH_SECONDARY_SYMBOLS_REFRESHING
+    now = time.time()
+    cached = PRICE_WATCH_SECONDARY_SYMBOLS_CACHE
+    fresh = bool(cached) and now - cached[0] < PRICE_WATCH_SECONDARY_SYMBOLS_SECONDS
+    if fresh:
+        return cached[1]
+    with PRICE_WATCH_SECONDARY_SYMBOLS_LOCK:
+        if not PRICE_WATCH_SECONDARY_SYMBOLS_REFRESHING:
+            PRICE_WATCH_SECONDARY_SYMBOLS_REFRESHING = True
+
+            def refresh_worker() -> None:
+                global PRICE_WATCH_SECONDARY_SYMBOLS_CACHE, PRICE_WATCH_SECONDARY_SYMBOLS_REFRESHING
+                try:
+                    built = _build_price_watch_secondary_symbols()
+                    if built:
+                        PRICE_WATCH_SECONDARY_SYMBOLS_CACHE = (time.time(), built)
+                    elif PRICE_WATCH_SECONDARY_SYMBOLS_CACHE is None:
+                        # 上游全挂时给个空集占位，免得每次调用都再排队重建；
+                        # 但只压 60 秒就重试（别像正常结果那样压满 5 分钟）。
+                        PRICE_WATCH_SECONDARY_SYMBOLS_CACHE = (
+                            time.time() - PRICE_WATCH_SECONDARY_SYMBOLS_SECONDS + 60,
+                            frozenset(),
+                        )
+                except Exception as exc:
+                    print(
+                        "Secondary-market symbol refresh failed: " + safe_error_text(str(exc))[:160],
+                        file=sys.stderr,
+                    )
+                finally:
+                    PRICE_WATCH_SECONDARY_SYMBOLS_REFRESHING = False
+
+            threading.Thread(
+                target=refresh_worker, name="price-watch-secondary-symbols", daemon=True
+            ).start()
+    return cached[1] if cached else frozenset()
+
+
+def price_watch_row_has_secondary_market(row: sqlite3.Row | dict[str, Any] | None) -> bool:
+    """这行在交易所二级市场有没有现货/合约（有 = 二级标的，链开关不许动它）。"""
+
+    item = row_dict(row)
+    if not item:
+        return False
+    if int(safe_float(item.get("new_contract_listed_at"), 0)) > 0:
+        return True
+    if int(safe_float(item.get("gainers_first_seen_at"), 0)) > 0:
+        return True
+    raw_symbol = clean_feed_text(item.get("symbol"), 40)
+    candidates = {clean_price_watch_symbol(raw_symbol), clean_price_watch_symbol(price_watch_symbol_without_quote(raw_symbol))}
+    candidates.discard("")
+    if not candidates:
+        return False
+    return bool(candidates & price_watch_secondary_market_symbols())
 
 
 def price_watch_chain_payload(toggles: dict[str, bool] | None = None) -> list[dict[str, Any]]:
@@ -35196,8 +35446,8 @@ def price_structure_watch_rows_uncached() -> list[dict[str, Any]]:
         )
         # 「链上入池」按链开关：结构扫描也按链过滤（池闸门已挡一层，这里再挡一层，
         # 因为「从未落库的活体发现行」不经过 price_watch_active_rows）。
-        # 交易所有上新记录的二级标的放行，与池闸门口径一致。
-        if int(merged.get("new_contract_listed_at") or 0) <= 0 and not price_watch_chain_intake_enabled(
+        # 交易所二级市场有现货/合约的标的一律放行，与池闸门口径一致。
+        if not price_watch_row_has_secondary_market(merged) and not price_watch_chain_intake_enabled(
             resolved_identity.get("chain")
         ):
             return False
@@ -58614,8 +58864,17 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if parsed.path == "/api/price-watch/chains":
             # 同 boards：单独一条，改开关后下一次轮询立刻看到，不必等 payload 重建。
+            # secondaryCount = 「交易所有现货/合约」清单里的标的数，纯诊断用（只读缓存，不等网络）。
             try:
-                self.send_json({"ok": True, "chains": price_watch_chain_payload()})
+                try:
+                    secondary_count = len(price_watch_secondary_market_symbols())
+                except Exception:
+                    secondary_count = 0
+                self.send_json({
+                    "ok": True,
+                    "chains": price_watch_chain_payload(),
+                    "secondaryCount": secondary_count,
+                })
             except Exception as exc:
                 self.send_json({"ok": False, "chains": [], "error": str(exc)}, status=502)
             return

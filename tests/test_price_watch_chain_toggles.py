@@ -27,6 +27,8 @@ class PriceWatchChainToggleTests(unittest.TestCase):
         server.AUTH_DB_PATH = Path(self.temp_dir.name) / "auth.db"
         server.init_auth_db()
         self.reset_cache()
+        # 交易所在线清单默认给空集：本用例不联网，也不让后台线程真的去抓交易所。
+        server.PRICE_WATCH_SECONDARY_SYMBOLS_CACHE = (__import__("time").time(), frozenset())
 
     def tearDown(self):
         self.reset_cache()
@@ -123,10 +125,88 @@ class PriceWatchChainToggleTests(unittest.TestCase):
         }
         self.assertFalse(server.price_watch_row_chain_blocked(row))
 
+    def test_symbol_listed_on_an_exchange_counts_as_secondary(self):
+        """用户口径：二级标的 = 交易所有现货/合约。真上过所的票即使没进过「新合约」榜也要放行。"""
+        server.set_price_watch_chain_toggle("Solana", False)
+        row = {"symbol": "JUP", "onchain_chain": "CT_501", "onchain_contract_address": "abc"}
+        # 不在交易所清单里 → 仍按一级链上标的挡掉
+        self.assertTrue(server.price_watch_row_chain_blocked(row))
+        server.PRICE_WATCH_SECONDARY_SYMBOLS_CACHE = (__import__("time").time(), frozenset({"JUP"}))
+        self.assertFalse(server.price_watch_row_chain_blocked(row))
+        self.assertTrue(server.price_watch_row_has_secondary_market(row))
+
+    def test_pool_symbol_suffix_is_normalised_before_lookup(self):
+        """池里偶尔存 ``JUPUSDT`` 这种带报价后缀的写法，查交易所清单前要去掉。"""
+        server.set_price_watch_chain_toggle("Solana", False)
+        server.PRICE_WATCH_SECONDARY_SYMBOLS_CACHE = (__import__("time").time(), frozenset({"JUP"}))
+        row = {"symbol": "JUPUSDT", "onchain_chain": "CT_501", "onchain_contract_address": "abc"}
+        self.assertFalse(server.price_watch_row_chain_blocked(row))
+
+    def test_gainers_membership_counts_as_secondary(self):
+        server.set_price_watch_chain_toggle("Solana", False)
+        row = {
+            "symbol": "XYZ",
+            "onchain_chain": "CT_501",
+            "onchain_contract_address": "abc",
+            "gainers_first_seen_at": 1_790_000_000_000,
+        }
+        self.assertFalse(server.price_watch_row_chain_blocked(row))
+
     def test_exchange_only_row_is_never_blocked(self):
         server.set_price_watch_chain_toggle("Solana", False)
         self.assertFalse(server.price_watch_row_chain_blocked({"symbol": "BTCUSDT"}))
         self.assertFalse(server.price_watch_row_chain_blocked(None))
+
+    # -- 交易所清单（「二级标的」判据的数据源）----------------------------
+
+    def test_secondary_symbol_builder_merges_universe_and_cached_activity(self):
+        """各所清单 + 已有成交额缓存（Aster/Hyperliquid 只在那边有）都要并进来。"""
+        with patch.object(server, "_fetch_exchange_symbol_universe", lambda **kw: {"wif", "bonk"}), patch.object(
+            server, "NEW_COIN_LOW_ACTIVITY_CACHE", (__import__("time").time(), {"aster": {}})
+        ):
+            symbols = server._build_price_watch_secondary_symbols()
+        self.assertIn("WIF", symbols)
+        self.assertIn("BONK", symbols)
+        self.assertIn("ASTER", symbols)
+
+    def test_secondary_symbol_builder_survives_a_dead_universe(self):
+        """上游全挂时返回空集（多挡不漏挡），绝不抛异常拖垮池构建。"""
+
+        def boom(**kwargs):
+            raise RuntimeError("all exchanges down")
+
+        with patch.object(server, "_fetch_exchange_symbol_universe", boom), patch.object(
+            server, "NEW_COIN_LOW_ACTIVITY_CACHE", None
+        ):
+            self.assertEqual(server._build_price_watch_secondary_symbols(), frozenset())
+
+    def test_secondary_symbol_variants_strip_large_denominations(self):
+        """交易所叫 1000PEPE / 1000000SATS，榜单叫 PEPE / SATS。"""
+        self.assertEqual(server._secondary_symbol_variants("1000PEPE"), {"1000PEPE", "PEPE"})
+        self.assertEqual(server._secondary_symbol_variants("1000000SATS"), {"1000000SATS", "SATS"})
+        self.assertEqual(server._secondary_symbol_variants("BTC"), {"BTC"})
+
+    def test_exchange_universe_fetcher_returns_symbols_from_whatever_source_answers(self):
+        """一个源通就够：出口烂到只剩 Gate 时清单照样成立。"""
+
+        class _Resp:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        def fake_get(url, **kwargs):
+            if "gateio" in url:
+                return _Resp([{"contract": "PEPE_USDT"}, {"contract": "BTC_USDT"}])
+            raise RuntimeError("proxy down")
+
+        with patch.object(server.requests, "get", fake_get):
+            symbols = server._fetch_exchange_symbol_universe(timeout=0.5)
+        self.assertEqual(symbols, {"PEPE", "BTC"})
 
     # -- 入池闸门 ---------------------------------------------------------
 
