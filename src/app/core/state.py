@@ -1375,6 +1375,27 @@ PRICE_WATCH_BOARD_DEFAULTS = {
 }
 
 
+# 「链上入池」按链开关（2026-11-07 用户：Solana 链的标的他不熟，希望能按链关掉入池）。
+# ``id`` 用 ``desktop_alert_chain_label()`` 归一后的展示标签 —— 池里的链号形态很杂
+# （CT_501 / 501 / sol / solana 都是 Solana），存标签才不会漏。**名单外的链一律视为开启**，
+# 这样以后出现新链不会因为没登记而被静默关掉。
+# 「二级标的」（交易所有上新/榜单记录的行）不受这里影响，见
+# ``price_watch_row_chain_blocked()``。
+PRICE_WATCH_INTAKE_CHAINS = (
+    {"id": "Solana", "short": "SOL", "note": "CT_501 / sol / solana"},
+    {"id": "BSC", "short": "BSC", "note": "56 / bsc"},
+    {"id": "ETH", "short": "ETH", "note": "1 / eth"},
+    {"id": "Base", "short": "BASE", "note": "8453 / base"},
+    {"id": "Robinhood", "short": "RH", "note": "4663 / robinhood"},
+)
+
+PRICE_WATCH_INTAKE_CHAIN_IDS = tuple(chain["id"] for chain in PRICE_WATCH_INTAKE_CHAINS)
+
+PRICE_WATCH_INTAKE_CHAIN_SHORTS = {
+    chain["id"]: chain.get("short") or chain["id"] for chain in PRICE_WATCH_INTAKE_CHAINS
+}
+
+
 PRICE_MONITOR_FAST_RETENTION_CONFIRM_INTERVAL_SECONDS = 6 * 60 * 60
 
 

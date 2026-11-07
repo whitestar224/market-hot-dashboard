@@ -5735,6 +5735,77 @@
   });
 
   refreshButton.addEventListener("click", () => load({ refresh: true }));
+
+  // ── 链上入池·按链开关（2026-11-07）──────────────────────────────────────
+  // 用户原话：「链上标的里，Solana 链的会加入结构监控里……可不可以做个开关……
+  // 或者为每条链做一个开关」。关掉某条链 = 该链的**纯链上标的**不再入池、也不再
+  // 进结构监控扫描；**交易所有上新记录的二级标的不受影响**。
+  // 状态存在服务端（price_watch_chain_toggles），换浏览器也跟得上；读失败就整块不渲染。
+  const chainFilterNode = document.querySelector("#watchChainFilter");
+  let chainToggles = [];
+
+  function renderChainFilter() {
+    if (!chainFilterNode) return;
+    if (!chainToggles.length) {
+      chainFilterNode.hidden = true;
+      chainFilterNode.innerHTML = "";
+      return;
+    }
+    chainFilterNode.hidden = false;
+    chainFilterNode.innerHTML = `
+      <span class="chain-filter-label" title="关掉的链：该链的纯链上标的不再入池、不再进结构监控；交易所已上新的二级标的不受影响">链上入池</span>
+      ${chainToggles.map((chain) => `
+        <button type="button" class="chain-filter-pill${chain.intake ? " is-on" : ""}"
+          data-chain-toggle="${escapeHtml(chain.id)}"
+          aria-pressed="${chain.intake ? "true" : "false"}"
+          title="${escapeHtml(`${chain.id} · ${chain.note} · ${chain.intake ? "入池中，点一下关闭" : "已关闭，点一下开启"}`)}"
+        >${escapeHtml(chain.short)}</button>
+      `).join("")}
+    `;
+  }
+
+  async function loadChainToggles() {
+    if (!chainFilterNode) return;
+    try {
+      const response = await fetch("/api/price-watch/chains", { cache: "no-store" });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || payload.ok === false) throw new Error(payload.error || `HTTP ${response.status}`);
+      chainToggles = Array.isArray(payload.chains) ? payload.chains : [];
+      renderChainFilter();
+    } catch {
+      // 读不到就不显示开关（等于回到上线前的行为），绝不猜一个状态出来。
+      chainFilterNode.hidden = true;
+    }
+  }
+
+  async function toggleChainIntake(chainId) {
+    const current = chainToggles.find((chain) => chain.id === chainId);
+    if (!current) return;
+    const next = !current.intake;
+    // 先落 UI，失败再回滚：开关手感要跟得上，但别让假状态留在屏幕上。
+    chainToggles = chainToggles.map((chain) => (chain.id === chainId ? { ...chain, intake: next } : chain));
+    renderChainFilter();
+    try {
+      const payload = await postAction("set_chain_toggle", "", { chain: chainId, enabled: next });
+      if (Array.isArray(payload.chains) && payload.chains.length) {
+        chainToggles = payload.chains;
+        renderChainFilter();
+      }
+      statusNode.textContent = payload.message
+        || `${chainId} 链 · 链上入池已${next ? "开启" : "关闭"}`;
+      await load({ refresh: true });
+    } catch (error) {
+      chainToggles = chainToggles.map((chain) => (chain.id === chainId ? { ...chain, intake: current.intake } : chain));
+      renderChainFilter();
+      statusNode.textContent = `${chainId} 开关保存失败：${error.message}`;
+    }
+  }
+
+  chainFilterNode?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-chain-toggle]");
+    if (!button) return;
+    toggleChainIntake(button.dataset.chainToggle);
+  });
   modeButtons.forEach((button) => {
     button.addEventListener("click", () => {
       const requested = button.dataset.watchMode;
@@ -5791,6 +5862,7 @@
   });
   updateModePresentation();
   initializeOkxWallet();
+  loadChainToggles();
   load();
   window.setInterval(() => {
     if (currentMode === "news") {

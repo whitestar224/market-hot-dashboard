@@ -618,6 +618,9 @@ from app.core.state import (
     PRICE_WATCH_BOARD_LABELS,
     PRICE_WATCH_BOARD_SHORTS,
     PRICE_WATCH_BOARDS,
+    PRICE_WATCH_INTAKE_CHAIN_IDS,
+    PRICE_WATCH_INTAKE_CHAIN_SHORTS,
+    PRICE_WATCH_INTAKE_CHAINS,
     PRICE_WATCH_CONSOLIDATION_BARS,
     PRICE_WATCH_CONSOLIDATION_NET_PCT,
     PRICE_WATCH_CONSOLIDATION_RANGE_PCT,
@@ -2146,6 +2149,17 @@ def init_auth_db() -> None:
                 board TEXT PRIMARY KEY,
                 intake_enabled INTEGER NOT NULL DEFAULT 1,
                 alert_enabled INTEGER NOT NULL DEFAULT 1,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        # 「链上入池」按链开关（2026-11-07）。没有行 = 该链开着，未动过开关的
+        # 安装行为与上线前完全一致；chain 存的是归一化后的展示标签（Solana/BSC/…）。
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_watch_chain_toggles (
+                chain TEXT PRIMARY KEY,
+                intake_enabled INTEGER NOT NULL DEFAULT 1,
                 updated_at INTEGER NOT NULL
             )
             """
@@ -30223,6 +30237,9 @@ def sync_price_watch_binance_wallet_candidates(
             or symbol in {"USDT", "USDC", "BUSD", "FDUSD", "DAI", "TUSD", "USDE", "USDD"}
         ):
             continue
+        # 「链上入池」按链开关：关掉的链不再收新标的（已在池的由池闸门挡住）。
+        if not price_watch_chain_intake_enabled(raw_row.get("chain")):
+            continue
         first_seen_at = int(safe_float(raw_row.get("firstSeenAt"), 0)) or last_seen_at or now_value
         candidates.append({
             "symbol": symbol,
@@ -30329,6 +30346,9 @@ def sync_price_watch_gmgn_hot_search_candidates(
         if not symbol or not contract or not chain:
             continue
         if is_excluded_crypto_asset(symbol) or symbol in {"USDT", "USDC", "BUSD", "FDUSD", "DAI", "TUSD", "USDE", "USDD"}:
+            continue
+        # 「链上入池」按链开关：关掉的链不再收新标的。
+        if not price_watch_chain_intake_enabled(chain):
             continue
         candidates.append({
             "symbol": symbol,
@@ -31586,6 +31606,150 @@ def set_price_watch_board_toggle(board: Any, kind: Any, enabled: Any) -> dict[st
     }
 
 
+# ── 「链上入池」按链开关（2026-11-07）─────────────────────────────────────
+# 用户原话：「链上标的里，Solana 链的会加入结构监控里……可不可以做个开关，
+# 不对 Solana 的链上标的做入池……或者为每条链做一个开关」。
+# 语义：关掉某条链 = 该链的**纯链上标的**不再入池、也不再进结构监控扫描；
+#       已在池里的当轮就被池闸门挡住（不必删库，重新打开立刻回来）；
+#       **交易所有上新记录的二级标的不受任何影响**（见 ``price_watch_row_chain_blocked``）。
+PRICE_WATCH_CHAIN_TOGGLE_CACHE: tuple[float, dict[str, bool]] | None = None
+PRICE_WATCH_CHAIN_TOGGLE_LOCK = threading.Lock()
+PRICE_WATCH_CHAIN_TOGGLE_SECONDS = max(
+    1.0,
+    float(os.getenv("PRICE_WATCH_CHAIN_TOGGLE_SECONDS", "5") or "5"),
+)
+
+
+def price_watch_chain_toggles(*, force: bool = False) -> dict[str, bool]:
+    """Return ``{chain_id: enabled}`` for the registered on-chain intake chains.
+
+    A chain without a stored row counts as enabled, so an untouched install
+    behaves exactly as before.  Any read failure fails open — a broken table
+    must never silently empty the monitor pool.
+    """
+
+    global PRICE_WATCH_CHAIN_TOGGLE_CACHE
+    state = {chain_id: True for chain_id in PRICE_WATCH_INTAKE_CHAIN_IDS}
+    now = time.time()
+    cached = PRICE_WATCH_CHAIN_TOGGLE_CACHE
+    if not force and cached and now - cached[0] < PRICE_WATCH_CHAIN_TOGGLE_SECONDS:
+        return cached[1]
+    try:
+        # Pure read (same reason as the board toggles): callers already hold the
+        # price DB transaction, re-entering AUTH_DB_LOCK would invert lock order.
+        with auth_db() as conn:
+            rows = conn.execute(
+                "SELECT chain, intake_enabled FROM price_watch_chain_toggles"
+            ).fetchall()
+    except Exception as exc:
+        print(
+            "Chain toggle state read failed: " + safe_error_text(str(exc))[:160],
+            file=sys.stderr,
+        )
+        # 失败也缓存一份「全开」，否则热路径（池构建/结构扫描）每次调用都打一行日志。
+        with PRICE_WATCH_CHAIN_TOGGLE_LOCK:
+            PRICE_WATCH_CHAIN_TOGGLE_CACHE = (now, state)
+        return state
+    for row in rows:
+        chain_id = desktop_alert_chain_label(row["chain"]) or clean_feed_text(row["chain"], 40)
+        if chain_id in state:
+            state[chain_id] = bool(row["intake_enabled"])
+    with PRICE_WATCH_CHAIN_TOGGLE_LOCK:
+        PRICE_WATCH_CHAIN_TOGGLE_CACHE = (now, state)
+    return state
+
+
+def price_watch_chain_intake_enabled(chain: Any) -> bool:
+    """Whether on-chain assets on ``chain`` may still enter the monitor pool.
+
+    Anything the alias table cannot map (empty chain, exchange-only symbols,
+    a chain we never registered) is allowed: 二级标的永远不该被这条开关误伤。
+    """
+
+    label = desktop_alert_chain_label(chain)
+    if not label:
+        return True
+    try:
+        return bool(price_watch_chain_toggles().get(label, True))
+    except Exception:
+        return True
+
+
+def price_watch_row_chain_blocked(row: sqlite3.Row | dict[str, Any] | None) -> bool:
+    """True when a pool row is an on-chain asset on a switched-off chain.
+
+    Exchange-listed rows (``new_contract_listed_at`` > 0, i.e. 二级标的) always
+    pass — the whole point of the switch is to stop unfamiliar on-chain noise,
+    not to hide coins the user tracks through exchange listings.
+    """
+
+    item = row_dict(row)
+    if not item:
+        return False
+    if int(safe_float(item.get("new_contract_listed_at"), 0)) > 0:
+        return False
+    source_chain = item.get("onchain_chain") or item.get("chain")
+    return not price_watch_chain_intake_enabled(source_chain)
+
+
+def price_watch_chain_payload(toggles: dict[str, bool] | None = None) -> list[dict[str, Any]]:
+    """Serialise the chain switches for the client."""
+
+    state = toggles if toggles is not None else price_watch_chain_toggles()
+    return [
+        {
+            "id": chain["id"],
+            "short": PRICE_WATCH_INTAKE_CHAIN_SHORTS.get(chain["id"], chain["id"]),
+            "note": chain.get("note") or "",
+            "intake": bool(state.get(chain["id"], True)),
+        }
+        for chain in PRICE_WATCH_INTAKE_CHAINS
+    ]
+
+
+def set_price_watch_chain_toggle(chain: Any, enabled: Any) -> dict[str, Any]:
+    raw = clean_feed_text(chain, 40)
+    chain_id = desktop_alert_chain_label(raw)
+    if chain_id not in PRICE_WATCH_INTAKE_CHAIN_IDS:
+        folded = raw.casefold()
+        chain_id = next(
+            (
+                candidate
+                for candidate in PRICE_WATCH_INTAKE_CHAIN_IDS
+                if PRICE_WATCH_INTAKE_CHAIN_SHORTS.get(candidate, "").casefold() == folded
+            ),
+            "",
+        )
+    if chain_id not in PRICE_WATCH_INTAKE_CHAIN_IDS:
+        raise ValueError("链无效")
+    enabled_value = bool_value(enabled, True)
+    now_ms = int(time.time() * 1000)
+    with AUTH_DB_LOCK, auth_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO price_watch_chain_toggles (chain, intake_enabled, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chain) DO UPDATE SET
+                intake_enabled = excluded.intake_enabled,
+                updated_at = excluded.updated_at
+            """,
+            (chain_id, 1 if enabled_value else 0, now_ms),
+        )
+    toggles = price_watch_chain_toggles(force=True)
+    # 开关一变，结构池名单必须立刻失效重建：那份名单有 TTL + 后台刷新，不清的话
+    # 用户点了开关还要等一会儿才生效（观感上就是「开关没用」）。
+    global PRICE_STRUCTURE_WATCH_ROWS_CACHE
+    with PRICE_STRUCTURE_WATCH_ROWS_CACHE_LOCK:
+        PRICE_STRUCTURE_WATCH_ROWS_CACHE = None
+    return {
+        "ok": True,
+        "chain": chain_id,
+        "enabled": enabled_value,
+        "chains": price_watch_chain_payload(toggles),
+        "message": f"{chain_id} 链 · 链上入池已{'开启' if enabled_value else '关闭'}",
+    }
+
+
 # ``key`` prefixes that identify which board a desktop alert came from.  The
 # order matters: the specific structure/oversold keys must be tested before the
 # generic ``price-watch:`` catch-all.  Keep in sync with the payloads emitted by
@@ -31762,11 +31926,14 @@ def price_watch_active_rows(
                 cutoff_ms, cutoff_ms,
             ),
         ).fetchall()
-    return filter_price_monitor_cold_archives(
+    rows = filter_price_monitor_cold_archives(
         [dict(row) for row in rows],
         now_ms=now_ms,
         persist_retention_transitions=persist_retention_transitions,
     )
+    # 「链上入池」按链开关：关掉的链上，纯链上标的当轮就退出池视图（页面、结构扫描、
+    # 各类弹窗都走这里），但库里那行不删 —— 重新打开立刻回来。二级标的不受影响。
+    return [row for row in rows if not price_watch_row_chain_blocked(row)]
 
 
 def price_watch_new_contract_prior_high_source_approved(row: sqlite3.Row | dict[str, Any] | None) -> bool:
@@ -35027,6 +35194,13 @@ def price_structure_watch_rows_uncached() -> list[dict[str, Any]]:
             wallet_row=wallet_row if wallet_last_seen_at >= priority_cutoff else {},
             market_activity=market_activity,
         )
+        # 「链上入池」按链开关：结构扫描也按链过滤（池闸门已挡一层，这里再挡一层，
+        # 因为「从未落库的活体发现行」不经过 price_watch_active_rows）。
+        # 交易所有上新记录的二级标的放行，与池闸门口径一致。
+        if int(merged.get("new_contract_listed_at") or 0) <= 0 and not price_watch_chain_intake_enabled(
+            resolved_identity.get("chain")
+        ):
+            return False
         item = {
             "symbol": symbol,
             "name": merged.get("name") or symbol,
@@ -58438,6 +58612,13 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"ok": False, "boards": [], "error": str(exc)}, status=502)
             return
+        if parsed.path == "/api/price-watch/chains":
+            # 同 boards：单独一条，改开关后下一次轮询立刻看到，不必等 payload 重建。
+            try:
+                self.send_json({"ok": True, "chains": price_watch_chain_payload()})
+            except Exception as exc:
+                self.send_json({"ok": False, "chains": [], "error": str(exc)}, status=502)
+            return
         if parsed.path == "/api/price-watch":
             try:
                 # Admission sources and price snapshots are maintained by the
@@ -59642,6 +59823,10 @@ class Handler(SimpleHTTPRequestHandler):
                 elif action in {"set_board_toggle", "toggle_board"}:
                     result = set_price_watch_board_toggle(
                         payload.get("board"), payload.get("kind"), payload.get("enabled", True)
+                    )
+                elif action in {"set_chain_toggle", "toggle_chain"}:
+                    result = set_price_watch_chain_toggle(
+                        payload.get("chain"), payload.get("enabled", True)
                     )
                 elif action == "refresh":
                     self.send_json(sync_price_watch_monitor())

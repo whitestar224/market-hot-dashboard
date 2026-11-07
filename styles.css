@@ -11896,6 +11896,67 @@ body.admin-console-body {
   background: var(--amber);
 }
 
+/* ── 链上入池·按链开关（2026-11-07）────────────────────────────────────
+   用户要的是「Solana 这些链上标的不想让它进池」，所以放在监控页模式条下面，
+   一行小 pill：亮=入池中，暗=已关闭。 */
+.price-watch-chain-filter {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: -6px 0 16px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgba(8, 11, 8, 0.6);
+}
+
+.price-watch-chain-filter[hidden] {
+  display: none;
+}
+
+.chain-filter-label {
+  margin-right: 2px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.chain-filter-pill {
+  min-width: 52px;
+  min-height: 30px;
+  padding: 4px 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+  letter-spacing: 0.03em;
+  background: rgba(0, 0, 0, 0.18);
+  transition: color 120ms ease, background 120ms ease, border-color 120ms ease;
+}
+
+.chain-filter-pill:hover {
+  color: var(--ink);
+  border-color: rgba(246, 187, 72, 0.6);
+}
+
+.chain-filter-pill.is-on {
+  border-color: rgba(246, 187, 72, 0.55);
+  color: var(--ink);
+  background: rgba(246, 187, 72, 0.18);
+}
+
+.chain-filter-pill[aria-pressed="false"] {
+  border-style: dashed;
+  color: var(--muted);
+  background: transparent;
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
 .price-watch-add-form {
   flex: 1 1 620px;
 }
