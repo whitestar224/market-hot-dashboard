@@ -206,6 +206,29 @@ class BinanceAlphaFeedTests(unittest.TestCase):
             server.sync_site_alert_feed(feed)
             self.assertEqual(popped, ["alpha-new:NEWT"])
 
+    def test_a_failed_fetch_does_not_mark_the_feed_ready(self):
+        """抓取失败时绝不能把 feed 标记 ready，否则网络一恢复、首轮真正抓到榜时，
+        会把榜上已有的 10 个存量币全部当成「新进」一次性刷屏（2026-11-08 线上复现）。"""
+        state = {"seen": {}, "ready": [], "newboardReadyScopes": [], "xTweetAnalysisWatermarks": {}}
+
+        def boom():
+            raise RuntimeError("dns resolve failed")
+
+        feed = {"name": "binance-alpha-new", "interval": 60, "maxAgeMs": server.ALPHA_NEW_ALERT_TTL_MS,
+                "fetch": boom, "parse": server.parse_binance_alpha_new_events}
+        with patch.object(server, "SITE_ALERT_STATE", state), \
+             patch.object(server, "SITE_ALERT_STATE_LOADED", True), \
+             patch.object(server, "save_site_alert_state", lambda: None):
+            server.sync_site_alert_feed(feed)
+        self.assertNotIn("binance-alpha-new", state["ready"])
+
+    def test_feed_payload_raises_instead_of_returning_empty_sections(self):
+        """fetch 失败时 binance_alpha_new_feed_payload 要抛异常，不能吞掉返回空 sections。
+        否则 sync_site_alert_feed 会把「空榜」当成正常轮询，照样标记 ready。"""
+        with patch.object(server, "cached", side_effect=RuntimeError("upstream down")):
+            with self.assertRaises(RuntimeError):
+                server.binance_alpha_new_feed_payload()
+
 
 class BinanceAlphaListedAssetTests(unittest.TestCase):
     """Alpha 清单要能被其它榜单新进弹窗复用（AIcoin 热榜新进 + Alpha 币 → 带提示与链）。"""

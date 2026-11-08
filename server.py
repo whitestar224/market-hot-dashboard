@@ -48229,12 +48229,15 @@ def apply_alpha_red_tone(event: dict[str, Any], chain_label: str) -> dict[str, A
 
 
 def binance_alpha_new_feed_payload() -> dict[str, Any]:
-    """只取 Alpha 那一段，避免与 18 秒一轮的新币榜全量轮询互相拖累。"""
-    try:
-        section = cached("binance-alpha-new", fetch_binance_alpha_new_coins)
-    except Exception as exc:
-        print(f"Binance Alpha new feed failed: {safe_error_text(str(exc))}", file=sys.stderr)
-        section = None
+    """只取 Alpha 那一段，避免与 18 秒一轮的新币榜全量轮询互相拖累。
+
+    抓不到时**必须抛异常**，而不是吞掉返回空 sections：``sync_site_alert_feed`` 只在
+    fetch 抛异常时才 return、不把 feed 标记 ready；若这里返回空 sections，它会照常把
+    ``binance-alpha-new`` 写进 ready，等网络一恢复、首轮真正抓到榜单时，榜上已有的
+    那 10 个币就全被当成「新进」一次性刷屏（2026-11-08 线上复现过：8 个存量 Alpha
+    币一起弹）。
+    """
+    section = cached("binance-alpha-new", fetch_binance_alpha_new_coins)
     return {
         "updatedAt": int(time.time() * 1000),
         "sections": [section] if isinstance(section, dict) else [],
