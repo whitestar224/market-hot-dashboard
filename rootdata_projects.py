@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import threading
 import time
 from datetime import datetime, timedelta
@@ -51,6 +52,10 @@ PROJECT_DISPLAY_LIMIT = max(1, int(float(os.getenv("ROOTDATA_PROJECT_DISPLAY_LIM
 PROJECT_WATCH_LIMIT = max(
     PROJECT_DISPLAY_LIMIT, int(float(os.getenv("ROOTDATA_PROJECT_WATCH_LIMIT", "20") or 20))
 )
+#: 每轮 refresh 最多补抓几个融资项目的详情页（详情/标签/生态/成立时间）。
+#: 详情页在 WAF 后面，抓密了会按出口 IP 封全站 —— 所以单轮只补几个、串行、失败即停，
+#: 宁可慢一点把 30 行补全，也不要为了快把整站撞进验证码。
+FUNDRAISING_DETAIL_BATCH = max(0, int(float(os.getenv("ROOTDATA_FUNDRAISING_DETAIL_BATCH", "3") or 3)))
 
 _HEADERS = {
     "User-Agent": (
@@ -418,6 +423,74 @@ def parse_fundraising(html: str) -> list[dict[str, Any]]:
     return rows
 
 
+# --------------------------------------------------------------------------- 项目详情
+
+def _fetch_detail(proxy: str, url: str) -> str:
+    """抓单个项目详情页。与 ``_try_fetch`` 不同：详情页**没有表格**（是侧栏 + ``<h2>详情</h2>``），
+    所以不能套「找不到 table 就报结构变了」那套校验，只拦验证码。"""
+    response = requests.get(
+        url, headers=_HEADERS, proxies=_proxies_for(proxy), timeout=(6, 25)
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"HTTP {response.status_code}")
+    text = response.text
+    if "CaptchaScript" in text:
+        raise RootdataBlocked("被腾讯云 WAF 拦住（滑块验证码）")
+    return text
+
+
+def parse_project_detail(html: str) -> dict[str, Any]:
+    """从项目详情页抽出「详情(简介)/标签/生态/成立时间」。
+
+    详情页右侧 ``<h2>详情</h2>`` 下面一段 ``p.line-clamp-3`` 是简介（最前面有个 RD-AI
+    的 sparkles 按钮，得剔掉），再往下三个 ``div.flex.min-w-0.items-baseline.gap-2``
+    分别是 标签 / 生态(n) / 成立时间，标签和生态是 badge（``<a>`` 里的小字），成立时间是
+    裸 ``<span>`` 值。任一字段拿不到就留空，绝不猜。
+    """
+    soup = BeautifulSoup(html, "lxml")
+    result: dict[str, Any] = {}
+
+    # 简介：详情标题正下方的 p.line-clamp-3。去掉 RD-AI 按钮里的图标残留（它没有文字，
+    # get_text 拿到的本来就干净，但保险起见用 p 的直接文本）。
+    detail_heading = soup.find("h2", string=lambda s: s and "详情" in str(s))
+    intro = ""
+    if detail_heading is not None:
+        container = detail_heading.parent
+        if container is not None:
+            para = container.find("p", class_=lambda c: c and "line-clamp" in c)
+            if para is not None:
+                intro = _text(para.get_text(" ", strip=True), 240)
+    result["intro"] = intro
+
+    # 标签 / 生态 / 成立时间：三个「label + value」行。
+    tags: list[str] = []
+    ecosystem: list[str] = []
+    founded = ""
+    for row in soup.find_all("div", class_=lambda c: c and "items-baseline" in c):
+        label_node = row.find("span", class_=lambda c: c and "shrink-0" in c)
+        if label_node is None:
+            continue
+        label = _text(label_node.get_text(" ", strip=True), 20).rstrip(":").strip()
+        if label in ("标签", "生态") or label.startswith("生态"):
+            # 徽章：<a><span data-slot="badge">DeFi</span></a>，badge 属性在 span 上。
+            values = [
+                _text(node.get_text(" ", strip=True), 40)
+                for node in row.select('[data-slot="badge"]')
+            ]
+            values = [value for value in values if value]
+            if label.startswith("生态"):
+                ecosystem = values
+            else:
+                tags = values
+        elif label == "成立时间":
+            value_node = row.find("div", class_=lambda c: c and "font-medium" in c)
+            founded = _text(value_node.get_text(" ", strip=True), 20) if value_node else ""
+    result["tags"] = tags
+    result["ecosystem"] = ecosystem
+    result["founded"] = founded
+    return result
+
+
 # --------------------------------------------------------------------------- 快照
 
 def _read(path: Path) -> dict[str, Any]:
@@ -578,6 +651,21 @@ def fundraising_rows(limit: int = 18) -> list[dict[str, Any]]:
             bits.append(f"估值 {valuation}")
         if investors:
             bits.append("投资方 " + " / ".join(investors))
+        # 详情页字段（2026-11-08 用户要求标在融资信息流上）：
+        # 简介和成立时间拼进 note（描述性信息），标签/生态拼进 tags（徽章）。
+        intro = _text(item.get("intro"), 240)
+        if intro:
+            bits.append(intro)
+        founded = _text(item.get("founded"), 20)
+        if founded:
+            bits.append(f"成立于 {founded}")
+        tags = [tag for tag in (round_name, "一级融资", f"估值 {valuation}" if valuation else "") if tag]
+        for tag in (item.get("tags") or [])[:4]:
+            if tag and tag not in tags:
+                tags.append(tag)
+        for eco in (item.get("ecosystem") or [])[:3]:
+            if eco and eco not in tags:
+                tags.append(f"生态 {eco}")
         rows.append({
             "id": "rootdata-funding-" + re.sub(r"\W+", "-", _fundraising_key(item))[:80],
             "group": "ipo",
@@ -595,7 +683,7 @@ def fundraising_rows(limit: int = 18) -> list[dict[str, Any]]:
             "date": int(item.get("date") or 0),
             "metric": amount or valuation or "金额未披露",
             "note": " · ".join(bits),
-            "tags": [tag for tag in (round_name, "一级融资", f"估值 {valuation}" if valuation else "") if tag],
+            "tags": tags,
             "url": _text(item.get("url"), 400) or FUNDRAISING_URL,
         })
     return rows
@@ -698,6 +786,9 @@ def refresh(datasets: tuple[str, ...] = ("projects", "fundraising")) -> dict[str
                 for event in events
                 if _fundraising_key(event) not in seen_set
             ]
+            # 详情字段（详情/标签/生态/成立时间）增量补齐：把上一轮已经抓到的详情并回
+            # 本轮，再对「还没有详情」的事件逐个补抓（每轮最多几个、串行、失败即停）。
+            events = _enrich_fundraising_details(events, previous)
             # 首跑只建账本（一次弹 30 条是灾难）；之后每轮把「新出现的」交给弹窗。
             # **没注册回调 = 没人听**（例如 tools/rootdata_login.py --pull 手动拉一次、
             # 或跑在没有 main() 的 worker 进程里）：这种情况下绝不能把这些 key 记成
@@ -713,6 +804,91 @@ def refresh(datasets: tuple[str, ...] = ("projects", "fundraising")) -> dict[str
         finally:
             _release_fundraising_lock()
     return result
+
+
+def _enrich_fundraising_details(
+    events: list[dict[str, Any]], previous: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """给融资事件补「详情/标签/生态/成立时间」四个字段（来自每个项目详情页）。
+
+    - 上一轮已经抓到的详情，按 ``_fundraising_key`` 并回本轮（详情页是慢资源，抓过就别重抓）；
+    - 还没详情的事件，每轮最多补 ``FUNDRAISING_DETAIL_BATCH`` 个，串行、遇封禁/网络错
+      立即停（详情页在 WAF 后面，抓密了会按出口 IP 封全站）。
+    - 抓不到就留空，下一轮再试；绝不伪造、也绝不让详情抓取失败拖垮整个融资刷新。
+    """
+    if not events:
+        return events
+    previous_events = previous.get("events") if isinstance(previous.get("events"), list) else []
+    detail_by_key: dict[str, dict[str, Any]] = {}
+    for item in previous_events:
+        if not isinstance(item, dict):
+            continue
+        # 只有当上一轮确实抓到了详情字段才缓存（intro 非空 或 有 tags/ecosystem/founded）。
+        if (
+            _text(item.get("intro"), 240)
+            or (item.get("tags") or item.get("ecosystem") or item.get("founded"))
+        ):
+            detail_by_key[_fundraising_key(item)] = {
+                "intro": item.get("intro") or "",
+                "tags": item.get("tags") or [],
+                "ecosystem": item.get("ecosystem") or [],
+                "founded": item.get("founded") or "",
+            }
+
+    missing = [
+        event for event in events
+        if _fundraising_key(event) not in detail_by_key and _text(event.get("url"), 40)
+    ]
+    if FUNDRAISING_DETAIL_BATCH <= 0 or not missing:
+        # 没得抓：直接把缓存里的详情并回来，然后返回。
+        for event in events:
+            detail = detail_by_key.get(_fundraising_key(event))
+            if detail:
+                event.update(detail)
+        return events
+
+    proxy = ""
+    try:
+        proxy = _working_proxy()
+    except Exception:
+        proxy = ""
+    if not proxy:
+        # 代理都不可用，别硬抓详情；缓存详情照常并回。
+        for event in events:
+            detail = detail_by_key.get(_fundraising_key(event))
+            if detail:
+                event.update(detail)
+        return events
+
+    patched = 0
+    for event in missing[:FUNDRAISING_DETAIL_BATCH]:
+        url = _text(event.get("url"), 400)
+        if not url.startswith("https://cn.rootdata.com/projects/detail/"):
+            continue
+        try:
+            detail = parse_project_detail(_fetch_detail(proxy, url))
+        except RootdataBlocked:
+            # 封禁：立即停手，别再敲下一个门。
+            break
+        except Exception:
+            # 单个详情页失败（404/结构变/超时）不致命，跳过继续下一个。
+            continue
+        event.update(detail)
+        detail_by_key[_fundraising_key(event)] = {
+            "intro": detail.get("intro") or "",
+            "tags": detail.get("tags") or [],
+            "ecosystem": detail.get("ecosystem") or [],
+            "founded": detail.get("founded") or "",
+        }
+        patched += 1
+
+    for event in events:
+        detail = detail_by_key.get(_fundraising_key(event))
+        if detail:
+            event.update(detail)
+    if patched:
+        print(f"RootData fundraising details enriched: {patched}", file=sys.stderr)
+    return events
 
 
 _THUMB_SIZED = re.compile(r"\.(?:png|jpe?g|webp|gif)$", re.I)

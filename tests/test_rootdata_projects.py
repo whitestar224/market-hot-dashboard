@@ -149,6 +149,40 @@ FUNDRAISING_ROW_HTML = """
 """
 
 
+#: 项目详情页「详情」区块的真实形状（2026-11-08 从 Avon 详情页截取）：
+#: h2 详情 + p.line-clamp-3 简介 + 三个「标签 / 生态(n) / 成立时间」行，徽章 data-slot="badge" 在 span 上。
+DETAIL_HTML = """
+<html><body><div>
+  <h2 class="mb-4 text-base font-semibold">详情</h2>
+  <div class="mb-4"><div class="relative">
+    <p class="line-clamp-3 text-sm leading-6 whitespace-pre-line text-foreground">
+      <button aria-label="本内容由 RD AI 生成" type="button"></button>
+      Avon 是一个可组合的基于订单簿的借贷框架。
+    </p>
+  </div></div>
+  <div class="flex flex-col gap-3">
+    <div class="flex min-w-0 items-baseline gap-2">
+      <span class="shrink-0 text-sm text-muted-foreground">标签 :</span>
+      <div class="min-w-0 text-sm font-medium">
+        <a class="inline-flex" href="/projects?sd=224"><span data-slot="badge">DeFi</span></a>
+        <a class="inline-flex" href="/projects?sd=75"><span data-slot="badge">借贷</span></a>
+      </div>
+    </div>
+    <div class="flex min-w-0 items-baseline gap-2">
+      <span class="shrink-0 text-sm text-muted-foreground">生态(1) :</span>
+      <div class="min-w-0 text-sm font-medium">
+        <a class="inline-flex" href="/ecosystemmap/list/336?n=MegaETH"><span data-slot="badge">MegaETH</span></a>
+      </div>
+    </div>
+    <div class="flex min-w-0 items-baseline gap-2">
+      <span class="shrink-0 text-sm text-muted-foreground">成立时间 :</span>
+      <div class="min-w-0 text-sm font-medium"><span>2024</span></div>
+    </div>
+  </div>
+</div></body></html>
+"""
+
+
 class RootdataParseTests(unittest.TestCase):
     def test_avatar_initial_is_never_mistaken_for_a_ticker(self):
         """单元格最左边的圆形头像是 ``span.text-muted-foreground``，里面只有项目名首字母。"""
@@ -158,6 +192,20 @@ class RootdataParseTests(unittest.TestCase):
         self.assertEqual(rows[0]["symbol"], "")
         self.assertEqual(rows[0]["popularity"], 297)
         self.assertEqual(rows[0]["growth"], 724)
+
+    def test_project_detail_extracts_intro_tags_ecosystem_and_founded(self):
+        detail = rp.parse_project_detail(DETAIL_HTML)
+        self.assertEqual(detail["intro"], "Avon 是一个可组合的基于订单簿的借贷框架。")
+        self.assertEqual(detail["tags"], ["DeFi", "借贷"])
+        self.assertEqual(detail["ecosystem"], ["MegaETH"])
+        self.assertEqual(detail["founded"], "2024")
+
+    def test_project_detail_without_blocks_returns_empty_fields(self):
+        detail = rp.parse_project_detail("<html><body>nothing here</body></html>")
+        self.assertEqual(detail["intro"], "")
+        self.assertEqual(detail["tags"], [])
+        self.assertEqual(detail["ecosystem"], [])
+        self.assertEqual(detail["founded"], "")
 
     def test_fundraising_row_maps_every_column(self):
         events = rp.parse_fundraising(FUNDRAISING_ROW_HTML)
@@ -246,6 +294,67 @@ class RootdataFundingLedgerTests(unittest.TestCase):
         rp.set_fundraising_alert_callback(received.append)
         self.assertTrue(rp._emit_fundraising_alerts([event]))  # noqa: SLF001
         self.assertEqual(len(received), 1)
+
+
+class RootdataFundingDetailTests(unittest.TestCase):
+    """融资事件补「详情/标签/生态/成立时间」：增量、串行、失败不拖垮刷新。"""
+
+    def _event(self, name="Avon", round_name="并购", date=1793937600000):
+        return {
+            "name": name, "symbol": "", "round": round_name, "amount": "", "valuation": "",
+            "date": date, "investors": ["Aave"], "investorExtra": 0,
+            "url": f"https://cn.rootdata.com/projects/detail/{name}?k=1", "newsUrl": "",
+        }
+
+    def test_carries_over_details_already_fetched_last_round(self):
+        """上一轮抓到的详情不能丢：按 key 并回本轮，别对同一项目反复抓详情页。"""
+        previous = {"events": [{
+            **self._event(), "intro": "借贷框架", "tags": ["DeFi"], "ecosystem": ["MegaETH"], "founded": "2024",
+        }]}
+        events = [self._event()]
+        with mock.patch.object(rp, "FUNDRAISING_DETAIL_BATCH", 0):
+            result = rp._enrich_fundraising_details(events, previous)  # noqa: SLF001
+        self.assertEqual(result[0]["intro"], "借贷框架")
+        self.assertEqual(result[0]["ecosystem"], ["MegaETH"])
+        self.assertEqual(result[0]["founded"], "2024")
+
+    def test_fetches_at_most_the_batch_size_per_round(self):
+        """每轮最多补 batch 个，串行；抓到的详情写回事件。"""
+        events = [self._event(name=f"P{i}") for i in range(5)]
+        with mock.patch.object(rp, "FUNDRAISING_DETAIL_BATCH", 2), \
+             mock.patch.object(rp, "_working_proxy", return_value="http://127.0.0.1:7890"), \
+             mock.patch.object(rp, "_fetch_detail", return_value=DETAIL_HTML):
+            result = rp._enrich_fundraising_details(events, {})  # noqa: SLF001
+        enriched = [event for event in result if event.get("intro")]
+        self.assertEqual(len(enriched), 2)  # 只补了 2 个
+        self.assertEqual(enriched[0]["tags"], ["DeFi", "借贷"])
+
+    def test_stops_on_waf_block(self):
+        """被 WAF 拦住立即停手，别再敲下一个门。"""
+        events = [self._event(name=f"P{i}") for i in range(3)]
+        with mock.patch.object(rp, "FUNDRAISING_DETAIL_BATCH", 3), \
+             mock.patch.object(rp, "_working_proxy", return_value="http://127.0.0.1:7890"), \
+             mock.patch.object(rp, "_fetch_detail", side_effect=rp.RootdataBlocked("captcha")):
+            result = rp._enrich_fundraising_details(events, {})  # noqa: SLF001
+        self.assertTrue(all(not event.get("intro") for event in result))
+
+    def test_rows_render_details_into_note_and_tags(self):
+        """行映射：简介+成立时间进 note（不受前端 tags 上限影响），标签/生态进 tags。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot = Path(tmp) / "fundraising.json"
+            with mock.patch.object(rp, "FUNDRAISING_SNAPSHOT", snapshot):
+                event = {
+                    **self._event(),
+                    "intro": "Avon 是一个可组合的基于订单簿的借贷框架。",
+                    "tags": ["DeFi", "借贷"], "ecosystem": ["MegaETH"], "founded": "2024",
+                }
+                rp.write_fundraising_snapshot([event], [])
+                rows = rp.fundraising_rows(limit=5)
+        row = rows[0]
+        self.assertIn("Avon 是一个可组合的基于订单簿的借贷框架", row["note"])
+        self.assertIn("成立于 2024", row["note"])
+        self.assertIn("DeFi", row["tags"])
+        self.assertIn("生态 MegaETH", row["tags"])
 
 
 class RootdataProjectWatchTests(unittest.TestCase):

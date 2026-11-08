@@ -370,10 +370,12 @@ function renderTimelineDay(group) {
 
 function renderTimelineItem(row, rank = 99) {
   const heat = rowHeatInfo(row, rank);
+  // 链上融资卡片要展示详情页的标签/生态，标签上限放宽（其它卡片维持 5 个）。
+  const tagCap = row.rootdata ? 8 : 5;
   const tags = [
     ...(heat.high ? ["高热"] : []),
     ...(row.tags || [])
-  ].slice(0, 5).map((tag) => `<span class="${tag === "高热" ? "is-hot" : ""}">${escapeHtml(tag)}</span>`).join("");
+  ].slice(0, tagCap).map((tag) => `<span class="${tag === "高热" ? "is-hot" : ""}">${escapeHtml(tag)}</span>`).join("");
   const title = escapeHtml(row.title || row.symbol || "--");
   const symbol = escapeHtml(row.symbol || row.sourceLabel || "--");
   const metric = escapeHtml(row.metric || row.price || row.status || "");
