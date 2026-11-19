@@ -1,0 +1,10 @@
+{
+  "token": "<App access token：JWT，aud 等于 privyAppId>",
+  "refreshToken": "<86 字符左右的不透明串>",
+  "tokenExp": "2026-11-18T10:13:05+00:00",
+  "privyCaId": "<uuid，可留空自动生成>",
+  "deviceId": "<uuid，自动生成并复用>",
+  "refreshTokenFirstSeenAt": "2026-11-18T17:00:15+08:00",
+  "source": "privy-refresh | emulator-dump",
+  "lastRefreshAt": "2026-11-18T17:33:10+08:00"
+}
