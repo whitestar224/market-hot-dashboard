@@ -53,12 +53,22 @@ CA_HOLD_ONLY = "0x2222222222222222222222222222222222222222"
 CA_AGENT = "0xe5881c31162488d335aab82a20cd4bf156487777"
 FAKE_HIT = "首个"                                     # 假装「上一版正文」命中过它
 
+# 自定义关键词（2026-11-19 用户要求）：
+# 这个币的真实叙事是「慈善CZ以CZ创办Giggle Academy咯咯学院…」，内置词表**一个字都不命中**
+# （无 新/第一/首个/发射台/agent…），所以只要卡片是蓝的，就只能是自定义词「咯咯学院」干的。
+CUSTOM_WORD = "咯咯学院"
+
 # 旧语义：拆掉 known 这道闸（补位不再看「当前正文已经取到」）
 OLD_PATCHES = [
     ("if (marks.has(ca) || known.has(ca)) continue;", "if (marks.has(ca)) continue;"),
     ("if (!hits.length) { dropHot(ca); continue; }", "if (!hits.length) continue;"),
     # 持仓豁免也一起拆掉，`--holdings --old` 才能证明这条闸真的在起作用
     ("if (inHoldingsPanel(card)) return;", "if (false) return;"),
+    # 预取只按 token 链接枚举（1.8.0 之前的样子）：`--data-only --old` 必须复现「一个请求都不发」
+    ("for (const node of document.querySelectorAll(CA_DATA_SEL)) {\n"
+     "        if (out.length >= 40) break;",
+     "for (const node of []) {\n"
+     "        if (out.length >= 40) break;"),
 ]
 
 SHIMS = r"""
@@ -87,6 +97,9 @@ SHIMS = r"""
   // 标记开关：1.7.7 起默认开；这里显式写 on 并把两个一次性迁移都标成已完成，结果才可复现
   __ls.setItem('gm_hotMark', JSON.stringify('on'));
   __ls.setItem('gm_hotMarkOnMigrated', JSON.stringify('v1'));
+  // 自定义关键词（1.8.0 面板）：预置词表 + 开关，等价于用户在面板里填好了
+  __ls.setItem('gm_customKw', JSON.stringify(__CUSTOM__));
+  __ls.setItem('gm_customKwOn', JSON.stringify('__CUSTOM_ON__'));
 """
 
 FIXTURE = r"""
@@ -106,7 +119,7 @@ FIXTURE = r"""
     </table>
     <div data-trenches-token-address="${CA}" data-trenches-token-chain="bsc" data-trenches-token-key="${CA}-bsc"
          style="position:absolute;left:200px;top:200px;width:320px;height:140px;z-index:1;background:#1b1b22;color:#eee;">
-      <a href="/bsc/token/${CA}" style="color:#8cf;">慈善CZ</a>
+      __CARD_LINK__
       <span style="font-size:12px;">$1.3万</span>
     </div>
 `;
@@ -159,7 +172,28 @@ FIXTURE = r"""
           return false;
         })(),
         title: card() ? (card().getAttribute('title') || '').slice(0, 60) : '',
+        // 自定义关键词面板（1.8.0）：挂上了没有、开关状态、chip 里是不是用户的词
+        kwPanel: !!document.getElementById('gigax-kw-panel'),
+        kwInput: !!document.querySelector('#gigax-kw-panel .kw-input'),
+        kwChips: [...document.querySelectorAll('#gigax-kw-panel .kw-chip')]
+                   .map(e => (e.textContent || '').replace('×', '').trim()),
+        kwSwitchOn: (() => {
+          const s = document.querySelector('#gigax-kw-panel .kw-switch');
+          return s ? s.getAttribute('aria-checked') : null;
+        })(),
         narratives: nb.map(u => u.replace(/^.*[?&]address=/, '').slice(0, 12)),
+        // 批量请求里**到底带了哪些币**（末尾 6 位）：只数「有没有请求」会被别的卡的请求骗过去
+        //（`--data-only` 那轮里，持仓表那行本身就带 token 链接，照样会发一条 batch）。
+        batchCas: (() => {
+          const set = new Set();
+          for (const u of reqs) {
+            if (!u.includes('/narratives?items=')) continue;
+            const q = u.split('items=')[1] || '';
+            decodeURIComponent(q.split('&')[0] || '').split(',')
+              .filter(Boolean).forEach(s => set.add(s.slice(-6)));
+          }
+          return [...set];
+        })(),
         paintBeacons: hit.length,
         paintBeat: hit.length ? decodeURIComponent(hit[hit.length - 1].split('hit=')[1] || '') : '',
         secs: SECS,
@@ -174,11 +208,17 @@ FIXTURE = r"""
 """
 
 
-def build(src: str, secs: int, ca: str = CA, fail_net: bool = False) -> str:
+def build(src: str, secs: int, ca: str = CA, fail_net: bool = False,
+          custom=None, custom_on: bool = True, card_link: bool = True) -> str:
+    words = json.dumps(custom or [], ensure_ascii=False)
+    link = ('<a href="/bsc/token/%s" style="color:#8cf;">慈善CZ</a>' % ca) if card_link \
+        else '<span style="font-size:13px;">慈善CZ</span>'
     return ('() => {\n' + SHIMS + '\n' + src + '\n' + FIXTURE + '\n}\n') \
         .replace('__FAIL_NET__', 'true' if fail_net else 'false') \
         .replace('__CA__', ca).replace('__CA_HOLD__', CA_HOLD_ONLY) \
-        .replace('__HIT__', FAKE_HIT).replace('__SECS__', str(secs))
+        .replace('__HIT__', FAKE_HIT).replace('__SECS__', str(secs)) \
+        .replace('__CUSTOM__', words).replace('__CUSTOM_ON__', 'on' if custom_on else 'off') \
+        .replace('__CARD_LINK__', link)
 
 
 def main():
@@ -193,6 +233,12 @@ def main():
                     help="同屏放一张行情卡 + 一行持仓表（同一个币）：行情卡要标，持仓行不许标")
     ap.add_argument("--narrative-none", action="store_true",
                     help="换成「桥接明确没叙事」的地址：1.7.6 起不许补位（期望不标）")
+    ap.add_argument("--custom", action="store_true",
+                    help="自定义关键词命中：内置词 0 命中，标蓝只能来自面板里填的词")
+    ap.add_argument("--custom-off", action="store_true",
+                    help="同 --custom，但把面板开关关掉：不许标记")
+    ap.add_argument("--data-only", action="store_true",
+                    help="卡片里没有 token 链接（新币格的真实形态）：预取必须靠 data 属性仍发请求")
     ap.add_argument("--url", default="http://127.0.0.1:8765/api/gigax/_diag?ev=fixture")
     a = ap.parse_args()
 
@@ -203,10 +249,14 @@ def main():
                 raise SystemExit("补丁没打上（源码变了？）：" + old[:60])
             src = src.replace(old, new, 1)
 
+    use_custom = a.custom or a.custom_off or a.data_only
     os.makedirs(os.path.dirname(OUT_JS), exist_ok=True)
     with open(OUT_JS, "w", encoding="utf-8") as f:
         ca = CA_NO_NARRATIVE if a.narrative_none else (CA_AGENT if a.ai else CA)
-        f.write(build(src, a.secs, ca, fail_net=a.fallback or a.holdings))
+        f.write(build(src, a.secs, ca, fail_net=a.fallback or a.holdings,
+                      custom=[CUSTOM_WORD] if use_custom else [],
+                      custom_on=not a.custom_off,
+                      card_link=not a.data_only))
     print(f"[fixture] {'OLD' if a.old else 'CURRENT'} → {OUT_JS}")
 
     m = Mcp()
@@ -224,10 +274,52 @@ def main():
     print(json.dumps(d, ensure_ascii=False, indent=1))
 
     ok = True
-    if not d.get("narratives"):
+    use_custom = a.custom or a.custom_off or a.data_only
+    if not d.get("narratives") and not a.data_only:
         print("!! 一个叙事请求都没发（预取没覆盖到这张卡），这次结果不能当验收")
         ok = False
-    if a.ai:
+    if use_custom:
+        # 面板本身：挂上了没、词在里面没、开关状态对不对
+        if not d.get("kwPanel") or not d.get("kwInput"):
+            print("!! 自定义关键词面板没挂上（缺 #gigax-kw-panel / .kw-input）")
+            ok = False
+        if CUSTOM_WORD not in "".join(d.get("kwChips") or []):
+            print("!! 面板 chips 里没有预置词：" + repr(d.get("kwChips")))
+            ok = False
+        want = "false" if a.custom_off else "true"
+        if d.get("kwSwitchOn") != want:
+            print(f"!! 面板开关状态不对：{d.get('kwSwitchOn')}（期望 {want}）")
+            ok = False
+    if a.data_only:
+        # 1.8.0 的关键修复：卡里没有 token 链接（新币格的真实形态）也必须被预取到。
+        # 判据必须是「batch 里带了这张卡的 CA」，不能只看「有没有发请求」——
+        # 同屏持仓表那行本来就带 token 链接，会白送一条 batch 把断言骗过去（第一版就骗了）。
+        ca6 = CA[-6:]
+        asked = ca6 in (d.get("batchCas") or [])
+        if a.old:
+            if asked:
+                print("!! 旧版也把这张卡预取到了 —— 探针没测到那个 bug（补丁没生效？）")
+                ok = False
+            else:
+                print("   （旧版符合预期：没有 token 链接的卡一个请求都不发 = 新币延迟的真凶）")
+        elif not asked:
+            print("!! 没有 token 链接的卡没进 batch 请求 —— 预取还是只认链接")
+            ok = False
+        elif not d.get("marked"):
+            print("!! 请求发了却没标上（自定义词没参与判定？看 kwChips / title）")
+            ok = False
+    elif a.custom:
+        if not d.get("blueMarked"):
+            print("!! 自定义关键词命中却没标蓝：" + (d.get("title") or ""))
+            ok = False
+        if d.get("aiMarked"):
+            print("!! 自定义词不该走白色标记")
+            ok = False
+    elif a.custom_off:
+        if d.get("marked"):
+            print("!! 面板开关关了，仍按自定义词标了：" + (d.get("title") or ""))
+            ok = False
+    elif a.ai:
         if not d.get("aiMarked"):
             print("!! AI 词没有走白色标记（看 hotNodes / title）")
             ok = False

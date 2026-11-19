@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GMGN AI 叙事 → GIGA X 叙事
 // @namespace    https://github.com/whitestar224/market-hot-dashboard
-// @version      1.7.9
+// @version      1.8.0
 // @description  把 GMGN 网页端代币 AI 叙事悬浮窗内容替换为 GIGA X 对应代币的叙事分析
 // @author       market-hot-dashboard
 // @match        *://gmgn.ai/*
@@ -30,7 +30,7 @@
   const API = BRIDGE + '/api/gigax';
   // 版本号写死一份：诊断面板会显示它，用来确认「你装的到底是不是这一版」
   //（反复修同一个问题、结果用户还在跑旧脚本，已经踩过一次）。
-  const SCRIPT_VERSION = '1.7.9';
+  const SCRIPT_VERSION = '1.8.0';
 
   const POLL_MS = 1500;            // 轮询保底（快路径是 DOM 观察 + hover 预热；放宽以减轻主线程压力）
   const CACHE_TTL = 30 * 60 * 1000;// 同一 CA 叙事缓存 30 分钟（和服务端一致）
@@ -495,6 +495,9 @@
       // → staleTarget 的 C 判据 1 秒判一次「换币」→ resetRoot 把原生小字还原 →
       // 下一轮又从缓存重绘 → 页面就这么 1 秒抖一次。
       if (stack.length && root && (root === stack[0] || root.contains(stack[0]))) return null;
+      // 自己的「叙事关键词」面板也是 fixed 浮层：指针停在它上面时，穿透到底下的卡片同样没意义
+      //（拖面板时尤其容易撞上，别让它把浮窗身份改掉）。
+      if (stack.length && stack[0] && stack[0].closest && stack[0].closest('#gigax-kw-panel')) return null;
       for (const r of knownRoots) {
         if (stack.length && (r === stack[0] || r.contains(stack[0]))) return null;
       }
@@ -1014,7 +1017,9 @@
     for (const el of knownRoots) {
       if (el.isConnected && isVisible(el)) roots.add(el);
     }
-    const out = [...roots].filter(el => el && el.isConnected && isFloatingLayer(el));
+    // 自己的面板（fixed）绝不能被当成叙事浮层 —— 认错的后果是它会把面板正文改写成「加载中」
+    const out = [...roots].filter(el => el && el.isConnected && isFloatingLayer(el)
+      && !(el.closest && el.closest('#gigax-kw-panel')));
     knownRoots = out;
     return out;
   }
@@ -1236,6 +1241,32 @@
     }
   });
 
+  // ===== 自定义关键词（2026-11-19 用户要求）=====
+  // 悬浮面板里自己填「要捕获的叙事词」：填了就存进 GM 存储，删了就立刻失效。
+  // 命中后**与内置词同权**参与标色（用户：「被捕获的关键词也是用蓝色标记」）——
+  // 也就是走 `.gigax-hot-card` 那条蓝底；只有词本身属于 AI 组时才变白。
+  const CUSTOM_MAX = 40;        // 最多存几个（面板 chip 太多会滚成一团）
+  const CUSTOM_WORD_MAX = 24;   // 单个词最长字符数
+  const CUSTOM_SEP = /[,，、;；\s]+/;   // 一次输入多个词的分隔符
+  let customKw = GM_getValue('customKw', []);
+  if (!Array.isArray(customKw)) customKw = [];
+  customKw = customKw
+    .filter(w => typeof w === 'string' && w.trim())
+    .map(w => w.trim().slice(0, CUSTOM_WORD_MAX));
+  let customKwOn = GM_getValue('customKwOn', 'on') !== 'off';
+
+  // 自定义词是运行时才知道的，短 ASCII 词（`id`/`xy`）的整词边界正则只能按需建；
+  // 内置词那几个已经在上面预编译过，这里直接复用同一个 Map。
+  function shortRxFor(p) {
+    if (!/^[a-z0-9]{1,2}$/.test(p)) return null;
+    let rx = SHORT_ASCII_RX.get(p);
+    if (!rx) {
+      rx = new RegExp(`(^|[^a-z0-9])${p}($|[^a-z0-9])`);
+      SHORT_ASCII_RX.set(p, rx);
+    }
+    return rx;
+  }
+
   // **英文一律不区分大小写**：GMGN/GIGA X 的文案里 `Launchpad`、`Agent ID`、`Agentic`
   // 首字母大写的写法很常见，以前 `text.includes('launchpad')` 直接漏掉（2026-11-19）。
   function matchHot(text) {
@@ -1243,14 +1274,16 @@
     const low = String(text).toLowerCase();
     const has = (w) => {
       const p = String(w).toLowerCase();
-      const rx = SHORT_ASCII_RX.get(p);
+      const rx = shortRxFor(p);
       return rx ? rx.test(low) : low.includes(p);
     };
     const strong = HOT_STRONG.filter(has);
     // '新模式' 已经算强词，别再把它里面的 '新' 重复算一个弱词
     const weak = HOT_WEAK.filter(w => has(w) && !strong.some(s => s.includes(w)));
-    if (!strong.length && !weak.length) return [];
-    return [...new Set(strong.concat(weak))];
+    // 自定义词：关掉开关就当它不存在（内置词不受影响）
+    const custom = customKwOn ? customKw.filter(has) : [];
+    if (!strong.length && !weak.length && !custom.length) return [];
+    return [...new Set(strong.concat(weak).concat(custom))];
   }
 
   let markedCards = [];
@@ -1567,11 +1600,352 @@
     }
   }
 
+  // ===== 自定义关键词面板（悬浮 / 可拖拽 / 可折叠）=====
+  // 用户 2026-11-19：「能不能再做一个自定义关键词的填写框，然后用一个悬浮可拖拽的开关去控制，
+  // 可以填写要捕获的叙事关键词，然后在输入框里填了之后会被保存，也可以通过删除键去删除」，
+  // 补一句「被捕获的关键词也是用蓝色标记」。
+  // 设计取舍：
+  //  · 面板只管「填词 / 删词 / 自定义词的开关」，**内置词表一个字都不动**（深浅与总开关仍在菜单）；
+  //  · 拖拽只挂标题栏，pointerdown 立刻 stopPropagation —— GMGN 自己也在监听指针事件，
+  //    不拦住的话拖面板会顺带把卡片 hover 起来；
+  //  · 面板直接挂 body，不参与 findFloatingRoots / 深扫，所以不会被当成叙事浮层；
+  //  · 词存在 GM 存储（`customKw`），页面刷新、换标签页都还在。
+  const KW_PANEL_ID = 'gigax-kw-panel';
+  const KW_POS_KEY = 'customKwPos';
+  let kwHidden = GM_getValue('customKwHidden', false) === true;
+  let kwCollapsed = GM_getValue('customKwCollapsed', false) === true;
+  let kwPanel = null;
+  let kwFlashTimer = null;
+
+  function ensureKwCss() {
+    if (document.getElementById('gigax-kw-style')) return;
+    const st = document.createElement('style');
+    st.id = 'gigax-kw-style';
+    st.textContent = `
+#gigax-kw-panel{position:fixed;right:18px;bottom:92px;width:252px;z-index:2147483002;
+  background:rgba(18,22,32,.97)!important;border:1px solid rgba(122,150,220,.30);border-radius:12px;
+  box-shadow:0 12px 32px rgba(0,0,0,.52);color:#e6ebf5!important;overflow:hidden;text-align:left;
+  font:12px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;}
+#gigax-kw-panel *{box-sizing:border-box;font-family:inherit;}
+#gigax-kw-panel.kw-collapsed .kw-body{display:none;}
+#gigax-kw-panel .kw-head{display:flex;align-items:center;gap:7px;padding:8px 9px;cursor:grab;
+  background:linear-gradient(180deg,rgba(77,107,254,.26),rgba(77,107,254,.06));
+  border-bottom:1px solid rgba(122,150,220,.16);}
+#gigax-kw-panel.kw-dragging .kw-head{cursor:grabbing;}
+#gigax-kw-panel .kw-dot{width:7px;height:7px;border-radius:50%;background:#4d6bfe;flex:0 0 auto;
+  box-shadow:0 0 8px rgba(77,107,254,.9);}
+#gigax-kw-panel .kw-title{font-size:12.5px;font-weight:600;color:#eef2fb;white-space:nowrap;}
+#gigax-kw-panel .kw-count{margin-left:auto;font-size:10.5px;color:#9fb0d0;min-width:13px;text-align:right;}
+#gigax-kw-panel .kw-switch{position:relative;width:34px;height:18px;border-radius:9px;border:0;padding:0;
+  cursor:pointer;flex:0 0 auto;background:#4d6bfe;transition:background .15s;}
+#gigax-kw-panel .kw-switch[aria-checked="false"]{background:rgba(255,255,255,.20);}
+#gigax-kw-panel .kw-switch>span{position:absolute;top:2px;left:18px;width:14px;height:14px;
+  border-radius:50%;background:#fff;transition:left .15s;}
+#gigax-kw-panel .kw-switch[aria-checked="false"]>span{left:2px;}
+#gigax-kw-panel .kw-min{border:0;background:rgba(255,255,255,.10);color:#cfd8ea;width:18px;height:18px;
+  border-radius:5px;line-height:1;cursor:pointer;font-size:12px;padding:0;flex:0 0 auto;}
+#gigax-kw-panel .kw-min:hover{background:rgba(255,255,255,.20);}
+#gigax-kw-panel .kw-body{padding:9px 9px 6px;}
+#gigax-kw-panel .kw-input-row{display:flex;gap:6px;}
+#gigax-kw-panel .kw-input{flex:1 1 auto;min-width:0;height:28px;background:rgba(255,255,255,.07)!important;
+  border:1px solid rgba(255,255,255,.16);color:#eef2fb!important;border-radius:8px;padding:0 8px;
+  font-size:12px;outline:none;}
+#gigax-kw-panel .kw-input::placeholder{color:#8494b0;}
+#gigax-kw-panel .kw-input:focus{border-color:#4d6bfe;box-shadow:0 0 0 2px rgba(77,107,254,.30);}
+#gigax-kw-panel .kw-add{border:0;background:#4d6bfe;color:#fff;border-radius:8px;padding:0 10px;
+  height:28px;cursor:pointer;font-size:12px;flex:0 0 auto;}
+#gigax-kw-panel .kw-add:hover{background:#5d79ff;}
+#gigax-kw-panel .kw-chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px;max-height:126px;
+  overflow:auto;}
+#gigax-kw-panel .kw-chip{display:inline-flex;align-items:center;gap:3px;max-width:100%;
+  background:rgba(77,107,254,.24);border:1px solid rgba(77,107,254,.55);color:#dfe6ff;
+  border-radius:999px;padding:1px 3px 1px 8px;font-size:11.5px;line-height:1.6;outline:none;}
+#gigax-kw-panel .kw-chip:focus{box-shadow:0 0 0 2px rgba(77,107,254,.55);}
+#gigax-kw-panel .kw-chip.off{opacity:.45;}
+#gigax-kw-panel .kw-chip>b{font-weight:500;max-width:152px;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;}
+#gigax-kw-panel .kw-x{border:0;background:transparent;color:#c8d4ff;cursor:pointer;font-size:13px;
+  line-height:1;padding:0 3px;border-radius:50%;}
+#gigax-kw-panel .kw-x:hover{background:rgba(255,255,255,.16);color:#fff;}
+#gigax-kw-panel .kw-empty{color:#7d8ca8;font-size:11px;padding:2px;}
+#gigax-kw-panel .kw-hint{margin-top:6px;color:#8291ad;font-size:10.5px;line-height:1.45;}
+#gigax-kw-panel .kw-flash{margin-top:2px;color:#8ad9a4;font-size:10.5px;height:14px;opacity:0;
+  transition:opacity .2s;}
+`;
+    (document.head || document.documentElement).appendChild(st);
+  }
+
+  function kwFlash(msg) {
+    if (!kwPanel) return;
+    const el = kwPanel.querySelector('.kw-flash');
+    if (!el) return;
+    el.textContent = msg || '';
+    el.style.opacity = msg ? '1' : '0';
+    if (kwFlashTimer) clearTimeout(kwFlashTimer);
+    if (msg) kwFlashTimer = setTimeout(() => { el.style.opacity = '0'; }, 1800);
+  }
+
+  function renderKwChips() {
+    if (!kwPanel) return;
+    const box = kwPanel.querySelector('.kw-chips');
+    const cnt = kwPanel.querySelector('.kw-count');
+    if (!box) return;
+    box.textContent = '';
+    if (!customKw.length) {
+      const e = document.createElement('span');
+      e.className = 'kw-empty';
+      e.textContent = '还没有自定义词';
+      box.appendChild(e);
+    }
+    customKw.forEach((w, i) => {
+      const chip = document.createElement('span');
+      chip.className = 'kw-chip' + (customKwOn ? '' : ' off');
+      chip.tabIndex = 0;
+      chip.title = `命中「${w}」的叙事会标蓝 · 点 × 或按 Delete 删除`;
+      const b = document.createElement('b');
+      b.textContent = w;
+      const x = document.createElement('button');
+      x.type = 'button';
+      x.className = 'kw-x';
+      x.textContent = '×';
+      x.title = '删除这个关键词';
+      x.addEventListener('click', ev => { ev.stopPropagation(); removeCustomKw(i); });
+      chip.appendChild(b);
+      chip.appendChild(x);
+      // 「删除键」也支持：聚焦到某个词上按 Delete / Backspace 就删它
+      chip.addEventListener('keydown', ev => {
+        if (ev.key === 'Delete' || ev.key === 'Backspace') {
+          ev.preventDefault();
+          removeCustomKw(i);
+        }
+      });
+      box.appendChild(chip);
+    });
+    if (cnt) cnt.textContent = String(customKw.length);
+  }
+
+  // 词表变了：落盘 + 重绘 + 立刻按新词重判一次（正文都在缓存里，不用重新请求桥接）
+  function kwSync() {
+    try { GM_setValue('customKw', customKw); } catch (e) { /* 配额满了就算了 */ }
+    renderKwChips();
+    try { paintHotCards(true); } catch (e) { /* 面板不该因为标色出错而挂掉 */ }
+  }
+
+  function addCustomWords(raw) {
+    const parts = String(raw || '').split(CUSTOM_SEP).map(s => s.trim()).filter(Boolean);
+    if (!parts.length) return 0;
+    let added = 0, dup = 0, full = 0;
+    for (const p of parts) {
+      const w = p.slice(0, CUSTOM_WORD_MAX);
+      if (customKw.some(x => x.toLowerCase() === w.toLowerCase())) { dup++; continue; }
+      if (customKw.length >= CUSTOM_MAX) { full++; break; }
+      customKw.push(w);
+      added++;
+    }
+    if (added) kwSync();
+    if (full) kwFlash(`最多 ${CUSTOM_MAX} 个词`);
+    else if (!added && dup) kwFlash('这些词已经在列表里了');
+    else if (added) kwFlash(`已添加 ${added} 个`);
+    return added;
+  }
+
+  function removeCustomKw(i) {
+    if (i < 0 || i >= customKw.length) return;
+    const w = customKw.splice(i, 1)[0];
+    kwSync();
+    kwFlash(`已删除「${w}」`);
+  }
+
+  function buildKwPanel() {
+    ensureKwCss();
+    const p = document.createElement('div');
+    p.id = KW_PANEL_ID;
+    if (kwCollapsed) p.classList.add('kw-collapsed');
+    const pos = GM_getValue(KW_POS_KEY, null);
+    if (pos && typeof pos.x === 'number' && typeof pos.y === 'number' && isFinite(pos.x) && isFinite(pos.y)) {
+      p.style.left = Math.max(0, pos.x) + 'px';
+      p.style.top = Math.max(0, pos.y) + 'px';
+      p.style.right = 'auto';
+      p.style.bottom = 'auto';
+    }
+
+    const head = document.createElement('div');
+    head.className = 'kw-head';
+    const dot = document.createElement('span');
+    dot.className = 'kw-dot';
+    const title = document.createElement('span');
+    title.className = 'kw-title';
+    title.textContent = '叙事关键词';
+    const cnt = document.createElement('span');
+    cnt.className = 'kw-count';
+    cnt.textContent = String(customKw.length);
+
+    const sw = document.createElement('button');
+    sw.type = 'button';
+    sw.className = 'kw-switch';
+    sw.setAttribute('role', 'switch');
+    sw.setAttribute('aria-checked', customKwOn ? 'true' : 'false');
+    sw.title = '自定义关键词开关（关掉后只有内置词生效）';
+    sw.appendChild(document.createElement('span'));
+    sw.addEventListener('click', ev => {
+      ev.stopPropagation();
+      customKwOn = !customKwOn;
+      sw.setAttribute('aria-checked', customKwOn ? 'true' : 'false');
+      try { GM_setValue('customKwOn', customKwOn ? 'on' : 'off'); } catch (e) { /* ignore */ }
+      renderKwChips();
+      try { paintHotCards(true); } catch (e) { /* ignore */ }
+      kwFlash(customKwOn ? '自定义词已开启' : '自定义词已关闭（内置词照常）');
+    });
+
+    const min = document.createElement('button');
+    min.type = 'button';
+    min.className = 'kw-min';
+    min.textContent = kwCollapsed ? '+' : '–';
+    min.title = '折叠 / 展开';
+    min.addEventListener('click', ev => {
+      ev.stopPropagation();
+      kwCollapsed = !kwCollapsed;
+      p.classList.toggle('kw-collapsed', kwCollapsed);
+      min.textContent = kwCollapsed ? '+' : '–';
+      try { GM_setValue('customKwCollapsed', kwCollapsed); } catch (e) { /* ignore */ }
+    });
+
+    head.appendChild(dot);
+    head.appendChild(title);
+    head.appendChild(cnt);
+    head.appendChild(sw);
+    head.appendChild(min);
+
+    const body = document.createElement('div');
+    body.className = 'kw-body';
+    const row = document.createElement('div');
+    row.className = 'kw-input-row';
+    const input = document.createElement('input');
+    input.className = 'kw-input';
+    input.type = 'text';
+    input.spellcheck = false;
+    input.maxLength = 60;
+    input.placeholder = '输入关键词，回车添加';
+    const add = document.createElement('button');
+    add.type = 'button';
+    add.className = 'kw-add';
+    add.textContent = '加';
+    add.addEventListener('click', () => {
+      if (addCustomWords(input.value)) input.value = '';
+      input.focus();
+    });
+    row.appendChild(input);
+    row.appendChild(add);
+
+    // 键盘：Enter 添加；输入框空着时 Backspace/Delete 删最后一个（用户要的「删除键」）
+    input.addEventListener('keydown', ev => {
+      if (ev.isComposing || ev.keyCode === 229) return;   // 中文输入法选词时的回车不能算提交
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        if (!input.value.trim()) return;
+        if (addCustomWords(input.value)) input.value = '';
+        return;
+      }
+      if ((ev.key === 'Backspace' || ev.key === 'Delete') && !input.value) {
+        if (!customKw.length) return;
+        ev.preventDefault();
+        removeCustomKw(customKw.length - 1);
+        return;
+      }
+      if (ev.key === 'Escape') input.blur();
+    });
+
+    const chips = document.createElement('div');
+    chips.className = 'kw-chips';
+    const hint = document.createElement('div');
+    hint.className = 'kw-hint';
+    hint.textContent = '回车添加（可逗号分隔多个）· 输入框空着按退格删最后一个 · 点 × 也能删';
+    const flash = document.createElement('div');
+    flash.className = 'kw-flash';
+    body.appendChild(row);
+    body.appendChild(chips);
+    body.appendChild(hint);
+    body.appendChild(flash);
+    p.appendChild(head);
+    p.appendChild(body);
+
+    // 拖拽：只认标题栏；pointer capture 保证拖出面板范围也跟手
+    let drag = null;
+    head.addEventListener('pointerdown', ev => {
+      if (ev.button !== 0) return;
+      if (sw.contains(ev.target) || min.contains(ev.target)) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      const r = p.getBoundingClientRect();
+      drag = { id: ev.pointerId, dx: ev.clientX - r.left, dy: ev.clientY - r.top };
+      try { head.setPointerCapture(ev.pointerId); } catch (e) { /* ignore */ }
+      p.classList.add('kw-dragging');
+    });
+    head.addEventListener('pointermove', ev => {
+      if (!drag || ev.pointerId !== drag.id) return;
+      ev.stopPropagation();
+      const vw = window.innerWidth || 1280;
+      const vh = window.innerHeight || 800;
+      const x = Math.max(0, Math.min(vw - 70, ev.clientX - drag.dx));
+      const y = Math.max(0, Math.min(vh - 30, ev.clientY - drag.dy));
+      p.style.left = x + 'px';
+      p.style.top = y + 'px';
+      p.style.right = 'auto';
+      p.style.bottom = 'auto';
+    });
+    const endDrag = () => {
+      if (!drag) return;
+      drag = null;
+      p.classList.remove('kw-dragging');
+      try {
+        const r = p.getBoundingClientRect();
+        GM_setValue(KW_POS_KEY, { x: Math.round(r.left), y: Math.round(r.top) });
+      } catch (e) { /* ignore */ }
+    };
+    head.addEventListener('pointerup', endDrag);
+    head.addEventListener('pointercancel', endDrag);
+
+    return p;
+  }
+
+  function ensureKwPanel() {
+    if (kwHidden) {
+      if (kwPanel) kwPanel.style.display = 'none';
+      return;
+    }
+    if (!document.body) return;
+    if (!kwPanel || !kwPanel.isConnected) {
+      kwPanel = buildKwPanel();
+      document.body.appendChild(kwPanel);
+      renderKwChips();
+    }
+    kwPanel.style.display = '';
+  }
+
+  function setKwHidden(hide) {
+    kwHidden = !!hide;
+    try { GM_setValue('customKwHidden', kwHidden); } catch (e) { /* ignore */ }
+    if (!kwHidden) ensureKwPanel();
+    else if (kwPanel) kwPanel.style.display = 'none';
+  }
+
+  GM_registerMenuCommand(kwHidden ? '显示「叙事关键词」面板' : '隐藏「叙事关键词」面板', () => {
+    setKwHidden(!kwHidden);
+  });
+  GM_registerMenuCommand('清空自定义关键词', () => {
+    if (!customKw.length) { kwFlash('列表本来就是空的'); return; }
+    if (!confirm(`确定清空这 ${customKw.length} 个自定义关键词？`)) return;
+    customKw = [];
+    kwSync();
+    kwFlash('已清空');
+  });
+
   // ===== 批量取叙事（一屏一个请求）=====
   // 单个币一个请求、串着发，一屏 20 个要十几秒；改成一次打包，由桥接并发去问 GIGA X。
-  // items = [{chain, ca}]；回调参数是「拿到正文的个数」
+  // items = [{chain, ca}]；回调参数是「拿到正文的个数」「其中是不是真的出错」
+  //（`no-narrative` 不算出错：GIGA X 只是还没生成，别按「撞墙」冷 2 分钟）
   function fetchBatch(items, cb) {
-    if (!items || !items.length) { cb && cb(0); return; }
+    if (!items || !items.length) { cb && cb(0, false); return; }
     const q = items.map(it => `${it.chain}:${it.ca}`).join(',');
     const url = `${API}/narratives?items=${encodeURIComponent(q)}&workers=8&v=${encodeURIComponent(SCRIPT_VERSION)}`;
     GM_xmlhttpRequest({
@@ -1581,22 +1955,33 @@
         try { d = JSON.parse(res.responseText || ''); } catch (e) { /* 下面统一报错 */ }
         if (!d || !d.results) {
           warn('批量返回异常', 'HTTP', res.status, (res.responseText || '').slice(0, 120));
-          cb && cb(0);
+          cb && cb(0, true);
           return;
         }
         let withText = 0;
+        let hardFail = 0;
+        const lat = [];
         for (const key of Object.keys(d.results)) {
           const p = d.results[key];
           if (!p) continue;
           if (p.ok && p.text) {
             cache.set(key, { text: p.text, ts: Date.now() });
             withText++;
+            const t0 = pfSeenAt.get(key);
+            if (t0) lat.push(Date.now() - t0);
           } else {
-            const ttl = Math.min(NO_DATA_TTL,
+            const reason = p.reason || 'error';
+            if (reason !== 'no-narrative') hardFail++;
+            let ttl = Math.min(NO_DATA_TTL,
               Math.max(10000, (Number(p.retryAfter) || 0) * 1000 + 2000));
+            // 新币：刚出现 10 分钟内的币，GIGA X 多数还没生成叙事 ——
+            // 按 2 分钟等太钝（用户「半小时后才被标记」），窗口内 45 秒探一次。
+            if (reason === 'no-narrative') {
+              const t0 = pfSeenAt.get(key);
+              if (t0 && Date.now() - t0 < NEW_COIN_FAST_MS) ttl = Math.min(ttl, NEW_COIN_FAST_TTL);
+            }
             cache.set(key, {
-              text: '', ts: Date.now(), ttl,
-              reason: p.reason || 'error',
+              text: '', ts: Date.now(), ttl, reason,
               status: p.status || '',
               retryAfter: Number(p.retryAfter) || 0,
               error: p.error || '',
@@ -1605,11 +1990,19 @@
         }
         log('批量结果：', withText, '/', Object.keys(d.results).length, '有正文',
             '| 服务端命中缓存', d.cached || 0);
+        // 「从卡片出现到拿到正文」的真实延迟：用户说慢时看这条，别再靠猜
+        if (lat.length) {
+          lat.sort((a, b) => a - b);
+          const p50 = lat[Math.floor(lat.length / 2)];
+          log('正文延迟 p50', p50, 'ms / 最慢', lat[lat.length - 1], 'ms');
+          try { beacon('narr', { n: String(withText), p50: String(p50), max: String(lat[lat.length - 1]) }); }
+          catch (e) { /* ignore */ }
+        }
         schedulePaint(0);
-        cb && cb(withText);
+        cb && cb(withText, hardFail > 0);
       },
-      onerror() { warn('批量请求连不上桥接'); cb && cb(0); },
-      ontimeout() { warn('批量请求超时'); cb && cb(0); },
+      onerror() { warn('批量请求连不上桥接'); cb && cb(0, true); },
+      ontimeout() { warn('批量请求超时'); cb && cb(0, true); },
     });
   }
 
@@ -1627,6 +2020,15 @@
   let pfLastRound = 0;
   const pfPending = new Set();   // 已发出去还没回来的 key（避免下一轮重复发）
   const pfFailed = new Map();    // key -> ts（撞墙的先冷一会儿）
+  // key -> 这个币**第一次进入预取视野**的时间。两个用途：
+  //  ① 算「从看到卡片到拿到正文」的真实延迟（_diag?ev=narr 上报，用户说「太慢」时不用猜）；
+  //  ② 认「新币」：刚出现 10 分钟内的币，没拿到正文时缩短重探间隔。
+  const pfSeenAt = new Map();
+
+  // 新币加速：GIGA X 对刚上线的币常常还没生成叙事，原来一等就是 2 分钟
+  //（用户 2026-11-19：新币延迟太高，都半小时了才被标）。窗口内改成 45 秒探一次。
+  const NEW_COIN_FAST_MS = 10 * 60 * 1000;
+  const NEW_COIN_FAST_TTL = 45 * 1000;
 
   function viewportTargets() {
     // 结果短缓存：同一批锚点的 getBoundingClientRect 结果在 500ms 内复用，
@@ -1639,14 +2041,41 @@
     const de = document.documentElement || document.body || {};
     const vh = de.clientHeight || (typeof innerHeight === 'number' ? innerHeight : 800);
     const vw = de.clientWidth || (typeof innerWidth === 'number' ? innerWidth : 1200);
+    const push = (chain, ca, el, top) => {
+      if (out.length >= 40 || !ca || seen.has(ca)) return;
+      seen.add(ca);
+      out.push({ chain, ca, el, top });
+      const key = (chain || '') + ':' + ca;
+      if (!pfSeenAt.has(key)) {
+        pfSeenAt.set(key, now);
+        if (pfSeenAt.size > 600) {          // 长期挂着的页面别让它无限长
+          const first = pfSeenAt.keys().next();
+          if (!first.done) pfSeenAt.delete(first.value);
+        }
+      }
+    };
     for (const a of document.querySelectorAll('a[href*="/token/"]')) {
       if (out.length >= 40) break;
       const p = parseUrlToken(a.getAttribute('href'));
-      if (!p || !p.ca || seen.has(p.ca)) continue;
+      if (!p || !p.ca) continue;
       const r = a.getBoundingClientRect();
       if (!r.width || r.bottom < -40 || r.top > vh + 40 || r.right < 0 || r.left > vw) continue;
-      seen.add(p.ca);
-      out.push({ chain: p.chain, ca: p.ca, el: a, top: r.top });
+      push(p.chain, p.ca, a, r.top);
+    }
+    // ② data 属性卡：**战壕格 / 新币格能不能被预取，全靠这一条**。
+    // 实测这些卡里 `a[href*="/token/"]` 只有 0~2 个、币名是纯文本 —— 只按链接枚举，
+    // 整片格子就永远等不到第一次请求，只能等用户自己去 hover（于是「半小时后才标」）。
+    // 属性所在节点就是卡片本身，用它自己的矩形判是否在视野内，不会串到隔壁卡。
+    if (out.length < 40) {
+      for (const node of document.querySelectorAll(CA_DATA_SEL)) {
+        if (out.length >= 40) break;
+        const hit = caFromDataAttrs(node);
+        if (!hit || !hit.ca) continue;
+        const r = node.getBoundingClientRect();
+        if (!r.width || !r.height || r.height > CARD_MAX_H) continue;
+        if (r.bottom < -40 || r.top > vh + 40 || r.right < 0 || r.left > vw) continue;
+        push(hit.chain, hit.ca, node, r.top);
+      }
     }
     out.sort((x, y) => x.top - y.top);      // 从上往下取：视野里先看到的先亮
     vpCache = { at: now, list: out };
@@ -1679,11 +2108,17 @@
     pfInFlight++;
     items.forEach(k => pfPending.add(k));
     log('批量预取', items.length, '个（在飞', pfInFlight, '批）');
-    fetchBatch(items, (n) => {
+    fetchBatch(items, (n, hard) => {
       pfInFlight = Math.max(0, pfInFlight - 1);
       keys.forEach(k => pfPending.delete(k));
-      if (!n) keys.forEach(k => pfFailed.set(k, Date.now()));
-      log('本批完成：', n, '/', items.length, '有正文');
+      // 只有**真出错**才冷 2 分钟；`no-narrative`（GIGA X 还没生成）交给 cache 的 TTL，
+      // 新币窗口内是 45 秒 —— 原来这里一律冷 2 分钟，等于把新币又拖慢一倍。
+      if (!n && hard) keys.forEach(k => pfFailed.set(k, Date.now()));
+      if (pfFailed.size > 400) {
+        const cut = Date.now() - PF_FAIL_TTL;
+        for (const [k, ts] of pfFailed) if (ts < cut) pfFailed.delete(k);
+      }
+      log('本批完成：', n, '/', items.length, '有正文', hard ? '（含错误）' : '');
     });
   }
 
@@ -2336,6 +2771,13 @@
       fetchNarrative(chain, hit.ca, () => { prefetchDepth--; });
     }, 180);
   }, { passive: true, capture: true });
+
+  // 自定义关键词面板：进页面就挂上 —— 它跟「浮层替换」无关（关掉替换也要能填词）。
+  try { ensureKwPanel(); } catch (e) { warn('关键词面板挂载失败', e); }
+  setInterval(() => {
+    if (kwHidden) return;
+    try { ensureKwPanel(); } catch (e) { /* ignore */ }   // React 换 body 的极端情况兜一下
+  }, 5000);
 
   log('已加载 v' + SCRIPT_VERSION + '。桥接=', API, ' 开关=', enabled ? '开' : '关', ' 机会标记=', hotMode);
   log('机会标记：叙事里出现「新机制/发射台/平台币/第一个/agentic…」时，对应卡片刷蓝底（菜单可关/可放宽/可调深浅）');
