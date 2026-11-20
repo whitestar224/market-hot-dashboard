@@ -183,11 +183,31 @@ class KolSyncJoinTests(unittest.TestCase):
         self.assertEqual([item["label"] for item in joins[1]["newcomers"]], ["戊"])
         self.assertEqual(joins[1]["onBoardCount"], 5)
 
-    def test_no_join_alert_before_the_trio_is_complete(self):
-        # 只有甲、乙 + 外围的丁：没凑齐核心三人，就不该有「同车」这回事。
+    def test_two_core_wallets_alone_are_not_a_sync(self):
+        # 只有甲、乙两个人（都是核心）——凑不满 3 个人，就不该有「同车」这回事。
         self.buy(A, at=self.t0 - 3000)
         self.buy(B, at=self.t0 - 2000)
-        self.buy(D, at=self.t0 - 1000)
+        self.assertEqual(self.contexts, [])
+
+    def test_three_wallets_with_two_core_trigger_a_sync(self):
+        """2026-11-12 新口径：任意 3 人 + 其中 ≥2 个核心就算同车。
+
+        起因是「币安生活」：cowboy $471 + 阿峰 $404 + antiposition $512 在 50 秒内
+        先后上车，合计 $2,922 却零弹窗 —— antiposition 在同车观察面但不在核心三人里，
+        旧口径 core_count 永远卡在 2。这里用甲/乙(核心) + 丁(外围) 复现同一形态。
+        """
+        self.buy(A, at=self.t0 - 3000)
+        self.buy(D, at=self.t0 - 2000)
+        self.buy(B, at=self.t0 - 1000)
+        self.assertEqual([ctx["mode"] for ctx in self.contexts], ["trio"])
+        self.assertEqual(self.contexts[0]["coreCount"], 2)
+        self.assertEqual(len(self.contexts[0]["buyers"]), 3)
+
+    def test_one_core_plus_two_aux_wallets_stay_silent(self):
+        # 核心 1 + 外围 2：这是辅助追踪钱包凑数，不是 KOL 共振。
+        self.buy(A, at=self.t0 - 3000)
+        self.buy(D, at=self.t0 - 2000)
+        self.buy(E, at=self.t0 - 1000)
         self.assertEqual(self.contexts, [])
 
     def test_untracked_wallet_does_not_count_as_a_joiner(self):
@@ -212,7 +232,14 @@ class KolSyncJoinTests(unittest.TestCase):
 
 
 class KolSyncTrackedSeedTests(unittest.TestCase):
-    """用户 2026-10-27 给的 20 个追踪钱包里，15 个是为此新接入的。"""
+    """用户 2026-10-27 给的 20 个追踪钱包里，15 个是为此新接入的。
+
+    2026-11-11 其中三个被用户点名升级成「要弹窗的聪明钱」
+    （0xa83b…8811 = antiposition、0xa7d4…2b9f = 米神、0x2ce9…3373 = 枯坐P小将），
+    2026-11-20 又有 0xc2c6…091c（区块日记）被点名，都已移出这份「只记录」清单 ——
+    所以现在是 11 个 / 33 行，但同车观察面仍是 20 人（名字在 KOL_SYNC_TRACK_LABELS
+    里单独登记）。
+    """
 
     def test_aux_tracked_wallets_are_seeded_record_only_on_three_chains(self):
         tmp = TemporaryDirectory()
@@ -220,23 +247,246 @@ class KolSyncTrackedSeedTests(unittest.TestCase):
         monitor = SMM.SmartMoneyMonitor(Path(tmp.name) / "seed.sqlite", seed_defaults=True)
         self.addCleanup(monitor.close)
         aux = set(SMM.TRACKED_KOL_AUX_WALLETS)
-        self.assertEqual(len(aux), 15)
+        self.assertEqual(len(aux), 11)
         rows = [row for row in monitor.store.list_wallets()
                 if (row["address"] or "").lower() in aux]
         # 每条三链（bsc / ethereum / base）。
-        self.assertEqual(len(rows), 45)
+        self.assertEqual(len(rows), 33)
         for row in rows:
             with self.subTest(address=row["address"], chain=row["chain"]):
                 self.assertTrue(row["enabled"])
                 # 阈值 10 亿 U = 只记录、不对单笔弹窗；同车判定照样能用到这笔。
                 self.assertGreaterEqual(row["alertThresholdUsd"], SMM.KOL_TRACK_RECORD_ONLY_THRESHOLD_USD)
                 self.assertEqual(row["sourceName"], "用户追踪钱包清单")
-        # 观察面一共 20 人（5 个老 KOL + 15 个新增）。
-        self.assertEqual(len(SMM.KOL_SYNC_TRACK_LABELS), 20)
+        # 观察面至少 20 人（5 个老 KOL + 15 个新增）；2026-11-12 加了 CryptoCharming
+        # 的两个 Solana 钱包变 22，所以这里只断下限，不钉死具体数字。
+        self.assertGreaterEqual(len(SMM.KOL_SYNC_TRACK_LABELS), 20)
         for known in ("0xcc291dcd83bd9f2600cca4d65ae3b724eaf4f5a9",
                       "0xbf004bff64725914ee36d03b87d6965b0ced4903",
                       "0xe1e3252b8b2f9bf2a8335389ba8ee62e6ea29407"):
             self.assertIn(known, SMM.KOL_SYNC_TRACK_LABELS)
+
+    def test_antiposition_is_promoted_to_a_bsc_only_popup_wallet(self):
+        """用户 2026-11-11：「0xa83b…8811，antiposition，bsc链的聪明钱」。
+
+        它以前在「只记录」清单里（阈值 10 亿 U、三条链），现在要真弹窗：
+        昵称改成 antiposition、只挂 BSC。阈值演变：11-11 定 1000U（中位 $522，
+        500U 会到每天 29 条）；11-12 用户要求与 cowboy / 阿峰 统一 300U
+        （约 35 张/天，用户知情同意）。
+        """
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        monitor = SMM.SmartMoneyMonitor(Path(tmp.name) / "seed.sqlite", seed_defaults=True)
+        self.addCleanup(monitor.close)
+        address = SMM.ANTIPOSITION_WALLET
+        self.assertNotIn(address, SMM.TRACKED_KOL_AUX_WALLETS)
+        # 同车观察面不能因为这次升级缩水。
+        self.assertEqual(SMM.KOL_SYNC_TRACK_LABELS[address], "antiposition")
+        rows = [row for row in monitor.store.list_wallets()
+                if (row["address"] or "").lower() == address]
+        self.assertEqual([row["chain"] for row in rows], ["bsc"])
+        self.assertEqual(rows[0]["nickname"], "antiposition")
+        self.assertEqual(rows[0]["alertThresholdUsd"], 300.0)
+        self.assertTrue(rows[0]["enabled"])
+
+    def test_mi_shen_is_promoted_to_a_bsc_only_popup_wallet(self):
+        """用户 2026-11-11：「0xa7d4…2b9f，这个也接上，KOL米神的」。
+
+        同样是「只记录」清单里的地址被点名升级。买单档位是 0.5 BNB（≈$340）试探、
+        1 BNB（≈$680）建仓；2026-11-11 定 500U 卡在两者之间（≈5.3 条/天），
+        2026-11-12 因 MIRO 那笔 $325.94 漏掉，用户要求降到 300U（实测 6.1 张/天）。
+        """
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        monitor = SMM.SmartMoneyMonitor(Path(tmp.name) / "seed.sqlite", seed_defaults=True)
+        self.addCleanup(monitor.close)
+        address = SMM.MI_SHEN_WALLET
+        self.assertNotIn(address, SMM.TRACKED_KOL_AUX_WALLETS)
+        self.assertEqual(SMM.KOL_SYNC_TRACK_LABELS[address], "米神")
+        rows = [row for row in monitor.store.list_wallets()
+                if (row["address"] or "").lower() == address]
+        self.assertEqual([row["chain"] for row in rows], ["bsc"])
+        self.assertEqual(rows[0]["nickname"], "米神")
+        self.assertEqual(rows[0]["alertThresholdUsd"], 300.0)
+        self.assertTrue(rows[0]["enabled"])
+
+    def test_qukuai_riji_is_promoted_from_record_only_to_popup(self):
+        """用户 2026-11-20：「0xc2c6…091c，区块日记的买入记录怎么没有弹出来」。
+
+        这个地址原本在 20 人「只记录、不弹窗」清单里（阈值 10 亿 U，历史 394 笔
+        popup_eligible 全为 0）。近 24h 21 笔 BSC 买单：中位 $286 / p90 $465 /
+        最大 $1,163 —— 阈值取 300U ≈ 5 条/天；500U 会把中位那档全挡掉。
+        三条链本来都在轮询，升级后保持不变。
+        """
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        monitor = SMM.SmartMoneyMonitor(Path(tmp.name) / "seed.sqlite", seed_defaults=True)
+        self.addCleanup(monitor.close)
+        address = SMM.QUKUAI_RIJI_WALLET
+        self.assertNotIn(address, SMM.TRACKED_KOL_AUX_WALLETS)
+        self.assertEqual(SMM.KOL_SYNC_TRACK_LABELS[address], "区块日记")
+        rows = [row for row in monitor.store.list_wallets()
+                if (row["address"] or "").lower() == address]
+        self.assertEqual(sorted(row["chain"] for row in rows), ["base", "bsc", "ethereum"])
+        for row in rows:
+            self.assertEqual(row["nickname"], "区块日记")
+            self.assertEqual(row["alertThresholdUsd"], 300.0)
+            self.assertTrue(row["enabled"])
+
+
+class NamedKolSeedTests(unittest.TestCase):
+    """用户点名的 KOL（不在那份「只记录」清单里，阈值按真实成交定）。"""
+
+    def _wallet_rows(self, address: str) -> list[dict]:
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        monitor = SMM.SmartMoneyMonitor(Path(tmp.name) / "seed.sqlite", seed_defaults=True)
+        self.addCleanup(monitor.close)
+        return [row for row in monitor.store.list_wallets()
+                if (row["address"] or "").lower() == address.lower()]
+
+    def test_leslie_is_monitored_on_three_chains_at_150u(self):
+        """用户 2026-11-11：「0x7942…1f87，kol leslie的」。
+
+        GMGN 实测：BSC 走小单高频（20.9 小时 117 笔，中位 $22，最大 $331，
+        $84~179 是空档），ETH 才是真实体量（中位 $1,313，但 10-06 后没动）。
+        阈值 150U 卡在 BSC 的双峰断点上；ETH/Base 只挂不常动、成本可以忽略。
+        """
+        rows = self._wallet_rows(SMM.LESLIE_WALLET)
+        self.assertEqual(sorted(row["chain"] for row in rows),
+                         ["base", "bsc", "ethereum"])
+        for row in rows:
+            with self.subTest(chain=row["chain"]):
+                self.assertEqual(row["nickname"], "leslie")
+                self.assertEqual(row["alertThresholdUsd"], 150.0)
+                self.assertTrue(row["enabled"])
+        # 同车提醒的观察面是「用户 10-27 给的 20 个追踪钱包」，leslie 不进去。
+        self.assertNotIn(SMM.LESLIE_WALLET, SMM.KOL_SYNC_TRACK_LABELS)
+        self.assertGreaterEqual(len(SMM.KOL_SYNC_TRACK_LABELS), 20)
+
+
+    def test_kuzuo_is_promoted_on_three_chains_at_400u(self):
+        """用户 2026-11-11：「0x2ce9…3373，KOL枯坐P小将」。
+
+        库里 57 笔 BSC 买单：0.69 BNB（≈$470）是标准仓（40 笔），1.3/2 BNB 是加仓，
+        0.15~0.5 BNB 是试水。阈值 400U 让标准仓全弹、试水单不弹（≈3.3 条/天）；
+        定 500U 会把 40 笔标准仓全挡掉，只剩每天 0.6 条。
+        ETH/Base 各有 5 笔真实买入，所以三条链都留。
+        """
+        rows = self._wallet_rows(SMM.KUZUO_WALLET)
+        self.assertEqual(sorted(row["chain"] for row in rows),
+                         ["base", "bsc", "ethereum"])
+        for row in rows:
+            with self.subTest(chain=row["chain"]):
+                self.assertEqual(row["nickname"], "枯坐P小将")
+                self.assertEqual(row["alertThresholdUsd"], 400.0)
+                self.assertTrue(row["enabled"])
+        self.assertNotIn(SMM.KUZUO_WALLET, SMM.TRACKED_KOL_AUX_WALLETS)
+        self.assertEqual(SMM.KOL_SYNC_TRACK_LABELS[SMM.KUZUO_WALLET], "枯坐P小将")
+        self.assertGreaterEqual(len(SMM.KOL_SYNC_TRACK_LABELS), 20)
+
+    def test_jingou_is_monitored_on_solana_only_at_300u(self):
+        """用户 2026-11-12：「KOL金狗挖掘机的SOL链地址」。
+
+        第一条纯 Solana 的 KOL 点名钱包 —— chains 必须显式只写 solana，
+        不写会按 EVM_CHAINS 铺 4 条，base58 地址在 EVM 上不存在、白烧扫描窗口。
+        GMGN 实测 8.23 天 66 笔买：脏单 $8~9×22、试水 $79~99×5、
+        标准仓 $244~343×35、重仓 $1,730/1,799×2；阈值 300U ≈ 2.3 条/天。
+        """
+        rows = self._wallet_rows(SMM.JINGOU_WALLET)
+        self.assertEqual([row["chain"] for row in rows], ["solana"])
+        row = rows[0]
+        self.assertEqual(row["nickname"], "金狗挖掘机")
+        self.assertEqual(row["alertThresholdUsd"], 300.0)
+        self.assertTrue(row["enabled"])
+        # 没被顺手加进「同车」集合，观察面仍是 20 人。
+        self.assertNotIn(SMM.JINGOU_WALLET, SMM.KOL_SYNC_TRACK_LABELS)
+        self.assertGreaterEqual(len(SMM.KOL_SYNC_TRACK_LABELS), 20)
+
+    def test_k99_is_monitored_on_solana_only_at_50u(self):
+        """用户 2026-11-12：「K99 | 1000X GEM，SOL链的地址」。
+
+        撒网型：235 天 120 笔，长期单笔 $8~20；11-12 当天突然密集建仓
+        （18 笔买 / 中位 $85 / p75 $95 / 最大 $170，基本 0.5 SOL 一档）。
+        阈值 50U 卡在「试水 $8~20」与「0.5 SOL 真仓」之间。
+        """
+        rows = self._wallet_rows(SMM.K99_GEM_WALLET)
+        self.assertEqual([row["chain"] for row in rows], ["solana"])
+        row = rows[0]
+        self.assertEqual(row["nickname"], "K99 | 1000X GEM")
+        self.assertEqual(row["alertThresholdUsd"], 50.0)
+        self.assertTrue(row["enabled"])
+
+    def test_latuche_is_monitored_on_solana_only_at_500u(self):
+        """用户 2026-11-12：「GJA1HEb…SU65，kol：Latuche，sol链的」。
+
+        高频单币加仓型：120 笔只覆盖 3.35 小时（23 笔买/小时），3.35 小时
+        砸 $23,856、75% 压在同一个币上。单笔只有 $273 与 $846 两档，
+        阈值 500U 卡在 $275 → $846 的空档。
+        """
+        rows = self._wallet_rows(SMM.LATUCHE_WALLET)
+        self.assertEqual([row["chain"] for row in rows], ["solana"])
+        row = rows[0]
+        self.assertEqual(row["nickname"], "Latuche")
+        self.assertEqual(row["alertThresholdUsd"], 500.0)
+        self.assertTrue(row["enabled"])
+
+    def test_yukaz_is_monitored_on_bsc_only_at_500u(self):
+        """用户 2026-11-12：「0xa05ec35f…742f，bsc链的，kol是yukaz」。
+
+        机器化高频：100 笔 / 1.07 天（买 63，≈59 笔/天）。$7 扫链单 38 笔；
+        0.5 BNB（$400~499）标准仓 22 笔却散在 22 个币上；$500 以上只有 3 笔。
+        阈值 500U → 合并后 1.9 张/天；降到 400U 会变成 20.6 张/天。
+        """
+        rows = self._wallet_rows(SMM.YUKAZ_WALLET)
+        self.assertEqual([row["chain"] for row in rows], ["bsc"])
+        row = rows[0]
+        self.assertEqual(row["nickname"], "yukaz")
+        self.assertEqual(row["alertThresholdUsd"], 500.0)
+        self.assertTrue(row["enabled"])
+
+    def test_cowboy_solana_wallet_is_separate_from_his_evm_chains(self):
+        """用户 2026-11-12：「cowboy的sol链买入也监控上」，阈值先 200U 后改 300U。
+
+        同一个人两套链，阈值现在**故意不同**（2026-11-15 17:30 按各自实测重定）：
+        Solana 侧 250U（200U 会把弹窗从 1 张/天推到 5 张/天，预算吃不消）；
+        EVM 三条链 200U（他 BSC 的日常仓位就在 300~490U，降到 200U 只多 0.4 张/天）。
+        「每日首单」上线后，弹窗数由标的数决定，所以 EVM 侧可以比 Solana 更敏感。
+        """
+        sol = self._wallet_rows(SMM.COWBOY_SOL_WALLET)
+        self.assertEqual([row["chain"] for row in sol], ["solana"])
+        self.assertEqual(sol[0]["nickname"], "cowboy")
+        self.assertEqual(sol[0]["alertThresholdUsd"], 250.0)
+        self.assertTrue(sol[0]["enabled"])
+
+        evm = [row for row in self._wallet_rows("0xe1e3252b8b2f9bf2a8335389ba8ee62e6ea29407")
+               if row["nickname"] == "cowboy"]
+        self.assertEqual(sorted(row["chain"] for row in evm), ["base", "bsc", "ethereum"])
+        for row in evm:
+            with self.subTest(chain=row["chain"]):
+                self.assertEqual(row["alertThresholdUsd"], 200.0)
+
+    def test_cryptocharming_solana_wallets_are_solana_only_at_100u(self):
+        """用户 2026-11-12 提供 GMGN profile 上的两个 Solana 公开钱包。
+
+        大仓那支 25 天 47 条、买入中位 $1,973（0.2 张/天）；小仓那支 26 天 60 条、
+        买入中位 $100（0.6 张/天）。阈值沿用他 EVM 那五条链的 100U，
+        两支合计约 0.8 张/天。
+        """
+        for address in (
+            "HyYvwH1bU8qb82wbhZvsgyVmjJroAv2W8qVyhccWj79P",
+            "4X43DmYRtzLcyv2YRhC8vaTeqB5BTL6jX7LDtzfz47aC",
+        ):
+            with self.subTest(address=address[:10]):
+                rows = self._wallet_rows(address)
+                # 纯 Solana 钱包必须只挂 solana —— 缺省会铺四条 EVM 链，白烧扫描窗口。
+                self.assertEqual([row["chain"] for row in rows], ["solana"])
+                self.assertEqual(rows[0]["nickname"], "CryptoCharming")
+                # 这两支是独立钱包（不同地址），阈值仍按各自实测：大仓那支 100U。
+                self.assertEqual(rows[0]["alertThresholdUsd"], 100.0)
+                self.assertTrue(rows[0]["enabled"])
+                # 同车观察面要认得这两支，否则「三支钱包同时上车」数不出来。
+                self.assertIn(address, SMM.KOL_SYNC_TRACK_LABELS)
 
 
 class KolSyncPopupTests(unittest.TestCase):
