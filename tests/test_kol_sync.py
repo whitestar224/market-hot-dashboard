@@ -314,8 +314,9 @@ class KolSyncTrackedSeedTests(unittest.TestCase):
         """用户 2026-11-20：「0xc2c6…091c，区块日记的买入记录怎么没有弹出来」。
 
         这个地址原本在 20 人「只记录、不弹窗」清单里（阈值 10 亿 U，历史 394 笔
-        popup_eligible 全为 0）。近 24h 21 笔 BSC 买单：中位 $286 / p90 $465 /
-        最大 $1,163 —— 阈值取 300U ≈ 5 条/天；500U 会把中位那档全挡掉。
+        popup_eligible 全为 0）。近 24h 23 笔 BSC 买单：试探单 $57~200、
+        标准档 0.5 BNB ≈ $286~291（9 笔）、加大仓 $400~1,163（5 笔）。
+        阈值先定 300U，用户当天改口「改成 200」→ ≈13 条/天。
         三条链本来都在轮询，升级后保持不变。
         """
         tmp = TemporaryDirectory()
@@ -330,7 +331,7 @@ class KolSyncTrackedSeedTests(unittest.TestCase):
         self.assertEqual(sorted(row["chain"] for row in rows), ["base", "bsc", "ethereum"])
         for row in rows:
             self.assertEqual(row["nickname"], "区块日记")
-            self.assertEqual(row["alertThresholdUsd"], 300.0)
+            self.assertEqual(row["alertThresholdUsd"], 200.0)
             self.assertTrue(row["enabled"])
 
 
