@@ -2105,6 +2105,33 @@ class SmartMoneyStore:
             ).fetchall()
         return [_row_dict(row) for row in rows]
 
+    def truncated_symbol_rows(self, limit: int = 6, chain: str | None = None) -> list[dict[str, Any]]:
+        """symbol 仍是「缩写合约」（`J1D7e7…eWfv` 这种）的去重清单，用来回头补名字。
+
+        真 symbol 里不会出现省略号，所以 ``LIKE '%…%'`` 就是准确判据。新事件在前
+        （``ORDER BY max(id) DESC``），因为刚发的新盘最有可能「等几十秒就有索引」。
+        """
+        sql = "SELECT chain, token_address FROM events WHERE symbol LIKE '%…%'"
+        params: list[Any] = []
+        if chain:
+            sql += " AND chain = ?"
+            params.append(str(chain))
+        sql += " GROUP BY chain, token_address ORDER BY max(id) DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self.lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def rename_token_symbol(self, token_address: str, symbol: str) -> int:
+        """把某个铸币上所有「缩写合约」事件改成真名字（Solana 地址大小写敏感，按原样比）。"""
+        with self.lock:
+            cursor = self.conn.execute(
+                "UPDATE events SET symbol = ? WHERE token_address = ? AND symbol LIKE '%…%'",
+                (str(symbol)[:40], str(token_address)),
+            )
+            self.conn.commit()
+            return int(cursor.rowcount or 0)
+
     def buys_for_token(
         self,
         chain: Any,
@@ -2347,12 +2374,16 @@ def classify_solana_buy(
     )
     signatures = (payload.get("transaction") or {}).get("signatures") or []
     tx_hash = str(signatures[0] if signatures else payload.get("signature") or "")
-    # 符号兜底顺序（2026-11-12）：元数据里的名字 → 铸币地址缩写。
+    # 符号兜底顺序（2026-11-21）：元数据里的 symbol → 元数据里的 name → 铸币地址缩写。
     # **不再写 "UNKNOWN"** —— 满屏 UNKNOWN 等于没给信息，而 ``9sFGCTjE…pump``
     # 这种缩写至少能让用户一眼认出是哪个盘（也能直接拿去 GMGN 搜）。
+    # 但缩写只是**最后**兜底：用户 2026-11-21 截图「zrool 买入 J1D7e7…eWfv」——
+    # 新盘在 DexScreener 还没 pair、DAS 也查不到时，Jupiter 索引里其实已经有名字了。
     # 缩写用 head 6 / tail 4，和 server.py 的 ``smart_money_short_address`` 同口径
     # （此处不能反向 import server.py，所以就地展开）。
     target_symbol = str(target_meta.get("symbol") or "").strip()
+    if not target_symbol or target_symbol.upper() == "UNKNOWN":
+        target_symbol = str(target_meta.get("name") or "").strip()
     if not target_symbol or target_symbol.upper() == "UNKNOWN":
         mint_text = str(target_mint or "").strip()
         target_symbol = f"{mint_text[:6]}…{mint_text[-4:]}" if len(mint_text) > 12 else (mint_text or "未知代币")
@@ -2759,6 +2790,65 @@ class SmartMoneyMonitor:
             self._session_local.session = local
         return local
 
+    # 「缩写合约」补名字的节流：稳定态每 2 分钟最多 12 个铸币，事件全部一起改。
+    SYMBOL_BACKFILL_INTERVAL = 120.0
+    SYMBOL_BACKFILL_BATCH = 12
+    # 查不到的铸币压 6 小时再试：老 pump 盘连 Jupiter 都没收录，一遍遍重试只白花配额
+    SYMBOL_BACKFILL_MISS_TTL = 6 * 3600.0
+
+    def backfill_truncated_symbols(self, limit: int | None = None) -> int:
+        """把 symbol 还是「缩写合约」的事件回头补成真名字（只处理 Solana）。
+
+        用户 2026-11-21 截图：「KOL zrool 买入 J1D7e7…eWfv · $85」—— 落库那一刻这个
+        新盘既没有 DexScreener 交易对、DAS 也查不到资产，只能写铸币缩写。等几十秒
+        Jupiter 索引就有了，所以这里定期回头补（`events` 上同一铸币全部一起改）。
+
+        **为什么要多取 4 倍候选**：库里躺着几百个老 pump 盘的缩写（DexScreener 没
+        交易对、Jupiter 也没收录），它们永远补不上。若按 ``LIMIT batch`` 取最新 12 个，
+        一旦这 12 个全是「查不到」，这一轮就白跑、下一轮又是同样的 12 个 —— 真正能补
+        的铸币永远轮不到。所以候选取 4 倍，查不到的记进 :attr:`_symbol_backfill_miss`
+        压 6 小时，跳过它们继续往下走。
+        """
+        now = time.time()
+        if now - float(getattr(self, "_symbol_backfill_at", 0.0) or 0.0) < self.SYMBOL_BACKFILL_INTERVAL:
+            return 0
+        self._symbol_backfill_at = now
+        batch = max(1, int(limit or self.SYMBOL_BACKFILL_BATCH))
+        misses = getattr(self, "_symbol_backfill_miss", None)
+        if not isinstance(misses, dict):
+            misses = self._symbol_backfill_miss = {}
+        if len(misses) > 800:
+            cut = now - self.SYMBOL_BACKFILL_MISS_TTL
+            for mint, ts in list(misses.items()):
+                if float(ts or 0) < cut:
+                    misses.pop(mint, None)
+        try:
+            rows = self.store.truncated_symbol_rows(batch * 4, chain="solana")
+        except Exception:
+            return 0
+        fixed = 0
+        attempts = 0
+        for row in rows:
+            if attempts >= batch:
+                break
+            mint = str(row.get("token_address") or "")
+            if not mint:
+                continue
+            hit_at = misses.get(mint)
+            if hit_at and now - float(hit_at) < self.SYMBOL_BACKFILL_MISS_TTL:
+                continue
+            attempts += 1
+            meta = self.solana_token_metadata(mint)
+            symbol = str(meta.get("symbol") or "").strip()
+            if not symbol or symbol.upper() == "UNKNOWN" or "…" in symbol:
+                misses[mint] = now
+                continue
+            misses.pop(mint, None)
+            fixed += self.store.rename_token_symbol(mint, symbol)
+        if fixed:
+            print(f"[smart-money] 缩写合约补名字：改了 {fixed} 条事件（查了 {attempts} 个铸币）", flush=True)
+        return fixed
+
     def _run_chain_once(self, chain: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
         """同一条链永远只有一个线程在跑；已经在跑就返回 None 让调用方跳过。"""
         guard = getattr(self, "_chain_guard", None)
@@ -2778,7 +2868,13 @@ class SmartMoneyMonitor:
     def _poll_chain(self, chain: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         try:
             if chain == "solana":
-                return self._poll_solana(rows)
+                events = self._poll_solana(rows)
+                # 顺手把「缩写合约」补成真名字（节流 5 分钟，见 backfill_truncated_symbols）
+                try:
+                    self.backfill_truncated_symbols()
+                except Exception:
+                    pass
+                return events
             return self._poll_evm(chain, rows)
         except Exception as exc:
             self.store.update_health(chain, "error", str(exc)[:300], self.store.cursor(
@@ -2937,15 +3033,45 @@ class SmartMoneyMonitor:
             return dict(cached[1])
         price, symbol = self._token_price_and_symbol("solana", mint)
         symbol = symbol or SOLANA_STABLE_MINTS.get(mint, "")
+        name = ""
+        if not symbol:
+            # DexScreener 对新盘常常还是一条 pair 都没有（`{"pairs": null}`），
+            # 这时换 Jupiter 的免费索引拿名字 —— 实测新发的 pump 盘几秒后就有。
+            symbol, name = self._jupiter_token(mint)
         if not symbol:
             symbol = self._solana_onchain_symbol(mint)
         result = {
-            "symbol": symbol[:40] or "UNKNOWN", "priceUsd": price,
+            "symbol": symbol[:40] or "UNKNOWN", "name": name[:60], "priceUsd": price,
             "stable": mint in SOLANA_STABLE_MINTS,
         }
         if symbol:
             self._metadata_cache[key] = (time.time(), result)
         return dict(result)
+
+    def _jupiter_token(self, mint: str) -> tuple[str, str]:
+        """Jupiter lite API（免费、免 key）里查 ``(symbol, name)``，取不到返回 ``("", "")``。
+
+        ``/tokens/v2/search?query=<mint>`` 是按关键词搜的，会顺带返回别的币，
+        所以必须校验 ``id`` 与铸币完全相同才算数。超时给得很紧（3/6 秒）：
+        这是弹窗链路，宁可没名字也不能把提醒卡住。
+        """
+        try:
+            response = self._thread_session().get(
+                "https://lite-api.jup.ag/tokens/v2/search",
+                params={"query": mint}, timeout=(3, 6),
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception:
+            return "", ""
+        if not isinstance(data, list):
+            return "", ""
+        for row in data:
+            if isinstance(row, dict) and str(row.get("id") or "") == mint:
+                return (str(row.get("symbol") or "").strip()[:40],
+                        str(row.get("name") or "").strip()[:60])
+        return "", ""
 
     def _solana_onchain_symbol(self, mint: str) -> str:
         """走 Solana RPC ``getAsset`` 读 Metaplex 元数据里的符号，失败返回 ``""``。

@@ -27,6 +27,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import contextlib
@@ -34,6 +35,23 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from onchain_research_framework import normalize_framework_assessment
+
+# ---------------------------------------------------------------------------
+# 控制台编码（2026-11-21）
+#
+# Windows 下重定向到日志文件时 stdout 是 **GBK**（locale cp936）。战壕榜里一旦出现
+# 韩文/日文/emoji 币名，`print(f"... Scoring {symbol} ...")` 直接抛 UnicodeEncodeError
+# —— 而它在评分循环里，**一抛就整批作废**，下一轮从头再来又死在同一个币上。实测日志里
+# 该异常累计 18462 次，战壕榜本地评分长期卡在第 4~5 行。
+#
+# 这里把不可编码字符替换掉即可（只影响打不出来的字符，业务逻辑一个字不动）。
+# 用 reconfigure 而不是包一层 print：进程里所有模块的 stdout 一起受益。
+# ---------------------------------------------------------------------------
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -1078,26 +1096,32 @@ def run_gmgn_local_batch(
     # --- 阶段 1: 逐条本地评分 (零 AI)，promising 入缓冲，其余收集待本地回写 ---
     scored: list[tuple[dict, dict, dict]] = []  # (job, base_row, local) 不 promising 的
     for idx, job in enumerate(rows):
-        base_row = _rebuild_candidate_row(job)
-        chain = str(base_row.get("network") or "").lower()
-        address = str(base_row.get("contractAddress") or "")
-        symbol = str(base_row.get("symbol") or "")
-        if not address or not chain:
-            continue
-        print(f"[GMGN-Local] [{idx+1}/{selected}] Scoring {symbol}...", flush=True)
-        # 直接读战壕榜 candidate 已有数据评分，零 gmgn-cli 调用（不再拉 info/security/holders/traders）
-        local = score_trench_from_candidate(base_row, chain=chain, symbol=symbol) if LOCAL_SCORE_ENABLED else None
-        if local is None:
-            local = {"score": 50, "redFlags": [], "signals": [], "verdict": "weak", "promising": False}
-        local_scored += 1
-        if local.get("promising"):
-            # 有苗头的进缓冲，攒够 PROMISING_BATCH_SIZE 才一次性送 DeepSeek（摊薄固定开销）
-            with _PROMISING_BUFFER_LOCK:
-                _PROMISING_BUFFER.append((job, base_row, local))
-                _PROMISING_BUFFERED_KEYS.add(job["key"])
-        else:
-            scored.append((job, base_row, local))
-        print(f"[GMGN-Local] [{idx+1}/{selected}] {symbol}: score={local.get('score')}, promising={local.get('promising')}", flush=True)
+        # 单条出错只丢这一条：整批作废→下一轮从头再来，会永远卡在同一个币上
+        # （2026-11-21 就是这个形态：一个韩文币名把 42 行的批次打死在第 4 行）。
+        try:
+            base_row = _rebuild_candidate_row(job)
+            chain = str(base_row.get("network") or "").lower()
+            address = str(base_row.get("contractAddress") or "")
+            symbol = str(base_row.get("symbol") or "")
+            if not address or not chain:
+                continue
+            print(f"[GMGN-Local] [{idx+1}/{selected}] Scoring {symbol}...", flush=True)
+            # 直接读战壕榜 candidate 已有数据评分，零 gmgn-cli 调用（不再拉 info/security/holders/traders）
+            local = score_trench_from_candidate(base_row, chain=chain, symbol=symbol) if LOCAL_SCORE_ENABLED else None
+            if local is None:
+                local = {"score": 50, "redFlags": [], "signals": [], "verdict": "weak", "promising": False}
+            local_scored += 1
+            if local.get("promising"):
+                # 有苗头的进缓冲，攒够 PROMISING_BATCH_SIZE 才一次性送 DeepSeek（摊薄固定开销）
+                with _PROMISING_BUFFER_LOCK:
+                    _PROMISING_BUFFER.append((job, base_row, local))
+                    _PROMISING_BUFFERED_KEYS.add(job["key"])
+            else:
+                scored.append((job, base_row, local))
+            print(f"[GMGN-Local] [{idx+1}/{selected}] {symbol}: score={local.get('score')}, promising={local.get('promising')}", flush=True)
+        except Exception as exc:
+            errors += 1
+            print(f"[GMGN-Local] [{idx+1}/{selected}] 跳过（{type(exc).__name__}: {exc}）", flush=True)
 
     # --- 阶段 2: 回写不 promising 的（本地结论，零 AI） ---
     if scored:

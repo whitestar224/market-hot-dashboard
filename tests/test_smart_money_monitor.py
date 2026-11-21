@@ -5,6 +5,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from smart_money_monitor import (
+    ELYSIUM_SMART_MONEY_WALLETS,
+    EVM_CHAINS,
+    DEFAULT_SMART_MONEY_SEEDS,
+    SOLANA_KOL_WALLETS,
     SOLANA_SIGNATURE_LIMIT_CEILING,
     SOLANA_SIGNATURE_LIMIT_DEFAULT,
     SOLANA_TX_BUDGET_PER_ROUND,
@@ -277,6 +281,111 @@ class SmartMoneyClassificationTests(unittest.TestCase):
         self.assertAlmostEqual(event["paymentUsd"], 150)
         self.assertFalse(event["popupEligible"])
 
+    def test_solana_symbol_falls_back_to_the_mint_abbreviation(self):
+        """符号取不到时**绝不能**写 "UNKNOWN"（2026-11-12 用户投诉）。
+
+        病根在 :meth:`SmartMoneyMonitor.solana_token_metadata` —— 它当时只查稳定币
+        表，查不到一律返回 ``"UNKNOWN"``，于是库里 2732 条 Solana 事件的符号全是
+        字面量 UNKNOWN，卡片标题成了「KOL cowboy 买入 UNKNOWN · $807」。
+
+        这里走的是最后一道兜底：连元数据都空着时，用铸币地址 head6…tail4，
+        至少能让用户认得出是哪个盘。
+        """
+        payload = {
+            "slot": 103,
+            "transaction": {"signatures": ["sig-noname"]},
+            "meta": {
+                "err": None,
+                "fee": 5000,
+                # 这个用例只关心「名字取不到时怎么兜底」，所以让付款侧直接是 SOL
+                # 原生扣减（有 accountKeys 才能算出 native_spend）。
+                "preBalances": [5_000_000_000],
+                "postBalances": [3_999_995_000],
+                "preTokenBalances": [
+                    {"owner": SOL_WALLET, "mint": SOL_TOKEN, "uiTokenAmount": {"uiAmountString": "0", "decimals": 6}},
+                ],
+                "postTokenBalances": [
+                    {"owner": SOL_WALLET, "mint": SOL_TOKEN, "uiTokenAmount": {"uiAmountString": "1000000", "decimals": 6}},
+                ],
+            },
+        }
+        payload["transaction"]["message"] = {"accountKeys": [{"pubkey": SOL_WALLET}]}
+        event = classify_solana_buy(
+            SOL_WALLET,
+            payload,
+            token_metadata=lambda mint: {"symbol": "UNKNOWN", "priceUsd": 0.001},
+            native_price_usd=150,
+        )
+        self.assertIsNotNone(event)
+        self.assertNotEqual(event["symbol"], "UNKNOWN")
+        self.assertEqual(event["symbol"], f"{SOL_TOKEN[:6]}…{SOL_TOKEN[-4:]}")
+        # 正文里那个 UNKNOWN 也不许漏进 paymentAsset
+        self.assertEqual(event["paymentAsset"], "SOL")
+
+
+class SolanaSymbolResolutionTests(unittest.TestCase):
+    """``solana_token_metadata`` 的取名顺序：稳定币表 → DexScreener → 链上 getAsset。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.monitor = SmartMoneyMonitor(Path(self.tmp.name) / "meta.sqlite")
+
+    def tearDown(self):
+        self.monitor.close()
+        self.tmp.cleanup()
+
+    def test_symbol_comes_from_dexscreener_base_token(self):
+        calls = []
+
+        def fake_get(url, **kwargs):
+            calls.append(url)
+            return _FakeResponse([
+                {"baseToken": {"address": "mint-x", "symbol": "Sakura"},
+                 "priceUsd": "0.0001749", "liquidity": {"usd": 42000}},
+            ])
+
+        self.monitor.session = type("S", (), {"get": staticmethod(fake_get)})()
+        meta = self.monitor.solana_token_metadata("mint-x")
+        self.assertEqual(meta["symbol"], "Sakura")
+        self.assertAlmostEqual(meta["priceUsd"], 0.0001749)
+        self.assertEqual(len(calls), 1, "取价和取名字必须是同一次请求")
+
+    def test_unknown_symbol_is_not_cached(self):
+        """取不到名字时不留缓存，否则一次抽风会让这个币一小时都没名。"""
+
+        def fake_get(url, **kwargs):
+            return _FakeResponse([])
+
+        self.monitor.session = type("S", (), {"get": staticmethod(fake_get)})()
+        self.monitor.rpc = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no das"))
+        meta = self.monitor.solana_token_metadata("mint-unknown")
+        self.assertEqual(meta["symbol"], "UNKNOWN")
+        self.assertNotIn(("solana", "mint-unknown"), self.monitor._metadata_cache)
+
+    def test_onchain_get_asset_is_the_last_resort(self):
+        def fake_get(url, **kwargs):
+            return _FakeResponse([])
+
+        self.monitor.session = type("S", (), {"get": staticmethod(fake_get)})()
+        self.monitor.rpc = lambda chain, method, params: {
+            "content": {"metadata": {"symbol": "PEAR"}},
+        }
+        meta = self.monitor.solana_token_metadata("mint-pear")
+        self.assertEqual(meta["symbol"], "PEAR")
+
+
+class _FakeResponse:
+    """给 ``session.get`` 用的最小替身：只要 ``raise_for_status`` / ``json``。"""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
 
 class SolanaSignatureWindowTests(unittest.TestCase):
     """被机器人灌垃圾交易的地址，签名窗口必须自动放大，否则真实买入被挤掉。"""
@@ -458,15 +567,39 @@ class SmartMoneyMonitorTests(unittest.TestCase):
             rows = seeded.store.list_wallets()
             # cowboy 占三行（BSC/ETH/Base 各一），阿峰占一行（只 BSC），
             # 15 个「追踪钱包」各占三行（只记录不弹窗，见 test_kol_sync），
-            # pons榜5 占一行（只 Robinhood），THEO 与 Limfork 各占一行（只 Solana）。
-            self.assertEqual(len(rows), 86)
-            self.assertEqual({row["chain"] for row in rows}, {"ethereum", "bsc", "base", "robinhood", "solana"})
+            # pons榜5 占一行（只 Robinhood），THEO 与 Limfork 各占一行（只 Solana），
+            # Elysium 两个聪明钱各占一行（用户点名，chains=("elysium",)）。
+            # 期望值从 seed 定义推出来，别再写死数字 —— 新增一条 seed 就挂的断言没有价值。
+            expected_rows = len({
+                (chain, str(seed["address"]).lower())
+                for seed in DEFAULT_SMART_MONEY_SEEDS
+                for chain in seed.get("chains", EVM_CHAINS)
+            })
+            self.assertEqual(len(rows), expected_rows)
+            self.assertEqual(
+                {row["chain"] for row in rows},
+                {"ethereum", "bsc", "base", "robinhood", "elysium", "solana"},
+            )
+            # elysium 是「只对点名地址开启」的链：不能因为加了这条链，就把所有种子
+            # 钱包都复制一份过去（那会把 30 多个地址全拖进每轮轮询）。目前只有三行 ——
+            # 两个 Elysium 聪明钱 + 用户点名要盯 elysium 的 CryptoCharming。
+            elysium_rows = [row for row in rows if row["chain"] == "elysium"]
+            self.assertEqual(
+                {row["address"] for row in elysium_rows},
+                {address for address, _nickname in ELYSIUM_SMART_MONEY_WALLETS}
+                | {CRYPTO_CHARMING_WALLET},
+            )
             by_address = {}
             for row in rows:
                 by_address.setdefault(row["address"], set()).add((row["nickname"], row["sourceName"]))
             self.assertEqual(by_address[EVM_WALLET], {("Inq", "Inq5️⃣连杆提供")})
             self.assertEqual(by_address[EVM_OTHER], {("身份待核验 · a0ed…ff85", "Inq5️⃣连杆提供")})
-            self.assertEqual(by_address[CRYPTO_CHARMING_WALLET], {("CryptoCharming", "用户提供 · Robinhood 链")})
+            # CryptoCharming 有两个来源标签：四个 EVM 链那条是「用户提供 · Robinhood 链」，
+            # 后来点名的 Elysium 单独一条写「用户点名 · Elysium 链」（别混成一个来源）。
+            self.assertEqual(
+                by_address[CRYPTO_CHARMING_WALLET],
+                {("CryptoCharming", "用户提供 · Robinhood 链"), ("CryptoCharming", "用户点名 · Elysium 链")},
+            )
             self.assertEqual(
                 by_address[ROBINHOOD_PLAIN_WALLET],
                 {("NΞO", "用户提供 · Robinhood 链")},
@@ -497,17 +630,27 @@ class SmartMoneyMonitorTests(unittest.TestCase):
             self.assertEqual(wallet["sourceName"], "用户提供 · Robinhood 链")
             self.assertEqual(wallet["sourceKind"], "seed")
             self.assertTrue(wallet["enabled"])
-            # 链上实测单笔成交在数十美元量级，默认 10000 阈值等于永不提醒。
-            self.assertEqual(wallet["alertThresholdUsd"], 100)
+            # 链上实测单笔成交在数十美元量级，默认 10000 阈值等于永不提醒；
+            # 2026-11-15 17:30 随「每日首单」100U → 50U。
+            self.assertEqual(wallet["alertThresholdUsd"], 50)
             # An EVM address is keyed by the same private key on every EVM chain,
-            # so the seed follows the existing four-EVM-chain convention.
+            # so the seed follows the existing four-EVM-chain convention；Elysium
+            # 是用户 2026-11-09 单独点名的（「cryptocharming 在 elysium 的买入
+            # 也要做弹窗」），走孪生 seed 只挂这一条链，所以这里是 4+1。
             self.assertEqual(
                 sorted(
                     row["chain"] for row in seeded.store.list_wallets()
                     if row["address"] == CRYPTO_CHARMING_WALLET
                 ),
-                ["base", "bsc", "ethereum", "robinhood"],
+                ["base", "bsc", "elysium", "ethereum", "robinhood"],
             )
+            elysium_row = seeded.store.wallet("elysium", CRYPTO_CHARMING_WALLET)
+            self.assertTrue(elysium_row)
+            # 来源必须写清楚是后来点名的 Elysium，不能沿用 Robinhood 那条的来源。
+            self.assertEqual(elysium_row["sourceName"], "用户点名 · Elysium 链")
+            # 与其它四链同档，2026-11-15 17:30 一起降到 50U。
+            self.assertEqual(elysium_row["alertThresholdUsd"], 50)
+            self.assertTrue(elysium_row["enabled"])
         finally:
             seeded.close()
 
@@ -535,8 +678,12 @@ class SmartMoneyMonitorTests(unittest.TestCase):
     def test_afeng_seed_watches_bsc_only_at_the_agreed_threshold(self):
         """用户 2026-10-22 指定监控的 KOL「阿峰_Afeng」。
 
-        拍板两点：**只盯 BSC**（他没要 ETH/Base 那两份）、单笔 **≥500U** 才弹
+        拍板两点：**只盯 BSC**（他没要 ETH/Base 那两份）、单笔过阈值才弹
         （GMGN 统计单笔买入均值约 $344，沿用默认 10000U 等于永不提醒）。
+
+        阈值演变：2026-10-22 定 500U → **2026-11-12 降到 300U**。起因是
+        「币安生活」那笔三 KOL 同买（阿峰 $403.86 + $168.28）被 500U 门槛整段
+        漏掉，用户看到成交却没弹窗。他实际是 403U / 168U 两档，300U 能接住前一档。
         """
         seeded = SmartMoneyMonitor(Path(self.tmp.name) / "afeng.sqlite", seed_defaults=True)
         try:
@@ -546,7 +693,7 @@ class SmartMoneyMonitorTests(unittest.TestCase):
             self.assertEqual(wallet["sourceName"], "用户提供 · GMGN KOL")
             self.assertEqual(wallet["sourceKind"], "seed")
             self.assertTrue(wallet["enabled"])
-            self.assertEqual(wallet["alertThresholdUsd"], 500)
+            self.assertEqual(wallet["alertThresholdUsd"], 300)
             self.assertEqual(
                 [row["chain"] for row in seeded.store.list_wallets()
                  if row["address"] == AFENG_WALLET],
@@ -555,12 +702,17 @@ class SmartMoneyMonitorTests(unittest.TestCase):
         finally:
             seeded.close()
 
-    def test_cowboy_seed_watches_his_three_active_chains_at_500(self):
+    def test_cowboy_seed_watches_his_three_active_chains_at_200(self):
         """用户 2026-10-27 指定监控的 KOL「cowboy」。
 
         链上核验（2026-10-27）：BSC nonce 11,164 / 83.41 BNB、ETH nonce 298 /
         1.78 ETH、Base nonce 162 / 1.34 ETH，全是普通 EOA。监控面给这三条
-        **他真实活跃的链**（不给 Robinhood）；提醒门槛沿用阿峰的拍板：单笔 ≥500U。
+        **他真实活跃的链**（不给 Robinhood）。
+
+        阈值演变：沿用阿峰的 500U → 2026-11-12 三 KOL 统一降到 300U
+        （「币安生活」那笔 cowboy $471.25 / $336.54 两单都被 500U 挡住）→
+        **2026-11-15 17:30 降到 200U**：每日首单上线后他一天 215 笔只落在
+        十几个标的上，降档只多 0.4 条/天。
         """
         seeded = SmartMoneyMonitor(Path(self.tmp.name) / "cowboy.sqlite", seed_defaults=True)
         try:
@@ -578,16 +730,83 @@ class SmartMoneyMonitorTests(unittest.TestCase):
                     self.assertEqual(row["sourceName"], "用户提供 · KOL")
                     self.assertEqual(row["sourceKind"], "seed")
                     self.assertTrue(row["enabled"])
-                    self.assertEqual(row["alertThresholdUsd"], 500)
+                    self.assertEqual(row["alertThresholdUsd"], 200)
         finally:
             seeded.close()
 
-    def test_inq_seed_now_clears_a_hundred_dollars_on_all_four_chains(self):
+    def test_five_named_solana_kols_watch_solana_only_at_500(self):
+        """用户点名的 Solana KOL：0xsun / gake / 冷静 / Ansem / 4BQ6…k3xK / jijo /
+        trunoest / Dior，以及 2026-11-17 那批（Hyin / DV / 7bn / 8kz / decu）。
+
+        三条铁律，缺一条就是白烧 RPC 或者静默漏消息：
+
+        1. ``chains`` 必须**只写 solana**。漏写会落到默认的 EVM_CHAINS 上，
+           同一个 Solana 地址被复制到 bsc/ethereum/base/robinhood 四条链各轮询一遍。
+        2. 昵称必须是用户叫得出来的那个名字（弹窗标题是「KOL <昵称> 买入 X」）。
+           4BQ6 在 GMGN 上无名无推特，只能先用地址缩写顶着。
+        3. 阈值按各自实测定，**不是统一值**：jijo 的标准仓压在 $200~$300 → 300U；
+           trunoest 用户 2026-11-15 要求跟着 $140~$352 那档 → 300U；
+           Dior 的 $76~$494 是空白带 → 300U；其余按大票量级用 500U。
+           照抄一个数字写死，早晚会出现「阈值比人家单笔还高」。
+        """
+        expected = {
+            "HUpPyLU8KWisCAr3mzWy2FKT6uuxQ2qGgJQxyTpDoes5": ("0xsun", 500),
+            "DNfuF1L62WWyW3pNakVkyGGFzVVhj4Yr52jSmdTyeBHm": ("gake", 500),
+            "Ay9wnuZCRTceZJuRpGZnuwYZuWdsviM4cMiCwFoSQiPH": ("冷静", 500),
+            "AVAZvHLR2PcWpDf8BXY4rVxNHYRBytycHkcB5z5QNXYm": ("Ansem", 500),
+            "4BQ6ATUt26GFdiYQfht23iwfKyYD9D7XbL5ATqNGk3xK": ("KOL · 4BQ6A…k3xK", 500),
+            # jijo 是唯一一个 300U 的：他的标准仓就压在 $200~$300，500U 会把标准仓全挡掉。
+            "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk": ("jijo", 300),
+            # trunoest 单笔上限只有 $352（5 SOL 固定仓），2026-11-15 16:29 用户拍板
+            # 从 500U 降到 300U：跟着 $140~$352 那档走，≈36.8 张/天，吵是已知代价。
+            "ardinRsN1mNYVeoJWTBsWeYeXvuR9UUDGMsCDKpb6AT": ("trunoest", 300),
+            # Dior 的 $76~$494 是空的，300U 正好落在那条空白带里。
+            "87rRdssFiTJKY4MGARa4G5vQ31hmR7MxSmhzeaJ5AAxJ": ("Dior", 300),
+            # 2026-11-17 用户连发点名的一批：Hyin（SOL+EVM）、DV（SOL+EVM）、7bn、8kz、decu。
+            # 阈值按各自成交画像定，不是统一值：Hyin 没有尘埃档、中位 $358 → 500U；
+            # DV 只有 $7~14 碎单 + 两笔 $278 → 100U 刚好滤干净；7bn 中位 $149 → 300U；
+            # 8kz 在 $100~240 之间 0.6 小时就 15 笔 → 300U 只留尾部的 724/1,058；
+            # decu 有 $2 试探 + $17~18 一坨 → 200U 卡在 $141/$207 之间。
+            "7mGZh58meFf8xsES37bc2hdffEmh8aTDcB2i725Zivyg": ("Hyin", 500),
+            "BCagckXeMChUKrHEd6fKFA1uiWDtcmCXMsqaheLiUPJd": ("DV", 100),
+            "7BNaxx6KdUYrjACNQZ9He26NBFoFxujQMAfNLnArLGH5": ("7bn", 300),
+            "8zkgFGVZrDLieViwqiXFCydSX6WL5hsxmUu55yBdsNsZ": ("8kz", 300),
+            "4vw54BmAogeRV3vPKWyFet5yf8DTLcREzdSzx4rw9Ud9": ("decu", 200),
+            # zrool：47 笔买入里 36 笔是 $7 碎单，真实档 $54~95，最大 $172。
+            # ≥80U 只剩 6 笔/5 标的，卡在碎单和真实仓之间。
+            "99i9uVA7Q56bY22ajKKUfTZTgTeP5yCtVGsrG9J4pDYQ": ("zrool", 80),
+        }
+        # cented 2026-11-15 当天先按点名加上、12:13 又被要求撤下 —— 所以它**只能**
+        # 从种子表里消失。留着他等于换台机器建库又卷土重来。
+        self.assertEqual(
+            {row["address"]: (row["nickname"], int(row["threshold"])) for row in SOLANA_KOL_WALLETS},
+            expected,
+        )
+
+        seeded = SmartMoneyMonitor(Path(self.tmp.name) / "solana-kol.sqlite", seed_defaults=True)
+        try:
+            rows = seeded.store.list_wallets()
+            for address, (nickname, threshold) in expected.items():
+                with self.subTest(kol=nickname):
+                    matched = [row for row in rows if row["address"] == address]
+                    self.assertEqual(len(matched), 1, f"{nickname} 只该有一行（只有 solana）")
+                    row = matched[0]
+                    self.assertEqual(row["chain"], "solana")
+                    self.assertEqual(row["nickname"], nickname)
+                    self.assertEqual(row["sourceName"], "用户点名 · KOL")
+                    self.assertTrue(row["enabled"])
+                    self.assertEqual(row["alertThresholdUsd"], threshold)
+                    self.assertIn(address, row["sourceUrl"])
+        finally:
+            seeded.close()
+
+    def test_inq_seed_now_clears_fifty_dollars_on_all_four_chains(self):
         """用户 2026-10-28：「把这个地址的买入也监控上并弹窗提示」——Inq。
 
         这个地址其实早就在库里，但阈值一直是默认的 10000U。实盘事件表里 1202 笔
         真实买入，单笔 ≥10000U 的有 **0** 笔（中位 $46、最大 $581），所以从来没
-        弹过一次窗。按实测规模定 100U（与 CryptoCharming / NΞO 同档）。
+        弹过一次窗。按实测规模定 100U（与 CryptoCharming / NΞO 同档）；
+        2026-11-15 17:30 随「每日首单」再降到 50U（只多 0.8 条/天）。
         """
 
         seeded = SmartMoneyMonitor(Path(self.tmp.name) / "inq.sqlite", seed_defaults=True)
@@ -604,7 +823,7 @@ class SmartMoneyMonitorTests(unittest.TestCase):
                 with self.subTest(chain=row["chain"]):
                     self.assertEqual(row["nickname"], "Inq")
                     self.assertTrue(row["enabled"])
-                    self.assertEqual(row["alertThresholdUsd"], 100)
+                    self.assertEqual(row["alertThresholdUsd"], 50)
         finally:
             seeded.close()
 
@@ -641,7 +860,7 @@ class SmartMoneyMonitorTests(unittest.TestCase):
             for chain in ("ethereum", "bsc", "base", "robinhood"):
                 with self.subTest(chain=chain):
                     self.assertEqual(
-                        upgraded.store.wallet(chain, INQ_WALLET)["alertThresholdUsd"], 100
+                        upgraded.store.wallet(chain, INQ_WALLET)["alertThresholdUsd"], 50
                     )
             # 用户手动调成 300 的不许被 seed 覆盖。
             self.assertEqual(
@@ -664,7 +883,7 @@ class SmartMoneyMonitorTests(unittest.TestCase):
             )
             # 幂等：第二次不会再改任何行（阈值已不是默认值）。
             self.assertEqual(upgraded.store.apply_seed_thresholds([
-                {"address": INQ_WALLET, "alertThresholdUsd": 100.0},
+                {"address": INQ_WALLET, "alertThresholdUsd": 50.0},
             ]), 0)
             self.assertEqual(manual["alertThresholdUsd"], 10000)
         finally:
@@ -886,7 +1105,8 @@ class SmartMoneyServerIntegrationTests(unittest.TestCase):
             "symbol": "MOON", "paymentAsset": "USDT", "paymentAmount": 12_000,
             "paymentUsd": 12_000, "observedAt": 1234,
         }
-        with patch.object(self.server, "launch_desktop_alert", return_value={"ok": True}) as launch:
+        with patch.object(self.server, "fetch_gigax_exchange_ai_narrative", return_value={}), \
+                patch.object(self.server, "launch_desktop_alert", return_value={"ok": True}) as launch:
             self.server.send_smart_money_buy_desktop_alert(event)
         payload = launch.call_args.args[0]
         self.assertEqual(payload["sourceType"], "smart-money-buy")
@@ -1019,6 +1239,89 @@ class SmartMoneyFallbackWindowTests(unittest.TestCase):
             self.assertIn("已扫描最近 240 个区块", health["message"])
         finally:
             monitor.close()
+
+
+class SmartMoneyDailyFirstBuyTests(unittest.TestCase):
+    """同一个 (链, 钱包, 代币) **当天只弹第一条** —— 用户 2026-11-15 16:41：
+    「所有的买入监控，只做某一个标的当天的第一次买入弹窗」，为的是把阈值调低后
+    不被同一个币的来回加仓刷屏。
+
+    两条铁律：
+
+    1. **只抑制弹窗，不抑制记账**。被压掉的那笔照样 ``popupEligible=True`` 进库、
+       页面上逐笔可见，``details.popupSuppressed`` 标出原因 —— 否则「今天买了 5 次」
+       在页面上会变成 1 次，等于把数据也删了。
+    2. **日界线走本地零点**。用 UTC 换天，用户会觉得「早上八点突然又能弹了」。
+    """
+
+    def setUp(self):
+        self.monitor = SmartMoneyMonitor(Path(tempfile.mkdtemp()) / "daily-first.sqlite")
+        self.monitor.add_wallet({
+            "chain": "bsc", "address": CRYPTO_CHARMING_WALLET,
+            "nickname": "高频哥", "alertThresholdUsd": 100,
+        })
+        self.alerts = []
+        self.monitor.set_alert_callback(self.alerts.append)
+
+    def tearDown(self):
+        self.monitor.close()
+
+    def _buy(self, tx: str, *, token: str = TOKEN, usd: float = 300.0) -> dict:
+        return self.monitor.record_buy({
+            "chain": "bsc", "walletAddress": CRYPTO_CHARMING_WALLET,
+            "transactionHash": tx, "tokenAddress": token, "symbol": "MEME",
+            "tokenAmount": 10.0, "paymentAsset": "USDT",
+            "paymentAmount": usd, "paymentUsd": usd, "priceUsd": 30.0,
+            "details": {"classification": "net-token-flow", "readOnly": True},
+        })
+
+    def test_same_token_same_day_pops_once_but_records_every_buy(self):
+        first = self._buy("0x" + "a1" * 32)
+        second = self._buy("0x" + "a2" * 32)
+
+        self.assertTrue(first["created"])
+        self.assertFalse(first["popupSuppressed"])
+        self.assertTrue(second["created"])
+        self.assertTrue(second["popupSuppressed"])
+        self.assertEqual(len(self.alerts), 1)
+        # 记账口径不变：第二笔仍然「过线」，只是不弹。
+        self.assertTrue(second["event"]["popupEligible"])
+        self.assertEqual(second["event"]["details"]["popupSuppressed"], "daily-first")
+        self.assertEqual(second["event"]["details"]["classification"], "net-token-flow")
+        self.assertEqual(len(self.monitor.store.list_events(limit=50)), 2)
+
+    def test_a_different_token_still_pops_the_same_day(self):
+        self._buy("0x" + "b1" * 32)
+        other = self._buy("0x" + "b2" * 32, token="0x" + "99" * 20)
+        self.assertFalse(other["popupSuppressed"])
+        self.assertEqual(len(self.alerts), 2)
+
+    def test_below_threshold_buys_neither_pop_nor_block_the_day(self):
+        quiet = self._buy("0x" + "c1" * 32, usd=5.0)  # 100U 阈值，这就是试探单
+        loud = self._buy("0x" + "c2" * 32, usd=300.0)
+        self.assertFalse(quiet["event"]["popupEligible"])
+        self.assertFalse(loud["popupSuppressed"])
+        self.assertEqual(len(self.alerts), 1)
+
+    def test_day_boundary_actually_gates_the_rule(self):
+        """把日界线推到「明天」后，同一个币的第二笔就该重新弹 —— 证明这条规则
+        真的是按「今天」判的，而不是一个进程内的去重字典。"""
+        self._buy("0x" + "d1" * 32)
+        import smart_money_monitor as m
+
+        with patch.object(m, "_local_day_start_ms", return_value=m._now_ms() + 60_000):
+            again = self._buy("0x" + "d2" * 32)
+        self.assertFalse(again["popupSuppressed"])
+        self.assertEqual(len(self.alerts), 2)
+
+    def test_switch_off_restores_the_old_burst_behaviour(self):
+        import smart_money_monitor as m
+
+        with patch.object(m, "SMART_MONEY_BUY_ONCE_PER_TOKEN_PER_DAY", False):
+            self._buy("0x" + "e1" * 32)
+            second = self._buy("0x" + "e2" * 32)
+        self.assertFalse(second["popupSuppressed"])
+        self.assertEqual(len(self.alerts), 2)
 
 
 class SmartMoneyAlertLineTests(unittest.TestCase):
@@ -1256,6 +1559,84 @@ class OnchainQuotePriceTests(unittest.TestCase):
     def test_broken_pool_read_returns_zero_instead_of_raising(self):
         with patch.object(SmartMoneyMonitor, "rpc", side_effect=RuntimeError("rpc down")):
             self.assertEqual(self.monitor.onchain_quote_price("robinhood", PONS_DELTA), 0.0)
+
+
+class SolanaSymbolBackfillTests(unittest.TestCase):
+    """落库时只拿到「缩写合约」的事件，要能被回头补成真名字。
+
+    用户 2026-11-21 截图「KOL zrool 买入 J1D7e7…eWfv · $85」：新盘那一刻既没有
+    DexScreener 交易对、DAS 也查不到资产，只能写铸币缩写。等 Jupiter 索引有了，
+    ``backfill_truncated_symbols`` 要把同一个铸币下**所有**缩写行一次改掉。
+    """
+
+    MINT = "J1D7e7FGYK7WLsZ7tZTdfcURwUScEs8DpoBe7QQbeWfv"
+    DEAD_MINT = "AACtroE9u7vTbLWBbMtkPx4bK79YYxBHgb8tfd1Apump"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.monitor = SmartMoneyMonitor(Path(self.tmp.name) / "backfill.sqlite")
+        self.store = self.monitor.store
+        self._seed(self.MINT, "J1D7e7…eWfv", 3)
+        self._seed(self.DEAD_MINT, "AACtro…pump", 1)
+
+    def tearDown(self):
+        self.monitor.close()
+        self.tmp.cleanup()
+
+    def _seed(self, mint, symbol, count):
+        for index in range(count):
+            self.store.conn.execute(
+                "INSERT INTO events (event_key, chain, wallet_address, wallet_nickname,"
+                " transaction_hash, token_address, symbol, token_amount, payment_asset,"
+                " payment_amount, payment_usd, price_usd, popup_eligible, alerted_at,"
+                " observed_at, block_ref, details_json)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (f"k:{mint[:6]}:{index}", "solana", "wallet-1", "zrool", f"sig-{index}",
+                 mint, symbol, 1.0, "SOL", 0.5, 85.0, 0.0, 0, 0, 1, "23", "{}"),
+            )
+        self.store.conn.commit()
+
+    def test_truncated_rows_are_grouped_and_newest_first(self):
+        rows = self.store.truncated_symbol_rows(10, chain="solana")
+        self.assertEqual([row["token_address"] for row in rows], [self.DEAD_MINT, self.MINT])
+
+    def test_every_truncated_row_of_the_mint_is_renamed(self):
+        self.assertEqual(self.store.rename_token_symbol(self.MINT, "EURO"), 3)
+        symbols = [row[0] for row in self.store.conn.execute(
+            "SELECT symbol FROM events WHERE token_address = ?", (self.MINT,))]
+        self.assertEqual(symbols, ["EURO"] * 3)
+        self.assertEqual(self.store.rename_token_symbol(self.MINT, "OTHER"), 0, "改完就不该再命中")
+
+    def test_backfill_resolves_names_and_skips_unresolvable_mints(self):
+        def fake_metadata(mint):
+            if mint == self.MINT:
+                return {"symbol": "EURO", "name": "eurc.cool", "priceUsd": 0.0, "stable": False}
+            return {"symbol": "UNKNOWN", "name": "", "priceUsd": 0.0, "stable": False}
+
+        with patch.object(SmartMoneyMonitor, "solana_token_metadata", side_effect=fake_metadata):
+            self.assertEqual(self.monitor.backfill_truncated_symbols(), 3)
+
+        symbol = self.store.conn.execute(
+            "SELECT symbol FROM events WHERE token_address = ? LIMIT 1", (self.MINT,)).fetchone()[0]
+        self.assertEqual(symbol, "EURO")
+        dead = self.store.conn.execute(
+            "SELECT symbol FROM events WHERE token_address = ? LIMIT 1", (self.DEAD_MINT,)).fetchone()[0]
+        self.assertEqual(dead, "AACtro…pump", "查不到就保持原样，绝不写 UNKNOWN")
+
+    def test_unresolvable_mint_is_not_retried_every_round(self):
+        """几百个老 pump 盘永远补不上；不压冷却的话每轮都白查它们，能补的永远轮不到。"""
+        calls = []
+
+        def fake_metadata(mint):
+            calls.append(mint)
+            return {"symbol": "UNKNOWN", "name": "", "priceUsd": 0.0, "stable": False}
+
+        with patch.object(SmartMoneyMonitor, "solana_token_metadata", side_effect=fake_metadata):
+            self.monitor.backfill_truncated_symbols()
+            self.monitor._symbol_backfill_at = 0.0  # 绕过节流，模拟「下一轮」
+            self.monitor.backfill_truncated_symbols()
+
+        self.assertEqual(calls, [self.DEAD_MINT, self.MINT], "每个铸币只该查一次")
 
 
 class PonsSeedRegistrationTests(unittest.TestCase):
