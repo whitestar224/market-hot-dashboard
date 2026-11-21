@@ -673,18 +673,27 @@ class FastResearch:
             return {"status": "disabled"}
         now_ms = _now_ms()
         woke_by_board_refresh = self._gmgn_local_wake.is_set()
-        if now_ms - self._gmgn_local_last_run_ms < self._gmgn_local_interval_s * 1000 and not woke_by_board_refresh:
+        # 硬地板：即使被「战壕榜刷新」唤醒，也不能比这更快地重跑一遍。
+        # 一批要逐条评分几十个币，唤醒频率跟着快照走的话等于常驻烧 CPU。
+        elapsed = now_ms - self._gmgn_local_last_run_ms
+        if elapsed < int(os.getenv("GMGN_LOCAL_MIN_INTERVAL_SECONDS", "8")) * 1000:
+            return {"status": "cooldown"}
+        if elapsed < self._gmgn_local_interval_s * 1000 and not woke_by_board_refresh:
             return {"status": "cooldown"}
         self._gmgn_local_wake.clear()
+        # **先在开工前钉住时间戳**。以前只在成功分支里写 `_gmgn_local_last_run_ms`，
+        # 于是任何异常（2026-11-21：韩文币名 print 抛 UnicodeEncodeError）都会让它
+        # 永远停在 0 —— 窗口每来一次快照就立刻重跑一次，一个坏批变成 3 秒一轮的死循环，
+        # 实测常驻吃掉 2 个核、日志刷了 18462 次编码异常。间隔必须记「开始时」。
+        self._gmgn_local_last_run_ms = now_ms
         import gmgn_local_trench_analyzer as _mod  # noqa: PLC0415
         try:
-            print(f"[GMGN-Local] Starting batch analysis, last_run={self._gmgn_local_last_run_ms}", flush=True)
+            print(f"[GMGN-Local] Starting batch analysis, last_run={now_ms}", flush=True)
             result = _mod.run_gmgn_local_batch(
                 self.store, self.analyzer, self.alert_sink,
                 batch_size=self._gmgn_local_batch_size, now_ms=now_ms,
             )
             result["status"] = "ok"
-            self._gmgn_local_last_run_ms = _now_ms()
             print(f"[GMGN-Local] Batch complete: {result}", flush=True)
             return result
         except Exception as exc:

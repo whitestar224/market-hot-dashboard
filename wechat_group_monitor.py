@@ -68,6 +68,13 @@ OCR_SKIP_TEXT = {
 _OCR_ENGINE: Any = None
 _OCR_ENGINE_ERROR = ""
 _OCR_ENGINE_LOCK = threading.Lock()
+# OCR 只是「取不到 UI 自动化文本」时的兜底，用一次就常驻太浪费：实测 cv2 + onnxruntime
+# + RapidOCR 引擎合计约 86MB（纯解释器 17MB → 跑完一张图 103MB），而它可能几小时才用一次。
+# 空闲超过这个秒数就丢掉引擎并 gc，下次真要用再重建（构建实测 0.8 秒，兜底路径等得起）。
+_OCR_IDLE_RELEASE_SECONDS = float(os.getenv("WECHAT_OCR_IDLE_RELEASE_SECONDS", "900") or 900)
+_OCR_LAST_USED = 0.0
+_OCR_IN_USE = 0
+_OCR_JANITOR_STARTED = False
 _WECHAT_SEND_LOCK = threading.Lock()
 _WECHAT_UIA_DRIVER: Any = None
 _WECHAT_UIA_DRIVER_ERROR = ""
@@ -629,16 +636,75 @@ def _capture_window_image(candidate: dict[str, Any]) -> Any:
         user32.ReleaseDC(hwnd, window_dc)
 
 
+def _ocr_run(engine: Any, image: Any) -> Any:
+    """跑一次识别，顺便标「正在用」（回收线程看到有人用就不动手）。"""
+    global _OCR_IN_USE, _OCR_LAST_USED
+    with _OCR_ENGINE_LOCK:
+        _OCR_IN_USE += 1
+        _OCR_LAST_USED = time.time()
+    try:
+        return engine(image)
+    finally:
+        with _OCR_ENGINE_LOCK:
+            _OCR_IN_USE = max(0, _OCR_IN_USE - 1)
+            _OCR_LAST_USED = time.time()
+
+
+def _release_ocr_if_idle() -> bool:
+    """空闲够久就把 OCR 引擎扔掉（86MB）；正在跑的那一路不受影响（引用在局部变量里）。"""
+    global _OCR_ENGINE
+    if _OCR_ENGINE is None:
+        return False
+    if _OCR_IN_USE:
+        return False
+    if time.time() - float(_OCR_LAST_USED or 0.0) < _OCR_IDLE_RELEASE_SECONDS:
+        return False
+    with _OCR_ENGINE_LOCK:
+        if _OCR_ENGINE is None:
+            return False
+        _OCR_ENGINE = None
+    import gc  # noqa: PLC0415
+
+    gc.collect()
+    print(
+        f"[wechat-ocr] 空闲超过 {int(_OCR_IDLE_RELEASE_SECONDS)} 秒，已释放 OCR 引擎（cv2/onnxruntime 约 86MB）",
+        flush=True,
+    )
+    return True
+
+
+def _start_ocr_janitor() -> None:
+    """引擎创建之后才起一个 60 秒巡视线程，没人用就回收（线程本身约 0.03MB）。"""
+    global _OCR_JANITOR_STARTED
+    if _OCR_JANITOR_STARTED:
+        return
+    _OCR_JANITOR_STARTED = True
+
+    def loop() -> None:
+        while True:
+            time.sleep(60)
+            try:
+                _release_ocr_if_idle()
+            except Exception:
+                pass
+
+    threading.Thread(target=loop, daemon=True, name="ocr-idle-reaper").start()
+
+
 def _rapid_ocr_engine() -> tuple[Any, str]:
-    global _OCR_ENGINE, _OCR_ENGINE_ERROR
+    global _OCR_ENGINE, _OCR_ENGINE_ERROR, _OCR_LAST_USED
     if _OCR_ENGINE is not None or _OCR_ENGINE_ERROR:
+        _OCR_LAST_USED = time.time()
         return _OCR_ENGINE, _OCR_ENGINE_ERROR
     with _OCR_ENGINE_LOCK:
         if _OCR_ENGINE is not None or _OCR_ENGINE_ERROR:
+            _OCR_LAST_USED = time.time()
             return _OCR_ENGINE, _OCR_ENGINE_ERROR
         try:
             from rapidocr_onnxruntime import RapidOCR  # type: ignore
             _OCR_ENGINE = RapidOCR()
+            _OCR_LAST_USED = time.time()
+            _start_ocr_janitor()
         except Exception as exc:
             _OCR_ENGINE_ERROR = str(exc)
     return _OCR_ENGINE, _OCR_ENGINE_ERROR
@@ -674,7 +740,7 @@ def _collect_with_window_ocr(group_name: str, platform: str = "wechat", sender_f
                 continue
             captured_any = True
             import numpy as np
-            rows = normalize_ocr_rows(engine(np.asarray(image)))
+            rows = normalize_ocr_rows(_ocr_run(engine, np.asarray(image)))
             parsed = messages_from_ocr_rows(
                 group_name,
                 rows,

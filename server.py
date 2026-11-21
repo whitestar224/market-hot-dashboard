@@ -58663,6 +58663,15 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/personal-x-stream":
             self.send_x_kol_stream(None, payload_transform=personal_x_monitor_payload)
             return
+        if parsed.path == "/api/_mem":
+            # 手动内存画像：全堆遍历要 1~2 秒，**只给诊断用**，别让页面轮询它。
+            try:
+                import mem_census  # noqa: PLC0415
+
+                self.send_json(mem_census.census())
+            except Exception as exc:  # 诊断工具坏了也不能影响主服务
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
         if parsed.path == "/api/smart-money-monitor":
             if force_refresh and self.request_is_local_or_admin():
                 threading.Thread(

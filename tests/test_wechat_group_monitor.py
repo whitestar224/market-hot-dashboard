@@ -1,4 +1,5 @@
 import os
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -251,6 +252,38 @@ class WechatGroupMonitorParsingTests(unittest.TestCase):
         self.assertEqual(rows[0]["text"], "测试文字")
         self.assertEqual(rows[0]["left"], 1)
         self.assertEqual(rows[0]["bottom"], 12)
+
+
+class WechatOcrLifecycleTests(unittest.TestCase):
+    """OCR 只是 UI 自动化失败时的兜底，用一次就常驻 86MB 不值得（实测 cv2+onnx+引擎）。"""
+
+    def tearDown(self):
+        wechat_group_monitor._OCR_ENGINE = None
+        wechat_group_monitor._OCR_LAST_USED = 0.0
+        wechat_group_monitor._OCR_IN_USE = 0
+
+    def test_idle_engine_is_released(self):
+        wechat_group_monitor._OCR_ENGINE = object()
+        wechat_group_monitor._OCR_LAST_USED = 0.0
+        with patch.object(wechat_group_monitor, "_OCR_IDLE_RELEASE_SECONDS", 60):
+            self.assertTrue(wechat_group_monitor._release_ocr_if_idle())
+        self.assertIsNone(wechat_group_monitor._OCR_ENGINE)
+
+    def test_recently_used_engine_is_kept(self):
+        wechat_group_monitor._OCR_ENGINE = object()
+        wechat_group_monitor._OCR_LAST_USED = time.time()
+        with patch.object(wechat_group_monitor, "_OCR_IDLE_RELEASE_SECONDS", 600):
+            self.assertFalse(wechat_group_monitor._release_ocr_if_idle())
+        self.assertIsNotNone(wechat_group_monitor._OCR_ENGINE)
+
+    def test_engine_in_use_is_never_released(self):
+        """正在跑识别的那一路不能被抽走引擎。"""
+        wechat_group_monitor._OCR_ENGINE = object()
+        wechat_group_monitor._OCR_LAST_USED = 0.0
+        wechat_group_monitor._OCR_IN_USE = 1
+        with patch.object(wechat_group_monitor, "_OCR_IDLE_RELEASE_SECONDS", 60):
+            self.assertFalse(wechat_group_monitor._release_ocr_if_idle())
+        self.assertIsNotNone(wechat_group_monitor._OCR_ENGINE)
 
 
 if __name__ == "__main__":
