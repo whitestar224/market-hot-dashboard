@@ -68,9 +68,20 @@ OCR_SKIP_TEXT = {
 _OCR_ENGINE: Any = None
 _OCR_ENGINE_ERROR = ""
 _OCR_ENGINE_LOCK = threading.Lock()
-# OCR 只是「取不到 UI 自动化文本」时的兜底，用一次就常驻太浪费：实测 cv2 + onnxruntime
-# + RapidOCR 引擎合计约 86MB（纯解释器 17MB → 跑完一张图 103MB），而它可能几小时才用一次。
-# 空闲超过这个秒数就丢掉引擎并 gc，下次真要用再重建（构建实测 0.8 秒，兜底路径等得起）。
+# **OCR 默认彻底停用（用户 2026-11-21 拍板「OCR 彻底不装」）**。
+#
+# OCR（RapidOCR + cv2 + onnxruntime）只在「UI 自动化取不到文本」时兜底，但它是重依赖：
+# 实测整条链 86MB（纯解释器 17MB → 跑完一张 900×1400 是 103MB），映射进进程的是
+# cv2 88MB + onnxruntime 16MB + OpenBLAS 20MB，而群里真正需要它的场景极少。
+#
+# 关掉之后**连 import 都不会发生**：`_rapid_ocr_engine()` 直接返回错误、
+# `_collect_with_window_ocr()` 直接返回 `collector_disabled`，所以这些包留在磁盘上
+# 也不占进程内存。要恢复：`WECHAT_OCR_ENABLED=1`（代码路径全保留，包括下面的空闲回收）。
+_OCR_ENABLED = str(os.getenv("WECHAT_OCR_ENABLED", "0") or "").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+# 万一将来重新开启：用一次就常驻太浪费，空闲超过这个秒数就丢掉引擎并 gc
+# （重建实测 0.8 秒，兜底路径等得起）。
 _OCR_IDLE_RELEASE_SECONDS = float(os.getenv("WECHAT_OCR_IDLE_RELEASE_SECONDS", "900") or 900)
 _OCR_LAST_USED = 0.0
 _OCR_IN_USE = 0
@@ -693,6 +704,9 @@ def _start_ocr_janitor() -> None:
 
 def _rapid_ocr_engine() -> tuple[Any, str]:
     global _OCR_ENGINE, _OCR_ENGINE_ERROR, _OCR_LAST_USED
+    if not _OCR_ENABLED:
+        # 连 import 都不做：cv2/onnxruntime 一旦加载就常驻几十 MB，见 _OCR_ENABLED 注释
+        return None, "文字识别（OCR）已停用（WECHAT_OCR_ENABLED=0）"
     if _OCR_ENGINE is not None or _OCR_ENGINE_ERROR:
         _OCR_LAST_USED = time.time()
         return _OCR_ENGINE, _OCR_ENGINE_ERROR
@@ -713,6 +727,14 @@ def _rapid_ocr_engine() -> tuple[Any, str]:
 def _collect_with_window_ocr(group_name: str, platform: str = "wechat", sender_filter: str = "") -> dict[str, Any]:
     normalized_platform = normalize_chat_platform(platform)
     platform_name = _platform_name(normalized_platform)
+    if not _OCR_ENABLED:
+        # 直接短路，连窗口枚举都不做：这条通道已按用户要求彻底停用
+        return {
+            "ok": False,
+            "status": "collector_disabled",
+            "messages": [],
+            "error": "文字识别（OCR）已停用，群聊采集只走 UI 自动化通道",
+        }
     if os.name != "nt":
         return {"ok": False, "status": "collector_unavailable", "messages": [], "error": f"仅支持 Windows {platform_name}"}
     candidates = _wechat_window_candidates(normalized_platform)
@@ -960,7 +982,9 @@ def collect_visible_group_messages(group_name: str, platform: str = "wechat", se
     ocr_result = _collect_with_window_ocr(wanted, normalized_platform, sender_filter)
     if ocr_result.get("ok"):
         return ocr_result
-    if str(ocr_result.get("status") or "") == "collector_unavailable":
+    # OCR 停用/不可用时，真正该报给用户的是**UI 自动化那一路的失败原因**
+    # （比如「没找到群」），而不是一句「OCR 不可用」。
+    if str(ocr_result.get("status") or "") in {"collector_unavailable", "collector_disabled"}:
         return accessibility_result
     return ocr_result
 

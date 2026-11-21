@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import unittest
 from types import SimpleNamespace
@@ -255,12 +256,35 @@ class WechatGroupMonitorParsingTests(unittest.TestCase):
 
 
 class WechatOcrLifecycleTests(unittest.TestCase):
-    """OCR 只是 UI 自动化失败时的兜底，用一次就常驻 86MB 不值得（实测 cv2+onnx+引擎）。"""
+    """OCR 只是 UI 自动化失败时的兜底，用一次就常驻 86MB 不值得（实测 cv2+onnx+引擎）。
+
+    用户 2026-11-21 拍板「OCR 彻底不装」，所以默认必须是关的，而且关闭时
+    **连 rapidocr/cv2 都不许 import**（重依赖一旦加载就常驻几十 MB）。
+    """
 
     def tearDown(self):
         wechat_group_monitor._OCR_ENGINE = None
         wechat_group_monitor._OCR_LAST_USED = 0.0
         wechat_group_monitor._OCR_IN_USE = 0
+
+    def test_ocr_is_off_by_default_and_never_imported(self):
+        self.assertFalse(wechat_group_monitor._OCR_ENABLED)
+        before = "rapidocr_onnxruntime" in sys.modules
+        engine, error = wechat_group_monitor._rapid_ocr_engine()
+        self.assertIsNone(engine)
+        self.assertIn("停用", error)
+        self.assertEqual(before, "rapidocr_onnxruntime" in sys.modules, "关掉时不许 import 重依赖")
+
+    def test_disabled_collector_short_circuits(self):
+        result = wechat_group_monitor._collect_with_window_ocr("地表最强bsc eth")
+        self.assertEqual(result["status"], "collector_disabled")
+
+    def test_disabled_ocr_reports_the_ui_automation_reason(self):
+        """最终报给用户的应该是「UI 自动化为什么失败」，不是「OCR 不可用」。"""
+        ui_fail = {"ok": False, "status": "group_not_found", "messages": [], "error": "没找到群聊窗口"}
+        with patch.object(wechat_group_monitor, "_collect_with_ui_automation", return_value=ui_fail):
+            actual = wechat_group_monitor.collect_visible_group_messages("地表最强bsc eth")
+        self.assertEqual(actual, ui_fail)
 
     def test_idle_engine_is_released(self):
         wechat_group_monitor._OCR_ENGINE = object()
