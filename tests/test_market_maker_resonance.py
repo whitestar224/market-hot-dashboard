@@ -19,8 +19,15 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import market_maker_monitor as mm
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
 
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.monitors import market_maker_monitor as mm
 TOKEN = "0x39dbed3a2bd333467115de4566f8d8b0e4a4f2f1"
 OTHER = "0x" + "7c" * 20
 

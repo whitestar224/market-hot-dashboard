@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
-const read = (name) => fs.readFileSync(path.join(root, name), "utf8");
+const read = (name) => fs.readFileSync(path.join(root, fs.existsSync(path.join(root, 'web', name)) ? 'web' : '', name), "utf8");
 
 test("background refresh reconciles stable elements instead of replacing the page", () => {
   const adapter = read("desktop_adapter.js");

@@ -2,8 +2,8 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fixture = require("./fixtures/dragon_wave_mother_context_prefixes.json");
-const Engine = require("../dragon-wave-engine.js");
-const Data = require("../dragon-wave-data.js");
+const Engine = require("../web/dragon-wave-engine.js");
+const Data = require("../web/dragon-wave-data.js");
 
 // These are single-candle, causal evaluations. They deliberately never call
 // analyzeTimeframe, applyContextGates, a production cache writer or feedback.

@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const Engine = require("../dragon-wave-engine.js");
+const Engine = require("../web/dragon-wave-engine.js");
 
 test("urgent horizontal sublabel is removed without deleting an independent triangle B", () => {
   const signal = {

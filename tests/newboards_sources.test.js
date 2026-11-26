@@ -4,8 +4,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
-const html = fs.readFileSync(path.join(root, "newboards.html"), "utf8");
-const js = fs.readFileSync(path.join(root, "newboards.js"), "utf8");
+const html = fs.readFileSync(path.join(root, 'web', 'newboards.html'), "utf8");
+const js = fs.readFileSync(path.join(root, 'web', 'newboards.js'), "utf8");
 const server = fs.readFileSync(path.join(root, "server.py"), "utf8");
 
 test("new coin page includes the four additional market sources", () => {

@@ -34,7 +34,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import trench_overlay as ov  # noqa: E402
+from app.alerts import trench_overlay as ov  # noqa: E402
 
 USER32 = ctypes.windll.user32
 VK_MENU = 0x12

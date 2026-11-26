@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const js = fs.readFileSync(path.join(__dirname, "../dragon-wave.js"), "utf8");
+const js = fs.readFileSync(path.join(__dirname, '../web/dragon-wave.js'), "utf8");
 const params = { historicalDocument: true, pair: "PIUSDT", caseStart: "2025-02-21", caseEnd: "2025-02-27", market: "futures", mainWaveStage: "active", window: {} };
 const identity = { requestedVersion: "v91", pair: params.pair, start: params.caseStart, end: params.caseEnd, market: params.market, stage: "active" };
 const data = { normalizePair: x => x, isCandleCoverageAcceptable: () => true };

@@ -6,7 +6,7 @@ const {
   isTotalBoardSource,
   paginateTotalBoardEntries,
   totalAssetIdentity
-} = require("../market_total_board.js");
+} = require("../web/market_total_board.js");
 
 function source(id, group, rows, sourceLabel = id.toUpperCase()) {
   return { id, group, sourceLabel, title: id, rows };

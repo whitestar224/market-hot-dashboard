@@ -131,10 +131,11 @@ class Instance:
         env["PORT"] = str(self.port)
         env["PYTHONIOENCODING"] = "utf-8"
         # 入口文件若不与同目录模块同级，Python 会把【入口所在目录】放进 sys.path[0]，
-        # `import quiet_http_server` 之类会找不到。显式补 PYTHONPATH=项目根，
-        # 使 sys.path 语义与「直接在根目录跑 server.py」完全一致。
+        # `from app.sources import quiet_http_server` 之类会找不到。业务模块搬进 src/app 之后
+        # 必须把 src 补进 PYTHONPATH，使 sys.path 语义与「直接跑 server.py」完全一致。
         existing = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = str(PROJECT_ROOT) + (os.pathsep + existing if existing else "")
+        src_dir = str(PROJECT_ROOT / "src")
+        env["PYTHONPATH"] = src_dir + (os.pathsep + existing if existing else "")
         # 遵守项目铁律：外网抓取一律跟随系统代理，本工具不做任何代理干预。
         self._fh = open(self.log_path, "wb")
         self.proc = subprocess.Popen(

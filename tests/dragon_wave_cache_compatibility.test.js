@@ -8,7 +8,7 @@ const path = require("node:path");
 const zlib = require("node:zlib");
 const Compatibility = require("../tools/dragon_wave_cache_compatibility.js");
 const Report = require("../tools/report_dragon_wave_precompute.js");
-const Data = require("../dragon-wave-data.js");
+const Data = require("../web/dragon-wave-data.js");
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "dragon-wave-compatibility-"));

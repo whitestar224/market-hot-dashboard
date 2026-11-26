@@ -3,7 +3,13 @@
 > 目标：在**不改变任何功能与页面表现**的前提下，对项目做代码拆分、技术栈升级与结构规范化。
 > 建立日期：2026-09-28　回滚基线：`backup/pre-refactor-20260928` / tag `backup-pre-refactor-20260928`
 
+> **进度更新（2026-11-26）**：第 1 节记录的是重构**开始前**的实测数据，保留作对照。
+> 目前根目录已收敛为「入口 + 启动脚本」：业务模块在 `src/app/{sources,monitors,alerts,research,core}`，
+> 前端在 `web/`，离线脚本在 `scripts/`；路径统一由 `app.core.paths` 提供
+> （`ROOT` / `WEB_DIR` / `APP_DIR` / `runtime_dir()`）。详见 `docs/PROJECT-STRUCTURE-INDEX.md`。
+
 ---
+
 
 ## 0. 结论摘要
 

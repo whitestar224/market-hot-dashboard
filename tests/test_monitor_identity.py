@@ -8,8 +8,16 @@ import time
 import unittest
 from unittest.mock import Mock
 
-from monitor_identity import MonitorIdentityRegistry, target_identity
-from monitor_buy import MonitorBuyService, SOLANA
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
+
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.monitors.monitor_identity import MonitorIdentityRegistry, target_identity
+from app.monitors.monitor_buy import MonitorBuyService, SOLANA
 
 CA = "0x" + "ab" * 20
 ROW = {"symbol": "TEST", "chain": "bsc", "contractAddress": CA}
@@ -204,7 +212,7 @@ class MonitorIdentityTests(unittest.TestCase):
             service.pool.shutdown(wait=True)
 
     def test_new_scan_enrolls_identity_without_opening_monitor_or_buy_page(self):
-        from chain_ecosystem_monitor import ChainEcosystemStore
+        from app.monitors.chain_ecosystem_monitor import ChainEcosystemStore
         store = ChainEcosystemStore(Path(self.temp.name) / "chain.sqlite")
         store.initialize()
         store.identity_observer = self.registry.observe

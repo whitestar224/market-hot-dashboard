@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const root = path.resolve(__dirname, '..');
-const ui = fs.readFileSync(path.join(root, 'monitor-buy.js'), 'utf8');
+const ui = fs.readFileSync(path.join(root, 'web', 'monitor-buy.js'), 'utf8');
 const server = fs.readFileSync(path.join(root, 'server.py'), 'utf8');
 
 test('free session mode pins supported stablecoin contracts and makes them read-only', () => {

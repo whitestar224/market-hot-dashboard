@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import rootdata_projects as rp  # noqa: E402
+from app.sources import rootdata_projects as rp  # noqa: E402
 
 
 def main() -> int:

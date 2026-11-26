@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const flow = require("../event-flow.js");
+const flow = require("../web/event-flow.js");
 
 test("live stream removes expired or withdrawn windows without a new revision", () => {
   const model = flow.createModel();

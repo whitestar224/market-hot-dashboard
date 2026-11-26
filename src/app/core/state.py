@@ -22,6 +22,7 @@ CACHE_LOCK = threading.Lock()
 """
 
 from __future__ import annotations
+from app.core.paths import ROOT
 import os
 import re
 import threading
@@ -31,19 +32,18 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 import httpx
-from alert_delivery import AlertDeliveryStore
-from app.core.paths import ROOT
-from chain_ecosystem_monitor import ChainEcosystemMonitor, ChainEcosystemStore
-from dev_launch_monitor import DevLaunchMonitor, DevLaunchStore
-from event_flow import EventFlowStore
-from arkham_cluster_monitor import ArkhamClusterMonitor, ArkhamClusterStore
-from market_maker_monitor import MarketMakerMonitor, MarketMakerStore
-from big_move_monitor import BigMoveMonitor, BigMoveStore
-from price_move_monitor import PriceMoveMonitor, PriceMoveStore
-from sandwich_detector import SandwichDetector, SandwichStore
-from smart_money_monitor import SmartMoneyMonitor
-from trench_person_signals import important_person_sources
-from x_tweet_analysis import XTweetAnalysisQueue
+from app.alerts.alert_delivery import AlertDeliveryStore
+from app.monitors.chain_ecosystem_monitor import ChainEcosystemMonitor, ChainEcosystemStore
+from app.monitors.dev_launch_monitor import DevLaunchMonitor, DevLaunchStore
+from app.alerts.event_flow import EventFlowStore
+from app.monitors.arkham_cluster_monitor import ArkhamClusterMonitor, ArkhamClusterStore
+from app.monitors.market_maker_monitor import MarketMakerMonitor, MarketMakerStore
+from app.monitors.big_move_monitor import BigMoveMonitor, BigMoveStore
+from app.monitors.price_move_monitor import PriceMoveMonitor, PriceMoveStore
+from app.monitors.sandwich_detector import SandwichDetector, SandwichStore
+from app.monitors.smart_money_monitor import SmartMoneyMonitor
+from app.monitors.trench_person_signals import important_person_sources
+from app.monitors.x_tweet_analysis import XTweetAnalysisQueue
 
 
 CACHE: dict[str, tuple[float, Any]] = {}

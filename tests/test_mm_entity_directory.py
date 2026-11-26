@@ -14,9 +14,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import mm_entity_directory as mdir
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
 
-
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.monitors import mm_entity_directory as mdir
 def fake_dir(fetched_at: int | None = None) -> dict:
     # `fetchedAt` 是**毫秒**时间戳，缓存新鲜度按它算。写死一个过去的秒数会被当成过期。
     stamp = fetched_at if fetched_at is not None else int(time.time() * 1000)

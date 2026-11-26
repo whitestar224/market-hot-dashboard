@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const core = require('../monitor-buy-core.js');
+const core = require('../web/monitor-buy-core.js');
 
 // Run the complete production controller with asynchronous HTTP and wallet events.
 // This DOM double implements only the surface used by the buy dialog; no wallet API is exposed.
@@ -58,7 +58,7 @@ function harness() {
       assert.equal(url, '/api/monitor-buy/capabilities', 'opening or retrying must never quote, sign, or submit');
       return new Promise((resolve, reject) => pending.push({resolve, reject}));
     }};
-  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../monitor-buy.js'), 'utf8'), context);
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../web/monitor-buy.js'), 'utf8'), context);
   return {window, pending, open: row => window.MonitorBuy.open(row),
     get dialog() { return dialogs[0]; },
     node: selector => dialogs[0].querySelector(selector),

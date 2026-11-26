@@ -3,9 +3,9 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 
 test("monitor page exposes the five-chain smart-money buy console", () => {
-  const html = fs.readFileSync("price-watch.html", "utf8");
-  const js = fs.readFileSync("price-watch.js", "utf8");
-  const css = fs.readFileSync("styles.css", "utf8");
+  const html = fs.readFileSync("web/price-watch.html", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
+  const css = fs.readFileSync("web/styles.css", "utf8");
 
   assert.match(html, /data-watch-mode="smartmoney"/);
   assert.match(js, /\/api\/smart-money-monitor/);
@@ -29,11 +29,13 @@ test("monitor page exposes the five-chain smart-money buy console", () => {
 test("desktop package includes the smart-money monitor module", () => {
   const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
   const resource = pkg.build.extraResources.find((item) => item.to === "dashboard");
-  assert.ok(resource.filter.includes("smart_money_monitor.py"));
+  // 业务模块搬进 src/app 之后按 src/** 整体打包，不再逐个列 .py。
+  assert.ok(resource.filter.includes("src/**"), "打包清单必须包含 src/**");
+  assert.ok(fs.existsSync("src/app/monitors/smart_money_monitor.py"), "模块必须真的在 src/app/monitors 下");
 });
 
 test("elysium 的聪明钱事件「查看」落 GMGN 交易页（不再去 429 的浏览器 / 站外站）", () => {
-  const js = fs.readFileSync("price-watch.js", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
   // 用户 2026-11-09：「点击查看要跳转到 GMGN 的交易页」「不要跳转到 dexscreener」。
   assert.match(js, /function smartMoneyGmgnUrl/);
   assert.ok(js.includes("https://gmgn.ai/elysium/token/"));

@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const Engine = require("../dragon-wave-engine.js");
+const Engine = require("../web/dragon-wave-engine.js");
 const snapshots = require("./fixtures/dragon_wave_structure_lifecycle_review.json");
 const bankSnapshot = require("./fixtures/dragon_wave_bank_secondary_review.json");
 

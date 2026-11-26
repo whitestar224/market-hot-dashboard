@@ -6,9 +6,9 @@ const vm = require("node:vm");
 const zlib = require("node:zlib");
 
 const root = path.join(__dirname, "..");
-const enginePath = path.join(root, "dragon-wave-engine.js");
+const enginePath = path.join(root, 'web', "dragon-wave-engine.js");
 const engineSource = fs.readFileSync(enginePath, "utf8");
-const Vision = require("../dragon-wave-vision.js");
+const Vision = require("../web/dragon-wave-vision.js");
 const INTERVAL_MS = { "1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000 };
 
 // An isolated proposal, deliberately not installed in the production engine.
@@ -282,7 +282,7 @@ test("TRB real-history cutoffs retain complete legacy results including non-null
   // The real-data comparison does not need synthetic hooks. Native modules
   // avoid the substantial VM built-in overhead during historical replay.
   const baseline = require(baselinePath);
-  const engine = require("../dragon-wave-engine.js");
+  const engine = require("../web/dragon-wave-engine.js");
   let nonNull = 0;
   let skipped = 0;
   for (const [interval, time, triggerPrice] of [

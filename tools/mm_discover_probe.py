@@ -24,7 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import market_maker_monitor as mm  # noqa: E402
+from app.monitors import market_maker_monitor as mm  # noqa: E402
 
 #: 标签里出现这些词就当作做市商/自营交易台（大小写不敏感）。
 MM_NAME_HINTS = (

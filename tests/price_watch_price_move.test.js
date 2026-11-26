@@ -6,9 +6,9 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 
-const js = fs.readFileSync("price-watch.js", "utf8");
-const html = fs.readFileSync("price-watch.html", "utf8");
-const css = fs.readFileSync("styles.css", "utf8");
+const js = fs.readFileSync("web/price-watch.js", "utf8");
+const html = fs.readFileSync("web/price-watch.html", "utf8");
+const css = fs.readFileSync("web/styles.css", "utf8");
 
 function slice(startMarker, endMarker) {
   const start = js.indexOf(startMarker);

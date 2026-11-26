@@ -5,10 +5,10 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const zlib = require("node:zlib");
-const Data = require("../dragon-wave-data");
-const Engine = require("../dragon-wave-engine");
-const Feedback = require("../dragon-wave-feedback");
-const cases = require("../dragon-wave-cases");
+const Data = require("../web/dragon-wave-data");
+const Engine = require("../web/dragon-wave-engine");
+const Feedback = require("../web/dragon-wave-feedback");
+const cases = require("../web/dragon-wave-cases");
 const Compatibility = require("./dragon_wave_cache_compatibility");
 
 const ROOT = path.resolve(__dirname, "..");

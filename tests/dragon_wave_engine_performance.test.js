@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 
-const enginePath = path.join(__dirname, "..", "dragon-wave-engine.js");
+const enginePath = path.join(__dirname, "..", 'web', "dragon-wave-engine.js");
 const engineSource = fs.readFileSync(enginePath, "utf8");
 
 // Instrument the isolated test module, without adding production test switches or

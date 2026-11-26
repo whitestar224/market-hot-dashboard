@@ -7,9 +7,15 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import rootdata_projects as rp
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
 
-
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.sources import rootdata_projects as rp
 PROJECTS = [
     {"name": "Elysium", "symbol": "", "tags": ["#DeFi", "#Layer2"], "ecosystem": "",
      "intro": "High-performance DeFi L2", "growth": 724, "popularity": 281,
@@ -358,7 +364,7 @@ class RootdataFundingDetailTests(unittest.TestCase):
         events = [self._event(name="Avon")]
         with mock.patch.object(rp, "SOSOVALUE_DETAIL_BATCH", 20), \
              mock.patch.object(rp, "FUNDRAISING_DETAIL_BATCH", 0), \
-             mock.patch("sosovalue_projects.resolve_detail_by_name", return_value={
+             mock.patch("app.sources.sosovalue_projects.resolve_detail_by_name", return_value={
                  "intro": "Avon 是一个可组合的基于订单簿的借贷框架。",
                  "tags": ["DeFi", "借贷"], "ecosystem": ["MegaETH"], "founded": "2024",
              }):
@@ -374,7 +380,7 @@ class RootdataFundingDetailTests(unittest.TestCase):
         events = [self._event(name="Avon")]
         with mock.patch.object(rp, "SOSOVALUE_DETAIL_BATCH", 20), \
              mock.patch.object(rp, "FUNDRAISING_DETAIL_BATCH", 3), \
-             mock.patch("sosovalue_projects.resolve_detail_by_name", return_value=None), \
+             mock.patch("app.sources.sosovalue_projects.resolve_detail_by_name", return_value=None), \
              mock.patch.object(rp, "_working_proxy", return_value="http://127.0.0.1:7890"), \
              mock.patch.object(rp, "_fetch_detail", return_value=DETAIL_HTML):
             result = rp._enrich_fundraising_details(events, {})  # noqa: SLF001

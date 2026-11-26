@@ -43,12 +43,20 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
 
+# ---------------------------------------------------------------------------
+# Phase 3 拆分：把 src/ 加入模块搜索路径。
+# **必须先于任何 app.* 导入**，所以在第三方包之后立刻注入，而不是等到文件中部。
+# ---------------------------------------------------------------------------
+_SRC_DIR = Path(__file__).resolve().parent / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
 import requests
 import httpx
 from bs4 import BeautifulSoup
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-import quiet_http_server as dragon_wave_local
-from network_proxy import (
+from app.core import quiet_http_server as dragon_wave_local
+from app.core.network_proxy import (
     collect_proxy_candidates,
     local_proxy_candidates,
     network_proxy_generation,
@@ -58,7 +66,7 @@ from network_proxy import (
     stop_network_proxy_adapter,
 )
 
-from chain_ecosystem_monitor import (
+from app.monitors.chain_ecosystem_monitor import (
     ChainEcosystemMonitor,
     ChainEcosystemStore,
     ONCHAIN_RESEARCH_DEFAULT_NETWORKS,
@@ -67,40 +75,40 @@ from chain_ecosystem_monitor import (
     normalize_onchain_dexscreener,
     safe_monitor_error,
 )
-from gmgn_agentic import (
+from app.sources.gmgn_agentic import (
     GMGN_MAX_DUPLICATE_FAMILY_SIZE,
     GMGN_TRENCH_CHAIN_FILTERS,
     GmgnRateLimitError,
     gmgn_readonly_post,
     gmgn_trench_passes_chain_filters,
 )
-from qq_onebot_bridge import start_qq_onebot_bridge, stop_qq_onebot_bridge
-from monitor_buy import MonitorBuyService, chain_id as monitor_buy_chain_id
-from event_flow import EventFlowStore, article_alias
-from alert_delivery import AlertDeliveryStore
-from monitor_exclusion_db import persist_global_monitor_exclusion
-from prior_high_monitor import analyze_prior_high
-from news_trade_explanations import ExplanationService, context_for as explanation_context, research_key as explanation_key
-from newsflash_sources import (
+from app.core.qq_onebot_bridge import start_qq_onebot_bridge, stop_qq_onebot_bridge
+from app.monitors.monitor_buy import MonitorBuyService, chain_id as monitor_buy_chain_id
+from app.alerts.event_flow import EventFlowStore, article_alias
+from app.alerts.alert_delivery import AlertDeliveryStore
+from app.monitors.monitor_exclusion_db import persist_global_monitor_exclusion
+from app.monitors.prior_high_monitor import analyze_prior_high
+from app.research.news_trade_explanations import ExplanationService, context_for as explanation_context, research_key as explanation_key
+from app.sources.newsflash_sources import (
     StoryIndex,
     aggregate_newsflash,
     fetch_configured_feed_items,
     http_get_race,
     source_family,
 )
-from event_flow_window import attention_evidence, attention_window, STAGES as ATTENTION_STAGES
-from listing_alerts import (attach_inventory as attach_listing_inventory, observe_listings,
+from app.alerts.event_flow_window import attention_evidence, attention_window, STAGES as ATTENTION_STAGES
+from app.monitors.listing_alerts import (attach_inventory as attach_listing_inventory, observe_listings,
                             observe_venue_listings, asset_key as listing_asset_key)
-from opennews_client import opennews_feed_payload
-from opentwitter_client import twitter_watch_feed_payload
-from pump_claim_monitor import pump_claim_feed_payload
-from onchain_fast_research import (
+from app.sources.opennews_client import opennews_feed_payload
+from app.sources.opentwitter_client import twitter_watch_feed_payload
+from app.monitors.pump_claim_monitor import pump_claim_feed_payload
+from app.research.onchain_fast_research import (
     CHATGPT_RESEARCH_ROUTE, FastResearch, NARRATIVE_VERSION, NEWS_TRIGGER_VERSION,
     ResearchCapacityBusy, story_text, paginate_research, formal_research_worthy,
     promote_resonance_priority, chatgpt_positive_alert_decision, news_trigger_signal,
     candidate_key as onchain_candidate_key,
 )
-from onchain_research_framework import (
+from app.research.onchain_research_framework import (
     FRAMEWORK_VERSION,
     FRAMEWORK_OUTPUT_SCHEMA,
     FULL_FRAMEWORK_PROMPT,
@@ -108,9 +116,9 @@ from onchain_research_framework import (
     golden_leader_alert_decision,
     normalize_framework_assessment,
 )
-from rapid_decision_compare import RAPID_DECISION_VERSION, analyze_rapid_candidates
-from jev_decision import JEV_SEMANTIC_VERSION, analyze_jev_person_semantics
-from dev_launch_monitor import (
+from app.research.rapid_decision_compare import RAPID_DECISION_VERSION, analyze_rapid_candidates
+from app.research.jev_decision import JEV_SEMANTIC_VERSION, analyze_jev_person_semantics
+from app.monitors.dev_launch_monitor import (
     chain_availability as dev_launch_chain_availability,
     chain_label as dev_launch_chain_label,
     gmgn_token_url as dev_launch_gmgn_url,
@@ -119,8 +127,8 @@ from dev_launch_monitor import (
     tier_for_market_cap as dev_launch_tier,
     token_market as dev_launch_token_market,
 )
-from sandwich_detector import explorer_url as sandwich_explorer_url
-from market_maker_monitor import (
+from app.monitors.sandwich_detector import explorer_url as sandwich_explorer_url
+from app.monitors.market_maker_monitor import (
     amount_text as mm_amount_text,
     board_symbol_index as mm_board_symbol_index,
     chain_label as mm_chain_label,
@@ -133,33 +141,33 @@ from market_maker_monitor import (
 )
 # 价格异动：稳定币 / 杠杆代币在**采集端**就剔掉，别写进帧。
 # 下游 collect_prices 还会再滤一次（纵深防御），但覆盖面统计只认第一次的结果。
-from price_move_monitor import is_tradable_symbol as price_move_is_tradable
-import alpha_mm_monitor as ALPHA_MM
+from app.monitors.price_move_monitor import is_tradable_symbol as price_move_is_tradable
+from app.monitors import alpha_mm_monitor as ALPHA_MM
 # 大幅异动（2026-11-01）：3 日跌 50%（流动性真空）/ 2 日涨 100%（反弹见顶）。
 # 规则、冷却、流水全在模块里；server 只喂标的清单与日线、拼弹窗文案。
-import big_move_monitor as BIG_MOVE
+from app.monitors import big_move_monitor as BIG_MOVE
 # 地址集群：候选标的只取「热门榜 + 涨幅榜」**榜上的**标的（价格异动 2026-10-22 起
 # 不算候选 —— 那个板块现在是币安合约，本来也没有链上合约可查），集群与跨标的判定
 # 全在模块里，这里只负责喂候选、拼文案、开路由。
-import arkham_client as ARKHAM_API
-import arkham_cluster_monitor as ARKHAM_CLUSTER
+from app.sources import arkham_client as ARKHAM_API
+from app.monitors import arkham_cluster_monitor as ARKHAM_CLUSTER
 # 链上 Top10 持仓集中度（口径 = Arkham 网页「主要持有者」前十行）：榜单与异动弹窗
 # 统一在 launch_desktop_alert 出闸时补一句「Top10 持仓 x%」，>70% 再加风险提示。
-import top10_holders as TOP10
+from app.monitors import top10_holders as TOP10
 # 弹窗里的 CoinMarketCap 流通市值（用户 2026-10-24）：整榜快照 + 后台刷新，
 # 出闸时统一补一句「流通市值 $…（CMC #rank）」。拿不到就沉默，绝不写 0。
-import cmc_market_cap as CMC_MC
-from smart_money_monitor import CHAIN_META as SMART_MONEY_CHAIN_META, SmartMoneyMonitor
+from app.monitors import cmc_market_cap as CMC_MC
+from app.monitors.smart_money_monitor import CHAIN_META as SMART_MONEY_CHAIN_META, SmartMoneyMonitor
 # 战壕「新创建」的关键词弹窗（用户 2026-11-25）：BSC / Solana / Robinhood 上刚发出来的币，
 # 名字或中文译名命中关键词就第一时间弹一条。关键词表在它自己的 sqlite 里，可增删。
-import new_token_alert_monitor as NEW_TOKEN_ALERTS_MODULE
+from app.monitors import new_token_alert_monitor as NEW_TOKEN_ALERTS_MODULE
 # RootData 项目热门榜（2026-11-07）：页面挂在腾讯云 WAF 后面，服务器直连只会拿到
 # 滑块验证码页，所以取数走「专用 Chrome 抓一次 → 落快照」，榜单只读快照。
-import rootdata_projects as ROOTDATA_PROJECTS
+from app.sources import rootdata_projects as ROOTDATA_PROJECTS
 # 机构投资视角（2026-11-14）：机构页 SSR 不带发币状态，只能走它自己的签名接口，
 # 「未发行 + 运营中」是服务端筛出来的。密钥硬编码在前端，轮换即失效 → 失败保留旧快照。
-import rootdata_investor as ROOTDATA_INVESTOR
-from trench_person_signals import (
+from app.sources import rootdata_investor as ROOTDATA_INVESTOR
+from app.monitors.trench_person_signals import (
     EXCHANGE_OFFICIAL_HANDLES,
     EXCLUDED_IMPORTANT_HANDLES,
     important_official_sources,
@@ -168,16 +176,16 @@ from trench_person_signals import (
     person_relevance_score,
     token_identity as trench_person_token_identity,
 )
-from x_tweet_analysis import (
+from app.monitors.x_tweet_analysis import (
     CHAT_TITLE as X_TWEET_ANALYSIS_CHAT_TITLE,
     XTweetAnalysisQueue,
 )
 from contextlib import closing, contextmanager, nullcontext
-from personal_x_future_event import (
+from app.monitors.personal_x_future_event import (
     detect_future_event,
     event_dedupe_key,
 )
-from wechat_group_monitor import (
+from app.core.wechat_group_monitor import (
     WechatDeliveryUncertainError,
     candidate_rule_score,
     collect_visible_group_messages,
@@ -194,17 +202,13 @@ from wechat_group_monitor import (
 # Phase 3 拆分：把 src/ 加入模块搜索路径，并导入已抽出的核心层。
 #
 # 顺序要求：
-#   1. sys.path 注入必须【先于】任何 app.* 导入
+#   1. src/ 的 sys.path 注入已在文件顶部（第三方包 import 之后）完成
 #   2. 本段必须【早于】文件中所有模块级代码（已核验：最早的模块级引用在第 49892 行）
 #
 # 这些名字原先在 server.py 里就地定义（ROOT 在 199 行、env 系列在 1455/1509/10040 行）。
 # 抽出后 server.py 不再定义它们，全部由 app.core 提供；引用点无需任何改动，
 # 因为名字在 server 模块命名空间里依然解析到同一个对象。
 # ---------------------------------------------------------------------------
-_SRC_DIR = Path(__file__).resolve().parent / "src"
-if str(_SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(_SRC_DIR))
-
 from app.core.config import (  # noqa: E402
     PRODUCTION_ENV_VALUES,
     TRUTHY_ENV_VALUES,
@@ -217,7 +221,7 @@ from app.core.config import (  # noqa: E402
     raw_env_flag,
     raw_env_value,
 )
-from app.core.paths import CODEX_HOME, ROOT  # noqa: E402
+from app.core.paths import APP_DIR, CODEX_HOME, ROOT, WEB_DIR, runtime_dir  # noqa: E402
 
 # ---- 由 tools/extract_module.py 从 server.py 抽出，见 app/api/seo.py
 from app.api.seo import (
@@ -18787,7 +18791,7 @@ def spawn_explanation_reader(key: str, title: str) -> subprocess.Popen:
     if not 1 <= port <= 65535:
         port = 8765
     return subprocess.Popen(
-        [sys.executable, str(ROOT / "desktop_alert.py"), "--explanation-title", clean_feed_text(title, 120),
+        [sys.executable, str(APP_DIR / "alerts" / "desktop_alert.py"), "--explanation-title", clean_feed_text(title, 120),
          "--explanations", key, "--port", str(port)],
         cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), close_fds=True,
@@ -23487,7 +23491,7 @@ def start_onchain_research_bridge() -> bool:
     if os.getenv("XINGYUN_DISABLE_ONCHAIN_RESEARCH_BRIDGE") == "1":
         return False
     try:
-        from onchain_research_bridge import configure_bridge, start_onchain_research_bridge as _start
+        from app.research.onchain_research_bridge import configure_bridge, start_onchain_research_bridge as _start
     except Exception as exc:
         print(f"链上投研桥接加载失败，已跳过：{safe_monitor_error(exc)}", file=sys.stderr)
         return False
@@ -26984,7 +26988,7 @@ def spawn_desktop_alert_process(normalized: dict[str, Any], slot: int) -> Any:
     log_file = DESKTOP_ALERT_LOG_PATH.open("a", encoding="utf-8")
     try:
         return subprocess.Popen(
-            [sys.executable, str(ROOT / "desktop_alert.py"), "--payload", encoded, "--slot", str(slot)],
+            [sys.executable, str(APP_DIR / "alerts" / "desktop_alert.py"), "--payload", encoded, "--slot", str(slot)],
             cwd=str(ROOT),
             stdin=subprocess.DEVNULL,
             stdout=log_file,
@@ -43312,7 +43316,7 @@ def start_price_watch_realtime_process() -> bool:
         return True
     command = [
         sys.executable,
-        str(ROOT / "price_watch_live_worker.py"),
+        str(APP_DIR / "core" / "price_watch_live_worker.py"),
         "--parent-pid",
         str(os.getpid()),
     ]
@@ -57269,7 +57273,7 @@ class Handler(SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=str(ROOT), **kwargs)
+        super().__init__(*args, directory=str(WEB_DIR), **kwargs)
 
     def send_text(self, text: str, content_type: str, status: int = 200, cache_control: str = "no-cache"):
         body = text.encode("utf-8")
@@ -57284,8 +57288,8 @@ class Handler(SimpleHTTPRequestHandler):
         safe_path = normalized_page_path(page_path)
         if safe_path not in SEO_PUBLIC_PAGES and safe_path not in SEO_NOINDEX_PATHS:
             return False
-        file_path = (ROOT / safe_path.lstrip("/")).resolve()
-        if not str(file_path).startswith(str(ROOT)) or not file_path.exists() or file_path.suffix.lower() not in {".html", ".htm"}:
+        file_path = (WEB_DIR / safe_path.lstrip("/")).resolve()
+        if not str(file_path).startswith(str(WEB_DIR)) or not file_path.exists() or file_path.suffix.lower() not in {".html", ".htm"}:
             return False
         html_text = file_path.read_text(encoding="utf-8", errors="replace")
         body = inject_seo_into_html(self, html_text, safe_path).encode("utf-8")
@@ -58140,7 +58144,7 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/_mem":
             # 手动内存画像：全堆遍历要 1~2 秒，**只给诊断用**，别让页面轮询它。
             try:
-                import mem_census  # noqa: PLC0415
+                from app.core import mem_census  # noqa: PLC0415
 
                 self.send_json(mem_census.census())
             except Exception as exc:  # 诊断工具坏了也不能影响主服务
@@ -58760,7 +58764,7 @@ class Handler(SimpleHTTPRequestHandler):
             # 缓存 TTL 走模块常量（30 分钟），force 时重抓。失败会带 error/stale，
             # 绝不伪装成空榜。
             try:
-                import icodrops_source
+                from app.sources import icodrops_source
                 payload = icodrops_source.fetch_active_airdrops(force=bool(force_refresh))
             except Exception as exc:
                 payload = {"ok": False, "error": clean_feed_text(exc, 200), "items": [], "total": 0}
@@ -58778,7 +58782,7 @@ class Handler(SimpleHTTPRequestHandler):
             # 缓存 TTL 走模块自己的常量（30 分钟），force 时重抓。懒 import 避免
             # 缺 curl_cffi 时把整个 server 拖垮。
             try:
-                import airdrops_source
+                from app.sources import airdrops_source
                 payload = airdrops_source.fetch_airdrops_overview(force=bool(force_refresh))
             except Exception as exc:
                 payload = {"ok": False, "error": clean_feed_text(exc, 200)}
@@ -60395,8 +60399,7 @@ def start_alert_stream_overlay(port: int | None = None) -> None:
     if os.name != "nt":
         return
     try:
-        import alert_stream_overlay
-
+        from app.alerts import alert_stream_overlay
         result = alert_stream_overlay.spawn_detached(source="server", port=port)
         if result.get("started"):
             print(f"Alert stream overlay spawned (pid {result.get('pid')}).", flush=True)
@@ -60419,8 +60422,7 @@ def start_trench_overlay() -> None:
     if os.name != "nt" or not TRENCH_OVERLAY_ENABLED:
         return
     try:
-        import trench_overlay
-
+        from app.alerts import trench_overlay
         result = trench_overlay.spawn_detached()
         if result.get("started"):
             print(f"Trench overlay spawned (pid {result.get('pid')}); hold Alt+Q to show it.", flush=True)

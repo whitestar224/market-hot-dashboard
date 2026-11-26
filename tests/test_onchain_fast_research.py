@@ -6,17 +6,25 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from chain_ecosystem_monitor import ChainEcosystemStore, evaluate_onchain_candidate, fetch_geckoterminal_new_pools, scan_onchain_research
-from onchain_fast_research import (
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
+
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.monitors.chain_ecosystem_monitor import ChainEcosystemStore, evaluate_onchain_candidate, fetch_geckoterminal_new_pools, scan_onchain_research
+from app.research.onchain_fast_research import (
     CHATGPT_CONTINUOUS_STREAM_MIGRATION, DISCORD_MONITOR_PURGE_MIGRATION,
     FastResearch, NARRATIVE_VERSION, ResearchCapacityBusy,
     evidence_digest, FLAP_PORTAL, FLAP_CREATED,
     breakout_research_signal, candidate_key, decode_launch_log, news_trigger_signal, paginate_research,
     resolve_same_symbol_leaders, sort_research_recommendations,
 )
-from onchain_research_framework import FRAMEWORK_VERSION
-from jev_decision import rapid_candidate_state
-from rapid_decision_compare import RAPID_DECISION_VERSION
+from app.research.onchain_research_framework import FRAMEWORK_VERSION
+from app.research.jev_decision import rapid_candidate_state
+from app.research.rapid_decision_compare import RAPID_DECISION_VERSION
 
 NOW = 1_788_836_000_000
 
@@ -89,7 +97,7 @@ class FastResearchTests(unittest.TestCase):
             self.store, self.analyzer, self.sink, resonance_sink=self.resonance_sink
         )
         self.fast.initialize()
-        self.clock = patch("onchain_fast_research._now_ms", return_value=NOW)
+        self.clock = patch("app.research.onchain_fast_research._now_ms", return_value=NOW)
         self.clock.start()
 
     def tearDown(self):
@@ -644,7 +652,7 @@ class FastResearchTests(unittest.TestCase):
             "popupSpeech": "链上投研提醒，LATE 刚完成联网判断。",
         }
 
-        with patch("onchain_fast_research._now_ms", return_value=NOW + 20 * 60_000):
+        with patch("app.research.onchain_fast_research._now_ms", return_value=NOW + 20 * 60_000):
             outcome = fast.complete_chatgpt_research_batch(
                 claimed["batchId"], claimed["claimToken"], [item],
             )
@@ -1143,7 +1151,7 @@ class FastResearchTests(unittest.TestCase):
         from concurrent.futures import ThreadPoolExecutor
         old = [candidate(str(n), address='0x'+f'{n:040x}') for n in range(30)]
         self.fast.ingest(old)
-        with patch('onchain_fast_research._now_ms', return_value=NOW+600_000):
+        with patch('app.research.onchain_fast_research._now_ms', return_value=NOW+600_000):
             fresh = [{**candidate('NEW'+str(n),address='0x'+f'{100+n:040x}'),
                 'firstSeenAt':NOW+600_000,'observedAt':NOW+600_000,'poolCreatedAt':NOW+590_000} for n in range(4)]
             self.fast.ingest(fresh)
@@ -1161,7 +1169,7 @@ class FastResearchTests(unittest.TestCase):
         self.fast.ingest([candidate()])
         self.analyzer.side_effect = ResearchCapacityBusy('occupied')
         for n in range(5):
-            with patch('onchain_fast_research._now_ms',return_value=NOW+n*3_000): self.fast.analyze_batch('live')
+            with patch('app.research.onchain_fast_research._now_ms',return_value=NOW+n*3_000): self.fast.analyze_batch('live')
         row=self.fast._query('SELECT * FROM onchain_fast_jobs')[0]
         self.assertEqual(row['status'],'pending')
         self.assertEqual(row['attempts'],0)
@@ -1170,9 +1178,9 @@ class FastResearchTests(unittest.TestCase):
 
     def test_first_analysis_timing_survives_later_reviews(self):
         self.fast.ingest([candidate()])
-        with patch('onchain_fast_research._now_ms',return_value=NOW+30_000): self.fast.analyze_batch()
+        with patch('app.research.onchain_fast_research._now_ms',return_value=NOW+30_000): self.fast.analyze_batch()
         self.fast._write("UPDATE onchain_fast_jobs SET status='pending',next_due_at=0,attempts=0")
-        with patch('onchain_fast_research._now_ms',return_value=NOW+600_000): self.fast.analyze_batch()
+        with patch('app.research.onchain_fast_research._now_ms',return_value=NOW+600_000): self.fast.analyze_batch()
         job=self.fast._query('SELECT * FROM onchain_fast_jobs')[0]
         self.assertEqual(job['first_analyzed_at'],NOW+30_000)
         self.assertEqual(job['analyzed_at'],NOW+600_000)
@@ -1206,7 +1214,7 @@ class FastResearchTests(unittest.TestCase):
         self.sink.assert_not_called()
         restarted = FastResearch(self.store, lambda rows: {candidate_key(rows[0]): {"verdict": "avoid", "summary": "没有可验证题材"}}, self.sink)
         restarted.initialize()
-        with patch("onchain_fast_research._now_ms", return_value=NOW + 12_000):
+        with patch("app.research.onchain_fast_research._now_ms", return_value=NOW + 12_000):
             restarted.analyze_batch()
             restarted.emit_alerts()
         row = restarted._query("SELECT * FROM onchain_fast_jobs")[0]
@@ -1217,7 +1225,7 @@ class FastResearchTests(unittest.TestCase):
     def test_empty_market_quote_keeps_launch_in_retry_scope(self):
         self.fast.ingest([{**candidate(), "metrics": {}}])
         self.fast.quote_fetcher = Mock(return_value={"pairs": []})
-        with patch("onchain_fast_research._now_ms", return_value=NOW + 16_000):
+        with patch("app.research.onchain_fast_research._now_ms", return_value=NOW + 16_000):
             self.fast.refresh_quotes()
         self.assertGreater(self.fast._query("SELECT quote_due_at FROM onchain_fast_jobs")[0]["quote_due_at"], NOW + 16_000)
         self.fast.analyze_batch()
@@ -1382,8 +1390,8 @@ class FastResearchTests(unittest.TestCase):
             "url": "https://example.test/early-ca",
         })
         resolved = candidate("EARLY", "bsc", address)
-        with patch("onchain_fast_research.fetch_dexscreener_token", return_value={}), patch(
-            "onchain_fast_research.normalize_onchain_dexscreener", return_value=[resolved]
+        with patch("app.research.onchain_fast_research.fetch_dexscreener_token", return_value={}), patch(
+            "app.research.onchain_fast_research.normalize_onchain_dexscreener", return_value=[resolved]
         ):
             self.fast.resolve_clues()
 
@@ -1560,7 +1568,7 @@ class FastResearchTests(unittest.TestCase):
 
     def test_late_qualification_and_oldest_job_do_not_expire(self):
         self.fast.ingest([{**candidate(), "metrics": {}}])
-        with patch("onchain_fast_research._now_ms", return_value=NOW + 3_600_000):
+        with patch("app.research.onchain_fast_research._now_ms", return_value=NOW + 3_600_000):
             self.fast.ingest([candidate()])
             self.fast.ingest([candidate(str(n), address="0x" + f"{n:040x}") for n in range(6)])
             self.fast.analyze_batch()
@@ -1663,7 +1671,7 @@ class FastResearchTests(unittest.TestCase):
     def test_withdrawn_recommendation_keeps_reason_and_original_analysis_after_restart(self):
         self.fast.ingest([candidate()])
         self.fast.analyze_batch()
-        with patch("onchain_fast_research._now_ms", return_value=NOW + 3_600_000):
+        with patch("app.research.onchain_fast_research._now_ms", return_value=NOW + 3_600_000):
             self.fast.ingest([{**candidate(), "metrics": {"liquidityUsd": 10, "transactionsH1": 1}}])
         restarted = FastResearch(self.store, self.analyzer, self.sink)
         restarted.initialize()
@@ -1683,7 +1691,7 @@ class FastResearchTests(unittest.TestCase):
         self.fast.rpc = Mock(side_effect=[hex(150), TimeoutError("offline")])
         self.fast.poll_launches()
         self.assertEqual(self.fast._query("SELECT block FROM onchain_launch_cursor")[0]["block"], 100)
-        with patch("onchain_fast_research._now_ms", return_value=NOW + 20_000):
+        with patch("app.research.onchain_fast_research._now_ms", return_value=NOW + 20_000):
             self.fast.rpc = Mock(side_effect=[hex(170), []])
             self.fast.poll_launches()
         self.assertEqual(self.fast._query("SELECT block FROM onchain_launch_cursor")[0]["block"], 168)
@@ -1705,7 +1713,7 @@ class FastResearchTests(unittest.TestCase):
         self.assertIsNone(decode_launch_log({**log, "address": "0x"+"ab"*20}))
 
     def test_missing_links_does_not_drop_second_page(self):
-        with patch("chain_ecosystem_monitor._get_json", side_effect=[{"data": [{"id": "new"}]}, {"data": [{"id": "known"}]}]) as fetch:
+        with patch("app.monitors.chain_ecosystem_monitor._get_json", side_effect=[{"data": [{"id": "new"}]}, {"data": [{"id": "known"}]}]) as fetch:
             payload = fetch_geckoterminal_new_pools("bsc", pages=3, known_pool_ids=["known"])
         self.assertEqual(len(payload["data"]), 2)
         self.assertEqual(fetch.call_count, 2)
@@ -1717,7 +1725,7 @@ class FastResearchTests(unittest.TestCase):
             self.assertEqual(jobs[0]["status"], "pending")
             self.assertLess(jobs[0]["screened_at"] - jobs[0]["first_seen_at"], 60_000)
             return {"pairs": []}
-        with patch("chain_ecosystem_monitor.normalize_gmgn_migrated_trenches", return_value=[candidate()]):
+        with patch("app.monitors.chain_ecosystem_monitor.normalize_gmgn_migrated_trenches", return_value=[candidate()]):
             scan_onchain_research(self.store, networks=["bsc"], observed_at=NOW,
                 binance_launch_fetcher=lambda *_args, **_kwargs: {"data": []},
                 gmgn_trenches_fetcher=lambda *args, **kwargs: {}, dexscreener_fetcher=enrich,

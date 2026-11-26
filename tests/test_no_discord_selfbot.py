@@ -6,7 +6,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def read(name: str) -> str:
-    return (ROOT / name).read_text(encoding="utf-8-sig")
+    """按现行分层回落：前端在 web/，业务模块在 src/app/<pkg>/。"""
+    for base in (ROOT, ROOT / "web", *(ROOT / "src" / "app").glob("*")):
+        path = base / name
+        if path.is_file():
+            return path.read_text(encoding="utf-8-sig")
+    raise FileNotFoundError(name)
 
 
 class NoDiscordSelfbotTests(unittest.TestCase):

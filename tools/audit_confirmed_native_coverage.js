@@ -4,8 +4,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const { DatabaseSync } = require("node:sqlite");
-const Engine = require("../dragon-wave-engine.js");
-const Feedback = require("../dragon-wave-feedback.js");
+const Engine = require("../web/dragon-wave-engine.js");
+const Feedback = require("../web/dragon-wave-feedback.js");
 
 const ROOT = path.resolve(__dirname, "..");
 const DB_PATH = path.join(ROOT, ".runtime-cache", "dragon_wave_feedback.db");

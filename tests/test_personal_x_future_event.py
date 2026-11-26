@@ -1,8 +1,14 @@
 import unittest
 
-import personal_x_future_event as fx
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
 
-
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.monitors import personal_x_future_event as fx
 class FutureEventDetectionTests(unittest.TestCase):
     def test_explicit_absolute_date(self):
         result = fx.detect_future_event("PixVerse 9月28日上市，重点关注")

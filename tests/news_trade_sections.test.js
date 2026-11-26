@@ -3,9 +3,9 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
-const sections = require("../news-trade-sections.js");
-const source = fs.readFileSync(path.join(__dirname, "../price-watch.js"), "utf8");
-const html = fs.readFileSync(path.join(__dirname, "../price-watch.html"), "utf8");
+const sections = require("../web/news-trade-sections.js");
+const source = fs.readFileSync(path.join(__dirname, '../web/price-watch.js'), "utf8");
+const html = fs.readFileSync(path.join(__dirname, '../web/price-watch.html'), "utf8");
 
 function rows(template, count, extra = {}) {
   return Array.from({ length: count }, (_, index) => ({

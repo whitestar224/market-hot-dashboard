@@ -1,5 +1,5 @@
 const test=require('node:test'), assert=require('node:assert/strict'), fs=require('node:fs'), vm=require('node:vm');
-const ui=fs.readFileSync(require.resolve('../monitor-buy.js'),'utf8');
+const ui=fs.readFileSync(require.resolve('../web/monitor-buy.js'),'utf8');
 test('amount debounce replaces previous read-only quote; close, edit and execution cancel stale work',()=>{
   const timers=new Map(), calls=[];let next=0;
   const ctx={autoQuoteTimer:null,generation:1,executing:false,config:{maxOrderUsd:200},

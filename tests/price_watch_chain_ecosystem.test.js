@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 
 test("research shows full narrative and server pagination without truncating candidates", () => {
-  const js = fs.readFileSync("price-watch.js", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
   assert.match(js, /data-chain-research-page/);
   assert.match(js, /data-research-history-page/);
   assert.match(js, /chainResearchPaging/);
@@ -61,7 +61,7 @@ test("research shows full narrative and server pagination without truncating can
   assert.match(js, /快速模式不调用聊天深研/);
   assert.match(js, /openedResearch/);
   assert.doesNotMatch(js, /watching\.slice\(0, 12\)/);
-  const css = fs.readFileSync("styles.css", "utf8");
+  const css = fs.readFileSync("web/styles.css", "utf8");
   assert.match(css, /\.onchain-research-mode-switch/);
   assert.match(css, /onchain-research-signal b,[\s\S]*white-space: normal/);
   assert.match(css, /\.onchain-research-selected\.is-provisional/);
@@ -72,9 +72,9 @@ test("research shows full narrative and server pagination without truncating can
 
 
 test("price watch exposes chain ecosystem mode and API", () => {
-  const html = fs.readFileSync("price-watch.html", "utf8");
-  const js = fs.readFileSync("price-watch.js", "utf8");
-  const css = fs.readFileSync("styles.css", "utf8");
+  const html = fs.readFileSync("web/price-watch.html", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
+  const css = fs.readFileSync("web/styles.css", "utf8");
   const server = fs.readFileSync("server.py", "utf8");
 
   assert.match(html, /data-watch-mode="chains"/);
@@ -163,7 +163,7 @@ test("price watch exposes chain ecosystem mode and API", () => {
 });
 
 test("NFT rankings show OpenSea floor price instead of token liquidity", () => {
-  const js = fs.readFileSync("price-watch.js", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
   assert.match(js, /marketKey === "nft"/);
   assert.match(js, /metrics\.floorPriceNative/);
   assert.match(js, /地板价/);
@@ -171,7 +171,7 @@ test("NFT rankings show OpenSea floor price instead of token liquidity", () => {
 });
 
 test("News Trade renders MEME opportunity evidence and a guarded per-candidate buy action", () => {
-  const js = fs.readFileSync("price-watch.js", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
   assert.match(js, /memeOpportunity/);
   assert.match(js, /data-news-trade-prepare/);
   assert.match(js, /\/api\/news-trade\/prepare/);
@@ -183,8 +183,8 @@ test("News Trade renders MEME opportunity evidence and a guarded per-candidate b
 });
 
 test("News Trade groups ranked candidates into paginated topic cards", () => {
-  const js = fs.readFileSync("price-watch.js", "utf8");
-  const css = fs.readFileSync("styles.css", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
+  const css = fs.readFileSync("web/styles.css", "utf8");
   assert.match(js, /NEWS_TRADE_PAGE_SIZE\s*=\s*10/);
   assert.match(js, /memeCandidates/);
   assert.match(js, /TOP1 主标/);
@@ -200,8 +200,8 @@ test("News Trade groups ranked candidates into paginated topic cards", () => {
 });
 
 test("News Trade exposes timing and narrative score labels on every topic card", () => {
-  const js = fs.readFileSync("price-watch.js", "utf8");
-  const css = fs.readFileSync("styles.css", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
+  const css = fs.readFileSync("web/styles.css", "utf8");
   assert.match(js, /0–6h 先手理解/);
   assert.match(js, /6–24h 预发酵/);
   assert.match(js, /新奇猎奇/);
@@ -215,8 +215,8 @@ test("News Trade exposes timing and narrative score labels on every topic card",
 });
 
 test("News Trade supports active topic discovery with a confirm-before-add preview", () => {
-  const js = fs.readFileSync("price-watch.js", "utf8");
-  const css = fs.readFileSync("styles.css", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
+  const css = fs.readFileSync("web/styles.css", "utf8");
   assert.match(js, /data-news-trade-search/);
   assert.match(js, /\/api\/news-trade\/search/);
   assert.match(js, /加入主题监控/);
@@ -226,9 +226,9 @@ test("News Trade supports active topic discovery with a confirm-before-add previ
 });
 
 test("News Trade connects OKX and Binance Wallet without exposing private key material", () => {
-  const page = fs.readFileSync("price-watch.js", "utf8");
-  const wallets = fs.readFileSync("wallets.js", "utf8");
-  const css = fs.readFileSync("styles.css", "utf8");
+  const page = fs.readFileSync("web/price-watch.js", "utf8");
+  const wallets = fs.readFileSync("web/wallets.js", "utf8");
+  const css = fs.readFileSync("web/styles.css", "utf8");
   assert.match(page, /const wallets = window\.XingyunWallets/);
   assert.match(page, /walletProvider: adapter\.authorizationProvider \|\| "injected"/);
   assert.match(wallets, /window\.okxwallet/);

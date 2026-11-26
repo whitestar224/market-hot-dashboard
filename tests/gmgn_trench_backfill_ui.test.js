@@ -4,8 +4,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
-const js = fs.readFileSync(path.join(root, "app.js"), "utf8");
-const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
+const js = fs.readFileSync(path.join(root, 'web', 'app.js'), "utf8");
+const css = fs.readFileSync(path.join(root, 'web', 'styles.css'), "utf8");
 const server = fs.readFileSync(path.join(root, "server.py"), "utf8");
 const state = fs.readFileSync(path.join(root, "src", "app", "core", "state.py"), "utf8");
 

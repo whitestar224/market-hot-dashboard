@@ -1,7 +1,7 @@
 "use strict";
 
 const fs = require("node:fs");
-const Engine = require("../dragon-wave-engine.js");
+const Engine = require("../web/dragon-wave-engine.js");
 
 const INTERVAL_MS = Object.freeze({
   "1m": 60_000,

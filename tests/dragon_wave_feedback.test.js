@@ -1,8 +1,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const Feedback = require("../dragon-wave-feedback.js");
-const Vision = require("../dragon-wave-vision.js");
+const Feedback = require("../web/dragon-wave-feedback.js");
+const Vision = require("../web/dragon-wave-vision.js");
 
 function signal(overrides = {}) {
   return {

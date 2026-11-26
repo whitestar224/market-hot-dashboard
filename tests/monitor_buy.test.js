@@ -3,9 +3,10 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const core = require('../monitor-buy-core.js');
+const core = require('../web/monitor-buy-core.js');
 const root = path.resolve(__dirname, '..');
-const read = name => fs.readFileSync(path.join(root, name), 'utf8');
+const web = path.join(root, 'web');
+const read = name => fs.readFileSync(path.join(name.startsWith('tools/') ? root : web, name), 'utf8');
 
 test('a quote failure exits the 91 percent working state and exposes a retry without signing', () => {
   const ui = read('monitor-buy.js'), fields = new Map();

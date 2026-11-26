@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const Engine = require("../dragon-wave-engine.js");
-const Data = require("../dragon-wave-data.js");
+const Engine = require("../web/dragon-wave-engine.js");
+const Data = require("../web/dragon-wave-data.js");
 const raw = require("./fixtures/turbousdt_okx_15m_2024-05-21_2024-05-25.json");
 
 const rows = Data.parseRows("okx", raw, 15 * 60_000);

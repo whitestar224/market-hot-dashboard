@@ -65,9 +65,11 @@ function harness(t, options = {}) {
     },
   };
   const module = { exports: {} };
-  const fakeRequire = (name) => {
+  const fakeRequire = (rawName) => {
+    // 前端资源已迁到 web/：把 "../web/xxx" 归一成 "../xxx" 便于匹配桩表
+    const name = String(rawName).replace("../web/", "../");
     if (name === "../dragon-wave-data") return Data;
-    if (name === "../dragon-wave-engine") return Engine;
+    if (name === "../dragon-wave-engine" || name === "../web/dragon-wave-engine") return Engine;
     if (name === "../dragon-wave-feedback") return { snapshotSignal: (value) => ({ ...value }) };
     if (name === "../dragon-wave-cases") return [example];
     if (name === "./dragon_wave_cache_compatibility") return options.compatibilityModule

@@ -48,7 +48,7 @@ if errorlevel 1 (
 echo.
 echo [1/2] Environment check
 echo ---------------------------------------------------------------
-"%PYDIR%python.exe" trench_overlay.py --selfcheck
+"%PYDIR%python.exe" src\app\alerts\trench_overlay.py --selfcheck
 echo ---------------------------------------------------------------
 if errorlevel 1 (
   echo [WARN] Self-check found a problem above. The panel may open but stay empty.
@@ -63,7 +63,7 @@ REM The log is appended, never deleted - a failed start must leave evidence.
 del "%PIDFILE%" >nul 2>&1
 >>"%LOGFILE%" echo.
 >>"%LOGFILE%" echo === launcher invoked %DATE% %TIME% ===
-start "" "%PYW%" trench_overlay.py
+start "" "%PYW%" src\app\alerts\trench_overlay.py
 
 REM Wait up to ~12s for the overlay to publish its pid file. Without this the
 REM launcher would claim success even when pythonw died on the first line.
@@ -89,7 +89,7 @@ if defined STARTED (
 echo.
 echo [ERROR] The overlay did NOT start ^(no pid file after 12s^). Last log lines:
 echo ---------------------------------------------------------------
-"%PYDIR%python.exe" trench_overlay.py --logtail 20
+"%PYDIR%python.exe" src\app\alerts\trench_overlay.py --logtail 20
 echo ---------------------------------------------------------------
 echo Usual causes: another copy already holds the hotkey, or pythonw.exe
 echo cannot create a window ^(no tkinter / blocked by policy^).

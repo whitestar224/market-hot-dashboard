@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
-const js = fs.readFileSync(path.join(root, "price-watch.js"), "utf8");
+const js = fs.readFileSync(path.join(root, 'web', 'price-watch.js'), "utf8");
 
 test("group monitor hides missing timestamps and accepts second-based timestamps", () => {
   assert.match(js, /Number\(item\.lastSeenAt\) > 0 \? relativeTime\(item\.lastSeenAt\) : ""/);

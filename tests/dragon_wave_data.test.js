@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const Data = require("../dragon-wave-data.js");
+const Data = require("../web/dragon-wave-data.js");
 
 test("exposes the six requested chart intervals", () => {
   assert.deepEqual(Object.keys(Data.INTERVALS), ["1m", "5m", "15m", "1h", "4h", "1d"]);

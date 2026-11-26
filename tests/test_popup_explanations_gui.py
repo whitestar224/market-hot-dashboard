@@ -1,9 +1,15 @@
 """Actual native popup widgets, withdrawn: no notifications, speech or external actions."""
 import unittest
 from unittest.mock import Mock, patch
-import desktop_alert
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
 
-
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.alerts import desktop_alert
 class PopupExplanationGuiTests(unittest.TestCase):
     def test_hot_and_news_button_visible_and_opens_same_context(self):
         import tkinter as tk
@@ -41,7 +47,7 @@ class PopupExplanationGuiTests(unittest.TestCase):
                 with patch("tkinter.Tk", return_value=root), patch.object(root, "mainloop", side_effect=exercise), \
                      patch.object(root, "destroy"), patch.object(root, "after"), patch.object(desktop_alert, "PopupReceipts"), \
                      patch.object(desktop_alert, "play_sound"), patch.object(desktop_alert, "speak_text"), \
-                     patch.object(desktop_alert.subprocess, "Popen", spawned), patch('news_trade_reader.reader_log'):
+                     patch.object(desktop_alert.subprocess, "Popen", spawned), patch('app.research.news_trade_reader.reader_log'):
                     desktop_alert.show_popup({"kind":kind,"title":"测试 · 不播报", "url":"https://example.test", "explanationKey":"a"*40,
                         "explanationPort":8765,"sound":False}, 0)
                 args = spawned.call_args.args[0]

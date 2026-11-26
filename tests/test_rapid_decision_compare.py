@@ -1,9 +1,17 @@
 import unittest
 
-from jev_decision import _normalize
-from onchain_research_framework import FRAMEWORK_VERSION
-from rapid_decision_compare import RAPID_DECISION_VERSION, _merge
-from rapid_decision_training import readiness_from_counts, target_from_analysis
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
+
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.research.jev_decision import _normalize
+from app.research.onchain_research_framework import FRAMEWORK_VERSION
+from app.research.rapid_decision_compare import RAPID_DECISION_VERSION, _merge
+from app.research.rapid_decision_training import readiness_from_counts, target_from_analysis
 
 
 def decision(priority, deep, watch, reject):

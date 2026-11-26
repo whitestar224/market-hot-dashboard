@@ -6,7 +6,15 @@ import json
 from eth_abi import decode, encode
 from eth_utils import keccak
 
-from session_buy import (
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
+
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.monitors.session_buy import (
     ALLOWANCE_KEY, APPROVE_SELECTOR, ASSIGN_ROLES_SELECTOR, BINANCE_ROUTER,
     BINANCE_SWAP_SELECTOR, MAX_ORDER_USDT, MAX_SESSION_USDT, ROLE_KEY,
     ROLES_MASTER_COPY, RpcCallReverted, SessionBuyService, bytes32_label, encode_call,

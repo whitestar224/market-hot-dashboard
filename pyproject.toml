@@ -53,8 +53,8 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # 单体文件在拆分完成前，只检查最严重的错误
 "server.py" = ["E", "F", "I", "UP", "B"]
-"chain_ecosystem_monitor.py" = ["E", "F", "I", "UP", "B"]
-"onchain_fast_research.py" = ["E", "F", "I", "UP", "B"]
+"src/app/monitors/chain_ecosystem_monitor.py" = ["E", "F", "I", "UP", "B"]
+"src/app/research/onchain_fast_research.py" = ["E", "F", "I", "UP", "B"]
 # 测试文件允许 assert 之外的宽松写法
 "tests/**" = ["E", "F", "I", "UP", "B"]
 

@@ -4,9 +4,17 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
-import gmgn_agentic
-from chain_ecosystem_monitor import ONCHAIN_RESEARCH_DEFAULT_NETWORKS, scan_onchain_research
-from gmgn_agentic import (
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
+
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.sources import gmgn_agentic
+from app.monitors.chain_ecosystem_monitor import ONCHAIN_RESEARCH_DEFAULT_NETWORKS, scan_onchain_research
+from app.sources.gmgn_agentic import (
     GmgnRateLimitError,
     GMGN_PUBLIC_READONLY_API_KEY,
     fetch_gmgn_migrated_trenches,
@@ -140,7 +148,7 @@ class GmgnAgenticTests(unittest.TestCase):
         session.post.return_value = response
 
         with patch.dict(os.environ, {"GMGN_API_KEY": "personal-paid-key"}), patch(
-            "gmgn_agentic._wait_for_readonly_slot"
+            "app.sources.gmgn_agentic._wait_for_readonly_slot"
         ):
             result = fetch_gmgn_migrated_trenches("bsc", limit=12, session=session)
 
@@ -160,7 +168,7 @@ class GmgnAgenticTests(unittest.TestCase):
         session = Mock()
         session.post.return_value = response
 
-        with patch("gmgn_agentic._wait_for_readonly_slot"):
+        with patch("app.sources.gmgn_agentic._wait_for_readonly_slot"):
             fetch_gmgn_migrated_trenches("robinhood", session=session)
 
         completed = session.post.call_args.kwargs["json"]["completed"]
@@ -173,7 +181,7 @@ class GmgnAgenticTests(unittest.TestCase):
         session = Mock()
         session.post.return_value = response
 
-        with patch("gmgn_agentic._wait_for_readonly_slot"):
+        with patch("app.sources.gmgn_agentic._wait_for_readonly_slot"):
             fetch_gmgn_migrated_trenches(
                 "solana",
                 launchpad_platforms=("stonkfun", "stonkfun"),
@@ -226,7 +234,7 @@ class GmgnAgenticTests(unittest.TestCase):
         session = Mock()
         session.get.return_value = response
 
-        with patch("gmgn_agentic._wait_for_readonly_slot"):
+        with patch("app.sources.gmgn_agentic._wait_for_readonly_slot"):
             payload = fetch_gmgn_recent_market_rank("bsc", session=session)
 
         params = session.get.call_args.kwargs["params"]
@@ -247,7 +255,7 @@ class GmgnAgenticTests(unittest.TestCase):
         session = Mock()
         session.get.return_value = response
 
-        with patch("gmgn_agentic._wait_for_readonly_slot"):
+        with patch("app.sources.gmgn_agentic._wait_for_readonly_slot"):
             fetch_gmgn_recent_market_rank(
                 "solana",
                 min_created="2h",
@@ -266,7 +274,7 @@ class GmgnAgenticTests(unittest.TestCase):
         session = Mock()
         session.get.return_value = response
 
-        with patch("gmgn_agentic._wait_for_readonly_slot"):
+        with patch("app.sources.gmgn_agentic._wait_for_readonly_slot"):
             payload = fetch_gmgn_migrated_trenches("arc", session=session)
 
         session.post.assert_not_called()
@@ -297,7 +305,7 @@ class GmgnAgenticTests(unittest.TestCase):
         session = Mock()
         session.get.return_value = response
 
-        with patch("gmgn_agentic._wait_for_readonly_slot"):
+        with patch("app.sources.gmgn_agentic._wait_for_readonly_slot"):
             payload = fetch_gmgn_migrated_trenches("arc", session=session)
 
         self.assertEqual(payload["data"]["completed"], [])
@@ -319,7 +327,7 @@ class GmgnAgenticTests(unittest.TestCase):
         session = Mock()
         session.get.return_value = response
 
-        with patch("gmgn_agentic._wait_for_readonly_slot"):
+        with patch("app.sources.gmgn_agentic._wait_for_readonly_slot"):
             result = fetch_gmgn_migrated_trenches("arc", session=session)
 
         self.assertEqual([row["symbol"] for row in result["data"]["completed"]], ["TIGRINO"])
@@ -332,7 +340,7 @@ class GmgnAgenticTests(unittest.TestCase):
         session = Mock()
         session.post.return_value = response
 
-        with patch("gmgn_agentic._wait_for_readonly_slot", wraps=gmgn_agentic._wait_for_readonly_slot):
+        with patch("app.sources.gmgn_agentic._wait_for_readonly_slot", wraps=gmgn_agentic._wait_for_readonly_slot):
             with self.assertRaises(GmgnRateLimitError) as first:
                 fetch_gmgn_migrated_trenches("bsc", session=session)
             with self.assertRaises(GmgnRateLimitError):
@@ -349,7 +357,7 @@ class GmgnAgenticTests(unittest.TestCase):
         session = Mock()
         session.post.return_value = response
 
-        with patch("gmgn_agentic._wait_for_readonly_slot"):
+        with patch("app.sources.gmgn_agentic._wait_for_readonly_slot"):
             fetch_gmgn_migrated_trenches("bsc", session=session)
             fetch_gmgn_migrated_trenches("bsc", session=session)
 
@@ -366,7 +374,7 @@ class GmgnAgenticTests(unittest.TestCase):
             return response
 
         session.post.side_effect = slow_post
-        with patch("gmgn_agentic._wait_for_readonly_slot"):
+        with patch("app.sources.gmgn_agentic._wait_for_readonly_slot"):
             with ThreadPoolExecutor(max_workers=8) as executor:
                 results = list(executor.map(
                     lambda _index: fetch_gmgn_migrated_trenches("bsc", session=session),
@@ -386,7 +394,7 @@ class GmgnAgenticTests(unittest.TestCase):
         session = Mock()
         session.post.side_effect = [success, limited]
 
-        with patch("gmgn_agentic._wait_for_readonly_slot"):
+        with patch("app.sources.gmgn_agentic._wait_for_readonly_slot"):
             fetch_gmgn_migrated_trenches("bsc", session=session)
             cache_key = "trenches:bsc:80"
             updated_at, value = gmgn_agentic._GMGN_RESPONSE_CACHE[cache_key]
@@ -410,7 +418,7 @@ class GmgnAgenticTests(unittest.TestCase):
         with patch.dict(os.environ, {
             "GMGN_READONLY_KEY_MODE": "personal",
             "GMGN_API_KEY": "personal-paid-key",
-        }), patch("gmgn_agentic._wait_for_readonly_slot"):
+        }), patch("app.sources.gmgn_agentic._wait_for_readonly_slot"):
             result = fetch_gmgn_migrated_trenches("bsc", session=session)
 
         self.assertEqual(session.post.call_args.kwargs["headers"]["X-APIKEY"], "personal-paid-key")
@@ -425,7 +433,7 @@ class GmgnAgenticTests(unittest.TestCase):
         session.post.return_value = response
 
         with patch.dict(os.environ, {"GMGN_PROXY_URL": "http://user:pass@203.0.113.8:8443"}), patch(
-            "gmgn_agentic._wait_for_readonly_slot"
+            "app.sources.gmgn_agentic._wait_for_readonly_slot"
         ):
             result = fetch_gmgn_migrated_trenches("bsc", session=session)
 

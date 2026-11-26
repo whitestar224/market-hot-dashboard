@@ -7,9 +7,15 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import icodrops_source as ic
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
 
-
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.sources import icodrops_source as ic
 def _row(name, ticker, round_text, raised="", preval="", date="", href="/demo/", img=None):
     """按上游真实 class 结构造一行（.Tbl-Row 里嵌套投资方 <li>，故意加一条验证不被截断）。
 

@@ -20,7 +20,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.chdir(ROOT)
 
-import alpha_mm_monitor as mm  # noqa: E402
+from app.monitors import alpha_mm_monitor as mm  # noqa: E402
 
 
 def main() -> int:

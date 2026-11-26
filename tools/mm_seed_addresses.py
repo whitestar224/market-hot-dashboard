@@ -30,8 +30,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import market_maker_monitor as mm  # noqa: E402
-import mm_entity_directory as mdir  # noqa: E402
+from app.monitors import market_maker_monitor as mm  # noqa: E402
+from app.monitors import mm_entity_directory as mdir  # noqa: E402
 
 #: 这些地址永远不是做市商的自有地址：
 #: * 零地址 / 黑洞；

@@ -13,8 +13,15 @@
 
 import unittest
 
-import arkham_client as ac
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
 
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.sources import arkham_client as ac
 #: 2026-10-21 从 arkm.com 真机抓包拿到的 (path, ts, X-Payload) 样本。
 CAPTURED = [
     ("/user", "1792562769", "ad84f8448abe6b22fdd813a387ff91238648c8e9741391bd8c9dcfff24feea80"),

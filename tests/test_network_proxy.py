@@ -2,7 +2,15 @@ import os
 import unittest
 from unittest.mock import patch
 
-from network_proxy import (
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
+
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.core.network_proxy import (
     NetworkProxyAdapter,
     RouteProbe,
     apply_proxy_environment,
@@ -67,8 +75,8 @@ class NetworkProxyAdapterTest(unittest.TestCase):
             return RouteProbe(route, reachable, len(tuple(urls)))
 
         adapter = NetworkProxyAdapter(environment=environment, probe=fake_probe)
-        with patch("network_proxy.windows_proxy_candidates", return_value=[]), patch(
-            "network_proxy.local_proxy_candidates", return_value=[]
+        with patch("app.core.network_proxy.windows_proxy_candidates", return_value=[]), patch(
+            "app.core.network_proxy.local_proxy_candidates", return_value=[]
         ):
             status = adapter.refresh()
 
@@ -89,8 +97,8 @@ class NetworkProxyAdapterTest(unittest.TestCase):
             return RouteProbe(route, reachable, total)
 
         adapter = NetworkProxyAdapter(environment=environment, probe=fake_probe)
-        with patch("network_proxy.windows_proxy_candidates", return_value=[]), patch(
-            "network_proxy.local_proxy_candidates", return_value=[]
+        with patch("app.core.network_proxy.windows_proxy_candidates", return_value=[]), patch(
+            "app.core.network_proxy.local_proxy_candidates", return_value=[]
         ):
             status = adapter.refresh()
 

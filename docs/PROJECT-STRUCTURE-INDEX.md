@@ -47,22 +47,42 @@
 `optimize_workspace.ps1` / `recover_napcat_bridge.ps1` / `run_dragon_wave_full_batch.ps1` /
 `start_dragon_wave_precompute.ps1`
 
-## 3. 根目录一次性脚本（注意：不可贸然搬移/删除）
+## 3. 分层目录（2026-11-26 起）
 
-### 3.1 版本迭代脚本（明显旧版本，疑似可归档）
+根目录**只留入口**：`server.py`、`service_guard.py`、`worker_runner.py`、双击启动用的
+`*.cmd` / `*.ps1`、`README.md`、`requirements.txt`。其余全部按模块分层：
 
-| 文件 | 说明 |
+| 目录 | 内容 |
 |---|---|
-| `backtest_unbiased2.py` / `backtest_unbiased_v3.py` | 回测无偏版本迭代 |
-| `deepseek_final_rank_v6.py` / `deepseek_final_rank_v7.py` | DeepSeek 排序版本迭代 |
-| `online_research_rank_v4.py` | 在线研报排序版本迭代 |
+| `src/app/api/` | 已抽出的路由（seo / dragon_wave / gigax / health / smart_money / login_rate） |
+| `src/app/core/` | 基础设施：`paths`、`state`、`config`、网络代理、`quiet_http_server`、微信 / QQ / 钉钉通道 |
+| `src/app/sources/` | 上游客户端：GMGN、Arkham、币安 Web3 / Agentic、RootData、空投、快讯、OpenNews… |
+| `src/app/monitors/` | 监控器：聪明钱、做市商、结构、前高、夹子、战壕、Dev Launch、CEX 上新… |
+| `src/app/alerts/` | 弹窗与事件流：`desktop_alert`、`alert_stream_overlay`、`trench_overlay`、`event_flow` |
+| `src/app/research/` | 链上投研与快速决策（含 `score_trench_board_batch`） |
+| `web/` | 全部前端 html / css / js / assets |
+| `scripts/` | 离线脚本（回测、报告生成、榜单构建），不属于运行期 |
 
-### 3.2 🔴 看似一次性、实为被依赖的脚本
+### 3.1 路径铁律
 
-`score_trench_board_batch.py` 被 `gmgn_local_trench_analyzer.py` 在**函数体内懒 import**
-（第 434 行 `_load_binance_wallet_hot_symbols`、第 450 行 `score_trench_row`）。这类「懒 import」
-让依赖关系不可见，**搬移前必须逐个 grep 核实**。教训：根目录 .py 的 import 依赖不可靠，
-不能凭文件名判断是否一次性。
+`app.core.paths` 是唯一真源：`ROOT` / `WEB_DIR` / `APP_DIR` / `runtime_dir()`。
+
+- 搬进 `src/app/<pkg>/` 之后，`Path(__file__).resolve().parent` **不再等于项目根**，
+  以前那套 `Path(__file__).parent / ".runtime-cache"` 会写出 `src/app/<pkg>/.runtime-cache`，
+  缓存与 SQLite 全部写丢且不报错。一律改用 `runtime_dir()`。
+- `server.py` 里以子进程拉起 `.py` 的地方（`desktop_alert.py`、`price_watch_live_worker.py`）
+  必须用 `APP_DIR` 拼路径。
+- 独立运行入口（`desktop_alert`、`desktop_alert_bridge`、`alert_stream_overlay`、
+  `quiet_http_server`、`dingtalk_price_watch_bot`、`prune_chain_ecosystem`、
+  `wechat_group_monitor`、`qq_onebot_bridge`）自带 `sys.path` 兜底块，
+  因为它们会被 `.cmd` / 计划任务 / `sys.executable` 直接当脚本跑。
+
+### 3.2 跨模块依赖的教训（保留原文）
+
+`score_trench_board_batch.py` 曾被 `gmgn_local_trench_analyzer.py` 在**函数体内懒 import**
+（`_load_binance_wallet_hot_symbols` / `score_trench_row`）。这类「懒 import」让依赖关系不可见，
+**搬移前必须逐个 grep 核实**。现两者同在 `src/app/research`、`src/app/monitors`，
+懒 import 已改成绝对导入。
 
 ## 4. 已知临时垃圾文件（建议清理，已 gitignore）
 
@@ -73,7 +93,7 @@
 
 ## 5. 维护约定
 
-1. 新增一次性脚本优先放 `tools/`，并在本文档登记。
-2. 根目录 .py 是「扁平 import」模块（`import X` 引用同目录 sibling），搬移会破坏 import，
-   除非先 grep 全仓确认无引用。
-3. 常驻工具（2.1/2.2）禁止删除或改名，它们是重构验收与运营的依赖。
+1. 新增模块一律放 `src/app/<pkg>/`，并在本文档登记；新增一次性脚本放 `scripts/`。
+2. 不要再把业务 `.py` 放回根目录：根目录只留入口，`src` 由入口注入 `sys.path`。
+3. 路径一律走 `app.core.paths`，禁止 `Path(__file__).parent` 推导项目根。
+4. 常驻工具（2.1/2.2）禁止删除或改名，它们是重构验收与运营的依赖。

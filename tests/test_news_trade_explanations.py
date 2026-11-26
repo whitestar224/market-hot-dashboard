@@ -6,9 +6,17 @@ import time
 import unittest
 from unittest.mock import Mock
 
-from news_trade_explanations import (ExplanationService, context_for, discovery_prompt, manual_search_links,
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
+
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.research.news_trade_explanations import (ExplanationService, context_for, discovery_prompt, manual_search_links,
     context_identity, normalize_posts, normalized_ai_explanation, research_key, search_query, select_posts, review_prompt)
-from news_trade_reader import ANALYSIS_FIELDS, centered_geometry, safe_post_url, safe_search_url
+from app.research.news_trade_reader import ANALYSIS_FIELDS, centered_geometry, safe_post_url, safe_search_url
 
 
 def post(pid="123456", handle="researcher", followers=1000):
@@ -367,7 +375,7 @@ class ServiceTests(unittest.TestCase):
             restarted=ExplanationService(path,lambda:'fake',Mock(return_value={'items':[verdict()]}))
             restarted._search=Mock(side_effect=AssertionError('reuse acquired originals'))
             self.assertEqual(restarted.retry(key)['status'],'unavailable') # cooldown retained across restart
-            with patch('news_trade_explanations.time.time',return_value=time.time()+31):
+            with patch('app.research.news_trade_explanations.time.time',return_value=time.time()+31):
                 self.assertEqual(restarted.retry(key)['status'],'pending')
                 restarted.jobs.join()
             self.assertEqual(restarted.get(key)['status'],'ready')
@@ -375,7 +383,7 @@ class ServiceTests(unittest.TestCase):
             restarted._search.assert_not_called()
 
     def test_legacy_retry_uses_exact_saved_popup_identity_without_replaying_alert(self):
-        from alert_delivery import AlertDeliveryStore
+        from app.alerts.alert_delivery import AlertDeliveryStore
         with tempfile.TemporaryDirectory() as directory:
             context={'symbol':'TEST','title':'TEST','eventAt':1};key=research_key(context)
             store=AlertDeliveryStore(Path(directory)/'alerts.sqlite')

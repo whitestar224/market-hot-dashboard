@@ -3,9 +3,9 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 
 test("monitor page exposes the sandwich-detection sub-board", () => {
-  const html = fs.readFileSync("price-watch.html", "utf8");
-  const js = fs.readFileSync("price-watch.js", "utf8");
-  const css = fs.readFileSync("styles.css", "utf8");
+  const html = fs.readFileSync("web/price-watch.html", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
+  const css = fs.readFileSync("web/styles.css", "utf8");
 
   assert.match(html, /data-watch-mode="sandwich"/);
   // supportedModes 里必须注册，否则 URL ?mode=sandwich 会被顶回 prior。
@@ -27,7 +27,7 @@ test("monitor page exposes the sandwich-detection sub-board", () => {
 });
 
 test("the four verdicts are the ones the engine actually emits", () => {
-  const js = fs.readFileSync("price-watch.js", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
   for (const verdict of ["confirmed", "suspected", "normal", "unknown"]) {
     assert.match(js, new RegExp(`\\b${verdict}: \\{ label:`), verdict);
   }
@@ -37,7 +37,7 @@ test("the four verdicts are the ones the engine actually emits", () => {
 });
 
 test("only confirmed/suspected alerts are painted as warnings", () => {
-  const css = fs.readFileSync("styles.css", "utf8");
+  const css = fs.readFileSync("web/styles.css", "utf8");
   const red = css.match(/\.sandwich-result\.is-confirmed \{[^}]*--down[^}]*\}/s);
   assert.ok(red, "已确认必须用红色（--down）");
   const amber = css.match(/\.sandwich-result\.is-suspected \{[^}]*--amber[^}]*\}/s);
@@ -47,7 +47,7 @@ test("only confirmed/suspected alerts are painted as warnings", () => {
 });
 
 test("the poller refreshes the sub-board only while it is on screen", () => {
-  const js = fs.readFileSync("price-watch.js", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
   assert.match(js, /if \(currentMode === "sandwich"\) \{\s*loadSandwichDetector\(\{ quiet: true \}\);\s*return;\s*\}/);
   assert.match(js, /grid\.classList\.add\("is-sandwich"\)/);
 });
@@ -55,5 +55,7 @@ test("the poller refreshes the sub-board only while it is on screen", () => {
 test("desktop package includes the sandwich detector module", () => {
   const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
   const resource = pkg.build.extraResources.find((item) => item.to === "dashboard");
-  assert.ok(resource.filter.includes("sandwich_detector.py"));
+  // 业务模块搬进 src/app 之后按 src/** 整体打包，不再逐个列 .py。
+  assert.ok(resource.filter.includes("src/**"), "打包清单必须包含 src/**");
+  assert.ok(fs.existsSync("src/app/monitors/sandwich_detector.py"), "模块必须真的在 src/app/monitors 下");
 });

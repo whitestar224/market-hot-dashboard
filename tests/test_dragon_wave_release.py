@@ -6,10 +6,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import dragon_wave_release as release
-import quiet_http_server as server
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
 
-
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.core import dragon_wave_release as release
+from app.core import quiet_http_server as server
 class StrategyReleaseTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="dragon-release-test-")

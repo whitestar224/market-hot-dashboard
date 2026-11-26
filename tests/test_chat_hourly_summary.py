@@ -6,7 +6,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 import server
-from wechat_group_monitor import extract_candidate_symbols, message_is_idle_chat
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
+
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.core.wechat_group_monitor import extract_candidate_symbols, message_is_idle_chat
 
 
 class ChatHourlySummaryTests(unittest.TestCase):
@@ -225,9 +233,9 @@ class ChatHourlySummaryTests(unittest.TestCase):
 
     def test_frontend_renders_hourly_ca_rank_and_filter_note(self):
         root = Path(__file__).resolve().parents[1]
-        source = (root / "price-watch.js").read_text(encoding="utf-8")
-        styles = (root / "styles.css").read_text(encoding="utf-8")
-        html = (root / "price-watch.html").read_text(encoding="utf-8")
+        source = (root / "web" / "price-watch.js").read_text(encoding="utf-8")
+        styles = (root / "web" / "styles.css").read_text(encoding="utf-8")
+        html = (root / "web" / "price-watch.html").read_text(encoding="utf-8")
 
         self.assertIn("chatHourlySummaryTemplate", source)
         self.assertIn("闲聊与非币种英文词已过滤", source)

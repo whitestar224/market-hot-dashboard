@@ -4,20 +4,20 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
-const html = fs.readFileSync(path.join(root, "dragon-wave.html"), "utf8");
-const css = fs.readFileSync(path.join(root, "dragon-wave.css"), "utf8");
-const js = fs.readFileSync(path.join(root, "dragon-wave.js"), "utf8");
-const dataSource = fs.readFileSync(path.join(root, "dragon-wave-data.js"), "utf8");
-const feedbackSource = fs.readFileSync(path.join(root, "dragon-wave-feedback.js"), "utf8");
-const engineSource = fs.readFileSync(path.join(root, "dragon-wave-engine.js"), "utf8");
-const analysisWorkerSource = fs.readFileSync(path.join(root, "dragon-wave-analysis-worker.js"), "utf8");
-const quietServerSource = fs.readFileSync(path.join(root, "quiet_http_server.py"), "utf8");
+const html = fs.readFileSync(path.join(root, 'web', 'dragon-wave.html'), "utf8");
+const css = fs.readFileSync(path.join(root, 'web', 'dragon-wave.css'), "utf8");
+const js = fs.readFileSync(path.join(root, 'web', 'dragon-wave.js'), "utf8");
+const dataSource = fs.readFileSync(path.join(root, 'web', 'dragon-wave-data.js'), "utf8");
+const feedbackSource = fs.readFileSync(path.join(root, 'web', 'dragon-wave-feedback.js'), "utf8");
+const engineSource = fs.readFileSync(path.join(root, 'web', 'dragon-wave-engine.js'), "utf8");
+const analysisWorkerSource = fs.readFileSync(path.join(root, 'web', 'dragon-wave-analysis-worker.js'), "utf8");
+const quietServerSource = fs.readFileSync(path.join(root, "src", "app", "core", "quiet_http_server.py"), "utf8");
 const serverSource = fs.readFileSync(path.join(root, "server.py"), "utf8");
 const launcher = fs.readFileSync(path.join(root, "打开龙头起爆策略页面.cmd"), "utf8");
 const precomputeSource = fs.readFileSync(path.join(root, "tools", "precompute_dragon_wave_cases.js"), "utf8");
 const precomputeLauncher = fs.readFileSync(path.join(root, "tools", "start_dragon_wave_precompute.ps1"), "utf8");
-const Cases = require("../dragon-wave-cases.js");
-const Data = require("../dragon-wave-data.js");
+const Cases = require("../web/dragon-wave-cases.js");
+const Data = require("../web/dragon-wave-data.js");
 
 test("page uses one TradingView-style main chart with five switchable core timeframes", () => {
   const intervals = [...html.matchAll(/data-timeframe="([^"]+)"/g)].map((match) => match[1]);
@@ -356,7 +356,7 @@ test("treats trendlines and previous highs as auxiliary triggers rather than sta
 });
 
 test("disabled W-continuation logic is absent from the strategy UI and engine", () => {
-  const engine = fs.readFileSync(path.join(root, "dragon-wave-engine.js"), "utf8");
+  const engine = fs.readFileSync(path.join(root, 'web', 'dragon-wave-engine.js'), "utf8");
   assert.doesNotMatch(html, /W中继/);
   assert.doesNotMatch(engine, /W中继|detectWContinuation/);
 });
@@ -661,5 +661,5 @@ test("launcher uses a quiet detached server so repeated requests cannot block th
   assert.match(launcher, /quiet_http_server\.py/i);
   assert.match(launcher, /Start-Sleep -Milliseconds 1200/);
   assert.match(launcher, /dragon-wave\.html\?v=91/);
-  assert.ok(fs.existsSync(path.join(root, "quiet_http_server.py")));
+  assert.ok(fs.existsSync(path.join(root, "src", "app", "core", "quiet_http_server.py")));
 });

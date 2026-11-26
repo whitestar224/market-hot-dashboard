@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from onchain_fast_research import NEWS_TRIGGER_VERSION, promote_resonance_priority
+from app.research.onchain_fast_research import NEWS_TRIGGER_VERSION, promote_resonance_priority
 
 from app.core.state import (
     DESKTOP_ALERT_MILITARY_PATTERN,

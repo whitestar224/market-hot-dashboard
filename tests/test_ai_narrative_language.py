@@ -211,8 +211,7 @@ class NarrativeLanguageGateTests(unittest.TestCase):
 
     # --- GMGN 原生叙事与桌面弹窗 ----------------------------------------
     def test_gmgn_narrative_requires_chinese(self):
-        import gmgn_agentic
-
+        from app.sources import gmgn_agentic
         self.assertEqual(
             gmgn_agentic._gmgn_native_narrative({"ai_narrative": {"cn": "GMGN 原生 AI 叙事样例。"}}),
             "GMGN 原生 AI 叙事样例。",
@@ -223,20 +222,19 @@ class NarrativeLanguageGateTests(unittest.TestCase):
         )
 
     def test_desktop_popup_tooltip_rejects_english(self):
-        import desktop_alert
-
+        from app.alerts import desktop_alert
         self.assertEqual(desktop_alert.chinese_ai_narrative(ENGLISH_NARRATIVE), "")
         self.assertEqual(desktop_alert.chinese_ai_narrative(CHINESE_NARRATIVE), CHINESE_NARRATIVE)
 
 
 class FrontendNarrativeGuardTests(unittest.TestCase):
     def test_app_tooltip_filters_non_chinese_narratives(self):
-        js = (ROOT / "app.js").read_text(encoding="utf-8")
+        js = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
         self.assertIn("function exchangeAiChineseNarrative(", js)
         self.assertIn('narrative: exchangeAiChineseNarrative(row?.exchangeAiNarrative', js)
 
     def test_gmgn_tooltip_filters_non_chinese_narratives(self):
-        js = (ROOT / "price-watch.js").read_text(encoding="utf-8")
+        js = (ROOT / "web" / "price-watch.js").read_text(encoding="utf-8")
         self.assertIn("function gmgnChineseNarrativeText(", js)
         # The GMGN trenches response carries no narrative field of its own, so
         # the board now draws its narrative from Binance AI and the language
@@ -246,7 +244,7 @@ class FrontendNarrativeGuardTests(unittest.TestCase):
         self.assertNotIn("gmgnChineseNarrativeText(row?.gmgnNarrative)", js)
 
     def test_trench_board_requests_binance_ai_narrative_for_the_visible_page(self):
-        js = (ROOT / "price-watch.js").read_text(encoding="utf-8")
+        js = (ROOT / "web" / "price-watch.js").read_text(encoding="utf-8")
         self.assertIn('fetch("/api/exchange-ai-narratives"', js)
         self.assertIn('sourceId: "gmgn-trenches"', js)
         # Cached per contract so paging, re-rendering and hover stay local.

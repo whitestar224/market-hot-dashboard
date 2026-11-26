@@ -3,8 +3,8 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
-const Data = require("../dragon-wave-data");
-const cases = require("../dragon-wave-cases");
+const Data = require("../web/dragon-wave-data");
+const cases = require("../web/dragon-wave-cases");
 
 const LOCAL_ORIGIN = process.env.DRAGON_WAVE_ORIGIN || "http://127.0.0.1:8791";
 const INTERVAL = process.argv.find((arg) => arg.startsWith("--interval="))?.split("=")[1] || "1h";

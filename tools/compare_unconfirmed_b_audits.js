@@ -3,7 +3,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { classify, normalizeFixture } = require("./audit_unconfirmed_b_points.js");
-const Engine = require("../dragon-wave-engine.js");
+const Engine = require("../web/dragon-wave-engine.js");
 const ROOT = path.resolve(__dirname, "..");
 const out = path.join(ROOT, "deliverables/2026-09-07-unconfirmed-b-audit");
 const args = Object.fromEntries(process.argv.slice(2).map(arg => { const p = arg.indexOf("="); return p < 0 ? [arg.slice(2), true] : [arg.slice(2, p), arg.slice(p + 1)]; }));

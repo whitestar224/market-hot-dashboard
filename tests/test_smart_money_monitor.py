@@ -4,7 +4,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from smart_money_monitor import (
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
+
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.monitors.smart_money_monitor import (
     ELYSIUM_SMART_MONEY_WALLETS,
     EVM_CHAINS,
     DEFAULT_SMART_MONEY_SEEDS,
@@ -1307,16 +1315,14 @@ class SmartMoneyDailyFirstBuyTests(unittest.TestCase):
         """把日界线推到「明天」后，同一个币的第二笔就该重新弹 —— 证明这条规则
         真的是按「今天」判的，而不是一个进程内的去重字典。"""
         self._buy("0x" + "d1" * 32)
-        import smart_money_monitor as m
-
+        from app.monitors import smart_money_monitor as m
         with patch.object(m, "_local_day_start_ms", return_value=m._now_ms() + 60_000):
             again = self._buy("0x" + "d2" * 32)
         self.assertFalse(again["popupSuppressed"])
         self.assertEqual(len(self.alerts), 2)
 
     def test_switch_off_restores_the_old_burst_behaviour(self):
-        import smart_money_monitor as m
-
+        from app.monitors import smart_money_monitor as m
         with patch.object(m, "SMART_MONEY_BUY_ONCE_PER_TOKEN_PER_DAY", False):
             self._buy("0x" + "e1" * 32)
             second = self._buy("0x" + "e2" * 32)
@@ -1656,7 +1662,7 @@ class PonsSeedRegistrationTests(unittest.TestCase):
         self.assertTrue(rows[0]["enabled"])
 
     def test_pons_wallet_is_whitelisted_for_quote_token_payment(self):
-        from smart_money_monitor import QUOTE_TOKEN_PAYMENT_WALLETS
+        from app.monitors.smart_money_monitor import QUOTE_TOKEN_PAYMENT_WALLETS
 
         self.assertIn(PONS_WALLET, QUOTE_TOKEN_PAYMENT_WALLETS)
 

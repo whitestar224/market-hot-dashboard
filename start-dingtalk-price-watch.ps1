@@ -6,7 +6,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $projectRoot = $PSScriptRoot
-$scriptPath = Join-Path $projectRoot "dingtalk_price_watch_bot.py"
+$scriptPath = Join-Path $projectRoot "src/app/core/dingtalk_price_watch_bot.py"
 
 $python = Get-Command python -ErrorAction SilentlyContinue
 if ($python) {

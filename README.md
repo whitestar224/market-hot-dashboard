@@ -145,6 +145,31 @@ python service_guard.py start --host 127.0.0.1 --port 8765
 http://127.0.0.1:8765/
 ```
 
+### 仓库结构
+
+根目录只保留入口与启动脚本，业务代码按模块分层：
+
+```text
+server.py                  # HTTP 入口（唯一的巨型单体）
+service_guard.py           # 守护进程入口
+worker_runner.py           # 独立 worker 入口
+*.cmd / *.ps1              # 双击启动、自启安装等脚本
+src/app/
+  api/                     # 已抽出的路由（seo、dragon_wave、gigax、health、smart_money、login_rate）
+  core/                    # 基础设施：paths、state、config、网络代理、守护、微信/QQ/钉钉通道
+  sources/                 # 上游数据源客户端（GMGN、Arkham、币安 Web3、RootData、空投、快讯…）
+  monitors/                # 各类监控器（聪明钱、做市商、结构、前高、夹子、战壕…）
+  alerts/                  # 弹窗与事件流（桌面 alert、悬浮窗、事件流窗口）
+  research/                # 链上投研与快速决策
+web/                       # 全部前端 html / css / js / assets（HTTP 对外的本站根）
+scripts/                   # 离线脚本（回测、报告生成、榜单构建），不属于运行期
+tools/                     # 开发工具与 Node 策略桥接
+tests/                     # Python unittest + Node test runner
+```
+
+`app.core.paths` 是路径唯一真源：`ROOT` / `WEB_DIR` / `APP_DIR` / `runtime_dir()`。
+新增模块一律放进对应的 `src/app/<pkg>/`，**不要**再用 `Path(__file__).parent` 推导项目根。
+
 ## Docker 本地部署
 
 1. 准备配置文件：

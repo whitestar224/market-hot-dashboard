@@ -4,7 +4,7 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 
-const cmc = require("../cmc-hover.js");
+const cmc = require("../web/cmc-hover.js");
 
 // ---------------------------------------------------------------- 极简假 DOM
 // 项目里没装 jsdom，这里只实现 install() 真正用到的那几个方法：
@@ -259,11 +259,11 @@ test("没有 data-cmc-symbol 的行不产生浮层", async () => {
 test("三个榜单页都引了浮层脚本，且行模板带 data-cmc-symbol", () => {
   const root = require("node:path").join(__dirname, "..");
   for (const page of ["index.html", "gainers.html", "turnover.html", "newboards.html"]) {
-    const html = fs.readFileSync(require("node:path").join(root, page), "utf8");
+    const html = fs.readFileSync(require("node:path").join(root, "web", page), "utf8");
     assert.match(html, /cmc-hover\.js\?v=\d+/, `${page} 少了浮层脚本`);
   }
   for (const script of ["app.js", "rankings.js", "newboards.js"]) {
-    const source = fs.readFileSync(require("node:path").join(root, script), "utf8");
+    const source = fs.readFileSync(require("node:path").join(root, "web", script), "utf8");
     assert.match(source, /data-cmc-symbol=/, `${script} 的行模板没挂 symbol`);
   }
 });

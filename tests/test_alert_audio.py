@@ -5,10 +5,16 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
-from alert_audio import speech_script
-import desktop_alert
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
 
-
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.alerts.alert_audio import speech_script
+from app.alerts import desktop_alert
 class AlertAudioTests(unittest.TestCase):
     def test_chime_and_entire_speech_share_one_cross_process_lock(self):
         script = speech_script(123)

@@ -9,10 +9,18 @@ import unittest
 from unittest.mock import Mock, patch
 from contextlib import closing
 import requests
-from monitor_buy import (DEFAULT_MAX_ORDER_USDT, MonitorBuyService, SOLANA, SOL_NATIVE, ZERO,
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
+
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.monitors.monitor_buy import (DEFAULT_MAX_ORDER_USDT, MonitorBuyService, SOLANA, SOL_NATIVE, ZERO,
                          address, decode_abi_text, units, digest, funding_kind, funding_tier, validate_quote,
                          validate_solana_instructions, FundingUnavailable)
-from session_buy import MODE as SESSION_MODE, ROLE_KEY as SESSION_ROLE_KEY, RpcCallReverted
+from app.monitors.session_buy import MODE as SESSION_MODE, ROLE_KEY as SESSION_ROLE_KEY, RpcCallReverted
 
 OWNER = "0x" + "12" * 20
 TOKEN = "0x" + "34" * 20
@@ -104,7 +112,7 @@ class MonitorBuyTests(unittest.TestCase):
         self.service.http_session = Mock(return_value=session)
         network = {"id": 56, "httpRpcUrl": "https://bsc-rpc.publicnode.com"}
         public_address = [(None, None, None, None, ("8.8.8.8", 443))]
-        with patch("monitor_buy.socket.getaddrinfo", return_value=public_address):
+        with patch("app.monitors.monitor_buy.socket.getaddrinfo", return_value=public_address):
             self.assertEqual(self.service.rpc(network, "eth_getTransactionReceipt", [ORDER]), {"status": "0x1"})
         self.assertEqual([call.args[0] for call in session.post.call_args_list],
                          ["https://bsc-dataseed.binance.org", "https://bsc-rpc.publicnode.com"])
@@ -115,7 +123,7 @@ class MonitorBuyTests(unittest.TestCase):
         self.service.http_session = Mock(return_value=session)
         network = {"id": 56, "httpRpcUrl": "https://bsc-rpc.publicnode.com"}
         public_address = [(None, None, None, None, ("8.8.8.8", 443))]
-        with patch("monitor_buy.socket.getaddrinfo", return_value=public_address):
+        with patch("app.monitors.monitor_buy.socket.getaddrinfo", return_value=public_address):
             with self.assertRaises(requests.Timeout):
                 self.service.session_rpc(network, "eth_sendRawTransaction", ["0x1234"])
             with self.assertRaisesRegex(ValueError, "单节点"):
@@ -133,7 +141,7 @@ class MonitorBuyTests(unittest.TestCase):
         self.service.http_session = Mock(return_value=session)
         network = {"id": 56, "httpRpcUrl": "https://bsc-rpc.publicnode.com"}
         public_address = [(None, None, None, None, ("8.8.8.8", 443))]
-        with patch("monitor_buy.socket.getaddrinfo", return_value=public_address):
+        with patch("app.monitors.monitor_buy.socket.getaddrinfo", return_value=public_address):
             with self.assertRaises(RpcCallReverted):
                 self.service.rpc(network, "eth_call", [{"to": TOKEN, "data": "0x"}, "latest"])
         self.assertEqual(session.post.call_count, 1)

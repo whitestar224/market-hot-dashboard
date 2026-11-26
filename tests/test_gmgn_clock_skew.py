@@ -15,9 +15,15 @@ from unittest.mock import Mock, patch
 
 import requests
 
-import gmgn_agentic
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
 
-
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.sources import gmgn_agentic
 def completed_payload():
     return {"code": 0, "data": {"completed": [{"address": "S" * 43, "symbol": "SKEW"}]}}
 
@@ -102,7 +108,7 @@ class GmgnClockSkewTests(unittest.TestCase):
     def test_calibration_is_cached_between_requests(self):
         self.unsync_clock()
         session = Mock()
-        with patch("gmgn_agentic._measure_gmgn_clock_offset", return_value=17.5) as measure:
+        with patch("app.sources.gmgn_agentic._measure_gmgn_clock_offset", return_value=17.5) as measure:
             first = gmgn_agentic._gmgn_clock_offset(session)
             second = gmgn_agentic._gmgn_clock_offset(session)
 
@@ -112,14 +118,14 @@ class GmgnClockSkewTests(unittest.TestCase):
 
     def test_forced_calibration_refreshes_the_cached_offset(self):
         session = Mock()
-        with patch("gmgn_agentic._measure_gmgn_clock_offset", side_effect=[17.5, 0.0]) as measure:
+        with patch("app.sources.gmgn_agentic._measure_gmgn_clock_offset", side_effect=[17.5, 0.0]) as measure:
             self.assertEqual(gmgn_agentic._gmgn_clock_offset(session, force=True), 17.5)
             self.assertEqual(gmgn_agentic._gmgn_clock_offset(session, force=True), 0.0)
         self.assertEqual(measure.call_count, 2)
 
     def test_failed_calibration_keeps_the_last_known_offset(self):
         session = Mock()
-        with patch("gmgn_agentic._measure_gmgn_clock_offset", side_effect=[17.5, RuntimeError("boom")]):
+        with patch("app.sources.gmgn_agentic._measure_gmgn_clock_offset", side_effect=[17.5, RuntimeError("boom")]):
             self.assertEqual(gmgn_agentic._gmgn_clock_offset(session, force=True), 17.5)
             self.assertEqual(gmgn_agentic._gmgn_clock_offset(session, force=True), 17.5)
 
@@ -128,8 +134,8 @@ class GmgnClockSkewTests(unittest.TestCase):
         session = Mock()
         session.post.side_effect = [expired_timestamp_response(), ok_response()]
 
-        with patch("gmgn_agentic._wait_for_readonly_slot"), patch(
-            "gmgn_agentic._measure_gmgn_clock_offset", return_value=17.6
+        with patch("app.sources.gmgn_agentic._wait_for_readonly_slot"), patch(
+            "app.sources.gmgn_agentic._measure_gmgn_clock_offset", return_value=17.6
         ) as measure:
             result = gmgn_agentic.gmgn_readonly_post(
                 "/v1/trenches",
@@ -158,8 +164,8 @@ class GmgnClockSkewTests(unittest.TestCase):
             ok_response(),
         ]
 
-        with patch("gmgn_agentic._wait_for_readonly_slot"), patch(
-            "gmgn_agentic._measure_gmgn_clock_offset", return_value=17.6
+        with patch("app.sources.gmgn_agentic._wait_for_readonly_slot"), patch(
+            "app.sources.gmgn_agentic._measure_gmgn_clock_offset", return_value=17.6
         ):
             with self.assertRaises(requests.HTTPError):
                 gmgn_agentic.gmgn_readonly_post(
@@ -179,8 +185,8 @@ class GmgnClockSkewTests(unittest.TestCase):
         session.post.return_value = ok_response()
 
         before = int(time.time())
-        with patch("gmgn_agentic._wait_for_readonly_slot"), patch(
-            "gmgn_agentic._measure_gmgn_clock_offset"
+        with patch("app.sources.gmgn_agentic._wait_for_readonly_slot"), patch(
+            "app.sources.gmgn_agentic._measure_gmgn_clock_offset"
         ) as measure:
             gmgn_agentic.gmgn_readonly_post(
                 "/v1/trenches",
@@ -207,7 +213,7 @@ class GmgnClockSkewTests(unittest.TestCase):
         session.get.return_value = response
 
         before = int(time.time())
-        with patch("gmgn_agentic._wait_for_readonly_slot"):
+        with patch("app.sources.gmgn_agentic._wait_for_readonly_slot"):
             gmgn_agentic.gmgn_readonly_get(
                 "/v1/market/rank",
                 cache_key="clock-get",
@@ -223,8 +229,8 @@ class GmgnClockSkewTests(unittest.TestCase):
         session = Mock()
         session.post.return_value = ok_response()
 
-        with patch("gmgn_agentic._wait_for_readonly_slot"), patch(
-            "gmgn_agentic._measure_gmgn_clock_offset"
+        with patch("app.sources.gmgn_agentic._wait_for_readonly_slot"), patch(
+            "app.sources.gmgn_agentic._measure_gmgn_clock_offset"
         ) as measure:
             gmgn_agentic.gmgn_readonly_post(
                 "/v1/trenches",

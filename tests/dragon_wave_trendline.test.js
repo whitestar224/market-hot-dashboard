@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const Engine = require("../dragon-wave-engine.js");
+const Engine = require("../web/dragon-wave-engine.js");
 
 test("long convergence keeps independently timed anchors inside the post-impulse structure window", () => {
   const candles = [];

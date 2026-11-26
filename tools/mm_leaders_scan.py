@@ -41,8 +41,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
-import arkham_client as ARKHAM  # noqa: E402
-import market_maker_monitor as mm  # noqa: E402
+from app.sources import arkham_client as ARKHAM  # noqa: E402
+from app.monitors import market_maker_monitor as mm  # noqa: E402
 from mm_discover_probe import holders as bs_holders  # noqa: E402
 from mm_discover_probe import transfers as bs_transfers  # noqa: E402
 
@@ -219,8 +219,7 @@ def onchain_evidence(chain: str, contract: str, *, pages: int = 2,
     Wintermute 8907 个地址（覆盖 20 条链），拿持币人去交集就是「这家持不持这只币」，
     BSC / Solana 一样成立 —— 而 Blockscout 标签只有 ethereum / robinhood 有。
     """
-    import mm_entity_directory as mdir
-
+    from app.monitors import mm_entity_directory as mdir
     hits: list[dict[str, Any]] = []
     notes: list[str] = []
     seen: set[str] = set()
@@ -332,7 +331,7 @@ def main() -> int:
     store = mm.MarketMakerStore()
     book = {row["address"].casefold(): row for row in store.addresses()}
     session = mm._session()
-    import mm_entity_directory as mdir
+    from app.monitors import mm_entity_directory as mdir
     directory = mdir.ensure()
     report: list[dict[str, Any]] = []
     proposed: dict[tuple[str, str], dict[str, str]] = {}

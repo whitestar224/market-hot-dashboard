@@ -144,7 +144,7 @@ try:
     import server
     result["ok"] = True
     result["root"] = str(server.ROOT)
-    result["root_is_project"] = (server.ROOT / "index.html").exists() and (server.ROOT / "server.py").exists()
+    result["root_is_project"] = (server.WEB_DIR / "index.html").exists() and (server.ROOT / "server.py").exists()
     result["persist_dir"] = str(server.PERSIST_CACHE_DIR)
     for mod, groups in spec.items():
         m = importlib.import_module(mod)

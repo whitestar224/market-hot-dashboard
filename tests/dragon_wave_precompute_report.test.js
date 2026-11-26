@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const path = require("node:path");
 const Report = require("../tools/report_dragon_wave_precompute.js");
-const Cases = require("../dragon-wave-cases.js");
+const Cases = require("../web/dragon-wave-cases.js");
 
 const catalog = [{ id: "sample", valid: true, symbol: "SAMPLE", pair: "SAMPLEUSDT", start: "2024-01-01", end: "2024-01-03" }];
 const task = Report.expectedTasks(catalog, "v90", ["1h"])[0];

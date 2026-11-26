@@ -22,7 +22,7 @@ echo 等待旧守护完全退出（30 秒）...
 timeout /t 30 /nobreak >nul
 
 echo [2/4] 淘汰旧数据 + VACUUM（含备份）...
-python prune_chain_ecosystem.py --backup
+python src\app\core\prune_chain_ecosystem.py --backup
 if errorlevel 1 (
     echo.
     echo [错误] 清理失败，数据库可能未改动。请检查上方报错。

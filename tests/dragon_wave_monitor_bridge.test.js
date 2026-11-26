@@ -193,7 +193,7 @@ test("strategy monitor exports the breakout candle low for unified stop-loss siz
 
 test("hot-coin monitor imports the shared engine instead of copying strategy rules", () => {
   const source = fs.readFileSync(path.join(__dirname, "../tools/dragon_wave_monitor_bridge.js"), "utf8");
-  assert.match(source, /require\("\.\.\/dragon-wave-engine\.js"\)/);
+  assert.match(source, /require\("\.\.\/web\/dragon-wave-engine\.js"\)/);
   assert.match(source, /Engine\.analyzeTimeframe/);
   assert.match(source, /Engine\.applyContextGates/);
   assert.match(source, /Engine\.enforceIntervalStructurePolicy/);

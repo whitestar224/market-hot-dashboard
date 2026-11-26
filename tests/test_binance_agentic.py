@@ -3,12 +3,20 @@ import subprocess
 import unittest
 from unittest.mock import Mock, patch
 
-from binance_agentic import (
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
+
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.sources.binance_agentic import (
     AgenticWalletReadBridge,
     agentic_wallet_capabilities,
     normalize_binance_meme_rush,
 )
-from chain_ecosystem_monitor import evaluate_onchain_candidate, scan_onchain_research
+from app.monitors.chain_ecosystem_monitor import evaluate_onchain_candidate, scan_onchain_research
 
 
 NOW = 1_789_200_000_000
@@ -146,7 +154,7 @@ class BinanceAgenticTests(unittest.TestCase):
     def test_capabilities_never_enable_paid_or_write_operations(self):
         with patch.object(AgenticWalletReadBridge, "status", return_value={
             "installed": True, "connected": True, "status": "CONNECTED",
-        }), patch("binance_agentic._WALLET_STATUS_CACHE", (0.0, {})):
+        }), patch("app.sources.binance_agentic._WALLET_STATUS_CACHE", (0.0, {})):
             result = agentic_wallet_capabilities(max_age_seconds=0)
 
         self.assertTrue(result["quoteEnabled"])

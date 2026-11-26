@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import smart_money_monitor as SMM  # noqa: E402
+from app.monitors import smart_money_monitor as SMM  # noqa: E402
 
 DEFAULT_DB = ROOT / ".runtime-cache" / "smart_money_monitor.sqlite"
 

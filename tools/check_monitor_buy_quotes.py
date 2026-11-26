@@ -3,7 +3,15 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import json
-from monitor_buy import MonitorBuyService, ZERO, SOL_NATIVE, SOLANA, validate_quote
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
+
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.monitors.monitor_buy import MonitorBuyService, ZERO, SOL_NATIVE, SOLANA, validate_quote
 
 service = MonitorBuyService(Path("unused-readonly.sqlite"))
 chains = service.networks()

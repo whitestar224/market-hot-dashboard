@@ -5,6 +5,7 @@
 """
 
 from __future__ import annotations
+from app.core.paths import ROOT, WEB_DIR
 import html
 import json
 import re
@@ -14,7 +15,6 @@ from http.server import SimpleHTTPRequestHandler
 from typing import Any
 from urllib.parse import urlparse
 from app.core.config import env_value
-from app.core.paths import ROOT
 
 
 SEO_PUBLIC_PAGES: dict[str, dict[str, str]] = {
@@ -240,7 +240,7 @@ def inject_site_footer(html_text: str) -> str:
 
 def refresh_stylesheet_version(html_text: str) -> str:
     try:
-        version = str(int((ROOT / "styles.css").stat().st_mtime))
+        version = str(int((WEB_DIR / "styles.css").stat().st_mtime))
     except Exception:
         version = str(int(time.time()))
     return re.sub(

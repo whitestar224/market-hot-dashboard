@@ -8,9 +8,17 @@ from unittest.mock import Mock, patch
 
 import server
 import tests.test_event_flow as fixtures
-from alert_delivery import AlertDeliveryStore
-from event_flow_window import attention_evidence, attention_window, HOUR
-from listing_alerts import REQUIRED_SOURCES, attach_inventory, observe_listings
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
+
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.alerts.alert_delivery import AlertDeliveryStore
+from app.alerts.event_flow_window import attention_evidence, attention_window, HOUR
+from app.monitors.listing_alerts import REQUIRED_SOURCES, attach_inventory, observe_listings
 
 
 class SemanticOpportunityTests(fixtures.NewsTradeDeliveryTests):

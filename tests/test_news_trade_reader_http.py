@@ -4,7 +4,15 @@ import json
 import unittest
 import urllib.error
 from unittest.mock import Mock, patch
-from news_trade_reader import reader_payload, show_reader
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
+
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.research.news_trade_reader import reader_payload, show_reader
 
 
 class ReaderHttpTests(unittest.TestCase):
@@ -16,7 +24,7 @@ class ReaderHttpTests(unittest.TestCase):
     def test_retry_fixed_loopback_json_and_actionable_http_failures(self):
         for code,expected in [(400,'原事件'),(403,'访问被拒绝'),(429,'一分钟'),(503,'繁忙')]:
             opener=Mock();opener.open.side_effect=urllib.error.HTTPError('http://127.0.0.1',code,'ignored',{},io.BytesIO(b'{"error":"SECRET_IGNORE"}'))
-            with patch('news_trade_reader.reader_log'):
+            with patch('app.research.news_trade_reader.reader_log'):
                 result=reader_payload(opener,'a'*40,8765,True)
             self.assertIn(expected,result['message']);self.assertNotIn('SECRET',result['message'])
             request=opener.open.call_args.args[0]
@@ -26,7 +34,7 @@ class ReaderHttpTests(unittest.TestCase):
 
     def test_transport_and_malformed_response_are_distinguished(self):
         opener=Mock();opener.open.side_effect=TimeoutError()
-        with patch('news_trade_reader.reader_log'):
+        with patch('app.research.news_trade_reader.reader_log'):
             reconnecting=reader_payload(opener,'a'*40,8765)
         self.assertTrue(reconnecting['connectionFailed'])
         self.assertEqual(reconnecting['status'],'pending')
@@ -35,6 +43,6 @@ class ReaderHttpTests(unittest.TestCase):
         response=Mock();response.__enter__=Mock(return_value=response);response.__exit__=Mock(return_value=False)
         response.read.return_value=b'{"ok":false,"error":"SECRET_IGNORE"}'
         opener.open.return_value=response
-        with patch('news_trade_reader.reader_log'):
+        with patch('app.research.news_trade_reader.reader_log'):
             result=reader_payload(opener,'a'*40,8765)
         self.assertIn('格式异常',result['message']);self.assertNotIn('SECRET',result['message'])

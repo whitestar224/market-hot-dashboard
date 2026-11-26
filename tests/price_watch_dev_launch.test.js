@@ -8,9 +8,9 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 
 test("monitor page exposes the dev-launch sub-board", () => {
-  const html = fs.readFileSync("price-watch.html", "utf8");
-  const js = fs.readFileSync("price-watch.js", "utf8");
-  const css = fs.readFileSync("styles.css", "utf8");
+  const html = fs.readFileSync("web/price-watch.html", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
+  const css = fs.readFileSync("web/styles.css", "utf8");
 
   assert.match(html, /data-watch-mode="devlaunch"/);
   // 必须注册进 supportedModes，否则 URL ?mode=devlaunch 会被顶回 prior。
@@ -30,7 +30,7 @@ test("monitor page exposes the dev-launch sub-board", () => {
 });
 
 test("the four dev tiers match the agreed thresholds", () => {
-  const js = fs.readFileSync("price-watch.js", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
   for (const tier of ["legendary", "premium", "quality", "flow"]) {
     assert.match(js, new RegExp(`\\b${tier}: \\{ label:`), tier);
   }
@@ -43,7 +43,7 @@ test("the four dev tiers match the agreed thresholds", () => {
 });
 
 test("the tier legend spells out the thresholds in the same wording the user agreed", () => {
-  const js = fs.readFileSync("price-watch.js", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
   // 中文刻度（1 亿 / 1000 万 / 100 万）而不是 compactUsd 的 $100.00M —— 后者是给市值用的，
   // 当阈值标签读起来很别扭。这四句同时也是后端 DEV_TIER_STEPS 阈值的前端镜像。
   for (const range of ["≥ $1 亿", "$1000 万 ~ $1 亿", "$100 万 ~ $1000 万", "低于 $100 万"]) {
@@ -52,7 +52,7 @@ test("the tier legend spells out the thresholds in the same wording the user agr
 });
 
 test("each tier badge has its own colour so levels are readable at a glance", () => {
-  const css = fs.readFileSync("styles.css", "utf8");
+  const css = fs.readFileSync("web/styles.css", "utf8");
   for (const tier of ["legendary", "premium", "quality", "flow"]) {
     assert.match(css, new RegExp(`\\.dev-launch-console \\.dev-tier\\.is-${tier} \\{`), tier);
   }
@@ -65,7 +65,7 @@ test("each tier badge has its own colour so levels are readable at a glance", ()
 });
 
 test("the poller only refreshes the sub-board while it is on screen", () => {
-  const js = fs.readFileSync("price-watch.js", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
   // 轮询分支里允许夹注释（\s* 不跨行吞注释），所以显式放行注释行。
   assert.match(
     js,
@@ -75,7 +75,7 @@ test("the poller only refreshes the sub-board while it is on screen", () => {
 });
 
 test("?mode=devlaunch direct open does not fall through to the price list", () => {
-  const js = fs.readFileSync("price-watch.js", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
   // load() 里必须显式分流：直接带 ?mode=devlaunch 打开（或在子板块里刷新页面）时
   // 不会走模式按钮的点击分支，漏了这处就会去拉价格监控列表。
   assert.match(js, /if \(currentMode === "devlaunch"\) \{\s*\/\/[^\n]*\n\s*await loadDevLaunch\(\{ refresh, quiet \}\);\s*return;\s*\}/);
@@ -90,7 +90,7 @@ test("?mode=devlaunch direct open does not fall through to the price list", () =
 });
 
 test("adding a dev address is validated before it reaches the server", () => {
-  const js = fs.readFileSync("price-watch.js", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
   assert.match(js, /Dev 发币监控只支持 EVM 地址/);
   // 该链索引器不可用时当场拦住：加进去了也扫不出东西，用户会一直白等提醒。
   assert.match(js, /chainMeta\.available === false/);
@@ -98,7 +98,7 @@ test("adding a dev address is validated before it reaches the server", () => {
 });
 
 test("dev launch records link out to gmgn with the same session as the hot board", () => {
-  const js = fs.readFileSync("price-watch.js", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
   // 「查看」口径与 GMGN 热搜榜弹窗一致：跳 GMGN 站内交易页（浏览器已登录就带登录态）。
   assert.match(js, /GMGN 交易/);
   assert.match(js, /GMGN 交易<\/a>/);
@@ -108,5 +108,7 @@ test("dev launch records link out to gmgn with the same session as the hot board
 test("dev launch module is shipped with the desktop package", () => {
   const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
   const resource = pkg.build.extraResources.find((item) => item.to === "dashboard");
-  assert.ok(resource.filter.includes("dev_launch_monitor.py"));
+  // 业务模块搬进 src/app 之后按 src/** 整体打包，不再逐个列 .py。
+  assert.ok(resource.filter.includes("src/**"), "打包清单必须包含 src/**");
+  assert.ok(fs.existsSync("src/app/monitors/dev_launch_monitor.py"), "模块必须真的在 src/app/monitors 下");
 });

@@ -2,7 +2,15 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
-from newsflash_sources import (
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
+
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.sources.newsflash_sources import (
     _get_via_route,
     aggregate_newsflash,
     deduplicate_news_items,
@@ -202,8 +210,8 @@ def test_aggregation_isolates_a_failed_source_and_reports_deduplication():
             raise RuntimeError("offline")
         return [item("bwenews", "方程式新闻", "快讯：币安将上线 ABC 永续合约", priority=80)]
 
-    with patch("newsflash_sources.configured_feed_sources", return_value=feeds), patch(
-        "newsflash_sources._fetch_feed", side_effect=fake_fetch
+    with patch("app.sources.newsflash_sources.configured_feed_sources", return_value=feeds), patch(
+        "app.sources.newsflash_sources._fetch_feed", side_effect=fake_fetch
     ):
         payload = aggregate_newsflash(base)
 
@@ -227,8 +235,8 @@ def test_http_get_race_returns_first_healthy_route_and_skips_dead_proxies():
             raise RuntimeError(f"proxy {proxy} is half-dead")
         return direct_response
 
-    with patch("newsflash_sources._get_via_route", side_effect=fake_route), patch(
-        "newsflash_sources._env_proxy_url", return_value="http://127.0.0.1:7890"
+    with patch("app.sources.newsflash_sources._get_via_route", side_effect=fake_route), patch(
+        "app.sources.newsflash_sources._env_proxy_url", return_value="http://127.0.0.1:7890"
     ):
         assert http_get_race("https://example.com/feed", timeout=8) is direct_response
 
@@ -242,8 +250,8 @@ def test_http_get_race_uses_proxy_route_when_direct_fails():
             raise RuntimeError("direct is blocked")
         return proxy_response
 
-    with patch("newsflash_sources._get_via_route", side_effect=fake_route), patch(
-        "newsflash_sources._env_proxy_url", return_value="http://127.0.0.1:7890"
+    with patch("app.sources.newsflash_sources._get_via_route", side_effect=fake_route), patch(
+        "app.sources.newsflash_sources._env_proxy_url", return_value="http://127.0.0.1:7890"
     ):
         assert http_get_race("https://example.com/feed", timeout=8) is proxy_response
 
@@ -252,8 +260,8 @@ def test_http_get_race_raises_last_error_when_every_route_fails():
     def fake_route(url, headers, timeout, proxy):
         raise RuntimeError(f"route {proxy or 'direct'} failed")
 
-    with patch("newsflash_sources._get_via_route", side_effect=fake_route), patch(
-        "newsflash_sources._env_proxy_url", return_value=""
+    with patch("app.sources.newsflash_sources._get_via_route", side_effect=fake_route), patch(
+        "app.sources.newsflash_sources._env_proxy_url", return_value=""
     ):
         try:
             http_get_race("https://example.com/feed", timeout=8)
@@ -276,7 +284,7 @@ def test_direct_route_ignores_proxy_environment():
         def close(self):
             return None
 
-    with patch("newsflash_sources.requests.Session", return_value=FakeSession()):
+    with patch("app.sources.newsflash_sources.requests.Session", return_value=FakeSession()):
         _get_via_route("https://example.com/feed", {"User-Agent": "t"}, 8, "")
 
     assert captured.get("timeout") == 8
@@ -347,11 +355,11 @@ class NewsflashSourcesTests(unittest.TestCase):
         source = {"id": "foresight", "name": "Foresight 空投线报", "label": "FN",
                   "url": "https://foresightnews.pro/airdropnews", "priority": 60,
                   "kind": "html-foresight"}
-        from newsflash_sources import _fetch_feed
+        from app.sources.newsflash_sources import _fetch_feed
 
-        with patch("newsflash_sources.fetch_foresight_airdrop_news", side_effect=RuntimeError("api down")), \
-                patch("newsflash_sources.fetch_foresight_html", return_value=FORESIGHT_HTML) as html_fetch, \
-                patch("newsflash_sources.http_get_race", side_effect=AssertionError("不该走 RSS/requests 路径")):
+        with patch("app.sources.newsflash_sources.fetch_foresight_airdrop_news", side_effect=RuntimeError("api down")), \
+                patch("app.sources.newsflash_sources.fetch_foresight_html", return_value=FORESIGHT_HTML) as html_fetch, \
+                patch("app.sources.newsflash_sources.http_get_race", side_effect=AssertionError("不该走 RSS/requests 路径")):
             rows = _fetch_feed(source, {"User-Agent": "test"}, 8)
         self.assertEqual(len(rows), 2)
         html_fetch.assert_called_once()
@@ -361,12 +369,12 @@ class NewsflashSourcesTests(unittest.TestCase):
         source = {"id": "foresight", "name": "Foresight 空投线报", "label": "FN",
                   "url": "https://foresightnews.pro/airdropnews", "priority": 60,
                   "kind": "html-foresight"}
-        from newsflash_sources import _fetch_feed
+        from app.sources.newsflash_sources import _fetch_feed
 
-        with patch("newsflash_sources.fetch_foresight_json",
+        with patch("app.sources.newsflash_sources.fetch_foresight_json",
                    return_value=_feed_payload([_news_row(116956, "Soneium 空投"), _article_row(1)],
                                               has_more=False)) as api, \
-                patch("newsflash_sources.fetch_foresight_html",
+                patch("app.sources.newsflash_sources.fetch_foresight_html",
                       side_effect=AssertionError("接口正常时不该抓 HTML")):
             rows = _fetch_feed(source, {"User-Agent": "test"}, 8)
         self.assertEqual([row["id"] for row in rows], ["foresight:116956"])
@@ -378,14 +386,14 @@ class NewsflashSourcesTests(unittest.TestCase):
         source = {"id": "foresight-tag-airdrop", "name": "Foresight 空投标签",
                   "label": "FN·标签", "url": "https://foresightnews.pro/tag?tagId=55",
                   "priority": 55, "kind": "html-foresight-tag"}
-        from newsflash_sources import _fetch_feed
+        from app.sources.newsflash_sources import _fetch_feed
 
         pages = [
             _feed_payload([_news_row(117029, "币安 Alpha 空投"), _article_row(9)], has_more=True),
             _feed_payload([_news_row(116950, "Bitget PoolX 空投"), _news_row(117029, "重复条目")],
                           has_more=False),
         ]
-        with patch("newsflash_sources.fetch_foresight_json", side_effect=pages) as api:
+        with patch("app.sources.newsflash_sources.fetch_foresight_json", side_effect=pages) as api:
             rows = _fetch_feed(source, {"User-Agent": "test"}, 8)
         # 两页都翻了，文章被丢掉，跨页重复 id 去重
         self.assertEqual(api.call_count, 2)
@@ -396,7 +404,7 @@ class NewsflashSourcesTests(unittest.TestCase):
         self.assertEqual(rows[0]["sourceLabel"], "FN·标签")
 
     def test_foresight_is_a_public_direct_source(self):
-        from newsflash_sources import DIRECT_SOURCE_FAMILIES, SOURCE_PRIORITY, configured_feed_sources, source_family
+        from app.sources.newsflash_sources import DIRECT_SOURCE_FAMILIES, SOURCE_PRIORITY, configured_feed_sources, source_family
 
         ids = {str(row.get("id")) for row in configured_feed_sources()}
         self.assertIn("foresight", ids)

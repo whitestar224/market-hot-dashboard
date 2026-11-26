@@ -9,7 +9,7 @@ const assert = require("node:assert/strict");
 const Module = require("node:module");
 const { performance } = require("node:perf_hooks");
 const ROOT = path.resolve(__dirname, "..");
-const Data = require("../dragon-wave-data.js");
+const Data = require("../web/dragon-wave-data.js");
 const fixtures = [
   ["H", "1h", "husdt_1h_2025-06-29_2025-07-01.json"],
   ["H", "5m", "husdt_5m_2025-07-02_1045.json"],

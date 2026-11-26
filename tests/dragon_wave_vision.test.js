@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const Vision = require("../dragon-wave-vision.js");
+const Vision = require("../web/dragon-wave-vision.js");
 
 function makeSeries({ scale = 1, noisy = false } = {}) {
   const start = Date.parse("2025-01-01T00:00:00Z");

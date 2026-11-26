@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
-const source = fs.readFileSync(path.join(__dirname, '../wallets.js'), 'utf8');
+const source = fs.readFileSync(path.join(__dirname, '../web/wallets.js'), 'utf8');
 const address = '0x' + '12'.repeat(20);
 class DetailEvent extends Event { constructor(type, options = {}) { super(type); this.detail = options.detail; } }
 function provider(initial = []) {
@@ -126,16 +126,16 @@ test('disconnect while a connection is pending cannot be undone by its late comp
   assert.equal(wallets.snapshot('binance').evm, '');
 });
 test('every authenticated page loads the same wallet module before page code', () => {
-  for (const name of fs.readdirSync(path.join(__dirname, '..')).filter(x => x.endsWith('.html'))) {
-    const html = fs.readFileSync(path.join(__dirname, '..', name), 'utf8');
+  for (const name of fs.readdirSync(path.join(__dirname, '..', 'web')).filter(x => x.endsWith('.html'))) {
+    const html = fs.readFileSync(path.join(__dirname, '..', 'web', name), 'utf8');
     if (!html.includes('./auth.js')) continue;
     assert.ok(html.includes('./wallets.js'), name);
     assert.ok(html.indexOf('./wallets.js') < html.indexOf('./auth.js'), name);
   }
 });
 test('wallet and account controls use a utility rail outside the balanced navigation grid', () => {
-  const authSource = fs.readFileSync(path.join(__dirname, '../auth.js'), 'utf8');
-  const styles = fs.readFileSync(path.join(__dirname, '../styles.css'), 'utf8');
+  const authSource = fs.readFileSync(path.join(__dirname, '../web/auth.js'), 'utf8');
+  const styles = fs.readFileSync(path.join(__dirname, '../web/styles.css'), 'utf8');
   assert.match(source, /topbarUtilitiesNode/);
   assert.match(source, /utilities\.appendChild\(navButton\)/);
   assert.match(authSource, /topbar-utilities/);
@@ -144,7 +144,7 @@ test('wallet and account controls use a utility rail outside the balanced naviga
 });
 test('full dashboard navigation is evenly split into two rows of six links', () => {
   for (const name of ['index.html', 'gainers.html', 'turnover.html', 'newboards.html', 'listings.html', 'newsflash.html', 'rss.html', 'xwatch.html', 'price-watch.html', 'event-flow.html', 'todo.html', 'legal.html']) {
-    const html = fs.readFileSync(path.join(__dirname, '..', name), 'utf8');
+    const html = fs.readFileSync(path.join(__dirname, '..', 'web', name), 'utf8');
     const nav = html.match(/<nav class="page-nav"[\s\S]*?<\/nav>/)?.[0] || '';
     assert.equal((nav.match(/class="nav-link/g) || []).length, 12, name);
     assert.match(nav, /href="\.\/event-flow\.html"/, name);

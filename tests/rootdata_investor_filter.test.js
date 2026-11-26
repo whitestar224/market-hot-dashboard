@@ -10,9 +10,9 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
-const js = fs.readFileSync(path.join(root, "app.js"), "utf8");
+const js = fs.readFileSync(path.join(root, 'web', 'app.js'), "utf8");
 const server = fs.readFileSync(path.join(root, "server.py"), "utf8");
-const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
+const html = fs.readFileSync(path.join(root, 'web', 'index.html'), "utf8");
 
 function extract(name) {
   const start = js.indexOf(`function ${name}(`);
@@ -117,7 +117,7 @@ test("机构视图在卡片里固定露 10 行、其余下滑查看", () => {
     "表头必须在滚动容器之前渲染"
   );
 
-  const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
+  const css = fs.readFileSync(path.join(root, 'web', 'styles.css'), "utf8");
   const rule = css.slice(css.indexOf(".rootdata-scroll {"), css.indexOf("}", css.indexOf(".rootdata-scroll {")));
   assert.match(rule, /max-height:\s*540px/, "540px = 10 行 × 54px");
   assert.match(rule, /overflow-y:\s*auto/);
@@ -174,7 +174,7 @@ test("服务端把 investorOptions / investorBoards 挂在榜单卡上", () => {
   assert.match(server, /source\["investorOptions"\] = options/);
   assert.match(server, /source\["investorBoards"\] = boards/);
   // 「未发行 + 运营中」必须是服务端筛的（lssuingStatus 0 / yyStatus 1）。
-  const module = fs.readFileSync(path.join(root, "rootdata_investor.py"), "utf8");
+  const module = fs.readFileSync(path.join(root, "src", "app", "sources", "rootdata_investor.py"), "utf8");
   assert.match(module, /"lssuingStatus": 0/);
   assert.match(module, /"yyStatus": 1/);
 });

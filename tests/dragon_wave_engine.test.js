@@ -1,9 +1,9 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const Engine = require("../dragon-wave-engine.js");
-const Cases = require("../dragon-wave-cases.js");
-const Data = require("../dragon-wave-data.js");
+const Engine = require("../web/dragon-wave-engine.js");
+const Cases = require("../web/dragon-wave-cases.js");
+const Data = require("../web/dragon-wave-data.js");
 const hOneHourWedgeRows = require("./fixtures/husdt_1h_2025-06-29_2025-07-01.json");
 const hFiveMinuteLaunchRows = require("./fixtures/husdt_5m_2025-07-02_1045.json");
 const piFiveMinuteTriangleRows = require("./fixtures/piusdt_okx_5m_2025-02-22_1530.json");
@@ -5809,7 +5809,7 @@ test("shock mother-box outer edge is generated before the breakout candle comple
 });
 
 test("engine source contains no future-bar confirmation path", () => {
-  const source = require("node:fs").readFileSync(require.resolve("../dragon-wave-engine.js"), "utf8");
+  const source = require("node:fs").readFileSync(require.resolve("../web/dragon-wave-engine.js"), "utf8");
   assert.doesNotMatch(source, /followThroughProfile|candles\.slice\(index \+ 1/);
   assert.doesNotMatch(source, /const requiredRebuild|尚未完成级别扩大/);
   assert.match(source, /prearmed-stop/);

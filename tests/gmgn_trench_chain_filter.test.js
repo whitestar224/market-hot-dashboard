@@ -9,10 +9,10 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
-const js = fs.readFileSync(path.join(root, "app.js"), "utf8");
-const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
+const js = fs.readFileSync(path.join(root, 'web', 'app.js'), "utf8");
+const css = fs.readFileSync(path.join(root, 'web', 'styles.css'), "utf8");
 const server = fs.readFileSync(path.join(root, "server.py"), "utf8");
-const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
+const html = fs.readFileSync(path.join(root, 'web', 'index.html'), "utf8");
 
 // 取一个顶层函数的源码：从 `function name(` 到下一个顶层的 `function `。
 function extract(name) {

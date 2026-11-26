@@ -12,9 +12,16 @@ import time
 import unittest
 from pathlib import Path
 
-import market_maker_monitor as mm
-import price_move_monitor as pm
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
 
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.monitors import market_maker_monitor as mm
+from app.monitors import price_move_monitor as pm
 ROOT = Path(__file__).resolve().parents[1]
 SERVER_SOURCE = ROOT.joinpath("server.py").read_text(encoding="utf-8")
 
@@ -383,7 +390,7 @@ class AlphaWiringTests(unittest.TestCase):
 
     def test_the_control_lookup_reuses_the_alpha_mm_state(self):
         self.assertIn("return ALPHA_MM.control_targets().get(key) or {}", SERVER_SOURCE)
-        self.assertIn("def control_targets(", ROOT.joinpath("alpha_mm_monitor.py").read_text(encoding="utf-8"))
+        self.assertIn("def control_targets(", ROOT.joinpath("src/app/monitors/alpha_mm_monitor.py").read_text(encoding="utf-8"))
 
 
 class PayloadLinkTest(unittest.TestCase):
@@ -488,16 +495,17 @@ class ServerWiringTests(unittest.TestCase):
         self.assertIn('"/api/price-move"', window)
 
     def test_the_page_has_a_tab_for_it(self):
-        html = ROOT.joinpath("price-watch.html").read_text(encoding="utf-8")
+        html = ROOT.joinpath("web/price-watch.html").read_text(encoding="utf-8")
         self.assertIn('data-watch-mode="pricemove"', html)
-        js = ROOT.joinpath("price-watch.js").read_text(encoding="utf-8")
+        js = ROOT.joinpath("web/price-watch.js").read_text(encoding="utf-8")
         self.assertIn('"pricemove"', js)
         self.assertIn("/api/price-move", js)
         self.assertIn("renderPriceMove", js)
 
     def test_the_packager_ships_the_module(self):
         package = ROOT.joinpath("package.json").read_text(encoding="utf-8")
-        self.assertIn('"price_move_monitor.py"', package)
+        # 业务模块搬进 src/app 之后按 src/** 整体打包，不再逐个列 .py。
+        self.assertIn('"src/**"', package)
 
     def test_the_singleton_lives_next_to_the_other_monitors(self):
         source = ROOT.joinpath("src/app/core/state.py").read_text(encoding="utf-8")

@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 
-const Vision = require("../dragon-wave-vision.js");
+const Vision = require("../web/dragon-wave-vision.js");
 
 // Keep the pre-optimization preparation as a self-contained reference so these
 // tests also work in checkouts without the ignored local performance baseline.
@@ -52,7 +52,7 @@ function legacyBuildVisualSignature(candles, selectedIndex, options = {}) {
   };
 }
 
-const sourcePath = path.join(__dirname, "..", "dragon-wave-vision.js");
+const sourcePath = path.join(__dirname, "..", 'web', "dragon-wave-vision.js");
 const baselinePath = path.join(__dirname, "..", ".runtime-cache", "performance-baseline-20260908", "dragon-wave-vision.js");
 const referenceSource = fs.existsSync(baselinePath)
   ? fs.readFileSync(baselinePath, "utf8")

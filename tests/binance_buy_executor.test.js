@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const {createHash, webcrypto} = require('node:crypto');
-const core = require('../monitor-buy-core.js');
+const core = require('../web/monitor-buy-core.js');
 const OWNER = '0x'+'12'.repeat(20), TOKEN = '0x'+'34'.repeat(20);
 const ZERO = '0x'+'0'.repeat(40), ROUTER = '0xb44446b0c8e56988c34f7ff73ae904982b5fdda5';
 const hash = q => createHash('sha256').update(core.stableJson(q)).digest('hex');

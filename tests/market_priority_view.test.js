@@ -5,13 +5,13 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const root = path.resolve(__dirname, "..");
-const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
-const js = fs.readFileSync(path.join(root, "app.js"), "utf8");
-const ai = fs.readFileSync(path.join(root, "ai_insights.js"), "utf8");
-const auth = fs.readFileSync(path.join(root, "auth.js"), "utf8");
-const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
+const html = fs.readFileSync(path.join(root, 'web', 'index.html'), "utf8");
+const js = fs.readFileSync(path.join(root, 'web', 'app.js'), "utf8");
+const ai = fs.readFileSync(path.join(root, 'web', 'ai_insights.js'), "utf8");
+const auth = fs.readFileSync(path.join(root, 'web', 'auth.js'), "utf8");
+const css = fs.readFileSync(path.join(root, 'web', 'styles.css'), "utf8");
 const server = fs.readFileSync(path.join(root, "server.py"), "utf8");
-const rankingPages = ["gainers.html", "turnover.html"].map((file) => fs.readFileSync(path.join(root, file), "utf8"));
+const rankingPages = ["gainers.html", "turnover.html"].map((file) => fs.readFileSync(path.join(root, "web", file), "utf8"));
 
 test("narrative strength stays inside the original independent-board layout", () => {
   assert.match(html, /<option value="rank">榜单原序<\/option>/);
@@ -83,7 +83,7 @@ test("AI insight requests cover every board in progressive 24-row batches", () =
   assert.match(ai, /for \(const batch of sourceBatches\(compact\)\)/);
   assert.match(ai, /state\.pendingKeys\.add/);
   assert.match(ai, /function isPending/);
-  const insights = fs.readFileSync(path.join(root, "insights.js"), "utf8");
+  const insights = fs.readFileSync(path.join(root, 'web', 'insights.js'), "utf8");
   assert.match(insights, /function buildFallbackInsight/);
   assert.match(insights, /return \{ \.\.\.fallback, pending: Boolean\(pending\) \}/);
   assert.match(insights, /binance\[-\\s\]\?wallet\|wallet\|币安钱包/);
@@ -100,7 +100,7 @@ test("Binance Wallet rows show an immediate onchain fallback while AI is pending
       }
     }
   };
-  vm.runInNewContext(fs.readFileSync(path.join(root, "insights.js"), "utf8"), context);
+  vm.runInNewContext(fs.readFileSync(path.join(root, 'web', 'insights.js'), "utf8"), context);
   const result = context.window.XingyunInsights.buildRowInsight(
     { symbol: "PONS", name: "PONS", rank: 9, change: "-3.99%" },
     { source: { id: "binance-wallet-hot", title: "币安钱包热门榜", group: "crypto" }, rank: 9, mode: "hot" }
@@ -131,8 +131,8 @@ test("all eligible crypto boards render exchange-native AI narratives with provi
 });
 
 test("Binance gainers card switches between spot and futures without duplicating the board", () => {
-  const gainers = fs.readFileSync(path.join(root, "gainers.html"), "utf8");
-  const rankings = fs.readFileSync(path.join(root, "rankings.js"), "utf8");
+  const gainers = fs.readFileSync(path.join(root, 'web', 'gainers.html'), "utf8");
+  const rankings = fs.readFileSync(path.join(root, 'web', 'rankings.js'), "utf8");
   assert.match(rankings, /BINANCE_GAINERS_MODE_KEY/);
   assert.match(rankings, /"binance-gainers": "spot"/);
   assert.match(rankings, /"binance-futures-gainers": "futures"/);

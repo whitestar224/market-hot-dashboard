@@ -4,9 +4,9 @@ const fs = require("node:fs");
 
 
 test("price watch exposes the existing personal X realtime monitor", () => {
-  const html = fs.readFileSync("price-watch.html", "utf8");
-  const js = fs.readFileSync("price-watch.js", "utf8");
-  const css = fs.readFileSync("styles.css", "utf8");
+  const html = fs.readFileSync("web/price-watch.html", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
+  const css = fs.readFileSync("web/styles.css", "utf8");
 
   assert.match(html, /data-watch-mode="personalx"/);
   assert.match(js, /\/api\/personal-x-monitor/);
@@ -31,8 +31,8 @@ test("price watch exposes the existing personal X realtime monitor", () => {
 });
 
 test("News Trade shows an auditable Meme-potential verdict for project X posts", () => {
-  const js = fs.readFileSync("price-watch.js", "utf8");
-  const css = fs.readFileSync("styles.css", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
+  const css = fs.readFileSync("web/styles.css", "utf8");
 
   assert.match(js, /xMemePotential/);
   assert.match(js, /推文 Meme 潜力/);
@@ -42,8 +42,8 @@ test("News Trade shows an auditable Meme-potential verdict for project X posts",
 });
 
 test("News Trade renders AI event and Meme analysis without replacing safety gates", () => {
-  const js = fs.readFileSync("price-watch.js", "utf8");
-  const css = fs.readFileSync("styles.css", "utf8");
+  const js = fs.readFileSync("web/price-watch.js", "utf8");
+  const css = fs.readFileSync("web/styles.css", "utf8");
 
   assert.match(js, /事件与 Meme 判断/);
   assert.match(js, /aiAnalysisStatus/);

@@ -10,7 +10,15 @@ from email.utils import format_datetime
 from unittest.mock import Mock
 from requests import Timeout
 
-from binance_web3 import BinanceWeb3Client, protect, save_credentials, signed_request
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
+
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.sources.binance_web3 import BinanceWeb3Client, protect, save_credentials, signed_request
 
 
 class BinanceWeb3Tests(unittest.TestCase):

@@ -16,9 +16,15 @@ CHAIN_META 的两条链能拼出 URL，BSC 的币点了是死链）。
 import threading
 import unittest
 
-import market_maker_monitor as mm
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
 
-
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.monitors import market_maker_monitor as mm
 def watch_entry(**overrides):
     entry = {
         "at": 1_790_000_000,

@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 
-const code = fs.readFileSync(path.join(__dirname, "..", "ai_insights.js"), "utf8");
+const code = fs.readFileSync(path.join(__dirname, "..", 'web', 'ai_insights.js'), "utf8");
 
 test("degraded results preserve cache, stop batches, enable rules and retry after cooldown", async () => {
   let now = 100000;

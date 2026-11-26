@@ -210,9 +210,9 @@ class PriceWatchManualAddTests(unittest.TestCase):
 class PriceWatchManualAddFrontendTests(unittest.TestCase):
     def test_add_button_has_independent_visible_loading_state(self):
         root = Path(server.ROOT)
-        html = (root / "price-watch.html").read_text(encoding="utf-8")
-        script = (root / "price-watch.js").read_text(encoding="utf-8")
-        styles = (root / "styles.css").read_text(encoding="utf-8")
+        html = (root / "web" / "price-watch.html").read_text(encoding="utf-8")
+        script = (root / "web" / "price-watch.js").read_text(encoding="utf-8")
+        styles = (root / "web" / "styles.css").read_text(encoding="utf-8")
 
         self.assertIn('id="watchAddButton"', html)
         self.assertIn('role="status" aria-live="polite"', html)

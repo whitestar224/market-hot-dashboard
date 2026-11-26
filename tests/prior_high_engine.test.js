@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const PriorHigh = require("../prior-high-engine.js");
+const PriorHigh = require("../web/prior-high-engine.js");
 
 function candle(index, open, high, low, close) {
   return {
@@ -168,8 +168,8 @@ test("merged resistance triggers at its highest zone edge rather than the first 
 
 test("dashboard exposes the prior-high page without replacing the ignition page", () => {
   const root = path.resolve(__dirname, "..");
-  const html = fs.readFileSync(path.join(root, "dragon-wave.html"), "utf8");
-  const script = fs.readFileSync(path.join(root, "dragon-wave.js"), "utf8");
+  const html = fs.readFileSync(path.join(root, 'web', 'dragon-wave.html'), "utf8");
+  const script = fs.readFileSync(path.join(root, 'web', 'dragon-wave.js'), "utf8");
   assert.match(html, /data-strategy-page="ignition"/);
   assert.match(html, /data-strategy-page="prior-high"/);
   assert.match(html, /prior-high-engine\.js/);

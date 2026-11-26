@@ -5,8 +5,16 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from monitor_balances import BalanceReadCache
-from monitor_buy import MonitorBuyService, ZERO
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
+
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.monitors.monitor_balances import BalanceReadCache
+from app.monitors.monitor_buy import MonitorBuyService, ZERO
 
 OWNER = "0x" + "12" * 20
 TOKEN = "0x" + "34" * 20
@@ -16,12 +24,12 @@ class BalanceCacheTests(unittest.TestCase):
     def test_ttl_copies_zero_and_isolation(self):
         cache = BalanceReadCache(capacity=2)
         loader = Mock(return_value={"balance": 0})
-        with patch("monitor_balances.time.monotonic", return_value=100):
+        with patch("app.monitors.monitor_balances.time.monotonic", return_value=100):
             cached = cache.get(("binance", OWNER, 56, ZERO), loader)
             cached["balance"] = 9
             self.assertEqual(cache.get(("binance", OWNER, 56, ZERO), loader)["balance"], 0)
         loader.assert_called_once()
-        with patch("monitor_balances.time.monotonic", return_value=121):
+        with patch("app.monitors.monitor_balances.time.monotonic", return_value=121):
             cache.get(("binance", OWNER, 56, ZERO), loader)
         self.assertEqual(loader.call_count, 2)
         cache.get(("okx", OWNER, 56, ZERO), loader)

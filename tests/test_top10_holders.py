@@ -19,10 +19,16 @@ import time
 import unittest
 from unittest.mock import patch
 
-import arkham_client as ARKHAM
-import top10_holders as TOP10
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
 
-
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.sources import arkham_client as ARKHAM
+from app.monitors import top10_holders as TOP10
 def holder(chain, pct, address="0xabc", **extra):
     row = {"chain": chain, "pct": pct, "address": address, "usd": 0.0, "balance": 0.0}
     row.update(extra)

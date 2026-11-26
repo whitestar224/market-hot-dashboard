@@ -4,12 +4,20 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from news_trade_reader import show_reader
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
+
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.research.news_trade_reader import show_reader
 
 
 class ReaderGuiTests(unittest.TestCase):
     def setUp(self):
-        patcher=patch('news_trade_reader.reader_log')
+        patcher=patch('app.research.news_trade_reader.reader_log')
         patcher.start();self.addCleanup(patcher.stop)
 
     def test_retry_error_preserves_original_symbol_and_actionable_reason(self):
@@ -74,7 +82,7 @@ class ReaderGuiTests(unittest.TestCase):
             with patch('tkinter.Tk',return_value=root), \
                  patch.object(root,'mainloop',side_effect=exercise), \
                  patch('urllib.request.build_opener',return_value=opener), \
-                 patch('news_trade_reader.threading.Event.wait',return_value=False):
+                 patch('app.research.news_trade_reader.threading.Event.wait',return_value=False):
                 self.assertEqual(show_reader('a'*40,8765,'BNBGUY'),0)
             self.assertEqual(opener.open.call_count,2)
         finally:root.destroy()

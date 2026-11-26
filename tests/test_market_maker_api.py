@@ -16,8 +16,15 @@ import time
 import unittest
 from pathlib import Path
 
-import market_maker_monitor as mm
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
 
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.monitors import market_maker_monitor as mm
 ROOT = Path(__file__).resolve().parents[1]
 SERVER_SOURCE = ROOT.joinpath("server.py").read_text(encoding="utf-8")
 # server.py 里 `from app.core.state import (...)`，所以 `src` 必须在 sys.path 上。
@@ -384,9 +391,9 @@ class ServerWiringTests(unittest.TestCase):
         self.assertIn("仅限本机或管理员配置做市商监控", self.source)
 
     def test_the_page_has_a_tab_for_it(self):
-        html = ROOT.joinpath("price-watch.html").read_text(encoding="utf-8")
+        html = ROOT.joinpath("web/price-watch.html").read_text(encoding="utf-8")
         self.assertIn('data-watch-mode="marketmaker"', html)
-        js = ROOT.joinpath("price-watch.js").read_text(encoding="utf-8")
+        js = ROOT.joinpath("web/price-watch.js").read_text(encoding="utf-8")
         self.assertIn('"marketmaker"', js)
         self.assertIn("/api/market-maker", js)
         self.assertIn("renderMarketMaker", js)
@@ -394,15 +401,15 @@ class ServerWiringTests(unittest.TestCase):
     def test_the_packager_ships_the_module(self):
         """desktop 打包是白名单制：漏一个文件，装了桌面版就整块消失。"""
         package = ROOT.joinpath("package.json").read_text(encoding="utf-8")
-        self.assertIn('"market_maker_monitor.py"', package)
-        self.assertIn('"alpha_mm_monitor.py"', package)
+        # 业务模块搬进 src/app 之后按 src/** 整体打包。
+        self.assertIn('"src/**"', package)
 
 
 class CadenceTest(unittest.TestCase):
     """一轮 30 个地址要几分钟：间隔必须按「起点」算，否则节奏会被拖成两倍。"""
 
     def test_the_interval_is_measured_from_the_cycle_start(self):
-        source = ROOT.joinpath("market_maker_monitor.py").read_text(encoding="utf-8")
+        source = ROOT.joinpath("src/app/monitors/market_maker_monitor.py").read_text(encoding="utf-8")
         loop = source[source.index("def _loop"):source.index("def run_cycle")]
         self.assertIn("started = time.time()", loop)
         self.assertIn("remaining = self.interval - (time.time() - started)", loop)

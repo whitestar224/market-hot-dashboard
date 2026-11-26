@@ -11,9 +11,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import trench_overlay as overlay
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
 
-
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.alerts import trench_overlay as overlay
 def make_row(index, *, symbol=None, network="solana", market_cap=10_000, change=1.0):
     return {
         "network": network,
@@ -1034,7 +1040,7 @@ class ServerWiringTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from pathlib import Path
-        cls.source = (Path(overlay.__file__).resolve().parent / "server.py").read_text(
+        cls.source = (Path(overlay.__file__).resolve().parents[3] / "server.py").read_text(
             encoding="utf-8", errors="replace"
         )
 

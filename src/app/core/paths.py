@@ -40,4 +40,25 @@ def _detect_project_root() -> Path:
 
 ROOT = Path(os.getenv("XINGYUN_APP_ROOT") or _detect_project_root()).resolve()
 
+# 静态资源根：所有 html / css / js / assets 都放在 web/ 下。
+# HTTP 侧仍然以【本站根】对外提供（Handler 的 directory 指向这里），
+# 所以浏览器地址仍是 /index.html、/assets/...，前端相对路径一行都不用改。
+WEB_DIR = ROOT / "web"
+
+# 业务模块根：根目录只留 server.py / 启动脚本 / README，其余代码都在 src/app 下。
+# server.py 里所有「以子进程拉起某个 .py」的地方都要用 APP_DIR 拼路径，别再拼 ROOT。
+APP_DIR = ROOT / "src" / "app"
+
+
+def runtime_dir() -> Path:
+    """运行态缓存目录。
+
+    ⚠️ 模块搬进 src/app/<pkg>/ 之后，`Path(__file__).resolve().parent` 不再等于项目根，
+    以前那套 `Path(__file__).parent / ".runtime-cache"` 会凭空造出
+    `src/app/<pkg>/.runtime-cache`，缓存与数据库全部写丢。统一走这里。
+    """
+    configured = str(os.getenv("XINGYUN_RUNTIME_DIR") or "").strip()
+    return Path(configured).expanduser() if configured else ROOT / ".runtime-cache"
+
+
 CODEX_HOME = Path(os.getenv("CODEX_HOME") or (Path.home() / ".codex"))

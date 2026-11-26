@@ -4,9 +4,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import gmgn_agentic
+# --- 业务代码在 src/ 下：把它加进 sys.path 才能 `from app.x import y` ---------
+import sys as _sys
+from pathlib import Path as _Path
 
-from chain_ecosystem_monitor import (
+_SRC_DIR = _Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+# ---------------------------------------------------------------------------
+from app.sources import gmgn_agentic
+from app.monitors.chain_ecosystem_monitor import (
     ChainEcosystemStore,
     ChainEcosystemMonitor,
     DEFAULT_MARKETS,
@@ -79,7 +86,7 @@ class ChainEcosystemScoringTests(unittest.TestCase):
             binance_called.append(True)
             raise AssertionError("Binance launch feed must not enter trench research by default")
 
-        with patch("chain_ecosystem_monitor.normalize_gmgn_migrated_trenches", return_value=[row]):
+        with patch("app.monitors.chain_ecosystem_monitor.normalize_gmgn_migrated_trenches", return_value=[row]):
             result = scan_onchain_research(
                 store,
                 networks=["bsc"],
@@ -210,12 +217,12 @@ class OnchainGoldenDogResearchTests(unittest.TestCase):
             "observedAt": 1_788_768_000_000,
             "metrics": {"liquidityUsd": 40_000, "volumeH24Usd": 80_000, "transactionsH24": 120},
         }
-        with patch("chain_ecosystem_monitor.fetch_gmgn_migrated_trenches", return_value={}), patch(
-            "chain_ecosystem_monitor.normalize_gmgn_migrated_trenches", return_value=[gmgn_row]
+        with patch("app.monitors.chain_ecosystem_monitor.fetch_gmgn_migrated_trenches", return_value={}), patch(
+            "app.monitors.chain_ecosystem_monitor.normalize_gmgn_migrated_trenches", return_value=[gmgn_row]
         ) as gmgn_normalizer, patch(
-            "chain_ecosystem_monitor.fetch_binance_meme_rush", return_value={"data": []}
+            "app.monitors.chain_ecosystem_monitor.fetch_binance_meme_rush", return_value={"data": []}
         ), patch(
-            "chain_ecosystem_monitor.normalize_binance_meme_rush", return_value=[binance_row]
+            "app.monitors.chain_ecosystem_monitor.normalize_binance_meme_rush", return_value=[binance_row]
         ) as binance_normalizer:
             payload = fetch_live_onchain_trenches(
                 networks=["eth", "bsc"],
@@ -250,8 +257,8 @@ class OnchainGoldenDogResearchTests(unittest.TestCase):
                 for index in range(3)
             ]
 
-        with patch("chain_ecosystem_monitor.fetch_gmgn_migrated_trenches", return_value={}), patch(
-            "chain_ecosystem_monitor.normalize_gmgn_migrated_trenches", side_effect=normalized
+        with patch("app.monitors.chain_ecosystem_monitor.fetch_gmgn_migrated_trenches", return_value={}), patch(
+            "app.monitors.chain_ecosystem_monitor.normalize_gmgn_migrated_trenches", side_effect=normalized
         ):
             payload = fetch_live_onchain_trenches(
                 networks=["eth", "bsc"],
@@ -286,13 +293,13 @@ class OnchainGoldenDogResearchTests(unittest.TestCase):
             }]
 
         with patch(
-            "chain_ecosystem_monitor.fetch_gmgn_migrated_trenches",
+            "app.monitors.chain_ecosystem_monitor.fetch_gmgn_migrated_trenches",
             return_value=native_payload,
         ), patch(
-            "chain_ecosystem_monitor.fetch_gmgn_recent_market_rank",
+            "app.monitors.chain_ecosystem_monitor.fetch_gmgn_recent_market_rank",
             return_value=rank_payload,
         ) as rank_fetch, patch(
-            "chain_ecosystem_monitor.normalize_gmgn_migrated_trenches",
+            "app.monitors.chain_ecosystem_monitor.normalize_gmgn_migrated_trenches",
             side_effect=normalized,
         ):
             payload = fetch_live_onchain_trenches(
@@ -354,13 +361,13 @@ class OnchainGoldenDogResearchTests(unittest.TestCase):
             return [dict(row) for _ in range(55)] if kind == "native" else [row]
 
         with patch(
-            "chain_ecosystem_monitor.fetch_gmgn_migrated_trenches",
+            "app.monitors.chain_ecosystem_monitor.fetch_gmgn_migrated_trenches",
             side_effect=fetch_native,
         ) as native_fetch, patch(
-            "chain_ecosystem_monitor.fetch_gmgn_recent_market_rank",
+            "app.monitors.chain_ecosystem_monitor.fetch_gmgn_recent_market_rank",
             return_value=payloads["rank"],
         ), patch(
-            "chain_ecosystem_monitor.normalize_gmgn_migrated_trenches",
+            "app.monitors.chain_ecosystem_monitor.normalize_gmgn_migrated_trenches",
             side_effect=normalized,
         ):
             result = fetch_live_onchain_trenches(
@@ -491,7 +498,7 @@ class OnchainGoldenDogResearchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = ChainEcosystemStore(Path(temp_dir) / "research.db")
             store.initialize()
-            with patch("chain_ecosystem_monitor._now_ms", return_value=1_788_793_718_413):
+            with patch("app.monitors.chain_ecosystem_monitor._now_ms", return_value=1_788_793_718_413):
                 result = scan_onchain_research_contract(
                     store,
                     contract,
@@ -1287,7 +1294,7 @@ class ChainEcosystemMonitorTests(unittest.TestCase):
                 chain_row = store.update_chain_stage(chain_row["id"], "mainnet_focus", observed_at=observed_at)
             return {"complete": True, "observedAt": observed_at, "chain": chain_row, "rankings": {}}
 
-        with patch("chain_ecosystem_monitor.discover_chain_ecosystem", side_effect=fake_discovery):
+        with patch("app.monitors.chain_ecosystem_monitor.discover_chain_ecosystem", side_effect=fake_discovery):
             self.monitor._refresh_worker(chain["id"])
             self.assertEqual(self.store.list_alerts(chain["id"]), [])
             self.monitor._refresh_worker(chain["id"])
@@ -1320,7 +1327,7 @@ class ChainEcosystemMonitorTests(unittest.TestCase):
             {"eth", "solana", "robinhood", "arc", "base", "bsc"},
         )
         self.assertFalse(self.monitor.schedule_research_refresh(now_ms=160_000))
-        with patch("chain_ecosystem_monitor.scan_onchain_research", return_value={"ok": True}), patch("chain_ecosystem_monitor._now_ms", return_value=100_000):
+        with patch("app.monitors.chain_ecosystem_monitor.scan_onchain_research", return_value={"ok": True}), patch("app.monitors.chain_ecosystem_monitor._now_ms", return_value=100_000):
             self.monitor._research_refresh_worker("bsc")
         self.assertFalse(self.monitor.schedule_research_refresh(now_ms=159_999))
         self.assertTrue(self.monitor.schedule_research_refresh(now_ms=160_000))
@@ -1333,7 +1340,7 @@ class ChainEcosystemMonitorTests(unittest.TestCase):
             calls.append(networks)
             return {"ok": networks != ["eth"]}
 
-        with patch("chain_ecosystem_monitor.scan_onchain_research", side_effect=scan):
+        with patch("app.monitors.chain_ecosystem_monitor.scan_onchain_research", side_effect=scan):
             self.monitor._research_refresh_worker()
             self.monitor._research_refresh_worker()
 

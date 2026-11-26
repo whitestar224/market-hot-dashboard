@@ -4,13 +4,13 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
-const html = fs.readFileSync(path.join(root, "price-watch.html"), "utf8");
-const js = fs.readFileSync(path.join(root, "price-watch.js"), "utf8");
-const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
+const html = fs.readFileSync(path.join(root, 'web', 'price-watch.html'), "utf8");
+const js = fs.readFileSync(path.join(root, 'web', 'price-watch.js'), "utf8");
+const css = fs.readFileSync(path.join(root, 'web', 'styles.css'), "utf8");
 const server = fs.readFileSync(path.join(root, "server.py"), "utf8");
-const monitorExclusionDb = fs.readFileSync(path.join(root, "monitor_exclusion_db.py"), "utf8");
+const monitorExclusionDb = fs.readFileSync(path.join(root, "src", "app", "monitors", "monitor_exclusion_db.py"), "utf8");
 const exclusionBackend = `${server}\n${monitorExclusionDb}`;
-const chainMonitor = fs.readFileSync(path.join(root, "chain_ecosystem_monitor.py"), "utf8");
+const chainMonitor = fs.readFileSync(path.join(root, "src", "app", "monitors", "chain_ecosystem_monitor.py"), "utf8");
 
 test("strategy replacement preserves the original monitor card layout", () => {
   assert.match(html, /id="priceWatchGrid" class="price-watch-grid"/);
@@ -177,7 +177,7 @@ test("News Trade blocks unsafe contracts and previews fees, slippage and minimum
 });
 
 test("News Trade wallet adapter supports multiple simultaneous wallet sessions", () => {
-  const shared = fs.readFileSync(path.join(root, "wallets.js"), "utf8");
+  const shared = fs.readFileSync(path.join(root, 'web', 'wallets.js'), "utf8");
   assert.match(js, /const wallets = window.XingyunWallets/);
   assert.doesNotMatch(js, /const walletSessions = new Map/);
   assert.ok(html.indexOf('wallets.js') < html.indexOf('price-watch.js'));
