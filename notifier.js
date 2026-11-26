@@ -41,13 +41,6 @@
       interval: 90_000,
       maxAgeMs: 12 * 60 * 1000,
       parse: parseMarketSignals
-    },
-    {
-      name: "briefs",
-      url: "/api/automation-briefs",
-      interval: 120_000,
-      maxAgeMs: DEFAULT_MAX_ALERT_AGE_MS,
-      parse: parseBriefEvents
     }
   ];
 
@@ -577,23 +570,6 @@
         };
       })
     );
-  }
-
-  function parseBriefEvents(payload) {
-    const briefs = Array.isArray(payload?.briefs) ? payload.briefs : [];
-    return briefs
-      .filter((brief) => brief?.completedAt)
-      .map((brief) => ({
-        key: stableKey("brief", brief.id, brief.completedAt, brief.name),
-        kind: "自动简报",
-        source: brief.name || "自动化简报",
-        sourceLabel: "AI",
-        title: brief.name || "新的自动化简报",
-        body: stripText(brief.content || "", 220),
-        url: "./briefs.html",
-        time: brief.completedAt,
-        priority: "简报"
-      }));
   }
 
   function ensureStack() {

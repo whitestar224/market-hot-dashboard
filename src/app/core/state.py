@@ -269,6 +269,18 @@ DESKTOP_ALERT_DELIVERY_TICK_LOCK = threading.Lock()
 DESKTOP_ALERT_MIN_INTERVAL_SECONDS = 10
 
 
+#: 弹窗只进事件流、不投递系统通知（用户 2026-11-26：「能不能把弹窗换成左下角固定
+#: 的事件流窗口，而不是这样一直弹来弹去的」→「全部停掉弹窗，只留事件流」）。
+#:
+#: 注意它不是 ``XINGYUN_DISABLE_DESKTOP_ALERT`` 的替代品，两者语义完全不同：
+#:   * ``DESKTOP_ALERT_STREAM_ONLY=1`` —— 过滤链全跑、事件流入库，**只是不弹窗**；
+#:   * ``XINGYUN_DISABLE_DESKTOP_ALERT=1`` —— 连事件流都不要（老总闸）。
+#: ``launch_desktop_alert()`` 里读的是前者，所以把后者设成 1 也不会顺手关掉事件流。
+DESKTOP_ALERT_STREAM_ONLY = str(
+    os.getenv("XINGYUN_DESKTOP_ALERT_STREAM_ONLY", "1") or "1"
+).strip().lower() not in {"0", "false", "off", "no", ""}
+
+
 DESKTOP_ALERT_URGENT_INTERVAL_SECONDS = 4
 
 
@@ -2054,35 +2066,6 @@ PRICE_STRUCTURE_CANDLE_LIMIT = 300
 DRAGON_WAVE_MONITOR_BRIDGE = ROOT / "tools" / "dragon_wave_monitor_bridge.js"
 
 
-STRATEGY_FEE_BUFFER_PCT = 0.12
-
-
-STRATEGY_DEFAULT_STOP_PCT = 3.0
-
-
-STRATEGY_MIN_STOP_PCT = 0.35
-
-
-STRATEGY_POSITION_REFRESH_SECONDS = 20
-
-
-STRATEGY_LIVE_TRADING_ENABLED = str(os.getenv("STRATEGY_LIVE_TRADING_ENABLED", "")).strip().lower() in {
-    "1", "true", "yes", "on"
-}
-
-
-STRATEGY_MAX_ORDER_NOTIONAL_USDT = float(os.getenv("STRATEGY_MAX_ORDER_NOTIONAL_USDT", "25000") or "25000")
-
-
-STRATEGY_EXCHANGE_CACHE: dict[str, tuple[float, Any]] = {}
-
-
-STRATEGY_EXCHANGE_CACHE_LOCK = threading.Lock()
-
-
-STRATEGY_POSITION_CACHE_SECONDS = 15
-
-
 LOGO_CACHE: dict[str, tuple[float, list[str]]] = {}
 
 
@@ -2484,23 +2467,6 @@ AICOIN_PAYLOAD_TOKEN_PATH = PERSIST_CACHE_DIR / "aicoin_payload_token.txt"
 
 
 AVE_TOKEN_CACHE_PATH = PERSIST_CACHE_DIR / "ave_token.json"
-
-
-AUTOMATION_BRIEF_IDS = ("automation", "automation-2")
-
-
-AUTOMATION_BRIEF_PLACEHOLDER = "暂时没有找到这条自动化任务最近生成的简报正文。"
-
-
-AUTOMATION_BRIEFS_REMOTE_CACHE_PATH = PERSIST_CACHE_DIR / "automation_briefs_remote.json"
-
-
-AUTOMATION_BRIEFS_BUNDLED_PATH = ROOT / "docs" / "automation-briefs.json"
-
-
-AUTOMATION_BRIEFS_DEFAULT_REMOTE_URL = (
-    "https://raw.githubusercontent.com/whitestar224/market-hot-dashboard/main/docs/automation-briefs.json"
-)
 
 
 RSS_FETCH_MAX_BYTES = 2_500_000

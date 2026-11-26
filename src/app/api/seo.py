@@ -48,11 +48,6 @@ SEO_PUBLIC_PAGES: dict[str, dict[str, str]] = {
         "description": "聚合 BlockBeats、方程式新闻、吴说区块链及扩展订阅源，并自动去除重复事件。",
         "keywords": "聚合快讯,律动快讯,方程式新闻,吴说区块链,币圈快讯,市场快讯",
     },
-    "/briefs.html": {
-        "title": "自动简报 - 星云社市场热点与交易情报简报",
-        "description": "自动汇总市场热门榜、成交额、涨幅异动和核心票热度，形成可快速阅读的交易情报简报。",
-        "keywords": "市场简报,交易简报,币圈简报,热点简报,自动简报",
-    },
     "/rss.html": {
         "title": "RSS 订阅 - 微信公众号与市场信息源聚合",
         "description": "订阅 RSS 和微信公众号信息源，聚合市场、科技、IPO、宏观和加密货币相关内容。",
@@ -69,7 +64,6 @@ SEO_NOINDEX_PATHS = {
     "/admin.html",
     "/login.html",
     "/profile.html",
-    "/strategy.html",
     "/todo.html",
     "/xwatch.html",
 }
@@ -162,7 +156,7 @@ def seo_head_block(handler: SimpleHTTPRequestHandler, page_path: str) -> str:
         page_path,
         {
             "title": "星云社 - 跨市场热点雷达",
-            "description": "星云社提供加密货币、港股、美股、A股市场热点榜单、快讯、简报和信息源聚合工具。",
+            "description": "星云社提供加密货币、港股、美股、A股市场热点榜单、快讯和信息源聚合工具。",
             "keywords": "星云社,市场热点,交易榜单,加密货币,港股,美股,A股",
         },
     )
@@ -215,7 +209,6 @@ def site_footer_html() -> str:
         <h2>数据与风险</h2>
         <a href="./legal.html#risk">风险提示</a>
         <a href="./legal.html#sources">数据来源说明</a>
-        <a href="./briefs.html">自动简报</a>
         <a href="./newsflash.html">律动快讯</a>
       </section>
       <section>
@@ -283,7 +276,7 @@ def sitemap_xml(handler: SimpleHTTPRequestHandler) -> str:
     base = request_base_url(handler)
     now = datetime.now().strftime("%Y-%m-%d")
     items = []
-    for path in ["/index.html", "/gainers.html", "/turnover.html", "/newboards.html", "/listings.html", "/newsflash.html", "/briefs.html", "/rss.html", "/price-watch.html", "/legal.html"]:
+    for path in ["/index.html", "/gainers.html", "/turnover.html", "/newboards.html", "/listings.html", "/newsflash.html", "/rss.html", "/price-watch.html", "/legal.html"]:
         loc = f"{base}{'/' if path == '/index.html' else path}"
         priority = "1.0" if path == "/index.html" else "0.8"
         changefreq = "hourly" if path in {"/index.html", "/gainers.html", "/turnover.html", "/newsflash.html"} else "daily"

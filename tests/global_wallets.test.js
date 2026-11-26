@@ -142,11 +142,11 @@ test('wallet and account controls use a utility rail outside the balanced naviga
   assert.match(styles, /grid-template-columns:\s*repeat\(7,/);
   assert.match(styles, /\.global-wallet-trigger\s*\{[^}]*order:\s*10/s);
 });
-test('full dashboard navigation is evenly split into two rows of seven links', () => {
-  for (const name of ['index.html', 'gainers.html', 'turnover.html', 'newboards.html', 'listings.html', 'newsflash.html', 'briefs.html', 'rss.html', 'xwatch.html', 'price-watch.html', 'event-flow.html', 'strategy.html', 'todo.html', 'legal.html']) {
+test('full dashboard navigation is evenly split into two rows of six links', () => {
+  for (const name of ['index.html', 'gainers.html', 'turnover.html', 'newboards.html', 'listings.html', 'newsflash.html', 'rss.html', 'xwatch.html', 'price-watch.html', 'event-flow.html', 'todo.html', 'legal.html']) {
     const html = fs.readFileSync(path.join(__dirname, '..', name), 'utf8');
     const nav = html.match(/<nav class="page-nav"[\s\S]*?<\/nav>/)?.[0] || '';
-    assert.equal((nav.match(/class="nav-link/g) || []).length, 14, name);
+    assert.equal((nav.match(/class="nav-link/g) || []).length, 12, name);
     assert.match(nav, /href="\.\/event-flow\.html"/, name);
   }
 });

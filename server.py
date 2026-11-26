@@ -150,9 +150,15 @@ import top10_holders as TOP10
 # 出闸时统一补一句「流通市值 $…（CMC #rank）」。拿不到就沉默，绝不写 0。
 import cmc_market_cap as CMC_MC
 from smart_money_monitor import CHAIN_META as SMART_MONEY_CHAIN_META, SmartMoneyMonitor
+# 战壕「新创建」的关键词弹窗（用户 2026-11-25）：BSC / Solana / Robinhood 上刚发出来的币，
+# 名字或中文译名命中关键词就第一时间弹一条。关键词表在它自己的 sqlite 里，可增删。
+import new_token_alert_monitor as NEW_TOKEN_ALERTS_MODULE
 # RootData 项目热门榜（2026-11-07）：页面挂在腾讯云 WAF 后面，服务器直连只会拿到
 # 滑块验证码页，所以取数走「专用 Chrome 抓一次 → 落快照」，榜单只读快照。
 import rootdata_projects as ROOTDATA_PROJECTS
+# 机构投资视角（2026-11-14）：机构页 SSR 不带发币状态，只能走它自己的签名接口，
+# 「未发行 + 运营中」是服务端筛出来的。密钥硬编码在前端，轮换即失效 → 失败保留旧快照。
+import rootdata_investor as ROOTDATA_INVESTOR
 from trench_person_signals import (
     EXCHANGE_OFFICIAL_HANDLES,
     EXCLUDED_IMPORTANT_HANDLES,
@@ -227,6 +233,9 @@ from app.api.seo import (
 # 注意：health_payload 会懒 import server（见 health.py docstring）读运行时状态。
 from app.api.health import health_payload, runtime_thread_groups
 
+# ---- GIGA X 叙事桥接（供油猴脚本把 GMGN 悬浮窗替换成 GIGA X 叙事）
+from app.api import gigax as gigax_api
+
 # ---- 批次 5：smart_money / 全网热点域抽出至 app/api/smart_money.py
 # 注意：这些函数会懒 import server（见 smart_money.py docstring）读仍留在
 # server.py 命名空间里的运行时函数/单例。start_global_hotspot_monitor 因含
@@ -297,11 +306,6 @@ from app.core.state import (
     AUTH_PHONE_LOCK,
     AUTH_SESSION_COOKIE,
     AUTH_SESSION_DAYS,
-    AUTOMATION_BRIEFS_BUNDLED_PATH,
-    AUTOMATION_BRIEFS_DEFAULT_REMOTE_URL,
-    AUTOMATION_BRIEFS_REMOTE_CACHE_PATH,
-    AUTOMATION_BRIEF_IDS,
-    AUTOMATION_BRIEF_PLACEHOLDER,
     AVE_CHAIN_POOL,
     AVE_HOT_ALERT_INTERVAL_SECONDS,
     AVE_HOT_ALERT_LOCK,
@@ -391,6 +395,7 @@ from app.core.state import (
     DESKTOP_ALERT_SEEN_LIMIT,
     DESKTOP_ALERT_SLOT,
     DESKTOP_ALERT_STATE_PATH,
+    DESKTOP_ALERT_STREAM_ONLY,
     DESKTOP_ALERT_STRUCTURE_AUTO_CLOSE_MS,
     DESKTOP_ALERT_STRUCTURE_PROCESSES,
     DESKTOP_ALERT_TRADING_PREARM_PRIORITY,
@@ -744,15 +749,6 @@ from app.core.state import (
     STOCK_RANK_DESKTOP_ALERT_SOURCE_IDS,
     STRATEGY_ADAPTIVE_CONTEXT_LOCK,
     STRATEGY_ADAPTIVE_CONTEXT_PATH,
-    STRATEGY_DEFAULT_STOP_PCT,
-    STRATEGY_EXCHANGE_CACHE,
-    STRATEGY_EXCHANGE_CACHE_LOCK,
-    STRATEGY_FEE_BUFFER_PCT,
-    STRATEGY_LIVE_TRADING_ENABLED,
-    STRATEGY_MAX_ORDER_NOTIONAL_USDT,
-    STRATEGY_MIN_STOP_PCT,
-    STRATEGY_POSITION_CACHE_SECONDS,
-    STRATEGY_POSITION_REFRESH_SECONDS,
     THREAD_STACK_SIZE_BYTES,
     THS_SOURCE_CACHE_PATH,
     TRANSLATION_CACHE_MAX_ENTRIES,
@@ -1034,6 +1030,14 @@ MONITOR_BUY = MonitorBuyService(
 )
 MONITOR_BUY.start_session_maintenance()
 DESKTOP_ALERT_MARKER_DIR.mkdir(exist_ok=True)
+# 战壕新币的关键词弹窗。独立的表，不碰 ``xingyunshe_auth.db``（省掉应用锁那套）；
+# 关键词表首次启动写默认词，之后走 ``/api/new-token-keywords`` 增删。
+# 取数来自油猴脚本回传的战壕页数据（``POST /api/new-token-feed``），后端不自己抓 GMGN ——
+# 页面数据是他筛选过的，币少一个数量级（用户 2026-11-25：「不然币太多了」）。
+NEW_TOKEN_FEED = NEW_TOKEN_ALERTS_MODULE.NewTokenFeed()
+NEW_TOKEN_ALERTS = NEW_TOKEN_ALERTS_MODULE.NewTokenAlertMonitor(
+    PERSIST_CACHE_DIR / "new_token_alerts.sqlite", feed=NEW_TOKEN_FEED
+)
 WECHAT_AUTH_ALERT_LAST_AT = 0.0
 WECHAT_AUTH_MONITOR_ACTIVE = False
 CHAIN_ECOSYSTEM_MONITOR.store.identity_observer = MONITOR_BUY.identities.observe
@@ -1341,13 +1345,6 @@ def maintain_runtime_memory(now: float | None = None) -> dict[str, int]:
             PRICE_STRUCTURE_MOMENTUM_CACHE,
             PRICE_STRUCTURE_MOMENTUM_CACHE_TTL_SECONDS,
             PRICE_STRUCTURE_MOMENTUM_CACHE_MAX_ENTRIES,
-        ),
-        (
-            "strategyExchange",
-            STRATEGY_EXCHANGE_CACHE_LOCK,
-            STRATEGY_EXCHANGE_CACHE,
-            STRATEGY_POSITION_CACHE_SECONDS,
-            96,
         ),
         ("logos", LOGO_CACHE_LOCK, LOGO_CACHE, LOGO_CACHE_TTL, LOGO_CACHE_MAX_ENTRIES),
     )
@@ -2263,61 +2260,6 @@ def init_auth_db() -> None:
         )
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS strategy_orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                symbol TEXT NOT NULL,
-                signal_episode INTEGER NOT NULL,
-                exchange TEXT NOT NULL,
-                mode TEXT NOT NULL DEFAULT 'paper',
-                side TEXT NOT NULL DEFAULT 'long',
-                order_type TEXT NOT NULL DEFAULT 'market',
-                status TEXT NOT NULL DEFAULT 'staged',
-                account_equity REAL NOT NULL,
-                current_gross_exposure REAL NOT NULL DEFAULT 0,
-                daily_loss REAL NOT NULL DEFAULT 0,
-                risk_pct REAL NOT NULL,
-                daily_loss_limit_pct REAL NOT NULL,
-                exposure_cap_pct REAL NOT NULL,
-                leverage REAL NOT NULL,
-                entry_price REAL NOT NULL,
-                mark_price REAL,
-                stop_loss_price REAL NOT NULL,
-                stop_distance_pct REAL NOT NULL,
-                risk_budget REAL NOT NULL,
-                notional REAL NOT NULL,
-                margin_required REAL NOT NULL,
-                quantity REAL NOT NULL,
-                unrealized_pnl REAL NOT NULL DEFAULT 0,
-                exchange_order_id TEXT NOT NULL DEFAULT '',
-                response_json TEXT NOT NULL DEFAULT '',
-                error TEXT NOT NULL DEFAULT '',
-                break_even_at INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL,
-                confirmed_at INTEGER NOT NULL DEFAULT 0,
-                submitted_at INTEGER NOT NULL DEFAULT 0,
-                updated_at INTEGER NOT NULL,
-                UNIQUE(user_id, symbol, signal_episode),
-                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_exchange_credentials (
-                user_id INTEGER NOT NULL,
-                exchange TEXT NOT NULL,
-                api_key TEXT NOT NULL DEFAULT '',
-                api_secret TEXT NOT NULL DEFAULT '',
-                passphrase TEXT NOT NULL DEFAULT '',
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY(user_id, exchange),
-                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-            )
-            """
-        )
-        conn.execute(
-            """
             CREATE TABLE IF NOT EXISTS wechat_group_monitors (
                 user_id INTEGER NOT NULL,
                 group_name TEXT NOT NULL,
@@ -2526,9 +2468,6 @@ def init_auth_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_price_watch_first_confirmed_at ON price_watch_first_confirmations(confirmed_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_price_watch_oversold_updated ON price_watch_oversold_alert_state(updated_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_price_watch_fib_updated ON price_watch_fib_alert_state(updated_at)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_strategy_orders_user_status ON strategy_orders(user_id, status)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_strategy_orders_symbol_episode ON strategy_orders(symbol, signal_episode)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_exchange_credentials_user ON user_exchange_credentials(user_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_wechat_group_monitors_enabled ON wechat_group_monitors(enabled)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_wechat_group_messages_user_time ON wechat_group_messages(user_id, captured_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_wechat_group_seen_time ON wechat_group_seen(seen_at)")
@@ -4043,7 +3982,6 @@ def payload_source_overview(key: str) -> dict[str, Any]:
     if not sources:
         for list_key, title in (
             ("items", "信息流"),
-            ("briefs", "简报"),
             ("sections", "分组"),
             ("events", "事件"),
         ):
@@ -4109,7 +4047,6 @@ def admin_summary_payload() -> dict[str, Any]:
             payload_source_overview("listing-events-v2"),
             payload_source_overview("new-coin-rankings"),
             payload_source_overview("newsflash"),
-            payload_source_overview("automation-briefs"),
         ],
         "updatedAt": int(time.time() * 1000),
     }
@@ -4118,7 +4055,6 @@ def admin_summary_payload() -> dict[str, Any]:
 def admin_refresh_cache_payload() -> dict[str, Any]:
     refresh_jobs = (
         ("newsflash", fetch_aggregated_newsflash),
-        ("automation-briefs", automation_briefs_payload),
         ("listing-events-v2", listing_events_payload),
         ("new-coin-rankings", new_coin_rankings_payload),
         ("market-hot", market_payload),
@@ -6164,6 +6100,31 @@ X_KOL_DIRECT_ALERT_DEFAULT_HANDLES: tuple[str, ...] = (
     "cryptokris666",
 )
 
+# 系统「官方源」里的账号**不在**手动名册（load_x_kol_sources）里，所以上面那套
+# 「名册行没设置过 → 落到点名默认」的机制对它们不生效。想让他们有新帖就弹窗，
+# 只能在这里单独点名。用户 2026-11-09：
+#   「Elysium (Hyperliquid生态L2) 官方号 @enter_elysium、Elysium Blockchain
+#    (Vulcan Forged开发) 官方号 @vulcanforged，这两个的 X 账号监控上，有新信息弹窗发送」
+# 两个号已在 trench_person_signals.DEFAULT_IMPORTANT_PROJECTS 里登记为 project_official，
+# 这里只负责「抓到了就弹」。
+X_KOL_DIRECT_ALERT_OFFICIAL_HANDLES: tuple[str, ...] = (
+    "enter_elysium",
+    "vulcanforged",
+)
+
+
+def x_kol_direct_alert_official_handles() -> frozenset[str]:
+    """官方源里被点名「有新帖就弹窗」的账号（大小写归一后）。"""
+
+    return frozenset(
+        folded
+        for folded in (
+            normalize_x_handle(value).casefold()
+            for value in X_KOL_DIRECT_ALERT_OFFICIAL_HANDLES
+        )
+        if folded
+    )
+
 
 def x_kol_direct_alert_default_handles() -> frozenset[str]:
     """Handles that pop by default while their roster row carries no explicit choice."""
@@ -6188,6 +6149,8 @@ def x_kol_direct_alert_handles() -> frozenset[str]:
 
     handles: set[str] = set()
     defaults = x_kol_direct_alert_default_handles()
+    # 官方源的点名账号先垫进去：它们不在手动名册里，走不到下面那段 flag 逻辑。
+    handles |= x_kol_direct_alert_official_handles()
     for value in str(os.getenv("X_KOL_DIRECT_ALERT_HANDLES", "") or "").split(","):
         folded = normalize_x_handle(value).casefold()
         if folded:
@@ -6930,7 +6893,9 @@ def ensure_local_translation_service(wait_seconds: int = 0) -> bool:
     return local_translation_service_ready()
 
 
-def libretranslate_translate(text: str, *, wait_seconds: int = 45) -> str:
+def libretranslate_translate(
+    text: str, *, wait_seconds: int = 45, timeout_seconds: int | None = None
+) -> str:
     ensure_local_translation_service(wait_seconds=wait_seconds)
     base_url = env_value("LIBRETRANSLATE_URL") or "http://127.0.0.1:5000"
     endpoint = f"{base_url.rstrip('/')}/translate"
@@ -6942,7 +6907,10 @@ def libretranslate_translate(text: str, *, wait_seconds: int = 45) -> str:
     }
     if api_key := env_value("LIBRETRANSLATE_API_KEY"):
         body["api_key"] = api_key
-    timeout = max(5, min(120, int(safe_float(env_value("LIBRETRANSLATE_TIMEOUT", "45"), 45))))
+    if timeout_seconds is not None:
+        timeout = max(2, min(120, int(timeout_seconds)))
+    else:
+        timeout = max(5, min(120, int(safe_float(env_value("LIBRETRANSLATE_TIMEOUT", "45"), 45))))
     response = requests.post(
         endpoint,
         headers={**HEADERS, "Accept": "application/json", "Content-Type": "application/json"},
@@ -6969,7 +6937,13 @@ def x_kol_text_looks_english(text: Any) -> bool:
     return latin >= 18 and latin >= max(12, cjk * 4)
 
 
-def x_kol_translate_payload(payload: dict[str, Any], settings: dict[str, Any] | None = None) -> dict[str, Any]:
+def x_kol_translate_payload(
+    payload: dict[str, Any],
+    settings: dict[str, Any] | None = None,
+    *,
+    wait_seconds: int = 45,
+    timeout_seconds: int | None = None,
+) -> dict[str, Any]:
     text = clean_feed_text(
         payload.get("text")
         or payload.get("translationText")
@@ -6992,7 +6966,9 @@ def x_kol_translate_payload(payload: dict[str, Any], settings: dict[str, Any] | 
     errors: list[str] = []
     if env_flag("LIBRETRANSLATE_ENABLED", default=True):
         try:
-            translation = libretranslate_translate(text)
+            translation = libretranslate_translate(
+                text, wait_seconds=wait_seconds, timeout_seconds=timeout_seconds
+            )
             updated_at = translation_cache_put(cache_key, text, translation, "libretranslate")
             return {
                 "ok": True,
@@ -10037,6 +10013,31 @@ EXCHANGE_AI_BINANCE_CHAIN_IDS = {
     "sol": "CT_501",
     "solana": "CT_501",
 }
+# GIGA X 叙事桥接认的链（键必须是 app/api/gigax.py 里 CHAIN_CODES 的键，别写链号）。
+# 全系统叙事查询先过这张表：命中就问 GIGA X，没命中（或 GIGA X 没这个币的叙事）
+# 才按 EXCHANGE_AI_NARRATIVE_LEGACY_FALLBACK 决定要不要退回币安 AI / Bitget。
+GIGAX_EXCHANGE_AI_CHAINS = {
+    "1": "eth", "eth": "eth", "ethereum": "eth", "erc20": "eth", "erc-20": "eth",
+    "56": "bsc", "bsc": "bsc", "bnb": "bsc", "bnb-chain": "bsc",
+    "bnb-smart-chain": "bsc", "bep20": "bsc", "bep-20": "bsc",
+    "8453": "base", "base": "base",
+    "501": "sol", "ct_501": "sol", "sol": "sol", "solana": "sol",
+    "4663": "robinhood", "robinhood": "robinhood", "robinhood-chain": "robinhood",
+    "99901": "elysium", "elysium": "elysium",
+    "arc": "arc",
+}
+# 前端把这两个值直接显示在气泡与免责声明里，别写死在多个函数里。
+GIGAX_EXCHANGE_AI_SOURCE_LABEL = "GIGA X"
+GIGAX_EXCHANGE_AI_PROVIDER = "gigax"
+# 机会关键词（和油猴脚本 tools/gmgn-gigax-narrative.user.js 的 HOT_STRONG/HOT_WEAK
+# 保持同源；改这里要同步改脚本，反之亦然）。强词命中 1 个、弱词命中 2 个才算「机会」。
+OPPORTUNITY_STRONG_KEYWORDS = (
+    "新模式", "新机制", "新玩法", "新叙事", "新范式", "新物种",
+    "第一个", "首个", "首家", "首例", "首款", "首创", "首发", "首次",
+    "地推", "平台币", "平台原生", "发射台", "发射平台", "launchpad", "launch pad",
+    "bonding curve", "agentic",
+)
+OPPORTUNITY_WEAK_KEYWORDS = ("新", "第一")
 BITGET_EXCHANGE_AI_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 BITGET_EXCHANGE_AI_CACHE_LOCK = threading.Lock()
 BITGET_COIN_IDENTITY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -10106,6 +10107,12 @@ GMGN_CHAIN_SLUGS = {
     "bsc": "bsc", "bnb": "bsc", "币安智能链": "bsc",
     "base": "base",
     "robinhood": "robinhood",
+    # Elysium（Kinetiq 的 Hyperliquid 生态 L2，主网 chainId 99901）。GMGN 首日就接了
+    # 这条链 —— 铁证是它自己的 /v1/token/info 返回
+    # ``link.gmgn = https://gmgn.ai/elysium/token/<CA>``，所以站内 slug 就是 ``elysium``。
+    # 注意 ``/v1/trenches`` 那条路由的链注册表里还没有它（会回 CHAIN_NOT_SUPPORTED），
+    # 那是战壕榜接口的事，和「交易页能不能打开」无关。
+    "elysium": "elysium", "99901": "elysium",
 }
 
 
@@ -10333,7 +10340,7 @@ def enrich_binance_wallet_ai_narratives(source: dict[str, Any]) -> dict[str, Any
         return source
     futures = {
         BINANCE_AI_NARRATIVE_POOL.submit(
-            fetch_binance_wallet_ai_narrative,
+            exchange_ai_narrative_for_row,
             row.get("chain"),
             row.get("contractAddress"),
         ): row
@@ -10345,13 +10352,141 @@ def enrich_binance_wallet_ai_narratives(source: dict[str, Any]) -> dict[str, Any
         except Exception:
             continue
         if result:
-            futures[future].update(binance_ai_narrative_chinese_result(result))
+            futures[future].update(result)
     return source
 
 
 def normalize_exchange_ai_binance_chain(value: Any) -> str:
     chain = re.sub(r"\s+", "-", str(value or "").strip().casefold())
     return EXCHANGE_AI_BINANCE_CHAIN_IDS.get(chain, "")
+
+
+def gigax_exchange_ai_chain(value: Any) -> str:
+    """把任意链别名（``bsc`` / ``56`` / ``solana`` / ``CT_501``）折成 GIGA X 桥接认的 slug。
+
+    认不出的链返回 ""，调用方据此直接跳过 GIGA X —— 别拿未映射的链去打上游，
+    那只会白等一次 2.6 秒的超时。
+    """
+    chain = re.sub(r"\s+", "-", clean_feed_text(value, 40).casefold())
+    return GIGAX_EXCHANGE_AI_CHAINS.get(chain, "")
+
+
+def exchange_ai_address_key(chain: Any, contract: Any) -> tuple[str, str]:
+    """同一条 (链, 合约) 的去重键。
+
+    EVM 地址忽略大小写，base58 地址**不**忽略 —— 把 Solana 地址小写化等于换成
+    另一个地址（GIGA X 直接回 Invalid token address），所以只有 ``0x`` 才折叠。
+    """
+    text = clean_feed_text(contract, 180)
+    if text.lower().startswith("0x"):
+        text = text.lower()
+    return (clean_feed_text(chain, 20).casefold(), text)
+
+
+def exchange_ai_legacy_narrative_enabled() -> bool:
+    """GIGA X 没叙事时要不要退回币安 AI / Bitget。
+
+    默认退回（GIGA X 优先 + 老接口兜底）。把 ``EXCHANGE_AI_NARRATIVE_LEGACY_FALLBACK``
+    设成 0 就变成纯 GIGA X：查不到就显示「暂无叙事」，不再问币安。
+    """
+    return env_flag("EXCHANGE_AI_NARRATIVE_LEGACY_FALLBACK", default=True)
+
+
+def exchange_ai_result_from_gigax(result: dict[str, Any]) -> dict[str, Any]:
+    """把 GIGA X 的返回折成 ``exchangeAi*`` 契约。
+
+    GIGA X 是三态（``ok`` / ``no-narrative`` / ``auth``），只有 ``ok`` 且真有正文
+    才算命中；其余一律返回 {}，让调用方继续按顺序兜底，而不是吐一个空框。
+    """
+    if not isinstance(result, dict) or not result.get("ok"):
+        return {}
+    narrative = narrative_chinese_or_unavailable(result.get("text"), 1600)
+    if not narrative:
+        return {}
+    shaped: dict[str, Any] = {
+        "exchangeAiNarrativeAvailable": True,
+        "exchangeAiNarrative": narrative,
+        "exchangeAiNarrativeStatus": "GENERATED",
+        "exchangeAiNarrativeSource": GIGAX_EXCHANGE_AI_SOURCE_LABEL,
+        "exchangeAiNarrativeProvider": GIGAX_EXCHANGE_AI_PROVIDER,
+    }
+    tags: list[str] = []
+    for raw_tag in result.get("categoryTags") or []:
+        tag = clean_feed_text(raw_tag, 24)
+        if tag and tag not in tags:
+            tags.append(tag)
+    if tags:
+        shaped["exchangeAiNarrativeTags"] = tags[:6]
+    return shaped
+
+
+def fetch_gigax_exchange_ai_narrative(chain: Any, contract_address: Any) -> dict[str, Any]:
+    """问 GIGA X 要一个币的叙事（桥接侧 cache-first，命中缓存 30 分钟）。
+
+    桥接只在 ``ok`` / ``no-narrative`` 时写缓存，鉴权与网络错误不会缓存 ——
+    所以这里不需要再加一层本地缓存，也不会把一次抖动记成「这个币没叙事」。
+    """
+    code = gigax_exchange_ai_chain(chain)
+    contract = clean_feed_text(contract_address, 180)
+    if not code or not contract:
+        return {}
+    try:
+        return exchange_ai_result_from_gigax(gigax_api.fetch_narrative(code, contract))
+    except Exception:
+        return {}
+
+
+def exchange_ai_narrative_for_row(chain: Any, contract_address: Any) -> dict[str, Any]:
+    """榜单行用的版本：GIGA X 优先、币安 AI 兜底，并同时写两套字段名。
+
+    新前端只读 ``exchangeAi*``；但弹窗摘要（``binance_wallet_hot_popup_summary``）
+    和 rank monitor 这些老路径仍在读 ``binanceAiNarrative*``，不镜像会让它们
+    在切到 GIGA X 之后凭空丢掉叙事。
+    """
+    hit = fetch_gigax_exchange_ai_narrative(chain, contract_address)
+    if not hit.get("exchangeAiNarrative") and exchange_ai_legacy_narrative_enabled():
+        try:
+            legacy = exchange_ai_result_from_binance(
+                fetch_binance_wallet_ai_narrative(
+                    normalize_exchange_ai_binance_chain(chain),
+                    clean_feed_text(contract_address, 180),
+                )
+            )
+        except Exception:
+            legacy = {}
+        if legacy.get("exchangeAiNarrative"):
+            hit = legacy
+    if not hit.get("exchangeAiNarrative"):
+        return {}
+    return {
+        **hit,
+        "binanceAiNarrative": hit.get("exchangeAiNarrative"),
+        "binanceAiNarrativeSource": hit.get("exchangeAiNarrativeSource"),
+        "binanceAiNarrativeStatus": hit.get("exchangeAiNarrativeStatus"),
+    }
+
+
+def exchange_ai_opportunity_hits(text: Any) -> list[str]:
+    """判断一段叙事里有没有「机会关键词」，返回命中的词（去重）。
+
+    和油猴脚本 ``matchHot`` 同一条规则：强词命中 1 个、弱词（新/第一）命中 2 个才算。
+    否则「新增 / 更新 / 最新」这类泛词会把机会提示刷满，失去区分度。
+    """
+    source = clean_feed_text(text, 1600)
+    if not source:
+        return []
+    strong = [word for word in OPPORTUNITY_STRONG_KEYWORDS if word in source]
+    weak = [
+        word for word in OPPORTUNITY_WEAK_KEYWORDS
+        if word in source and not any(word in item for item in strong)
+    ]
+    hits: list[str] = []
+    for word in strong + weak:
+        if word not in hits:
+            hits.append(word)
+    if not strong and len(weak) < 2:
+        return []
+    return hits
 
 
 def exchange_ai_result_from_binance(result: dict[str, Any]) -> dict[str, Any]:
@@ -10615,12 +10750,31 @@ def exchange_ai_narrative_for_item(raw: dict[str, Any]) -> dict[str, Any]:
     if source_id not in EXCHANGE_AI_NARRATIVE_ALLOWED_SOURCES:
         return {**result, "exchangeAiNarrativeStatus": "UNAVAILABLE", "attemptedProviders": attempted}
 
+    chain_raw = clean_feed_text(raw.get("chain"), 40)
+    contract = clean_feed_text(raw.get("contractAddress"), 180)
+    gigax_tried: set[tuple[str, str]] = set()
+
+    def gigax_lookup(chain_value: Any, contract_value: Any) -> dict[str, Any]:
+        """问一次 GIGA X，并记下这条 (链, 合约) 已经问过，避免同一轮重复等 2.6 秒。"""
+        hit = fetch_gigax_exchange_ai_narrative(chain_value, contract_value)
+        gigax_tried.add(exchange_ai_address_key(chain_value, contract_value))
+        if "GIGA X" not in attempted:
+            attempted.append("GIGA X")
+        return hit
+
+    # 全系统叙事统一先问 GIGA X：行里带合约就先打它，命中直接返回，不再问币安 / Bitget。
+    if contract and gigax_exchange_ai_chain(chain_raw):
+        hit = gigax_lookup(chain_raw, contract)
+        if hit.get("exchangeAiNarrative"):
+            return {**result, **hit, "attemptedProviders": attempted}
+
+    legacy_allowed = exchange_ai_legacy_narrative_enabled()
     if source_id.startswith("okx"):
         # OKX currently exposes no stable anonymous token-narrative endpoint.
         # Keep the provider slot explicit so an upstream OKX AI field can be
         # added without changing the client/provider order.
         attempted.append("OKX AI")
-    elif source_id.startswith("bitget"):
+    elif source_id.startswith("bitget") and legacy_allowed:
         attempted.append("Bitget AI")
         native = fetch_bitget_exchange_ai_narrative(symbol)
         if native.get("exchangeAiNarrative"):
@@ -10634,8 +10788,7 @@ def exchange_ai_narrative_for_item(raw: dict[str, Any]) -> dict[str, Any]:
                 and item.get("contractAddress")
             ][:3]
 
-    chain_id = normalize_exchange_ai_binance_chain(raw.get("chain"))
-    contract = clean_feed_text(raw.get("contractAddress"), 180)
+    chain_id = normalize_exchange_ai_binance_chain(chain_raw)
     if (
         not (chain_id and contract)
         and not verified_fallbacks
@@ -10667,6 +10820,15 @@ def exchange_ai_narrative_for_item(raw: dict[str, Any]) -> dict[str, Any]:
             fallback_targets.append(candidate)
 
     if fallback_targets:
+        # ticker → 官方合约 identity 解出来的目标也要先过 GIGA X：CEX 榜单行
+        # 本身没合约，真正能问 GIGA X 的只有这里解出来的那几个。
+        for fallback_chain_id, fallback_contract in fallback_targets:
+            if exchange_ai_address_key(fallback_chain_id, fallback_contract) in gigax_tried:
+                continue
+            hit = gigax_lookup(fallback_chain_id, fallback_contract)
+            if hit.get("exchangeAiNarrative"):
+                return {**result, **hit, "attemptedProviders": attempted}
+    if fallback_targets and legacy_allowed:
         attempted.append("Binance AI")
         for fallback_chain_id, fallback_contract in fallback_targets:
             try:
@@ -10735,8 +10897,9 @@ def exchange_ai_narratives_payload(payload: dict[str, Any]) -> dict[str, Any]:
         for item in items
     )
     # A trench batch can contain ten brand-new contracts at once. Keep that
-    # Binance AI fan-out deliberately narrow; positive and negative results are
-    # cached by fetch_binance_wallet_ai_narrative.
+    # narrative fan-out deliberately narrow; positive and negative results are
+    # cached inside the GIGA X bridge (30 min / 2 min) and, for the legacy
+    # fallback, by fetch_binance_wallet_ai_narrative.
     worker_limit = 2 if contains_trenches else 6
     pool = EXCHANGE_AI_TRENCH_POOL if worker_limit == 2 else BINANCE_AI_NARRATIVE_POOL
     futures = {
@@ -18141,14 +18304,96 @@ def spawn_background_news_ingest(items: Any) -> None:
     threading.Thread(target=ingest_worker, args=(rows,), daemon=True, name="newsflash-research-ingest").start()
 
 
-def fetch_blockbeats_flash() -> dict[str, Any]:
-    # Race direct + local proxy routes: a stale desktop proxy (HTTP(S)_PROXY env
-    # pointing at a half-dead Clash node) must not hold the newsflash hostage.
-    html_text = http_get_race(
-        "https://www.theblockbeats.info/newsflash",
-        headers=HEADERS,
-        timeout=20,
-    ).text
+BLOCKBEATS_URL = "https://www.theblockbeats.info/newsflash"
+#: 直连取不到律动时的**海外文本中转**。2026-11-18 定案：用户要求「不开 Clash、
+#: 也不断开 Proton」。Proton 的 split tunneling 只解除了 socket 拦截，包仍被改道
+#: 回隧道，所以物理侧无解；能改的只有「谁来帮我们取这一页」。
+#:
+#: 实测（经 Proton，日本出口）：`api.allorigins.win` / `api.codetabs.com` 都 520，
+#: `r.jina.ai` **200 + 2~3 秒**，而且它回的是服务端渲染后的整页 HTML ——
+#: `window.__NUXT__=(function(a,b,…){…})` 原始脚本连变量映射表都在，
+#: 所以 `extract_nuxt_var_map` / `extract_nuxt_object_blocks` **一行都不用改**
+#: （实测 18 条全部解出，id/add_time/title 都对）。
+#:
+#: 置空环境变量 `NEWSFLASH_BLOCKBEATS_RELAY=` 可关闭中转。
+BLOCKBEATS_RELAY_TEMPLATE = (
+    "https://r.jina.ai/{url}"
+    if os.getenv("NEWSFLASH_BLOCKBEATS_RELAY") is None
+    else str(os.getenv("NEWSFLASH_BLOCKBEATS_RELAY") or "").strip()
+)
+BLOCKBEATS_RELAY_TIMEOUT_SECONDS = max(
+    5.0,
+    min(40.0, float(os.getenv("NEWSFLASH_BLOCKBEATS_RELAY_TIMEOUT_SECONDS", "15") or "15")),
+)
+
+#: 律动最后一次成功抓到的条目。上游不可达时（现场：切到 Proton VPN 后出口在日本，
+#: 对方只放行国内 IP，TCP 能连但 TLS 握手被丢包）继续把这份快照端给面板，并显式
+#: 标记 ``stale`` + 原始 ``updatedAt``，而不是让「律动」整个源从快讯页消失。
+#: 铁律同 AIcoin：照回缓存但必须明说年龄，绝不伪装成刚抓到的。
+BLOCKBEATS_LAST_GOOD_PATH = PERSIST_CACHE_DIR / "blockbeats_flash_last_good.json"
+BLOCKBEATS_LAST_GOOD_LOCK = threading.Lock()
+BLOCKBEATS_LAST_GOOD: dict[str, Any] = {"updatedAt": 0, "items": []}
+
+
+def blockbeats_relay_url(template: str, target: str) -> str:
+    body = str(template or "").strip().rstrip("/")
+    if not body:
+        return ""
+    if "{url}" in body:
+        return body.replace("{url}", target)
+    return f"{body}/{target}"
+
+
+def fetch_blockbeats_html() -> tuple[str, str]:
+    """返回 ``(html, route)``；先直连，失败再走海外中转。
+
+    两条路线各有一份独立的死路熔断（键是「域名 + 线路」），所以中转站出问题
+    也不会反过来拖慢直连。
+    """
+    try:
+        return http_get_race(BLOCKBEATS_URL, headers=HEADERS, timeout=12).text, "direct"
+    except Exception as direct_error:
+        relay_url = blockbeats_relay_url(BLOCKBEATS_RELAY_TEMPLATE, BLOCKBEATS_URL)
+        if not relay_url:
+            raise
+        try:
+            relay_headers = {**HEADERS, "X-Return-Format": "html"}
+            return http_get_race(
+                relay_url, headers=relay_headers, timeout=BLOCKBEATS_RELAY_TIMEOUT_SECONDS,
+            ).text, "relay"
+        except Exception as relay_error:
+            raise RuntimeError(
+                f"直连失败（{str(direct_error)[:120]}）；中转失败（{str(relay_error)[:120]}）"
+            ) from direct_error
+
+
+def blockbeats_last_good_snapshot() -> dict[str, Any]:
+    with BLOCKBEATS_LAST_GOOD_LOCK:
+        if BLOCKBEATS_LAST_GOOD.get("items"):
+            return {"updatedAt": int(BLOCKBEATS_LAST_GOOD.get("updatedAt") or 0),
+                    "items": list(BLOCKBEATS_LAST_GOOD["items"])}
+    snapshot = read_json_cache(BLOCKBEATS_LAST_GOOD_PATH)
+    items = snapshot.get("items") if isinstance(snapshot.get("items"), list) else []
+    if not items:
+        return {"updatedAt": 0, "items": []}
+    return {"updatedAt": int(safe_float(snapshot.get("updatedAt"), 0)), "items": items}
+
+
+def remember_blockbeats_last_good(items: list[dict[str, Any]], updated_at: int) -> None:
+    if not items:
+        return
+    with BLOCKBEATS_LAST_GOOD_LOCK:
+        BLOCKBEATS_LAST_GOOD["updatedAt"] = int(updated_at)
+        BLOCKBEATS_LAST_GOOD["items"] = list(items)
+    try:
+        write_json_cache(BLOCKBEATS_LAST_GOOD_PATH, {"updatedAt": int(updated_at), "items": items})
+    except Exception as exc:
+        print(f"BlockBeats snapshot persist deferred: {safe_monitor_error(exc)}", file=sys.stderr)
+
+
+def scrape_blockbeats_flash() -> dict[str, Any]:
+    # 直连优先；直连被拒（境外出口被对方丢包）时自动改走海外中转，解析器不变。
+    html_text, route = fetch_blockbeats_html()
     start = html_text.find("window.__NUXT__=")
     script = html_text[start:] if start >= 0 else html_text
     var_map = extract_nuxt_var_map(script)
@@ -18184,9 +18429,30 @@ def fetch_blockbeats_flash() -> dict[str, Any]:
                 "add_time": add_time,
             }
         )
+    # 抓到 0 条不能当成「律动今天没新闻」：页面结构变了或被降级页顶掉时，
+    # 空列表会把面板清空，比报错更难查。
+    if not items:
+        raise RuntimeError("律动快讯页面解析出 0 条（页面结构可能已变）")
     items = sorted(items, key=lambda item: item.get("add_time") or 0, reverse=True)[:60]
-    spawn_background_news_ingest(items)
-    return {"updatedAt": int(time.time() * 1000), "items": items}
+    return {"updatedAt": int(time.time() * 1000), "items": items, "fetchedVia": route}
+
+
+def fetch_blockbeats_flash() -> dict[str, Any]:
+    try:
+        payload = scrape_blockbeats_flash()
+    except Exception as exc:
+        snapshot = blockbeats_last_good_snapshot()
+        if not snapshot["items"]:
+            raise
+        return {
+            "updatedAt": snapshot["updatedAt"],
+            "items": snapshot["items"],
+            "stale": True,
+            "error": str(exc)[:300],
+        }
+    remember_blockbeats_last_good(payload["items"], payload["updatedAt"])
+    spawn_background_news_ingest(payload["items"])
+    return payload
 
 
 BLOCKBEATS_FLASH_MEMO_LOCK = threading.Lock()
@@ -19855,196 +20121,6 @@ def parse_iso_ms(value: str | None) -> int | None:
         return None
 
 
-def clean_automation_message(value: str) -> str:
-    value = re.sub(r"\n?::inbox-item\{.*?\}\s*$", "", value or "", flags=re.S).strip()
-    value = value.replace("\ue200", "").replace("\ue201", "").replace("\ue202", " ")
-    return value
-
-
-def automation_brief_time_ms(value: Any) -> int | None:
-    if value is None or value == "":
-        return None
-    if isinstance(value, (int, float)):
-        number = float(value)
-        return int(number if number > 10_000_000_000 else number * 1000)
-    text = str(value).strip()
-    if not text:
-        return None
-    if re.fullmatch(r"\d+(?:\.\d+)?", text):
-        number = float(text)
-        return int(number if number > 10_000_000_000 else number * 1000)
-    return parse_iso_ms(text)
-
-
-def automation_brief_has_content(brief: dict[str, Any]) -> bool:
-    content = clean_automation_message(str(brief.get("content") or ""))
-    return bool(content and content != AUTOMATION_BRIEF_PLACEHOLDER)
-
-
-def normalize_automation_brief(value: Any, fallback_id: str = "") -> dict[str, Any]:
-    if not isinstance(value, dict):
-        return {}
-    automation_id = str(value.get("id") or value.get("automationId") or fallback_id or "").strip()
-    if not automation_id:
-        return {}
-    config = automation_config(automation_id)
-    content = clean_automation_message(str(value.get("content") or value.get("body") or value.get("markdown") or ""))
-    return {
-        "id": automation_id,
-        "name": value.get("name") or config.get("name") or automation_id,
-        "status": value.get("status") or config.get("status") or "UNKNOWN",
-        "rrule": value.get("rrule") or config.get("rrule") or "",
-        "updatedAt": automation_brief_time_ms(value.get("updatedAt") or value.get("updated_at") or config.get("updated_at")),
-        "completedAt": automation_brief_time_ms(value.get("completedAt") or value.get("completed_at") or value.get("createdAt")),
-        "sourceFile": value.get("sourceFile") or value.get("source") or "",
-        "content": content or AUTOMATION_BRIEF_PLACEHOLDER,
-    }
-
-
-def normalize_automation_briefs_payload(payload: Any, *, source_name: str) -> dict[str, Any]:
-    if isinstance(payload, list):
-        raw_briefs = payload
-        updated_at = int(time.time() * 1000)
-    elif isinstance(payload, dict):
-        raw_briefs = payload.get("briefs") if isinstance(payload.get("briefs"), list) else []
-        updated_at = automation_brief_time_ms(payload.get("updatedAt") or payload.get("generatedAt")) or int(time.time() * 1000)
-    else:
-        raw_briefs = []
-        updated_at = int(time.time() * 1000)
-    briefs = []
-    for index, item in enumerate(raw_briefs):
-        fallback_id = AUTOMATION_BRIEF_IDS[index] if index < len(AUTOMATION_BRIEF_IDS) else ""
-        brief = normalize_automation_brief(item, fallback_id=fallback_id)
-        if brief:
-            briefs.append(brief)
-    return {"updatedAt": updated_at, "source": source_name, "briefs": briefs}
-
-
-def automation_briefs_remote_url() -> str:
-    if raw_env_flag("AUTOMATION_BRIEFS_DISABLE_REMOTE", default=False):
-        return ""
-    return (
-        env_value("AUTOMATION_BRIEFS_REMOTE_URL")
-        or env_value("XINGYUN_BRIEFS_GITHUB_RAW_URL")
-        or AUTOMATION_BRIEFS_DEFAULT_REMOTE_URL
-    ).strip()
-
-
-def load_bundled_automation_briefs() -> dict[str, Any]:
-    if not AUTOMATION_BRIEFS_BUNDLED_PATH.exists():
-        return {}
-    payload = read_json_cache(AUTOMATION_BRIEFS_BUNDLED_PATH)
-    normalized = normalize_automation_briefs_payload(payload, source_name="github-bundled")
-    if normalized.get("briefs"):
-        normalized["_cache"] = {
-            "key": "automation-briefs-bundled",
-            "updatedAt": automation_brief_time_ms(normalized.get("updatedAt")) or int(time.time() * 1000),
-            "stale": False,
-        }
-        normalized["remoteUrl"] = str(AUTOMATION_BRIEFS_BUNDLED_PATH)
-    return normalized
-
-
-def prefer_newer_automation_payload(primary: dict[str, Any], secondary: dict[str, Any]) -> dict[str, Any]:
-    if not primary.get("briefs"):
-        return secondary
-    if not secondary.get("briefs"):
-        return primary
-    primary_time = automation_brief_time_ms(primary.get("updatedAt")) or 0
-    secondary_time = automation_brief_time_ms(secondary.get("updatedAt")) or 0
-    return primary if primary_time >= secondary_time else secondary
-
-
-def load_remote_automation_briefs() -> dict[str, Any]:
-    url = automation_briefs_remote_url()
-    cached_remote = read_json_cache(AUTOMATION_BRIEFS_REMOTE_CACHE_PATH)
-    bundled_remote = load_bundled_automation_briefs()
-    if not url:
-        return prefer_newer_automation_payload(cached_remote, bundled_remote)
-    cached_age = time.time() - payload_cache_time(cached_remote) if cached_remote else 10**9
-    if cached_remote and cached_age < int(safe_float(env_value("AUTOMATION_BRIEFS_REMOTE_TTL_SECONDS", "120"), 120)):
-        return prefer_newer_automation_payload(cached_remote, bundled_remote)
-    try:
-        response = requests.get(
-            url,
-            headers={
-                **HEADERS,
-                "Accept": "application/json,text/plain,*/*",
-                "Cache-Control": "no-cache",
-            },
-            timeout=int(safe_float(env_value("AUTOMATION_BRIEFS_REMOTE_TIMEOUT", "12"), 12)),
-        )
-        response.raise_for_status()
-        payload = normalize_automation_briefs_payload(response.json(), source_name="github")
-        payload["_cache"] = {"key": "automation-briefs-remote", "updatedAt": int(time.time() * 1000), "stale": False}
-        payload["remoteUrl"] = url
-        if payload.get("briefs"):
-            write_json_cache(AUTOMATION_BRIEFS_REMOTE_CACHE_PATH, payload)
-            return prefer_newer_automation_payload(payload, bundled_remote)
-    except Exception:
-        pass
-    return prefer_newer_automation_payload(cached_remote, bundled_remote)
-
-
-def merge_automation_brief(local: dict[str, Any], remote: dict[str, Any] | None) -> dict[str, Any]:
-    if not remote or not automation_brief_has_content(remote):
-        return local
-    if automation_brief_has_content(local):
-        local_time = automation_brief_time_ms(local.get("completedAt")) or 0
-        remote_time = automation_brief_time_ms(remote.get("completedAt")) or 0
-        if local_time >= remote_time:
-            return local
-    merged = dict(local)
-    merged.update({key: value for key, value in remote.items() if value not in (None, "")})
-    if local.get("status") and local.get("status") != "UNKNOWN":
-        merged["status"] = local["status"]
-    if local.get("rrule"):
-        merged["rrule"] = local["rrule"]
-    return merged
-
-
-def automation_config(automation_id: str) -> dict[str, Any]:
-    path = CODEX_HOME / "automations" / automation_id / "automation.toml"
-    if not path.exists():
-        return {"id": automation_id, "name": automation_id, "status": "UNKNOWN", "rrule": "", "target_thread_id": ""}
-    with path.open("rb") as handle:
-        data = tomllib.load(handle)
-    return {
-        "id": data.get("id") or automation_id,
-        "name": data.get("name") or automation_id,
-        "status": data.get("status") or "UNKNOWN",
-        "rrule": data.get("rrule") or "",
-        "target_thread_id": data.get("target_thread_id") or "",
-        "updated_at": data.get("updated_at"),
-    }
-
-
-def automation_run_threads(automation_id: str) -> list[str]:
-    db_path = CODEX_HOME / "sqlite" / "codex-dev.db"
-    thread_ids: list[str] = []
-    if db_path.exists():
-        try:
-            conn = sqlite3.connect(db_path)
-            rows = conn.execute(
-                """
-                select thread_id
-                from automation_runs
-                where automation_id = ?
-                order by coalesce(updated_at, created_at) desc
-                limit 12
-                """,
-                (automation_id,),
-            ).fetchall()
-            thread_ids.extend(row[0] for row in rows if row and row[0])
-            conn.close()
-        except Exception:
-            pass
-    config_thread = automation_config(automation_id).get("target_thread_id")
-    if config_thread:
-        thread_ids.append(config_thread)
-    return list(dict.fromkeys(thread_ids))
-
-
 def session_files_for_threads(thread_ids: list[str]) -> list[Path]:
     files: list[Path] = []
     roots = [CODEX_HOME / "sessions", CODEX_HOME / "archived_sessions"]
@@ -20126,51 +20202,6 @@ def parse_automation_records(path: Path, automation_id: str, name: str) -> list[
     return records
 
 
-def latest_automation_brief(automation_id: str) -> dict[str, Any]:
-    config = automation_config(automation_id)
-    thread_ids = automation_run_threads(automation_id)
-    records: list[dict[str, Any]] = []
-    for path in session_files_for_threads(thread_ids):
-        records.extend(parse_automation_records(path, automation_id, config["name"]))
-    records = [record for record in records if record.get("content")]
-    records.sort(key=lambda record: record.get("completedAt") or record.get("startedAt") or 0, reverse=True)
-    latest = records[0] if records else {}
-    return {
-        "id": automation_id,
-        "name": config["name"],
-        "status": config["status"],
-        "rrule": config["rrule"],
-        "updatedAt": config.get("updated_at"),
-        "completedAt": latest.get("completedAt"),
-        "sourceFile": latest.get("sourceFile"),
-        "content": latest.get("content") or AUTOMATION_BRIEF_PLACEHOLDER,
-    }
-
-
-def automation_briefs_payload() -> dict[str, Any]:
-    ids = list(AUTOMATION_BRIEF_IDS)
-    local_briefs = [latest_automation_brief(automation_id) for automation_id in ids]
-    remote_payload = load_remote_automation_briefs()
-    remote_by_id = {
-        str(item.get("id")): item
-        for item in remote_payload.get("briefs", [])
-        if isinstance(item, dict) and item.get("id")
-    }
-    briefs = [merge_automation_brief(brief, remote_by_id.get(brief.get("id"))) for brief in local_briefs]
-    updated_at = max(
-        [int(time.time() * 1000)]
-        + [int(automation_brief_time_ms(item.get("completedAt") or item.get("updatedAt")) or 0) for item in briefs]
-        + [int(automation_brief_time_ms(remote_payload.get("updatedAt")) or 0)]
-    )
-    return {
-        "updatedAt": updated_at,
-        "source": "local+github" if remote_payload.get("briefs") else "local",
-        "remoteLoaded": bool(remote_payload.get("briefs")),
-        "remoteUpdatedAt": remote_payload.get("updatedAt"),
-        "briefs": briefs,
-    }
-
-
 def recover_market_sources_from_independent_caches(payload: dict[str, Any]) -> dict[str, Any]:
     """Replace failed composite cards with their latest successful source cache.
 
@@ -20210,7 +20241,42 @@ def recover_market_sources_from_independent_caches(payload: dict[str, Any]) -> d
     return {**payload, "sources": repaired} if changed else payload
 
 
+def attach_rootdata_investors(source: dict[str, Any]) -> dict[str, Any]:
+    """把「机构在投项目」挂在项目榜卡片上，供前端下拉框客户端切换。
+
+    交付形态照抄 GMGN 热搜 / 币安钱包那套：``investorOptions`` + ``investorBoards``，
+    切机构**不重新请求**，直接在已有 payload 里换一张板 —— 因为驱动这张板的是
+    RootData 的签名接口，来得慢（3 秒一轮），不能挂在 60 秒轮询的路径上。
+
+    数据过期就在后台补一次（``refresh_async`` 自带闸门），本轮仍返回旧快照 + 年龄。
+    """
+    options = [{"value": "", "label": "全部 · 热度榜"}]
+    boards: list[dict[str, Any]] = []
+    for investor in ROOTDATA_INVESTOR.INVESTORS:
+        board = ROOTDATA_INVESTOR.board_rows(investor["value"])
+        total = int(board.get("total") or 0)
+        options.append({
+            "value": investor["value"],
+            # 数字写进标签：切过去之前就能看出这机构有多少「没发币还在跑」的项目。
+            "label": f"{investor['label']} · 未发币 {total}" if total else f"{investor['label']} · 未发币",
+        })
+        if total and board.get("status") != "stale":
+            boards.append(board)
+            continue
+        # 快照缺失或已过期 → 派一次后台刷新；这一轮先把旧行发出去（有就发）。
+        ROOTDATA_INVESTOR.refresh_async(investor["value"])
+        boards.append(board)
+    source["investor"] = ""
+    source["investorOptions"] = options
+    source["investorBoards"] = boards
+    return source
+
+
 def fetch_rootdata_projects() -> dict[str, Any]:
+    return attach_rootdata_investors(_rootdata_projects_source())
+
+
+def _rootdata_projects_source() -> dict[str, Any]:
     """RootData 项目热门榜：按 RD 热度指数倒排，滤掉交易所/稳定币这些老大哥。
 
     2026-11-07 实测：``www.rootdata.com`` 挂在腾讯云 WAF 后面，但 ``cn.rootdata.com``
@@ -22512,7 +22578,7 @@ def self_optimization_project_snapshot() -> dict[str, Any]:
             continue
         todo_count += len(re.findall(r"\b(?:TODO|FIXME|HACK)\b", content, flags=re.I))
     sources = []
-    for key in ("market-hot", "gainers-rankings", "newsflash", "automation-briefs"):
+    for key in ("market-hot", "gainers-rankings", "newsflash"):
         overview = payload_source_overview(key)
         sources.append({
             "key": key,
@@ -23718,11 +23784,6 @@ def deepseek_load_discussion_items() -> list[dict[str, Any]]:
             ])
             add_item("X/KOL", item, text)
 
-    briefs = read_json_cache(PERSIST_CACHE_DIR / "api_automation-briefs.json")
-    for item in briefs.get("briefs", []) if isinstance(briefs.get("briefs"), list) else []:
-        if isinstance(item, dict):
-            add_item("自动简报", item, deepseek_flat_text(item.get("content"), 900))
-
     candidates.sort(key=lambda item: item.get("time") or 0, reverse=True)
     return candidates[: int(safe_float(env_value("MARKET_NARRATIVE_CONTEXT_LIMIT", "180"), 180))]
 
@@ -24046,7 +24107,7 @@ def deepseek_chat(messages: list[dict[str, str]], settings: dict[str, Any] | Non
 def deepseek_rank_prompt(rows: list[dict[str, Any]], mode: str) -> list[dict[str, str]]:
     system = (
         "你是星云社的交易市场题材分析助手，擅长把榜单变化拆成明牌原因、真实情绪点和当前市场叙事。"
-        "请综合交易所、榜单类型、标的名称、价格、涨跌幅、成交额、热度、备注、标签、row.taxonomyContext，以及 row.discussionContext 中的近期快讯/X/KOL/自动简报上下文。"
+        "请综合交易所、榜单类型、标的名称、价格、涨跌幅、成交额、热度、备注、标签、row.taxonomyContext，以及 row.discussionContext 中的近期快讯/X/KOL 上下文。"
         "所有标的都必须按同一套逻辑处理：先看近期市场讨论，再看生态/板块/题材，再结合价格和成交额验证。"
         "如果 discussionContext 不为空，必须优先参考它；其次参考 taxonomyContext；不要只按静态板块或旧项目标签判断。"
         "必须谨慎：可以基于输入给出判断，但不要编造没有依据的合作、上市或监管信息。"
@@ -25038,6 +25099,9 @@ DESKTOP_ALERT_CHAIN_ALIASES: dict[str, str] = {
     "starknet": "Starknet", "strk": "Starknet", "hyperliquid": "Hyperliquid",
     "hyperevm": "Hyperliquid", "mantle": "Mantle", "sei": "Sei", "plasma": "Plasma",
     "megaeth": "MegaETH", "berachain": "Berachain", "blast": "Blast", "linea": "Linea",
+    # Elysium（Kinetiq 的 Hyperliquid 生态 L2，主网 chainId 99901）。
+    # 裸链号一律不认（那一段逻辑在上面直接拦截），这里只给名字。
+    "elysium": "Elysium", "99901": "Elysium",
 }
 # 上游占位符不是链名（「链上」「多链」清洗后为空，这里再兜一层英文占位）。
 DESKTOP_ALERT_CHAIN_PLACEHOLDERS = frozenset({
@@ -26438,6 +26502,12 @@ def desktop_alert_political_military_reason(item: dict[str, Any]) -> str:
     # 跟聪明钱一样按 key 前缀白名单放行，否则用户点名要的弹窗会被静默规则悄悄吃掉。
     if key.startswith(("rootdata-funding:", "rootdata-project:")):
         return ""
+    # 战壕新币关键词（2026-11-25）：这条消息讲的是「链上刚发了一个叫 XX 的币」，
+    # 名字里带「特朗普 / 马斯克 / 大选」正是**要抓的信号**，不是政治军事动态。
+    # 不按 key 放行的话，用户点名要的那几个词会被这条静默规则悄悄吃掉 —— 和白名单里
+    # 一级融资那两条是同一个道理。
+    if key.startswith(("new-token-keyword:",)):
+        return ""
     text = " ".join(
         part for part in (
             alert_text(item.get("title"), 240),
@@ -26585,7 +26655,7 @@ def desktop_alert_is_news_trade_intake(item: dict[str, Any]) -> bool:
         or kind.startswith("News Trade")
     ):
         return False
-    if kind in {"公众号授权", "自动简报", "微信群聊机会", "系统自优化", "系统优化结果"}:
+    if kind in {"公众号授权", "微信群聊机会", "系统自优化", "系统优化结果"}:
         return False
     # These are the news/event families currently capable of producing a popup.
     # Market rank/price movement popups are intentionally not treated as news.
@@ -26930,6 +27000,14 @@ def desktop_alert_delivery_tick() -> None:
     """Display every fresh pending alert immediately while a window slot exists."""
     global DESKTOP_ALERT_LAST_LAUNCHED_AT, DESKTOP_ALERT_LAST_LAUNCHED_PRIORITY
     global DESKTOP_ALERT_ACTIVE_PROCESS, DESKTOP_ALERT_ACTIVE_PROCESS_SLOT
+    # 事件流只读模式的总闸。**必须堵在这里**，不能只堵 `launch_desktop_alert()`：
+    # `desktop_alert_queue_worker()` 是个后台线程，每 0.5 秒无脑调一次本函数，
+    # 只要队列里有 pending 行它就会 `spawn_desktop_alert_process()` 弹出窗口 ——
+    # 而那批行是 admit() 写进去的，跟「谁触发投递」毫无关系。
+    # 只 sweep 不投递：过期的行照常清掉，别让 SQLite 里堆一辈子。
+    if DESKTOP_ALERT_STREAM_ONLY:
+        ALERT_DELIVERY_STORE.sweep(now=time.time())
+        return
     now = time.time()
     for identity, active in list(DESKTOP_ALERT_DELIVERIES.items()):
         row = ALERT_DELIVERY_STORE.get(identity)
@@ -27149,6 +27227,26 @@ def claim_desktop_alert_marker(keys: list[str], now: float) -> bool:
 
 
 def record_event_flow_popup(item: dict[str, Any], stage: str, reason: str = "") -> None:
+    # 事件流窗口（左下角固定浮窗）要把原先弹窗的能力原样带过去：语音、查看、叙事。
+    # 这三样以前只活在 ``desktop_alert.py`` 的进程内存里 —— 弹窗一关就没了 ——
+    # 所以必须在这里落库，否则窗口只能显示一行标题，点开任何按钮都是空的。
+    #
+    # 注意 ``EventFlowStore.record()`` 会把整个 data 当 fingerprint 的一部分，
+    # 所以**不要**往里塞每次调用都变的字段（比如 now()），否则同一条消息每写一次
+    # 都会 bump 一次 revision，窗口的 after 游标就会重复推送整屏。
+    voice_text = (
+        clean_feed_text(item.get("speech"), 160)
+        or clean_feed_text(item.get("originalText"), 800)
+        or clean_feed_text(item.get("body"), 400)
+        or clean_feed_text(item.get("title"), 220)
+    )
+    # ``item["time"]`` 在不同源上单位不一致：Alpha/价格异动那几条给的是**秒**，
+    # 聪明钱给的是**毫秒**。实测 16:45 那条 Alpha 写进去是 1795682674，渲染侧
+    # 一律按毫秒除 1000 → 直接显示成 1970。这里统一成毫秒再入库存。
+    raw_event_at = safe_float(item.get("time"), 0)
+    event_at_ms = (
+        int(raw_event_at * 1000) if 0 < raw_event_at < 1e11 else int(raw_event_at)
+    ) or int(time.time() * 1000)
     try:
         identity = str(item.get("eventFlowKey") or "") or "popup:" + str(item.get("key") or js_stable_key(item.get("source"), item.get("title")))
         EVENT_FLOW_STORE.record(identity, "popup", {
@@ -27159,6 +27257,20 @@ def record_event_flow_popup(item: dict[str, Any], stage: str, reason: str = "") 
             "url": clean_feed_text(item.get("url"), 600),
             "reason": clean_feed_text(reason, 180),
             "symbol": desktop_alert_monitor_symbol(item),
+            # —— 以下是「事件流窗口」专用字段（老页面不读，不影响任何渲染）——
+            "voiceText": voice_text,
+            "quoteText": clean_feed_text(item.get("quoteText"), 900),
+            "explanation": clean_feed_text(item.get("binanceAiNarrative"), 1200),
+            "explanationStatus": clean_feed_text(item.get("binanceAiNarrativeStatus"), 40),
+            "contractAddress": clean_feed_text(item.get("contractAddress"), 180),
+            "chain": clean_feed_text(item.get("chain"), 50),
+            "chainLabel": clean_feed_text(item.get("chainLabel"), 40),
+            "sourceId": clean_feed_text(item.get("sourceId"), 120),
+            "priority": clean_feed_text(item.get("priority"), 18),
+            "alertTone": clean_feed_text(item.get("alertTone"), 12),
+            "board": clean_feed_text(item.get("board"), 24),
+            # 毫秒时间戳：窗口要按它排「几点几分」，而且它天然稳定（同一条消息不变）。
+            "eventAt": event_at_ms,
         }, stage, int(time.time() * 1000), aliases=desktop_alert_flow_aliases(item))
     except Exception as exc:
         print(f"Event flow popup record failed: {safe_error_text(str(exc))}", file=sys.stderr)
@@ -27166,7 +27278,13 @@ def record_event_flow_popup(item: dict[str, Any], stage: str, reason: str = "") 
 
 def launch_desktop_alert(payload: dict[str, Any]) -> dict[str, Any]:
     global DESKTOP_ALERT_SEEN_LOADED
-    if env_flag("XINGYUN_DISABLE_DESKTOP_ALERT", default=is_production_mode()):
+    # 事件流只读模式（用户 2026-11-26：「弹窗全部停掉，只留事件流」）：
+    # 弹窗不再投递到系统通知，但**照样入库到事件流**。过滤/静音/去重/结构剔除全都照跑，
+    # 绝不在这里早退 —— 否则事件流会被本该静音的噪音灌满，而且窗口一条也收不到。
+    # `XINGYUN_DISABLE_DESKTOP_ALERT=1` 仍是「连事件流也不要」的总闸（老语义）。
+    if not DESKTOP_ALERT_STREAM_ONLY and env_flag(
+        "XINGYUN_DISABLE_DESKTOP_ALERT", default=is_production_mode()
+    ):
         return {"ok": True, "skipped": True, "reason": "desktop alerts disabled"}
     # 所有弹窗都从这一处出闸：在这里统一补「这个币在哪条链」，别指望 26 个调用点各自记得带上。
     normalized = annotate_desktop_alert_chain(normalize_desktop_alert(payload))
@@ -27249,9 +27367,17 @@ def launch_desktop_alert(payload: dict[str, Any]) -> dict[str, Any]:
         return result
     # Delivery is attempted in the producer's own turn. Persistence remains
     # only for dedupe/crash recovery and must never pace fresh information.
-    deliver_desktop_alerts_now()
-    prefetch_popup_explanations(normalized)
-    record_event_flow_popup(normalized, "accepted", "消息到达后已直接触发并发窗口")
+    if DESKTOP_ALERT_STREAM_ONLY:
+        # 用户 2026-11-26：「弹窗全部停掉，只留左下角事件流窗口」。
+        # 走到这里说明这条消息已经过了全部闸门（静音 / 板块 / 结构剔除 / 链上去重），
+        # 只差最后一步投递。跳过它，但**照常入库事件流** —— 窗口读的就是这张表。
+        prefetch_popup_explanations(normalized)
+        record_event_flow_popup(normalized, "stream", "弹窗已关闭，只进事件流窗口")
+        result = {**result, "ok": True, "skipped": True, "streamOnly": True}
+    else:
+        deliver_desktop_alerts_now()
+        prefetch_popup_explanations(normalized)
+        record_event_flow_popup(normalized, "accepted", "消息到达后已直接触发并发窗口")
 
     # Recording happens only after global filtering and desktop-alert dedupe, so
     # suppressed military/whale items and duplicate popups never enter News Trade.
@@ -27262,14 +27388,81 @@ def launch_desktop_alert(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+# 同一钱包在同一代币上的连续买入只弹一次（用户 2026-11-09「重复弹了」）。
+#
+# 事件唯一性由 ``event_key``（= tx hash）保证，所以 KOL 把一笔买单拆成两笔 tx 时，
+# 两笔天然是两个 key，投递层 ``DESKTOP_ALERT_SEEN_*`` 拦不住 —— 实测 09:50:58 与
+# 09:51:01 各弹了一条一模一样的「买入 MONTRA · $3,740」（50 HYPE × 2 笔，间隔 20 秒）。
+# 所以在这一层按 (链, 钱包, 代币) 做时间窗合并：窗口内只弹第一条，后面的累计笔数与
+# 金额；下一个窗口打开时的第一条把上一窗口的累计值写在正文里，钱不会被吃掉。
+#
+# 窗口用**墙钟**而不是事件时间：事件时间来自链上出块，回填/重启补扫时会把几个小时前
+# 的成交一次性喂进来，用它算窗口会把真实的连续买入误合并。
+SMART_MONEY_BUY_POPUP_WINDOW_SECONDS = 300.0
+SMART_MONEY_BUY_POPUP_LEDGER_LIMIT = 2000
+SMART_MONEY_BUY_POPUP_LEDGER: dict[str, dict[str, float]] = {}
+SMART_MONEY_BUY_POPUP_LEDGER_LOCK = threading.Lock()
+
+
+def smart_money_short_address(value: Any, head: int = 6, tail: int = 4) -> str:
+    """0x7b3d8e939ee08b52d06ab5e6f85791a6007e8d61 → 0x7b3d…8d61。
+
+    弹窗正文只有一行，几十个字符的完整地址会把后面的内容挤出可视区域 —— 用户看到的
+    就是「钱包」后面一片空白（2026-11-09 截图）。标题本来就按这个规则缩写，正文跟着走。
+    """
+    text = clean_feed_text(value, 120)
+    if len(text) <= head + tail + 1:
+        return text
+    return f"{text[:head]}…{text[-tail:]}"
+
+
+def smart_money_buy_popup_cluster(
+    chain: Any, wallet: Any, token: Any, usd: Any = 0.0, now: float | None = None
+) -> tuple[bool, int, float]:
+    """判断这条买入该不该弹，顺带把上一窗口被合并掉的笔数/金额带出来。
+
+    返回 ``(允许弹?, 上一窗口合并的笔数, 上一窗口合并的美元金额)``。
+    """
+    chain_key = clean_feed_text(chain, 30).lower()
+    wallet_key = clean_feed_text(wallet, 120).lower()
+    token_key = clean_feed_text(token, 120).lower()
+    if not wallet_key or not token_key:
+        return True, 0, 0.0
+    key = f"{chain_key}:{wallet_key}:{token_key}"
+    stamp = time.time() if now is None else now
+    amount = max(0.0, safe_float(usd))
+    with SMART_MONEY_BUY_POPUP_LEDGER_LOCK:
+        entry = SMART_MONEY_BUY_POPUP_LEDGER.get(key)
+        if entry and stamp - safe_float(entry.get("at")) < SMART_MONEY_BUY_POPUP_WINDOW_SECONDS:
+            entry["count"] = safe_float(entry.get("count")) + 1
+            entry["usd"] = safe_float(entry.get("usd")) + amount
+            return False, 0, 0.0
+        merged_count = int(safe_float(entry.get("count"))) if entry else 0
+        merged_usd = safe_float(entry.get("usd")) if entry else 0.0
+        SMART_MONEY_BUY_POPUP_LEDGER[key] = {"at": stamp, "count": 0.0, "usd": 0.0}
+        if len(SMART_MONEY_BUY_POPUP_LEDGER) > SMART_MONEY_BUY_POPUP_LEDGER_LIMIT:
+            cutoff = stamp - 3600.0
+            for stale_key, stale in list(SMART_MONEY_BUY_POPUP_LEDGER.items()):
+                if safe_float(stale.get("at")) < cutoff:
+                    SMART_MONEY_BUY_POPUP_LEDGER.pop(stale_key, None)
+        return True, merged_count, merged_usd
+
+
+def reset_smart_money_buy_popup_cluster() -> None:
+    """清空合并台账（测试用；进程内重启也会自然清空）。"""
+    with SMART_MONEY_BUY_POPUP_LEDGER_LOCK:
+        SMART_MONEY_BUY_POPUP_LEDGER.clear()
+
+
 def send_smart_money_buy_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
     chain = clean_feed_text(event.get("chain"), 30).lower()
     chain_meta = SMART_MONEY_CHAIN_META.get(chain) or {}
     symbol = clean_feed_text(event.get("symbol") or "未知代币", 40)
-    nickname = clean_feed_text(
-        event.get("walletNickname") or event.get("walletAddress") or "聪明钱",
-        80,
-    )
+    wallet_address = clean_feed_text(event.get("walletAddress"), 60)
+    # 没有备注名时不要退化成 42 位完整地址（标题会被撑爆）：直接用缩写。
+    nickname = clean_feed_text(event.get("walletNickname"), 80)
+    if not nickname or nickname.lower() == wallet_address.lower():
+        nickname = smart_money_short_address(wallet_address) or "聪明钱"
     payment_usd = safe_float(event.get("paymentUsd"))
     payment_asset = clean_feed_text(event.get("paymentAsset") or "USDT", 20)
     payment_amount = safe_float(event.get("paymentAmount"))
@@ -27278,11 +27471,14 @@ def send_smart_money_buy_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
     # 「查看」必须落在 GMGN 的对应 CA 交易页（用户就在那儿下单），而不是链上交易
     # 记录查询页。链代号先折算成 GMGN 的 slug（ethereum→eth、solana→sol），折算不出来
     # 时才回落到区块浏览器，保证这个按钮永远不会变成死链接。
+    #
+    # 2026-11-09 用户明确要求「点击查看要跳转到 GMGN 的交易页 / 不要跳转到
+    # dexscreener」，所以这里不再做任何站外特判：elysium 的 slug 已补进
+    # ``GMGN_CHAIN_SLUGS``，和其它链走同一条路径。
     explorer = clean_feed_text(chain_meta.get("explorer"), 300)
     url = gmgn_token_trade_url(gmgn_chain_slug(chain), token_address) or (
         explorer.format(quote(tx_hash, safe="")) if explorer and tx_hash else ""
     )
-    wallet_address = clean_feed_text(event.get("walletAddress"), 60)
     # The popup line is PER WALLET (e.g. 100U for a small KOL wallet), so the card
     # must print the line this event actually cleared instead of a fixed 10,000U.
     # ``record_buy`` stamps the threshold onto the event's details.
@@ -27291,6 +27487,45 @@ def send_smart_money_buy_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
     priority_label = (
         f"单笔 ≥ {alert_threshold_usd:,.0f}U" if alert_threshold_usd > 0 else "单笔 ≥ 10,000U"
     )
+    # 拆单/连买只弹一条：窗口内的后续买入在弹窗层静默（聪明钱列表仍然逐笔记账）。
+    allow_popup, merged_count, merged_usd = smart_money_buy_popup_cluster(
+        chain, wallet_address, token_address, payment_usd
+    )
+    if not allow_popup:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "clustered with a recent buy on the same token",
+            "category": "smart-money-cluster",
+        }
+    body = (
+        f"{chain_meta.get('label') or chain} · 支付 {payment_amount:,.4g} {payment_asset} · "
+        f"钱包 {smart_money_short_address(wallet_address)}"
+    )
+    if merged_count > 0:
+        body = (
+            f"{body} · 近 {int(SMART_MONEY_BUY_POPUP_WINDOW_SECONDS // 60)} 分钟另 "
+            f"{merged_count} 笔 +${merged_usd:,.0f}"
+        )
+    # 机会关键词联动（用户 2026-11-18）：KOL 买入的币如果 GIGA X 叙事命中了机会
+    # 关键词（新机制 / 首个 / 平台币 / 发射台 / agentic…），在弹窗正文点名命中的词，
+    # 并把整条弹窗报红（alertTone=red）—— KOL 买 + 新叙事 = 更该看的信号。
+    # 取数走 GIGA X 桥接（cache-first，冷查 ~2.6s、命中缓存 0.01s）；查不到 / 没叙事
+    # 就静默，绝不为一句可选提示阻塞或拖慢弹窗本身。
+    opportunity_note = ""
+    alert_tone = None
+    if token_address:
+        try:
+            opp_hits = exchange_ai_opportunity_hits(
+                fetch_gigax_exchange_ai_narrative(chain, token_address).get("exchangeAiNarrative")
+            )
+        except Exception:
+            opp_hits = []
+        if opp_hits:
+            opportunity_note = f"机会关键词命中：{'、'.join(opp_hits[:4])}"
+            alert_tone = "red"
+    if opportunity_note:
+        body = append_alert_body_note(body, opportunity_note, limit=180)
     return launch_desktop_alert({
         "key": f"smart-money-buy:{clean_feed_text(event.get('eventKey'), 160)}",
         "kind": "聪明钱买入",
@@ -27303,10 +27538,7 @@ def send_smart_money_buy_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
         # EXCHANGE_AI_NARRATIVE_ALLOWED_SOURCES or the lookup returns UNAVAILABLE.
         "sourceId": "smart-money-buy",
         "title": f"KOL {nickname} 买入 {symbol} · ${payment_usd:,.0f}",
-        "body": (
-            f"{chain_meta.get('label') or chain} · 支付 {payment_amount:,.4g} {payment_asset} · "
-            f"钱包 {wallet_address}"
-        ),
+        "body": body,
         "contractAddress": token_address,
         "chain": chain,
         "url": url,
@@ -27315,6 +27547,7 @@ def send_smart_money_buy_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
         "queuePriority": 120,
         "speech": f"聪明钱 {nickname} 买入 {symbol}，金额约 {payment_usd:,.0f} 美元",
         "originalText": json.dumps(event, ensure_ascii=False)[:1800],
+        **({"alertTone": alert_tone} if alert_tone else {}),
     })
 
 
@@ -27393,6 +27626,24 @@ def send_rootdata_funding_desktop_alert(event: dict[str, Any]) -> dict[str, Any]
         body_parts.append(f"估值 {valuation}")
     if investors:
         body_parts.append("投资方 " + " / ".join(investors[:3]))
+    # 详情页补的字段也进正文（增量抓取补齐后，新进弹窗能带上简介/标签/生态/成立时间）。
+    intro = clean_feed_text(event.get("intro"), 90)
+    if intro:
+        body_parts.append(intro)
+    detail_tags = [
+        clean_feed_text(tag, 24)
+        for tag in (event.get("tags") or [])
+        if clean_feed_text(tag, 24)
+    ]
+    if detail_tags:
+        body_parts.append(" ".join(detail_tags[:3]))
+    for eco in (event.get("ecosystem") or [])[:2]:
+        eco_text = clean_feed_text(eco, 24)
+        if eco_text:
+            body_parts.append(f"生态 {eco_text}")
+    founded = clean_feed_text(event.get("founded"), 20)
+    if founded:
+        body_parts.append(f"成立于 {founded}")
     body = " · ".join(body_parts) or "链上融资新收录一条一级市场事件"
     event_key = ROOTDATA_PROJECTS.fundraising_event_key(event)
     title = f"{name} {round_name}" + (f" ${ticker}" if ticker else "")
@@ -27441,6 +27692,9 @@ def send_kol_sync_desktop_alert(context: dict[str, Any]) -> dict[str, Any]:
     chain = clean_feed_text(context.get("chain"), 30).lower()
     chain_meta = SMART_MONEY_CHAIN_META.get(chain) or {}
     token = clean_feed_text(context.get("tokenAddress"), 180)
+    # 去重 key 里的代币串：EVM 地址统一小写（校验和写法在库里可能是混合大小写），
+    # Solana mint 是大小写敏感的 base58，**原样**放进去 —— 小写就成另一个 mint 了。
+    token_key_part = token.lower() if token.lower().startswith("0x") else token
     symbol = clean_feed_text(context.get("symbol") or "未知代币", 40)
     buyers = context.get("buyers") if isinstance(context.get("buyers"), list) else []
     min_buyers = max(2, int(safe_float(context.get("minBuyers"), 3)))
@@ -27448,10 +27702,20 @@ def send_kol_sync_desktop_alert(context: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "skipped": True, "reason": "kol-sync context incomplete"}
     total_usd = safe_float(context.get("totalUsd"))
     window_hours = max(1, int(safe_float(context.get("windowHours"), 24)))
+
+    def _usd_text(value: Any) -> str:
+        """单个人那笔的金额。
+
+        Solana 的 ``paymentUsd`` 常常算不出来（pump.fun 内盘 bonding curve、非稳定币
+        报价），会留下 0 —— 卡片上写 ``$0`` 会让人以为他没买，所以 1 美元以下写「小额」。
+        """
+        usd = safe_float(value)
+        return f"${usd:,.0f}" if usd >= 1 else "小额"
+
     # 按「谁先上车」排序，金额取该钱包在这个币上的合计。
     parts = [
         f"{clean_feed_text(buyer.get('label'), 30) or clean_feed_text(buyer.get('address'), 12)} "
-        f"${safe_float(buyer.get('usd')):,.0f}"
+        f"{_usd_text(buyer.get('usd'))}"
         for buyer in sorted(buyers, key=lambda item: safe_float(item.get("firstAt")))
     ]
     first_at = min((safe_float(buyer.get("firstAt")) for buyer in buyers), default=0)
@@ -27470,7 +27734,7 @@ def send_kol_sync_desktop_alert(context: dict[str, Any]) -> dict[str, Any]:
             return {"ok": True, "skipped": True, "reason": "kol-sync join without newcomers"}
         joined = "、".join(
             f"{clean_feed_text(item.get('label'), 30) or clean_feed_text(item.get('address'), 12)} "
-            f"${safe_float(item.get('usd')):,.0f}"
+            f"{_usd_text(item.get('usd'))}"
             for item in sorted(newcomers, key=lambda item: safe_float(item.get("firstAt")))
         )
         on_board = int(safe_float(context.get("onBoardCount"), len(buyers)))
@@ -27478,7 +27742,7 @@ def send_kol_sync_desktop_alert(context: dict[str, Any]) -> dict[str, Any]:
             clean_feed_text(item.get("address"), 42) for item in newcomers[:3]
         )
         return launch_desktop_alert({
-            "key": f"kol-join:{chain}:{token.lower()}:{address_key}"[:220],
+            "key": f"kol-join:{chain}:{token_key_part}:{address_key}"[:220],
             "kind": "KOL 同车",
             "source": "聪明钱买入监控",
             "sourceLabel": "SM",
@@ -27507,7 +27771,7 @@ def send_kol_sync_desktop_alert(context: dict[str, Any]) -> dict[str, Any]:
         (clean_feed_text(chain_meta.get("explorer"), 300) or "").format(quote(token, safe=""))
     )
     return launch_desktop_alert({
-        "key": f"kol-sync:{chain}:{token.lower()}",
+        "key": f"kol-sync:{chain}:{token_key_part}",
         "kind": "KOL 共振",
         "source": "聪明钱买入监控",
         "sourceLabel": "SM",
@@ -27531,6 +27795,103 @@ def send_kol_sync_desktop_alert(context: dict[str, Any]) -> dict[str, Any]:
             ensure_ascii=False,
         )[:1800],
     })
+
+
+def send_new_token_keyword_desktop_alert(context: dict[str, Any]) -> dict[str, Any]:
+    """战壕「新创建」的币命中关键词 → 弹窗（用户 2026-11-25）。
+
+    用户原话：「做一个弹窗提示，如果 bsc，sol 和 robinhood 上出现了命中关键词的新币，
+    第一时间提示」，随后补图说明「也就是战壕里这种新出来的币」。
+
+    和聪明的钱那些弹窗是**两条独立消息**：那条讲「谁买了多少钱」，这条讲「链上刚发出来
+    一个叫某某的币，名字撞上了我在意的词」。判定与去重全在
+    ``new_token_alert_monitor``，这里只排版。
+
+    ``queuePriority`` 给 140 —— 比同车（130）还高：新币的窗口是按分钟算的，晚两分钟
+    就没有意义了。但仍然**不动静音**，红色留给 Alpha 控盘那种真风险。
+    """
+    if not isinstance(context, dict):
+        return {"ok": False, "error": "invalid new-token context"}
+    chain = clean_feed_text(context.get("chain"), 30).lower()
+    chain_meta = SMART_MONEY_CHAIN_META.get(chain) or {}
+    token = clean_feed_text(context.get("tokenAddress"), 180)
+    if not token:
+        return {"ok": True, "skipped": True, "reason": "new-token context without contract"}
+    # 去重 key 里的合约：EVM 统一小写，Solana base58 原样（小写就是另一个 mint）。
+    token_key_part = token.lower() if token.lower().startswith("0x") else token
+    keywords = [
+        clean_feed_text(word, 30) for word in (context.get("keywords") or [])
+        if clean_feed_text(word, 30)
+    ]
+    if not keywords:
+        return {"ok": True, "skipped": True, "reason": "no keyword hit"}
+    symbol = clean_feed_text(context.get("symbol") or context.get("name") or "未知代币", 40)
+    name = clean_feed_text(context.get("name"), 60)
+    platform = clean_feed_text(context.get("platform"), 30)
+    age = max(0, int(safe_float(context.get("ageSeconds"))))
+    if age < 60:
+        age_text = f"{age} 秒"
+    elif age < 3600:
+        age_text = f"{age // 60} 分钟"
+    else:
+        age_text = f"{age // 3600} 小时"
+    # 「创建」和「打满/开盘」是两个时钟（见 new_token_context）：战壕「已开盘」列的币
+    # 常常是几小时前创建、一分钟前才打满，正文必须说清楚是哪一个，否则看着像谎报。
+    fresh_verb = "打满" if clean_feed_text(context.get("freshKind"), 20) == "opened" else "创建"
+    market_cap = safe_float(context.get("marketCap"))
+    chain_label = clean_feed_text(chain_meta.get("label"), 30) or chain
+    url = gmgn_token_trade_url(gmgn_chain_slug(chain), token) or (
+        (clean_feed_text(chain_meta.get("explorer"), 300) or "").format(quote(token, safe=""))
+    )
+    headline_keyword = "、".join(keywords[:2])
+    title = f"新币命中「{headline_keyword}」：{symbol}"
+    if market_cap >= 1:
+        title = f"{title} · MC ${market_cap:,.0f}"
+    body_parts = [chain_label]
+    if platform:
+        body_parts.append(platform)
+    # 战壕一次请求返回三段、页面只显示一列。不写清是哪一列，用户翻「新创建」列找不到
+    # 就会认定「战壕里根本没这个币」（2026-11-26 反馈）。DOM 兜底拿不到列身份就不标。
+    segment_text = NEW_TOKEN_ALERTS_MODULE.segment_label(context.get("segment"))
+    if segment_text:
+        body_parts.append(segment_text)
+    body_parts.append(f"{age_text}前{fresh_verb}")
+    if name and name.casefold() != symbol.casefold():
+        body_parts.append(name)
+    if len(keywords) > 2:
+        body_parts.append(f"命中 {'、'.join(keywords)}")
+    return launch_desktop_alert({
+        "key": f"new-token-keyword:{chain}:{token_key_part}"[:220],
+        "kind": "新币命中",
+        "source": "链上战壕",
+        "sourceLabel": "战壕",
+        "sourceType": "new-token-keyword",
+        "sourceId": "new-token-keyword",
+        "title": title,
+        "body": " · ".join(body_parts),
+        "contractAddress": token,
+        "chain": chain,
+        "url": url,
+        "time": int(safe_float(context.get("openedAt" if fresh_verb == "打满" else "createdAt")))
+        or int(time.time() * 1000),
+        "priority": f"新币 · {age_text}",
+        "queuePriority": 140,
+        "speech": f"新币命中关键词，{symbol}，命中{headline_keyword}，{chain_label} 上刚{fresh_verb} {age_text}",
+        "originalText": json.dumps(
+            {
+                "chain": chain, "tokenAddress": token, "symbol": symbol, "name": name,
+                "keywords": keywords, "ageSeconds": age, "marketCap": market_cap,
+                "platform": platform, "freshKind": context.get("freshKind"),
+                "segment": context.get("segment"),
+            },
+            ensure_ascii=False,
+        )[:1200],
+    })
+
+
+# 模块级注册（不是 main()）：轮询线程由 main() 启动，但回调本身没有进程依赖，
+# 放在这里保证「谁跑轮询谁就有弹窗」。
+NEW_TOKEN_ALERTS.set_alert_callback(send_new_token_keyword_desktop_alert)
 
 
 def send_sandwich_detected_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
@@ -27770,8 +28131,17 @@ def market_maker_payload_with_gate(*, force_refresh: bool = False) -> dict[str, 
         gate = {"symbols": frozenset(), "note": safe_error_text(str(exc)), "gainers": 0, "aicoin": 0}
     monitor_gate = payload.get("summary", {}).get("entryGate") or {}
     payload["entryGate"] = {
-        "mode": "resonance",
+        # 2026-11-15 起「新标的」不再被共振闸拦（改成金额闸），这里只保留
+        # **共振现状**给页面展示：哪几只标的正在榜单上，做市商同时在动。
+        "mode": "resonance-info",
         "enabled": MARKET_MAKER_MONITOR.entry_qualifier is not None,
+        "enforces": False,
+        "minUsd": float(getattr(MARKET_MAKER_MONITOR, "new_token_min_usd", 0) or 0),
+        # 标的成熟度闸（2026-11-16）：光看金额挡不住老币。口径是**以基线为准**——
+        # 基线之前就在流通的一律老币，只用「基线之后才上线」这一条，不再用滚动窗口。
+        "baselineMode": "baseline",
+        "newTokenFiltered": int(getattr(MARKET_MAKER_MONITOR, "new_token_filtered", 0) or 0),
+        "newTokenFilterNote": str(getattr(MARKET_MAKER_MONITOR, "new_token_filter_note", "") or ""),
         "resonance": len(gate.get("symbols") or ()),
         "gainers": int(gate.get("gainers") or 0),
         "aicoin": int(gate.get("aicoin") or 0),
@@ -27801,6 +28171,11 @@ def send_market_maker_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
     共振这一条（不再发普通大额），同一标的 6 小时内只提示一次。
     「新标的」只在**整家做完一轮基线之后**才可能触发——首次接线时每个地址都会吐一屏
     历史流水，那批一律 ``baseline=1``，不弹。
+
+    **2026-11-15 改**：用户要求「出现了之前从来没有操盘过的代币就报红」，于是
+    「新标的」不再是普通提示（原来 78 分），而是 ``alertTone=red`` + 940 分；
+    同时把「必须与涨幅榜 / AIcoin 共振」那道闸撤到监控器侧（见
+    `MarketMakerMonitor._maybe_announce`），改成 $100 金额闸。
     """
     if not MARKET_MAKER_MONITOR.alerts_enabled():
         return {"ok": True, "skipped": True, "reason": "market maker popups disabled"}
@@ -27825,22 +28200,38 @@ def send_market_maker_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
         mm_money_text(usd),
         chain_name,
     ]
+    # 共振明细拼法只有一份：三方共振拿它当正文，「新标的」顺带附在末尾（没上榜就不写）。
+    detail = event.get("resonance") if isinstance(event.get("resonance"), dict) else {}
+    board_bits = []
+    gainers_rank = int(safe_float(detail.get("gainersRank")))
+    gainers_change = safe_float(detail.get("gainersChangePct"))
+    aicoin_rank = int(safe_float(detail.get("aicoinRank")))
+    if gainers_rank:
+        board_bits.append(
+            f"涨幅榜第 {gainers_rank}" + (f"（{gainers_change:+.1f}%）" if gainers_change else "")
+        )
+    if aicoin_rank:
+        board_bits.append(f"AIcoin 热门第 {aicoin_rank}")
     if reason == "new-token":
-        title = f"做市商进场：{firm_name} 开始操作 {symbol}"
-        priority, queue_priority = "做市商新标的", 78
-        speech = f"做市商监控，{firm_name} 开始操作 {symbol}，{direction} {amount_text}"
+        # 用户 2026-11-15：「出现了之前从来没有操盘过的代币，就做链上操盘异动提示，报红」。
+        # 报红走 `alertTone = "red"`（desktop_alert 的 is_red），优先级抬到
+        # `DESKTOP_ALERT_CRITICAL_PRIORITY + 40`（940），与台子币同一档 —— 比
+        # 三方共振(90)/大额调仓(84) 高得多，因为这条是**最早的信号**：做市商接新币
+        # 通常在它上榜之前，等榜单出来就晚了。
+        title = f"做市商新标的：{firm_name} 首次操作 {symbol}"
+        priority, queue_priority = "做市商新标的", DESKTOP_ALERT_CRITICAL_PRIORITY + 40
+        body_bits.insert(0, "首次出现")
+        # 「上线多久」写进正文：既证明这条真的过了标的成熟度闸（≤14 天），
+        # 也让用户一眼判断「这盘有多新」。查不到年龄的不会走到这里（监控器侧已拦）。
+        maturity = event.get("maturity") if isinstance(event.get("maturity"), dict) else {}
+        raw_age = maturity.get("ageDays")
+        age_days = safe_float(raw_age) if raw_age is not None else -1.0
+        if age_days >= 0:
+            body_bits.insert(1, f"上线 {age_days:.0f} 天" if age_days >= 1 else "今天刚建池")
+        if board_bits:
+            body_bits.append(" · ".join(board_bits))
+        speech = f"做市商操盘异动，{firm_name} 首次操作 {symbol}，{direction} {amount_text}"
     elif reason == "triple-resonance":
-        detail = event.get("resonance") if isinstance(event.get("resonance"), dict) else {}
-        gainers_rank = int(safe_float(detail.get("gainersRank")))
-        gainers_change = safe_float(detail.get("gainersChangePct"))
-        aicoin_rank = int(safe_float(detail.get("aicoinRank")))
-        board_bits = []
-        if gainers_rank:
-            board_bits.append(
-                f"涨幅榜第 {gainers_rank}" + (f"（{gainers_change:+.1f}%）" if gainers_change else "")
-            )
-        if aicoin_rank:
-            board_bits.append(f"AIcoin 热门第 {aicoin_rank}")
         body_bits.append(" · ".join(board_bits) if board_bits else "涨幅榜 · AIcoin 热门")
         title = f"做市商三方共振：{firm_name} {direction} {mm_money_text(usd) or ''} {symbol}".strip()
         priority, queue_priority = "做市商三方共振", 90
@@ -27849,7 +28240,7 @@ def send_market_maker_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
         title = f"做市商大额调仓：{firm_name} {direction} {mm_money_text(usd) or ''} {symbol}".strip()
         priority, queue_priority = "做市商大额调仓", 84
         speech = f"做市商大额调仓，{firm_name} {direction} {symbol}，约 {mm_money_text(usd)}"
-    return launch_desktop_alert({
+    payload = {
         "key": f"market-maker:{reason}:{firm}:{chain}:{token}:{tx_hash}",
         "kind": "做市商监控",
         "source": "做市商监控",
@@ -27869,7 +28260,12 @@ def send_market_maker_desktop_alert(event: dict[str, Any]) -> dict[str, Any]:
         "queuePriority": queue_priority,
         "speech": speech,
         "originalText": json.dumps(event, ensure_ascii=False)[:1800],
-    })
+    }
+    if reason == "new-token":
+        # 「报红」的唯一开关：desktop_alert 里只认这一个键（`is_red`），
+        # 传其它写法（red=True / tone）都不生效。
+        payload["alertTone"] = "red"
+    return launch_desktop_alert(payload)
 
 
 # --------------------------------------------------------------------------- #
@@ -28083,6 +28479,9 @@ BIG_MOVE_PAIR_CACHE_SECONDS = 1800.0
 BIG_MOVE_PAIR_RETRY_SECONDS = 600.0
 BIG_MOVE_PAIR_CACHE_LOCK = threading.Lock()
 BIG_MOVE_SPOT_HOSTS = (
+    # data-api.binance.vision 是币安官方的公开行情镜像：`api.binance.com` 在部分地区
+    # 直接 ConnectTimeout，而它一直通（2026-11-26 实测）。放最前面，别白等 4 个超时。
+    "https://data-api.binance.vision",
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
@@ -31706,6 +32105,20 @@ PRICE_WATCH_SECONDARY_SYMBOLS_SECONDS = max(
     float(os.getenv("PRICE_WATCH_SECONDARY_SYMBOLS_SECONDS", "300") or "300"),
 )
 
+#: 二级标的 / TradFi 名单落盘位置：进程重启后先读回上一版，别让准入在冷启动时失效。
+PRICE_STRUCTURE_CEX_UNIVERSE_PATH = PERSIST_CACHE_DIR / "structure_cex_universe.json"
+#: 股票/指数/商品/外汇合约的标的（结构监控一律不收，见 `price_structure_symbol_is_secondary`）。
+PRICE_STRUCTURE_TRADFI_SYMBOLS: frozenset[str] = frozenset()
+PRICE_STRUCTURE_TRADFI_LOCK = threading.Lock()
+#: Aster / HTX / OKX 独家上的股票、指数合约，Gate 名单覆盖不到、本机又抓不到
+#: `fapi.binance.com` / `www.okx.com` 的合约元数据（2026-11-26 实测全超时），只能
+#: 靠实测观测补种子。**只增不减**：代码里这几个永远当 TradFi，宁可多挡一只。
+PRICE_STRUCTURE_TRADFI_EXTRA_SEED: frozenset[str] = frozenset({
+    "US100",  # 纳斯达克 100 指数 CFD（OKX SWAP，instCategory 4）
+    "BBX",    # 股票合约（Binance / Aster 上架，币安现货无此对）
+    "STXX",   # 股票合约（Binance / Aster 上架，币安现货无此对）
+})
+
 
 def _secondary_symbol_variants(base: str) -> set[str]:
     """交易所叫 ``1000PEPE`` / ``1000000SATS``，榜单和用户嘴里叫 ``PEPE`` / ``SATS``。"""
@@ -31740,15 +32153,18 @@ def _fetch_exchange_symbol_universe(*, timeout: float = 8.0) -> set[str]:
                     host + "/fapi/v1/exchangeInfo", headers=HEADERS, timeout=(4, timeout)
                 )
                 response.raise_for_status()
-                pairs = [
-                    str((item or {}).get("symbol") or "").upper()
-                    for item in (response.json() or {}).get("symbols") or []
-                ]
+                items = (response.json() or {}).get("symbols") or []
             except Exception:
                 continue
-            for pair in pairs:
-                if pair.endswith("USDT") and len(pair) > 4:
-                    symbols.update(_secondary_symbol_variants(pair[:-4]))
+            for item in items:
+                pair = str((item or {}).get("symbol") or "").upper()
+                if not (pair.endswith("USDT") and len(pair) > 4):
+                    continue
+                # 合约里混着股票/指数/外汇（TRADIFI_PERPETUAL）。结构监控只做加密，
+                # 这里就用交易所自己的合约元数据把它们摘掉（绝不靠 ticker 猜）。
+                if binance_contract_is_tradfi(item):
+                    continue
+                symbols.update(_secondary_symbol_variants(pair[:-4]))
             return symbols
         raise RuntimeError("binance futures exchangeInfo unreachable")
 
@@ -31774,7 +32190,7 @@ def _fetch_exchange_symbol_universe(*, timeout: float = 8.0) -> set[str]:
 
     def okx() -> set[str]:
         response = requests.get(
-            "https://www.okx.com/api/v5/market/tickers",
+            "https://www.okx.com/api/v5/public/instruments",
             params={"instType": "SWAP"},
             headers=HEADERS,
             timeout=timeout,
@@ -31784,20 +32200,28 @@ def _fetch_exchange_symbol_universe(*, timeout: float = 8.0) -> set[str]:
         symbols: set[str] = set()
         for item in payload.get("data") or []:
             match = re.fullmatch(r"(.+)-USDT-SWAP", str((item or {}).get("instId") or ""))
-            if match:
-                symbols.update(_secondary_symbol_variants(match.group(1)))
+            if not match:
+                continue
+            # instCategory 3=代币化股票 4=商品/指数（`okx_contract_is_tradfi`）。
+            if okx_contract_is_tradfi(item):
+                continue
+            symbols.update(_secondary_symbol_variants(match.group(1)))
         return symbols
 
     def gate() -> set[str]:
+        # 用 contracts 而不是 tickers：只有 contracts 带 contract_type，
+        # 才能把股票/指数/外汇/商品合约摘掉（`gate_contract_is_tradfi`）。
         response = requests.get(
-            "https://api.gateio.ws/api/v4/futures/usdt/tickers",
+            "https://api.gateio.ws/api/v4/futures/usdt/contracts",
             headers=HEADERS,
             timeout=timeout,
         )
         response.raise_for_status()
         symbols: set[str] = set()
         for item in response.json() or []:
-            base = str((item or {}).get("contract") or "").split("_", 1)[0]
+            if gate_contract_is_tradfi(item):
+                continue
+            base = str((item or {}).get("name") or (item or {}).get("contract") or "").split("_", 1)[0]
             symbols.update(_secondary_symbol_variants(base))
         return symbols
 
@@ -31860,9 +32284,84 @@ def _fetch_exchange_symbol_universe(*, timeout: float = 8.0) -> set[str]:
     return symbols
 
 
-def _build_price_watch_secondary_symbols() -> frozenset[str]:
-    """各所「交易所有现货/合约」的标的集合（自持网络 + 自持缓存，不抢别人的锁）。"""
+def _fetch_exchange_tradfi_symbols(*, timeout: float = 8.0) -> set[str]:
+    """各所**股票/指数/商品/外汇**合约的标的集合（= 结构监控一律不收的东西）。
 
+    判据只认交易所自己的合约元数据（`*_contract_is_tradfi`），**绝不靠 ticker 猜**
+    ——NVDA 既可能是股票代币也可能是某条链上的同名币，只有交易所说了算。
+    主机不通就少一路，不影响加密集合；这条路径本来就不该因为一个所挂掉而阻塞。
+    """
+
+    def from_binance_futures() -> set[str]:
+        out: set[str] = set()
+        for host in ("https://fapi.binance.com",) + tuple(
+            f"https://fapi{i}.binance.com" for i in range(1, 5)
+        ):
+            try:
+                response = requests.get(
+                    host + "/fapi/v1/exchangeInfo", headers=HEADERS, timeout=(4, timeout)
+                )
+                response.raise_for_status()
+                items = (response.json() or {}).get("symbols") or []
+            except Exception:
+                continue
+            for item in items:
+                pair = str((item or {}).get("symbol") or "").upper()
+                if pair.endswith("USDT") and binance_contract_is_tradfi(item):
+                    out.update(_secondary_symbol_variants(pair[:-4]))
+            return out
+        raise RuntimeError("binance futures exchangeInfo unreachable")
+
+    def from_gate() -> set[str]:
+        response = requests.get(
+            "https://api.gateio.ws/api/v4/futures/usdt/contracts",
+            headers=HEADERS,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        out: set[str] = set()
+        for item in response.json() or []:
+            if not gate_contract_is_tradfi(item):
+                continue
+            base = str((item or {}).get("name") or (item or {}).get("contract") or "").split("_", 1)[0]
+            out.update(_secondary_symbol_variants(base))
+        return out
+
+    def from_okx() -> set[str]:
+        response = requests.get(
+            "https://www.okx.com/api/v5/public/instruments",
+            params={"instType": "SWAP"},
+            headers=HEADERS,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        out: set[str] = set()
+        for item in (response.json() or {}).get("data") or []:
+            match = re.fullmatch(r"(.+)-USDT-SWAP", str((item or {}).get("instId") or ""))
+            if match and okx_contract_is_tradfi(item):
+                out.update(_secondary_symbol_variants(match.group(1)))
+        return out
+
+    sources = {"binance-futures": from_binance_futures, "gate": from_gate, "okx": from_okx}
+    symbols: set[str] = set()
+    with ThreadPoolExecutor(max_workers=len(sources), thread_name_prefix="pw-tradfi") as pool:
+        futures = {pool.submit(fetch): name for name, fetch in sources.items()}
+        for future in as_completed(futures):
+            try:
+                symbols.update(future.result())
+            except Exception:
+                continue
+    return {clean_price_watch_symbol(symbol) for symbol in symbols if clean_price_watch_symbol(symbol)}
+
+
+def _build_price_watch_secondary_symbols() -> frozenset[str]:
+    """各所「交易所有现货/合约」的标的集合（自持网络 + 自持缓存，不抢别人的锁）。
+
+    顺手把 **TradFi（股票/指数/商品/外汇）集合**也算出来并存盘：结构监控的准入要
+    两头都看 —— 在交易所（二级）但又不是股票代币，才允许做结构。
+    """
+
+    global PRICE_STRUCTURE_TRADFI_SYMBOLS
     try:
         symbols = _fetch_exchange_symbol_universe()
     except Exception as exc:
@@ -31879,15 +32378,101 @@ def _build_price_watch_secondary_symbols() -> frozenset[str]:
             symbols.update(cached_activity[1].keys())
     except Exception:
         pass
-    return frozenset(
-        cleaned for cleaned in (clean_price_watch_symbol(symbol) for symbol in symbols) if cleaned
+    cleaned = {
+        cleaned_symbol for cleaned_symbol in (clean_price_watch_symbol(symbol) for symbol in symbols)
+        if cleaned_symbol
+    }
+    # OKX / Bitget / HTX 这些所在本机网络里经常连不上（2026-11-26 实测只剩币安现货镜像和
+    # Gate 通），只靠网络清单会把「只在 OKX 上新合约」的币误判成链上标的。库里已经记下
+    # `new_contract_*` 的符号就是交易所挂过合约的：直接并进加密二级集合（本地读，零网络）。
+    try:
+        with auth_db() as conn:
+            for (raw_symbol,) in conn.execute(
+                "SELECT symbol FROM price_watch_assets WHERE COALESCE(new_contract_listed_at, 0) > 0"
+            ):
+                cleaned_symbol = clean_price_watch_symbol(raw_symbol)
+                if cleaned_symbol:
+                    cleaned.add(cleaned_symbol)
+    except Exception:
+        pass
+    try:
+        tradfi = _fetch_exchange_tradfi_symbols()
+    except Exception as exc:
+        print(
+            "TradFi universe fetch failed: " + safe_error_text(str(exc))[:160],
+            file=sys.stderr,
+            flush=True,
+        )
+        tradfi = set()
+    # TradFi 名单只增不减：某个股票合约下架后，同名 ticker 可能被链上土狗复用，
+    # 留着这条墓碑比漏掉更安全（历史审计里被清掉的那批也并进来）。
+    with PRICE_STRUCTURE_TRADFI_LOCK:
+        tradfi |= set(PRICE_STRUCTURE_TRADFI_SYMBOLS)
+    tradfi |= _persisted_tradfi_seed()
+    PRICE_STRUCTURE_TRADFI_SYMBOLS = frozenset(tradfi)
+    # 落盘必须写**扣掉 TradFi 之后**的集合。各所 24h 行情给的 symbol 列表不区分
+    # 资产类别（BABA / NFLX 这些股票合约混在里面），原样存盘下一版 hydrate 读回来
+    # 就把股票当成「加密二级标的」，`price_structure_symbol_is_stock_token()` 的
+    # 同名翻案又会把它们放回来（2026-11-26 实测：新币低点榜 61 条股票一条没剔掉）。
+    crypto = cleaned - tradfi
+    if crypto:
+        write_json_cache(PRICE_STRUCTURE_CEX_UNIVERSE_PATH, {
+            "updatedAt": int(time.time() * 1000),
+            "crypto": sorted(crypto),
+            "tradfi": sorted(tradfi),
+        })
+    print(
+        "Structure universe: %d 加密二级标的 / %d TradFi 剔除" % (len(crypto), len(tradfi)),
+        file=sys.stderr,
+        flush=True,
     )
+    return frozenset(crypto)
+
+
+def _persisted_tradfi_seed() -> set[str]:
+    """历史 TradFi 名单（一次性清理审计 + 上一版存盘），冷启动时兜底。"""
+
+    seed: set[str] = set(PRICE_STRUCTURE_TRADFI_EXTRA_SEED)
+    payload = read_json_cache(PRICE_STRUCTURE_CEX_UNIVERSE_PATH)
+    for symbol in payload.get("tradfi") or []:
+        cleaned = clean_price_watch_symbol(symbol)
+        if cleaned:
+            seed.add(cleaned)
+    return seed
+
+
+def hydrate_price_structure_cex_universe() -> None:
+    """冷启动把上一版「加密二级标的 / TradFi」从磁盘捞回来。
+
+    没有它，进程刚起来那几分钟集合是空的、准入全放行（fail-open），
+    链上标的和股票代币会趁机挤进结构池。
+    """
+
+    global PRICE_WATCH_SECONDARY_SYMBOLS_CACHE, PRICE_STRUCTURE_TRADFI_SYMBOLS
+    if PRICE_WATCH_SECONDARY_SYMBOLS_CACHE is not None:
+        return
+    payload = read_json_cache(PRICE_STRUCTURE_CEX_UNIVERSE_PATH)
+    crypto = {
+        cleaned for cleaned in (clean_price_watch_symbol(s) for s in payload.get("crypto") or [])
+        if cleaned
+    }
+    tradfi = _persisted_tradfi_seed()
+    # 上一版存盘可能把股票合约混在 `crypto` 里（各所 24h 行情不区分资产类别），
+    # 读回来先扣一遍，别让股票代币借 hydrate 复活。
+    crypto -= tradfi
+    if not crypto:
+        return
+    with PRICE_STRUCTURE_TRADFI_LOCK:
+        PRICE_STRUCTURE_TRADFI_SYMBOLS = frozenset(tradfi | set(PRICE_STRUCTURE_TRADFI_SYMBOLS))
+    PRICE_WATCH_SECONDARY_SYMBOLS_CACHE = (time.time(), frozenset(crypto))
 
 
 def price_watch_secondary_market_symbols() -> frozenset[str]:
     """交易所有现货/合约的标的集合（后台刷新，读路径零阻塞）。"""
 
     global PRICE_WATCH_SECONDARY_SYMBOLS_CACHE, PRICE_WATCH_SECONDARY_SYMBOLS_REFRESHING
+    if PRICE_WATCH_SECONDARY_SYMBOLS_CACHE is None:
+        hydrate_price_structure_cex_universe()
     now = time.time()
     cached = PRICE_WATCH_SECONDARY_SYMBOLS_CACHE
     fresh = bool(cached) and now - cached[0] < PRICE_WATCH_SECONDARY_SYMBOLS_SECONDS
@@ -31940,6 +32525,79 @@ def price_watch_row_has_secondary_market(row: sqlite3.Row | dict[str, Any] | Non
     if not candidates:
         return False
     return bool(candidates & price_watch_secondary_market_symbols())
+
+
+#: 结构监控只看**二级标的**（交易所有现货/合约），链上内盘的币不再进结构池
+#: （用户 2026-11-26：「把链上标的的结构监控给停止掉」「只监控二级合约的结构」）。
+#: 关掉用 ``XINGYUN_STRUCTURE_SECONDARY_ONLY=0``（恢复到「链上+二级全都扫」）。
+PRICE_STRUCTURE_SECONDARY_ONLY = str(
+    os.getenv("XINGYUN_STRUCTURE_SECONDARY_ONLY", "1") or "1"
+).strip().lower() not in ("0", "false", "off", "no")
+
+
+def price_structure_symbol_is_secondary(
+    symbol: Any, *, universe: frozenset[str] | None = None
+) -> bool:
+    """这个结构标的允许做结构监控吗（= **交易所的加密**现货/合约）。
+
+    两道门，顺序不能颠倒：
+
+    1. **股票代币一票否决**：交易所自己标了 TradFi（`*_contract_is_tradfi`）的一律不收
+       —— 用户 2026-11-26：「股票代币也不做任何的结构监控」。这条在集合为空时**也要生效**，
+       所以放在 fail-open 前面。
+    2. **必须是二级标的**：链上内盘、币安钱包 4H、GMGN 热搜那些只在 DEX 交易的币不收
+       （用户 2026-11-26：「链上标的的结构监控停掉」「只监控二级合约的结构」）。
+
+    ``universe`` 全空（交易所清单抓不到、且磁盘也没有上一版）时第 2 道放行 —— **宁可照旧，
+    也别把整池关掉**。第 1 道不受影响。
+    """
+    raw = clean_feed_text(symbol, 100)
+    if not raw:
+        return False
+    candidates: set[str] = set()
+    for candidate in (
+        clean_price_watch_symbol(raw),
+        clean_price_watch_symbol(price_watch_symbol_without_quote(raw)),
+    ):
+        # 交易所叫 1000PEPE，榜单叫 PEPE —— 两边都试，别因为这个漏判。
+        candidates.update(_secondary_symbol_variants(candidate))
+    candidates.discard("")
+    if candidates & set(PRICE_STRUCTURE_TRADFI_SYMBOLS):
+        return False
+    pool = universe if universe is not None else price_watch_secondary_market_symbols()
+    if not pool:
+        return True
+    return bool(candidates & pool)
+
+
+def price_structure_symbol_is_stock_token(symbol: Any) -> bool:
+    """只判「股票 / 指数 / 商品代币」，不要求它同时是二级标的。
+
+    `new-coin-low`（新币低点）榜和主结构池不一样：榜上本来就全是**刚上市的新合约**，
+    很多是 Aster / Bitget / HTX 刚上、还没进 `crypto` 名单的小币，套
+    `price_structure_symbol_is_secondary()` 会把它们一起误杀、把整条新币池清空。
+    这里只否决「交易所明确标过 TradFi」的符号 —— 用户 2026-11-26：
+    「股票代币也不做任何的结构监控」。
+
+    唯一放行例外是**同名撞车**：符号同时出现在某所的 TradFi 名单和另一所的加密合约里
+    （`CAT` 既是 Gate 的 Caterpillar，也是币安的 Simons Cat），加密那份赢 ——
+    和 `new_coin_low_symbol_excluded_as_tradfi()` 的口径保持一致。
+    """
+
+    raw = clean_feed_text(symbol, 100)
+    if not raw:
+        return False
+    candidates: set[str] = set()
+    for candidate in (
+        clean_price_watch_symbol(raw),
+        clean_price_watch_symbol(price_watch_symbol_without_quote(raw)),
+    ):
+        candidates.update(_secondary_symbol_variants(candidate))
+    candidates.discard("")
+    if not candidates & set(PRICE_STRUCTURE_TRADFI_SYMBOLS):
+        return False
+    crypto = price_watch_secondary_market_symbols()
+    return not (crypto and candidates & crypto)
 
 
 def price_watch_chain_payload(toggles: dict[str, bool] | None = None) -> list[dict[str, Any]]:
@@ -34853,9 +35511,20 @@ def price_structure_item_in_visible_monitor(
     if not isinstance(item, dict):
         return False
     if clean_feed_text(item.get("monitorPool"), 40) == "new-coin-low":
+        # 新币低点池有自己的一页，不按价格监控名单判；但**股票 / 指数代币仍然一票
+        # 否决**（用户 2026-11-26：「股票代币也不做任何的结构监控」）。这里用
+        # `is_stock_token` 而不是 `is_secondary`：新币池里全是刚上市的小合约，
+        # 用二级白名单会把它们一起误杀。
+        if PRICE_STRUCTURE_SECONDARY_ONLY and price_structure_symbol_is_stock_token(item.get("symbol")):
+            return False
         return True
     symbol = price_structure_monitor_symbol(item.get("symbol"))
     if not symbol:
+        return False
+    # 链上标的的结构弹窗一律不出（用户 2026-11-26）。`new-coin-low` 已在上面放行：
+    # 那是交易所新上市的低位池，本来就有自己的页面，且新币刚上市时交易所清单缓存
+    # 可能还没刷到，让它按原口径走更稳。
+    if PRICE_STRUCTURE_SECONDARY_ONLY and not price_structure_symbol_is_secondary(symbol):
         return False
     roster = visibility if visibility is not None else price_structure_monitor_visibility()
     if roster is None:
@@ -35280,6 +35949,11 @@ def price_structure_watch_rows_uncached() -> list[dict[str, Any]]:
         source_is_current=str(source.get("status") or "").lower() == "ok" and bool(current_symbols),
         bypass_process_lock=True,
     )
+    # 只监控二级标的（用户 2026-11-26）：这一轮把交易所清单取一次，链上内盘的币
+    # 直接在入口挡掉 —— 它们连 worker 配额都不该占。
+    secondary_universe = (
+        price_watch_secondary_market_symbols() if PRICE_STRUCTURE_SECONDARY_ONLY else frozenset()
+    )
     now_ms = int(time.time() * 1000)
     priority_cutoff = now_ms - PRICE_WATCH_RETENTION_SECONDS * 1000
     gainers_cutoff = now_ms - GAINERS_MONITOR_PROMOTION_SECONDS * 1000
@@ -35346,6 +36020,12 @@ def price_structure_watch_rows_uncached() -> list[dict[str, Any]]:
     ) -> bool:
         symbol = price_structure_monitor_symbol(raw_row.get("symbol") or raw_row.get("asset"))
         if not symbol or symbol in seen or symbol in excluded_symbols or symbol in cold_archived_symbols:
+            return False
+        # 进结构池的唯一门票：交易所有现货/合约（二级标的）。
+        # 链上内盘 / 币安钱包 4H / GMGN 热搜的币在这里就被挡掉，不再排队等 worker。
+        if PRICE_STRUCTURE_SECONDARY_ONLY and not price_structure_symbol_is_secondary(
+            symbol, universe=secondary_universe
+        ):
             return False
         db_row = active_by_symbol.get(symbol, {})
         persisted_row = persisted_by_symbol.get(symbol, {})
@@ -38444,7 +39124,17 @@ def new_coin_low_inventory_rows(
     now_ms = int(now * 1000)
     candidates: dict[str, dict[str, Any]] = {}
     candidates_lock = threading.Lock()
-    tradfi_assets: set[str] = set()
+    # 2026-11-26 用户要求「股票代币也不做任何的结构监控」。
+    # 本机网络实测 `fapi.binance.com` 长期超时，`binance_inventory()` 一挂，
+    # 下面这份 `tradfi_assets` 就只剩空集 —— 股票代币（BABA/ADBE/NFLX…）于是
+    # 全被当成新币灌进「新币低点」榜。先把已经算好的全局 TradFi 名单（Gate
+    # 美股/商品合约 + 落盘种子，见 `PRICE_STRUCTURE_TRADFI_SYMBOLS`）并进来兜底，
+    # 各 venue 本轮抓到的结果再往上加。
+    try:
+        _tradfi_seed = set(PRICE_STRUCTURE_TRADFI_SYMBOLS)
+    except Exception:
+        _tradfi_seed = set()
+    tradfi_assets: set[str] = {asset for asset in _tradfi_seed if asset}
     # TradFi symbols listed inside the pool's age window.  The counter the page
     # surfaces must not include stock contracts that are already too old to be
     # a "new coin" in the first place.
@@ -38773,6 +39463,7 @@ def new_coin_low_structure_payload(*, force_refresh: bool = False) -> dict[str, 
         for row in rows
         if clean_price_watch_symbol(row.get("symbol"))
     }
+    stock_token_skipped = 0
     with NEW_COIN_LOW_LOCK:
         hydrate_new_coin_low_snapshot()
         if force_refresh and rows:
@@ -38805,6 +39496,10 @@ def new_coin_low_structure_payload(*, force_refresh: bool = False) -> dict[str, 
             if not item.get("checkedAt"):
                 continue
             symbol = clean_price_watch_symbol(item.get("symbol"))
+            if PRICE_STRUCTURE_SECONDARY_ONLY and price_structure_symbol_is_stock_token(symbol):
+                # 股票 / 指数代币不进新币低点结构池（用户 2026-11-26）。
+                stock_token_skipped += 1
+                continue
             inventory_row = rows_by_symbol.get(symbol, {})
             scanned.append({
                 **item,
@@ -38836,6 +39531,7 @@ def new_coin_low_structure_payload(*, force_refresh: bool = False) -> dict[str, 
             "monitorMode": "parallel-new-coin-low",
             "inactiveExcluded": int(safe_float(NEW_COIN_LOW_ACTIVITY_SUMMARY.get("excluded"), 0)),
             "tradfiExcluded": int(safe_float(NEW_COIN_LOW_ACTIVITY_SUMMARY.get("tradfiExcluded"), 0)),
+            "stockTokenExcluded": stock_token_skipped,
             "activityUnavailable": int(safe_float(NEW_COIN_LOW_ACTIVITY_SUMMARY.get("unavailable"), 0)),
             "activityUnavailableExcluded": int(safe_float(
                 NEW_COIN_LOW_ACTIVITY_SUMMARY.get("unavailableExcluded"), 0
@@ -41362,20 +42058,111 @@ def reconcile_price_watch_flow_signals(
         return 0
 
 
+#: 前高对账的节流窗口（秒）。
+#:
+#: `reconcile_price_watch_flow_signals()` 里要 `price_watch_active_rows()` **全量读一遍
+#: 监控池**，重得很。原先 ``/api/event-flow`` 每次请求都同步跑一遍 —— 事件流窗口是
+#: 2 秒一轮的轮询，等于每 2 秒强抢一次监控池，单个请求被拖到 17~20 秒，并发时
+#: 还会撞上写事务直接报 503（2026-11-26 实测：日志里成对的 200/503 + client_disconnect）。
+#: 它干的活只是「把已被新前高取代的旧档位撤下来」，秒级精度毫无意义，60 秒一次足够。
+PRICE_WATCH_FLOW_RECONCILE_INTERVAL_SECONDS = float(
+    os.getenv("XINGYUN_PRICE_FLOW_RECONCILE_SECONDS", "60") or 60
+)
+_PRICE_WATCH_FLOW_RECONCILE_AT = 0.0
+_PRICE_WATCH_FLOW_RECONCILE_LOCK = threading.Lock()
+
+
+def reconcile_price_watch_flow_signals_throttled() -> int:
+    """``reconcile_price_watch_flow_signals()`` 的节流版。
+
+    失败也照样计时（不在 except 里回滚时间戳）：宁可 60 秒不重试，也不要让一条
+    抽风的路径被 2 秒一次的轮询放大成雪崩。
+    """
+    global _PRICE_WATCH_FLOW_RECONCILE_AT
+    if time.time() - _PRICE_WATCH_FLOW_RECONCILE_AT < PRICE_WATCH_FLOW_RECONCILE_INTERVAL_SECONDS:
+        return 0
+    # 只做「谁先到谁跑」的互斥，快路径已经在上面挡掉了绝大多数调用。
+    if not _PRICE_WATCH_FLOW_RECONCILE_LOCK.acquire(blocking=False):
+        return 0
+    try:
+        now = time.time()
+        if now - _PRICE_WATCH_FLOW_RECONCILE_AT < PRICE_WATCH_FLOW_RECONCILE_INTERVAL_SECONDS:
+            return 0
+        _PRICE_WATCH_FLOW_RECONCILE_AT = now
+        return reconcile_price_watch_flow_signals()
+    finally:
+        _PRICE_WATCH_FLOW_RECONCILE_LOCK.release()
+
+
+_PRICE_WATCH_FLOW_RECONCILE_WORKER_STARTED = False
+_PRICE_WATCH_FLOW_RECONCILE_WORKER_LOCK = threading.Lock()
+
+
+def ensure_price_watch_flow_reconcile_worker() -> None:
+    """把前高对账彻底挪出请求路径，交给一个低频后台线程。
+
+    它要 ``price_watch_active_rows()`` 全量读监控池，实测单次 10~20 秒 —— 挂在
+    ``/api/event-flow`` 里就等于让 2 秒一轮的浮窗轮询去背这个锅（窗口第一次轮询
+    直接超时，日志里是 ``poll failed: timed out``）。事件流接口只负责读；撤回的
+    结果靠 ``revision`` 自增自然推到窗口，晚几十秒完全没影响。
+    """
+    global _PRICE_WATCH_FLOW_RECONCILE_WORKER_STARTED
+    with _PRICE_WATCH_FLOW_RECONCILE_WORKER_LOCK:
+        if _PRICE_WATCH_FLOW_RECONCILE_WORKER_STARTED or SERVER_SHUTDOWN_EVENT.is_set():
+            return
+        _PRICE_WATCH_FLOW_RECONCILE_WORKER_STARTED = True
+
+    def _loop() -> None:
+        # 启动初期 12 个源都在抢 CPU 和数据库，先缓 90 秒，别和冷启动硬碰。
+        if SERVER_SHUTDOWN_EVENT.wait(90):
+            return
+        while not SERVER_SHUTDOWN_EVENT.is_set():
+            try:
+                reconcile_price_watch_flow_signals_throttled()
+            except Exception as exc:
+                print(
+                    f"Price watch flow reconcile worker: {safe_error_text(str(exc))}",
+                    file=sys.stderr,
+                )
+            SERVER_SHUTDOWN_EVENT.wait(PRICE_WATCH_FLOW_RECONCILE_INTERVAL_SECONDS)
+
+    try:
+        threading.Thread(target=_loop, daemon=True, name="price-flow-reconcile").start()
+    except Exception:
+        _PRICE_WATCH_FLOW_RECONCILE_WORKER_STARTED = False
+        raise
+
+
 def launch_price_watch_alert(event: dict[str, Any], *, persist_only: bool = False) -> dict[str, Any]:
     def dispatch(payload):
         if not persist_only:
             return launch_desktop_alert(payload)
         # Caller holds the price DB transaction and already checked exclusions.
         # Do not re-enter AUTH_DB_LOCK, start workers, or perform source intake here.
-        if env_flag('XINGYUN_DISABLE_DESKTOP_ALERT', default=is_production_mode()):
+        if not DESKTOP_ALERT_STREAM_ONLY and env_flag(
+            'XINGYUN_DISABLE_DESKTOP_ALERT', default=is_production_mode()
+        ):
             return {'ok': True, 'skipped': True}
         # 这条路径被设计成"只落库、不做 I/O"（调用方还持有价格库事务），所以只认
         # 事件自带的链与 Alpha 清单，不去查监控池。
         normalized = annotate_desktop_alert_chain(
             normalize_desktop_alert(payload), allow_pool_lookup=False
         )
-        return ALERT_DELIVERY_STORE.admit(normalized, alert_dedupe_keys(normalized), desktop_alert_queue_priority(normalized))
+        if DESKTOP_ALERT_STREAM_ONLY:
+            # 事件流只读模式（用户 2026-11-26「原先会触发弹窗的东西都要做进事件流里，
+            # 别漏了」）：这条线（前高 / 超卖 / 斐波那契）原本绕过 launch_desktop_alert
+            # 直接 admit，关掉弹窗后就**两头都不落** —— 窗口里一条都看不到。所以必须
+            # 在这里补写事件流；也正因为不投递，就别再往 outbox 里塞 pending 行。
+            #
+            # 写事件流是另一个 sqlite 文件（EVENT_FLOW_STORE，WAL），和调用方持有的
+            # 价格库事务无关；同一循环里 `record_price_watch_flow_event()` 早就在干
+            # 同样的事，不会引入新的锁序。
+            record_event_flow_popup(normalized, "stream", "弹窗已关闭，只进事件流窗口")
+            return {'ok': True, 'skipped': True, 'streamOnly': True}
+        result = ALERT_DELIVERY_STORE.admit(normalized, alert_dedupe_keys(normalized), desktop_alert_queue_priority(normalized))
+        if result.get('ok') and not result.get('deduped'):
+            record_event_flow_popup(normalized, "accepted", "价格监控信号已落库等待投递")
+        return result
 
     symbol = price_structure_monitor_symbol(event.get("symbol")) or "--"
     distance = safe_float(event.get("distancePct"))
@@ -45506,496 +46293,6 @@ def start_wechat_group_monitor() -> None:
     threading.Thread(target=wechat_group_monitor_loop, name="wechat-group-monitor", daemon=True).start()
 
 
-def strategy_live_enabled() -> bool:
-    return str(env_value("STRATEGY_LIVE_TRADING_ENABLED", "0")).strip().lower() in TRUTHY_ENV_VALUES
-
-
-def strategy_max_notional() -> float:
-    return max(100.0, safe_float(env_value("STRATEGY_MAX_ORDER_NOTIONAL_USDT", "25000"), 25000.0))
-
-
-def strategy_risk_tier(account_equity: Any) -> dict[str, Any]:
-    equity = max(0.0, safe_float(account_equity))
-    if equity < 10_000:
-        values = ("< 1万 U", 0.5, 0.8, 50.0, 120.0, 1.0, 3.0, 2.0)
-    elif equity < 100_000:
-        values = ("1万 - 10万 U", 0.4, 0.6, 40.0, 100.0, 2.0, 3.0, 1.5)
-    elif equity < 1_000_000:
-        values = ("10万 - 100万 U", 0.25, 0.4, 30.0, 80.0, 1.5, 2.0, 1.0)
-    elif equity < 5_000_000:
-        values = ("100万 - 500万 U", 0.15, 0.3, 20.0, 60.0, 1.0, 2.0, 0.8)
-    else:
-        values = ("> 500万 U", 0.1, 0.2, 10.0, 40.0, 1.0, 1.5, 0.5)
-    label, risk_min, risk_max, exposure_min, exposure_max, lev_min, lev_max, daily_loss = values
-    return {
-        "label": label,
-        "riskMinPct": risk_min,
-        "riskMaxPct": risk_max,
-        "riskDefaultPct": round((risk_min + risk_max) / 2, 3),
-        "exposureMinPct": exposure_min,
-        "exposureMaxPct": exposure_max,
-        "exposureDefaultPct": exposure_max,
-        "leverageMin": lev_min,
-        "leverageMax": lev_max,
-        "leverageDefault": 3.0,
-        "dailyLossLimitPct": daily_loss,
-    }
-
-
-def strategy_clamp(value: Any, low: float, high: float, fallback: float) -> float:
-    number = safe_float(value, fallback)
-    return min(high, max(low, number))
-
-
-def strategy_dragon_wave_signal_candidates(item: dict[str, Any], field: str) -> list[dict[str, Any]]:
-    """Read the shared engine's compact signals without duplicating strategy rules."""
-    candidates: list[dict[str, Any]] = []
-    direct_field = "signals" if field == "signal" else "pending"
-    for row in (item.get(direct_field) if isinstance(item.get(direct_field), list) else []):
-        if isinstance(row, dict):
-            candidates.append(dict(row))
-    for frame in item.get("frames") if isinstance(item.get("frames"), list) else []:
-        if not isinstance(frame, dict) or not isinstance(frame.get(field), dict):
-            continue
-        candidates.append(dict(frame[field]))
-    deduped: dict[str, dict[str, Any]] = {}
-    for candidate in candidates:
-        identity = clean_feed_text(
-            candidate.get("id")
-            or f"{candidate.get('interval')}:{candidate.get('decisionTime') or candidate.get('time')}",
-            180,
-        )
-        if identity:
-            deduped[identity] = candidate
-    return sorted(
-        deduped.values(),
-        key=lambda candidate: (
-            1 if clean_feed_text(candidate.get("grade"), 8).upper() == "A+" else 0,
-            safe_float(candidate.get("certainty"), 0),
-            safe_float(candidate.get("score"), 0),
-            int(safe_float(candidate.get("decisionTime") or candidate.get("time"), 0)),
-        ),
-        reverse=True,
-    )
-
-
-def strategy_dragon_wave_context(item: dict[str, Any]) -> dict[str, Any]:
-    signals = strategy_dragon_wave_signal_candidates(item, "signal")
-    pending = strategy_dragon_wave_signal_candidates(item, "pending")
-    meaningful_frames = [
-        dict(frame)
-        for frame in (item.get("frames") if isinstance(item.get("frames"), list) else [])
-        if isinstance(frame, dict)
-        if str(frame.get("stage") or "") not in {"", "等待", "观察"}
-        and str(frame.get("pattern") or "") not in {"", "无明确结构", "数据不足"}
-    ]
-    meaningful_frames.sort(
-        key=lambda frame: (
-            safe_float(frame.get("confidence"), 0),
-            1 if frame.get("signal") else 0,
-            1 if frame.get("pending") else 0,
-        ),
-        reverse=True,
-    )
-    return {
-        "signal": signals[0] if signals else None,
-        "pending": pending[0] if pending else None,
-        "frame": meaningful_frames[0] if meaningful_frames else None,
-    }
-
-
-def strategy_dragon_wave_items() -> dict[str, dict[str, Any]]:
-    """Return the latest shared-engine rows from main and independent new-coin pools."""
-    payload = price_structure_latest_snapshot_payload()
-    rows = [
-        dict(row)
-        for row in (payload.get("items") if isinstance(payload.get("items"), list) else [])
-        if isinstance(row, dict)
-    ]
-    if NEW_COIN_LOW_MONITOR_ACTIVE:
-        with NEW_COIN_LOW_LOCK:
-            hydrate_new_coin_low_snapshot()
-            rows.extend(
-                dict(row) for row in NEW_COIN_LOW_ITEMS.values()
-                if isinstance(row, dict) and new_coin_low_row_admitted(row)
-            )
-    selected: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        symbol = clean_price_watch_symbol(row.get("symbol"))
-        if not symbol:
-            continue
-        current = selected.get(symbol)
-        current_context = strategy_dragon_wave_context(current) if current else {}
-        row_context = strategy_dragon_wave_context(row)
-        current_rank = (
-            1 if current_context.get("signal") else 0,
-            1 if current_context.get("pending") else 0,
-            int(safe_float((current or {}).get("checkedAt"), 0)),
-        )
-        row_rank = (
-            1 if row_context.get("signal") else 0,
-            1 if row_context.get("pending") else 0,
-            int(safe_float(row.get("checkedAt"), 0)),
-        )
-        if current is None or row_rank >= current_rank:
-            selected[symbol] = row
-    return selected
-
-
-def strategy_stop_loss_plan(entry_price: Any, breakout_candle_low: Any = 0) -> dict[str, Any]:
-    """Use the breakout candle low, widening sub-3% noise to a 3% default stop."""
-    entry = safe_float(entry_price, 0)
-    if entry <= 0:
-        raise ValueError("入场价格无效")
-    candle_low = safe_float(breakout_candle_low, 0)
-    default_stop = entry * (1 - STRATEGY_DEFAULT_STOP_PCT / 100)
-    candle_distance_pct = (
-        max(0.0, (entry - candle_low) / entry * 100)
-        if 0 < candle_low < entry
-        else 0.0
-    )
-    use_candle_low = bool(
-        0 < candle_low < entry
-        and candle_distance_pct >= STRATEGY_DEFAULT_STOP_PCT
-    )
-    stop_price = candle_low if use_candle_low else default_stop
-    return {
-        "stopLossPrice": stop_price,
-        "stopDistancePct": max(0.0, (entry - stop_price) / entry * 100),
-        "breakoutCandleLow": candle_low or None,
-        "breakoutCandleDistancePct": round(candle_distance_pct, 4),
-        "stopLossSource": "breakout-candle-low" if use_candle_low else "default-3pct",
-        "stopLossSourceLabel": "突破K低点" if use_candle_low else "入场价下方3%",
-        "stopLossReason": (
-            "突破K低点距离入场价不少于3%，按真实结构低点止损"
-            if use_candle_low
-            else (
-                "突破K低点距离入场价不足3%，按入场价下方3%防止正常波动扫损"
-                if candle_low > 0
-                else "尚无可用突破K低点，按入场价下方3%止损"
-            )
-        ),
-    }
-
-
-def strategy_asset_row(symbol: Any) -> dict[str, Any]:
-    clean_symbol = clean_price_watch_symbol(symbol)
-    if not clean_symbol:
-        raise ValueError("币种代码无效")
-    rows = price_watch_active_rows()
-    row = next((item for item in rows if item.get("symbol") == clean_symbol), None)
-    structure_item = strategy_dragon_wave_items().get(clean_symbol)
-    if not row and not structure_item:
-        raise ValueError("该币种已不在热门币价格监控中")
-    result = dict(row or {
-        "symbol": clean_symbol,
-        "name": (structure_item or {}).get("name") or clean_symbol,
-        "icon": (structure_item or {}).get("icon") or crypto_icon_url(clean_symbol),
-    })
-    if structure_item:
-        context = strategy_dragon_wave_context(structure_item)
-        structure_price = safe_float(structure_item.get("currentPrice"), 0)
-        if structure_price > 0:
-            result["current_price"] = structure_price
-        result.update({
-            "strategy_structure_item": structure_item,
-            "strategy_signal": context.get("signal"),
-            "strategy_pending": context.get("pending"),
-            "strategy_frame": context.get("frame"),
-            "strategy_engine": structure_item.get("strategy") or "dragon-wave-engine",
-            "strategy_version": structure_item.get("strategyVersion") or "shared-live",
-        })
-    return result
-
-
-STRATEGY_EXCHANGE_DEFINITIONS = {
-    "binance": {"label": "Binance"},
-    "okx": {"label": "OKX"},
-    "bitget": {"label": "Bitget"},
-}
-
-
-def clean_strategy_exchange(exchange: Any) -> str:
-    name = str(exchange or "").strip().lower()
-    if name not in STRATEGY_EXCHANGE_DEFINITIONS:
-        raise ValueError("不支持该交易所")
-    return name
-
-
-def clean_exchange_credential(value: Any, limit: int = 800) -> str:
-    return str(value or "").strip()[:limit]
-
-
-def strategy_user_exchange_credentials(user_id: int | None, exchange: str) -> dict[str, str]:
-    if not user_id:
-        return {}
-    name = clean_strategy_exchange(exchange)
-    with AUTH_DB_LOCK, auth_db() as conn:
-        row = conn.execute(
-            "SELECT api_key, api_secret, passphrase, updated_at FROM user_exchange_credentials WHERE user_id = ? AND exchange = ?",
-            (int(user_id), name),
-        ).fetchone()
-    if not row:
-        return {}
-    return {
-        "key": clean_exchange_credential(decrypt_field(row["api_key"])),
-        "secret": clean_exchange_credential(decrypt_field(row["api_secret"])),
-        "passphrase": clean_exchange_credential(decrypt_field(row["passphrase"])),
-        "updatedAt": int(row["updated_at"] or 0),
-        "source": "user",
-    }
-
-
-def strategy_environment_exchange_credentials(exchange: str) -> dict[str, str]:
-    name = clean_strategy_exchange(exchange)
-    prefix = "BINANCE" if name == "binance" else "OKX" if name == "okx" else "BITGET"
-    return {
-        "key": clean_exchange_credential(env_value(f"{prefix}_API_KEY")),
-        "secret": clean_exchange_credential(env_value(f"{prefix}_API_SECRET")),
-        "passphrase": clean_exchange_credential(
-            env_value(f"{prefix}_API_PASSPHRASE") or env_value(f"{prefix}_API_PASSWORD")
-        ),
-        "source": "server",
-    }
-
-
-def strategy_exchange_credentials(exchange: str, user_id: int | None = None) -> dict[str, str]:
-    name = clean_strategy_exchange(exchange)
-    personal = strategy_user_exchange_credentials(user_id, name)
-    if strategy_credentials_complete(name, personal):
-        return personal
-    return strategy_environment_exchange_credentials(name)
-
-
-def strategy_credentials_complete(exchange: str, credentials: dict[str, Any]) -> bool:
-    name = clean_strategy_exchange(exchange)
-    required = ("key", "secret", "passphrase") if name == "okx" else ("key", "secret")
-    return all(clean_exchange_credential(credentials.get(key)) for key in required)
-
-
-def strategy_exchange_configured(exchange: str, user_id: int | None = None) -> bool:
-    name = clean_strategy_exchange(exchange)
-    return strategy_credentials_complete(name, strategy_exchange_credentials(name, user_id))
-
-
-def strategy_exchange_cache_get(key: str) -> Any | None:
-    with STRATEGY_EXCHANGE_CACHE_LOCK:
-        cached = STRATEGY_EXCHANGE_CACHE.get(key)
-        if not cached:
-            return None
-        cached_at, value = cached
-        if time.time() - cached_at > STRATEGY_POSITION_CACHE_SECONDS:
-            STRATEGY_EXCHANGE_CACHE.pop(key, None)
-            return None
-        return value
-
-
-def strategy_exchange_cache_set(key: str, value: Any) -> Any:
-    with STRATEGY_EXCHANGE_CACHE_LOCK:
-        STRATEGY_EXCHANGE_CACHE[key] = (time.time(), value)
-    return value
-
-
-def strategy_clear_exchange_cache(user_id: int | None = None, exchange: str = "") -> None:
-    user_marker = f":{int(user_id)}:" if user_id else ""
-    exchange_marker = f":{clean_strategy_exchange(exchange)}:" if exchange else ""
-    with STRATEGY_EXCHANGE_CACHE_LOCK:
-        for key in list(STRATEGY_EXCHANGE_CACHE):
-            if user_marker and user_marker not in key:
-                continue
-            if exchange_marker and exchange_marker not in key:
-                continue
-            STRATEGY_EXCHANGE_CACHE.pop(key, None)
-
-
-def binance_futures_error_message(code: Any, message: Any, status_code: int = 0) -> str:
-    clean_code = int(safe_float(code)) if str(code or "").strip() else 0
-    clean_message = re.sub(r"\s+", " ", str(message or "")).strip()
-    if clean_code == -2015:
-        return (
-            "API Key 无效、未开放合约读取权限，或当前服务出口 IP 不在币安白名单中。"
-            "请确认币安 API 的“允许读取、允许合约”已开启，并将运行本站的出口 IP 加入白名单。"
-        )
-    if clean_code == -1022:
-        return "币安签名校验失败，请重新保存正确的 API Secret。"
-    if clean_code == -1021:
-        return "本站时间与币安服务器时间偏差过大，请同步电脑系统时间后重试。"
-    if clean_code == -1003:
-        return "币安接口访问频率受限，请稍后再试。"
-    if status_code in {401, 403}:
-        return "币安拒绝了账户读取请求，请检查 API 权限和 IP 白名单。"
-    if status_code == 451:
-        return "当前网络区域无法访问币安合约接口。"
-    detail = clean_message or (f"HTTP {status_code}" if status_code else "未知错误")
-    return f"币安合约接口返回：{detail}"[:420]
-
-
-def binance_futures_signed_get(
-    path: str,
-    credentials: dict[str, str],
-    params: dict[str, Any] | None = None,
-) -> Any:
-    api_key = clean_exchange_credential(credentials.get("key"))
-    api_secret = clean_exchange_credential(credentials.get("secret"))
-    if not api_key or not api_secret:
-        raise RuntimeError("币安 API Key 或 Secret 尚未配置完整。")
-
-    timestamp = int(time.time() * 1000)
-    try:
-        time_response = requests.get(
-            "https://fapi.binance.com/fapi/v1/time",
-            headers=HEADERS,
-            timeout=6,
-        )
-        if time_response.ok:
-            timestamp = int(time_response.json().get("serverTime") or timestamp)
-    except (requests.RequestException, TypeError, ValueError, json.JSONDecodeError):
-        pass
-
-    query_params = dict(params or {})
-    query_params["recvWindow"] = 10_000
-    query_params["timestamp"] = timestamp
-    query = urlencode(query_params)
-    signature = hmac.new(api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
-    url = f"https://fapi.binance.com{path}?{query}&signature={signature}"
-    try:
-        response = requests.get(
-            url,
-            headers={**HEADERS, "Accept": "application/json", "X-MBX-APIKEY": api_key},
-            timeout=12,
-        )
-    except requests.RequestException as exc:
-        raise RuntimeError(f"无法连接币安合约接口：{safe_error_text(str(exc))}") from exc
-
-    try:
-        payload = response.json()
-    except (ValueError, json.JSONDecodeError):
-        payload = None
-    if not response.ok:
-        error_payload = payload if isinstance(payload, dict) else {}
-        raise RuntimeError(
-            binance_futures_error_message(
-                error_payload.get("code"),
-                error_payload.get("msg") or response.text[:240],
-                response.status_code,
-            )
-        )
-    if isinstance(payload, dict) and safe_float(payload.get("code")) < 0:
-        raise RuntimeError(binance_futures_error_message(payload.get("code"), payload.get("msg"), response.status_code))
-    return payload
-
-
-def binance_futures_positions(user_id: int) -> list[dict[str, Any]]:
-    credentials = strategy_exchange_credentials("binance", user_id)
-    if not strategy_credentials_complete("binance", credentials):
-        return []
-    key_fingerprint = hashlib.sha256(credentials["key"].encode("utf-8")).hexdigest()[:12]
-    cache_key = f"positions:{int(user_id)}:binance:{key_fingerprint}"
-    cached = strategy_exchange_cache_get(cache_key)
-    if cached is not None:
-        return cached
-
-    payload = binance_futures_signed_get("/fapi/v3/positionRisk", credentials)
-    if not isinstance(payload, list):
-        raise RuntimeError("币安合约持仓接口没有返回有效列表。")
-
-    positions: list[dict[str, Any]] = []
-    for row in payload:
-        if not isinstance(row, dict):
-            continue
-        signed_quantity = safe_float(row.get("positionAmt"))
-        if abs(signed_quantity) <= 0:
-            continue
-        symbol = normalize_asset_symbol(row.get("symbol"))
-        if not symbol:
-            continue
-        position_side = str(row.get("positionSide") or "BOTH").strip().upper()
-        side = "short" if position_side == "SHORT" or (position_side == "BOTH" and signed_quantity < 0) else "long"
-        quantity = abs(signed_quantity)
-        entry_price = safe_float(row.get("entryPrice"))
-        mark_price = safe_float(row.get("markPrice")) or entry_price
-        notional = abs(safe_float(row.get("notional"))) or mark_price * quantity
-        initial_margin = (
-            safe_float(row.get("positionInitialMargin"))
-            or safe_float(row.get("initialMargin"))
-            or safe_float(row.get("isolatedMargin"))
-        )
-        leverage = safe_float(row.get("leverage"))
-        if leverage <= 0 and initial_margin > 0:
-            leverage = max(1.0, round(notional / initial_margin, 2))
-        if leverage <= 0:
-            leverage = 1.0
-        margin = initial_margin or (notional / leverage if leverage > 0 else notional)
-        unrealized_pnl = safe_float(row.get("unRealizedProfit"))
-        pnl_pct = unrealized_pnl / margin * 100 if margin > 0 else 0.0
-        asset_symbol = re.sub(r"(?:USDT|USDC|BUSD)$", "", symbol)
-        positions.append(
-            {
-                "key": f"exchange:binance:{symbol}:{side}",
-                "id": f"binance:{symbol}:{side}",
-                "symbol": symbol,
-                "name": asset_symbol or symbol,
-                "icon": crypto_icon_url(asset_symbol or symbol),
-                "exchange": "binance",
-                "mode": "live",
-                "source": "exchange",
-                "side": side,
-                "positionSide": position_side,
-                "entryPrice": entry_price,
-                "breakEvenPrice": safe_float(row.get("breakEvenPrice")),
-                "markPrice": mark_price,
-                "liquidationPrice": safe_float(row.get("liquidationPrice")),
-                "quantity": quantity,
-                "notional": notional,
-                "margin": margin,
-                "marginType": str(row.get("marginType") or "").strip().lower(),
-                "leverage": leverage,
-                "stopLossPrice": 0,
-                "unrealizedPnl": round(unrealized_pnl, 6),
-                "unrealizedPnlPct": round(pnl_pct, 4),
-                "breakEvenAt": 0,
-                "canBreakEven": False,
-                "createdAt": int(row.get("updateTime") or 0),
-            }
-        )
-    positions.sort(key=lambda item: safe_float(item.get("notional")), reverse=True)
-    return strategy_exchange_cache_set(cache_key, positions)
-
-
-def parse_binance_futures_account(payload: dict[str, Any]) -> dict[str, Any]:
-    assets = payload.get("assets") if isinstance(payload.get("assets"), list) else []
-    usdt_asset = next(
-        (
-            item
-            for item in assets
-            if isinstance(item, dict) and str(item.get("asset") or "").strip().upper() == "USDT"
-        ),
-        {},
-    )
-    available_balance = safe_float(payload.get("availableBalance"))
-    if not str(payload.get("availableBalance") or "").strip():
-        available_balance = safe_float(usdt_asset.get("availableBalance"))
-    wallet_balance = safe_float(payload.get("totalWalletBalance"))
-    if not str(payload.get("totalWalletBalance") or "").strip():
-        wallet_balance = safe_float(usdt_asset.get("walletBalance"))
-    margin_balance = safe_float(payload.get("totalMarginBalance"))
-    if not str(payload.get("totalMarginBalance") or "").strip():
-        margin_balance = safe_float(usdt_asset.get("marginBalance"))
-    initial_margin = safe_float(payload.get("totalInitialMargin"))
-    if not str(payload.get("totalInitialMargin") or "").strip():
-        initial_margin = safe_float(usdt_asset.get("initialMargin"))
-    return {
-        "exchange": "binance",
-        "label": "Binance U 本位",
-        "currency": "USDT",
-        "availableBalance": round(max(0.0, available_balance), 8),
-        "walletBalance": round(max(0.0, wallet_balance), 8),
-        "marginBalance": round(max(0.0, margin_balance), 8),
-        "initialMargin": round(max(0.0, initial_margin), 8),
-        "updatedAt": int(time.time() * 1000),
-    }
-
-
 def x_kol_realtime_key(user: dict[str, Any] | None = None) -> int:
     return int(safe_float((user or {}).get("id")) or 0)
 
@@ -46951,802 +47248,6 @@ def x_kol_realtime_snapshot(
     return payload, x_kol_payload_signature(payload)
 
 
-def binance_futures_account(user_id: int) -> dict[str, Any]:
-    credentials = strategy_exchange_credentials("binance", user_id)
-    if not strategy_credentials_complete("binance", credentials):
-        raise RuntimeError("Binance API Key 或 Secret 尚未配置完整")
-    key_fingerprint = hashlib.sha256(credentials["key"].encode("utf-8")).hexdigest()[:12]
-    cache_key = f"account:{int(user_id)}:binance:{key_fingerprint}"
-    cached = strategy_exchange_cache_get(cache_key)
-    if cached is not None:
-        return cached
-
-    errors: list[str] = []
-    account_payload: dict[str, Any] | None = None
-    for path in ("/fapi/v3/account", "/fapi/v2/account"):
-        try:
-            candidate = binance_futures_signed_get(path, credentials)
-            if isinstance(candidate, dict):
-                account_payload = candidate
-                break
-            errors.append(f"{path} 未返回账户对象")
-        except Exception as exc:
-            errors.append(safe_error_text(str(exc)))
-    if account_payload is None:
-        detail = next((item for item in errors if item), "Binance 合约账户余额读取失败")
-        raise RuntimeError(detail)
-    return strategy_exchange_cache_set(cache_key, parse_binance_futures_account(account_payload))
-
-
-def okx_private_error_message(code: Any, message: Any, status_code: int = 0) -> str:
-    clean_code = str(code or "").strip()
-    clean_message = re.sub(r"\s+", " ", str(message or "")).strip()
-    if clean_code in {"50111", "50119"}:
-        return "OKX API Key 无效或已被删除，请重新创建并保存。"
-    if clean_code == "50113":
-        return "OKX 签名校验失败，请检查 API Secret 和 API 密码（Passphrase）。"
-    if clean_code in {"50110", "50011"}:
-        return "OKX 拒绝了当前出口 IP，请检查 API 的 IP 白名单。"
-    if clean_code in {"50105", "50120"}:
-        return "OKX API 未开放账户读取权限，请在 OKX API 管理中启用读取权限。"
-    if clean_code in {"50112", "50114"}:
-        return "OKX 请求时间已失效，请同步电脑系统时间后重试。"
-    if status_code in {401, 403}:
-        return "OKX 拒绝了账户读取请求，请检查 API Key、Secret、API 密码和 IP 白名单。"
-    detail = clean_message or (f"HTTP {status_code}" if status_code else "未知错误")
-    prefix = f"OKX 接口 {clean_code}" if clean_code else "OKX 合约接口"
-    return f"{prefix}：{detail}"[:420]
-
-
-def okx_private_signed_get(
-    path: str,
-    credentials: dict[str, str],
-    params: dict[str, Any] | None = None,
-) -> Any:
-    api_key = clean_exchange_credential(credentials.get("key"))
-    api_secret = clean_exchange_credential(credentials.get("secret"))
-    passphrase = clean_exchange_credential(credentials.get("passphrase"))
-    if not api_key or not api_secret or not passphrase:
-        raise RuntimeError("OKX 私有账户读取需要 API Key、Secret 和创建 API 时设置的 API 密码。")
-
-    query = urlencode({key: value for key, value in (params or {}).items() if value is not None})
-    request_path = f"{path}?{query}" if query else path
-    timestamp = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
-    prehash = f"{timestamp}GET{request_path}"
-    signature = base64.b64encode(
-        hmac.new(api_secret.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).digest()
-    ).decode("ascii")
-    try:
-        response = requests.get(
-            f"https://www.okx.com{request_path}",
-            headers={
-                **HEADERS,
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "OK-ACCESS-KEY": api_key,
-                "OK-ACCESS-SIGN": signature,
-                "OK-ACCESS-TIMESTAMP": timestamp,
-                "OK-ACCESS-PASSPHRASE": passphrase,
-            },
-            timeout=12,
-        )
-    except requests.RequestException as exc:
-        raise RuntimeError(f"无法连接 OKX 合约接口：{safe_error_text(str(exc))}") from exc
-
-    try:
-        payload = response.json()
-    except (ValueError, json.JSONDecodeError):
-        payload = None
-    error_payload = payload if isinstance(payload, dict) else {}
-    code = str(error_payload.get("code") or "").strip()
-    if not response.ok or (code and code != "0"):
-        raise RuntimeError(
-            okx_private_error_message(
-                code,
-                error_payload.get("msg") or response.text[:240],
-                response.status_code,
-            )
-        )
-    return payload
-
-
-def parse_okx_futures_account(payload: dict[str, Any]) -> dict[str, Any]:
-    data = payload.get("data") if isinstance(payload.get("data"), list) else []
-    account = data[0] if data and isinstance(data[0], dict) else {}
-    details = account.get("details") if isinstance(account.get("details"), list) else []
-    usdt = next(
-        (
-            item
-            for item in details
-            if isinstance(item, dict) and str(item.get("ccy") or "").strip().upper() == "USDT"
-        ),
-        {},
-    )
-    available = safe_float(usdt.get("availBal"))
-    if not str(usdt.get("availBal") or "").strip():
-        available = safe_float(usdt.get("availEq"))
-    wallet = safe_float(usdt.get("cashBal"))
-    if not str(usdt.get("cashBal") or "").strip():
-        wallet = safe_float(usdt.get("eq"))
-    margin_balance = safe_float(usdt.get("eq"))
-    if not str(usdt.get("eq") or "").strip():
-        margin_balance = safe_float(account.get("totalEq"))
-    initial_margin = safe_float(usdt.get("imr"))
-    if not str(usdt.get("imr") or "").strip():
-        initial_margin = safe_float(account.get("imr"))
-    return {
-        "exchange": "okx",
-        "label": "OKX USDT 合约",
-        "currency": "USDT",
-        "availableBalance": round(max(0.0, available), 8),
-        "walletBalance": round(max(0.0, wallet), 8),
-        "marginBalance": round(max(0.0, margin_balance), 8),
-        "initialMargin": round(max(0.0, initial_margin), 8),
-        "updatedAt": int(time.time() * 1000),
-    }
-
-
-def okx_futures_account(user_id: int) -> dict[str, Any]:
-    credentials = strategy_exchange_credentials("okx", user_id)
-    if not strategy_credentials_complete("okx", credentials):
-        raise RuntimeError("OKX API 配置不完整，请补填创建 API 时设置的 API 密码。")
-    fingerprint_source = f"{credentials['key']}:{credentials.get('passphrase', '')}"
-    key_fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:12]
-    cache_key = f"account:{int(user_id)}:okx:{key_fingerprint}"
-    cached = strategy_exchange_cache_get(cache_key)
-    if cached is not None:
-        return cached
-    payload = okx_private_signed_get("/api/v5/account/balance", credentials, {"ccy": "USDT"})
-    if not isinstance(payload, dict):
-        raise RuntimeError("OKX 合约账户接口没有返回有效账户对象。")
-    return strategy_exchange_cache_set(cache_key, parse_okx_futures_account(payload))
-
-
-def okx_futures_positions(user_id: int) -> list[dict[str, Any]]:
-    credentials = strategy_exchange_credentials("okx", user_id)
-    if not strategy_credentials_complete("okx", credentials):
-        return []
-    fingerprint_source = f"{credentials['key']}:{credentials.get('passphrase', '')}"
-    key_fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:12]
-    cache_key = f"positions:{int(user_id)}:okx:{key_fingerprint}"
-    cached = strategy_exchange_cache_get(cache_key)
-    if cached is not None:
-        return cached
-    payload = okx_private_signed_get("/api/v5/account/positions", credentials, {"instType": "SWAP"})
-    rows = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), list) else None
-    if rows is None:
-        raise RuntimeError("OKX 合约持仓接口没有返回有效列表。")
-
-    positions: list[dict[str, Any]] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        signed_quantity = safe_float(row.get("pos"))
-        if abs(signed_quantity) <= 0:
-            continue
-        inst_id = str(row.get("instId") or "").strip().upper()
-        symbol = normalize_asset_symbol(inst_id.replace("-SWAP", "").replace("-", ""))
-        if not symbol:
-            continue
-        position_side = str(row.get("posSide") or "net").strip().lower()
-        side = "short" if position_side == "short" or (position_side == "net" and signed_quantity < 0) else "long"
-        quantity = abs(signed_quantity)
-        entry_price = safe_float(row.get("avgPx"))
-        mark_price = safe_float(row.get("markPx")) or entry_price
-        notional = abs(safe_float(row.get("notionalUsd")))
-        leverage = max(1.0, safe_float(row.get("lever"), 1.0))
-        margin = safe_float(row.get("margin")) or safe_float(row.get("imr"))
-        if notional <= 0:
-            contract_value = safe_float(row.get("ctVal"), 1.0)
-            contract_multiplier = safe_float(row.get("ctMult"), 1.0)
-            notional = abs(quantity * mark_price * contract_value * contract_multiplier)
-        if margin <= 0:
-            margin = notional / leverage if leverage > 0 else notional
-        unrealized_pnl = safe_float(row.get("upl"))
-        pnl_pct = safe_float(row.get("uplRatio")) * 100
-        if not str(row.get("uplRatio") or "").strip() and margin > 0:
-            pnl_pct = unrealized_pnl / margin * 100
-        asset_symbol = re.sub(r"(?:USDT|USDC)$", "", symbol)
-        positions.append(
-            {
-                "key": f"exchange:okx:{symbol}:{side}",
-                "id": f"okx:{symbol}:{side}",
-                "symbol": symbol,
-                "name": asset_symbol or symbol,
-                "icon": crypto_icon_url(asset_symbol or symbol),
-                "exchange": "okx",
-                "mode": "live",
-                "source": "exchange",
-                "side": side,
-                "positionSide": position_side.upper(),
-                "entryPrice": entry_price,
-                "breakEvenPrice": 0,
-                "markPrice": mark_price,
-                "liquidationPrice": safe_float(row.get("liqPx")),
-                "quantity": quantity,
-                "notional": notional,
-                "margin": margin,
-                "marginType": str(row.get("mgnMode") or "").strip().lower(),
-                "leverage": leverage,
-                "stopLossPrice": 0,
-                "unrealizedPnl": round(unrealized_pnl, 6),
-                "unrealizedPnlPct": round(pnl_pct, 4),
-                "breakEvenAt": 0,
-                "canBreakEven": False,
-                "createdAt": int(safe_float(row.get("uTime") or row.get("cTime"))),
-            }
-        )
-    positions.sort(key=lambda item: safe_float(item.get("notional")), reverse=True)
-    return strategy_exchange_cache_set(cache_key, positions)
-
-
-def strategy_exchange_account(exchange: str, user_id: int) -> dict[str, Any]:
-    name = clean_strategy_exchange(exchange)
-    if name == "binance":
-        return binance_futures_account(user_id)
-    if name == "okx":
-        return okx_futures_account(user_id)
-    raise RuntimeError(f"{STRATEGY_EXCHANGE_DEFINITIONS[name]['label']} 账户读取尚未接入")
-
-
-def strategy_exchange_accounts(user_id: int) -> list[dict[str, Any]]:
-    accounts: list[dict[str, Any]] = []
-    for exchange, definition in STRATEGY_EXCHANGE_DEFINITIONS.items():
-        personal = strategy_user_exchange_credentials(user_id, exchange)
-        credentials_stored = any(
-            clean_exchange_credential(personal.get(key)) for key in ("key", "secret", "passphrase")
-        )
-        configured = strategy_exchange_configured(exchange, user_id)
-        base = {
-            "exchange": exchange,
-            "label": definition["label"],
-            "configured": configured,
-            "credentialsStored": credentials_stored,
-            "ok": False,
-            "currency": "USDT",
-            "availableBalance": None,
-            "updatedAt": int(time.time() * 1000),
-        }
-        if not configured:
-            error = (
-                "OKX API 配置不完整，请补填创建 API 时设置的 API 密码"
-                if exchange == "okx" and credentials_stored
-                else "尚未配置交易 API"
-            )
-            accounts.append({**base, "error": error})
-            continue
-        try:
-            accounts.append({**base, **strategy_exchange_account(exchange, user_id), "configured": True, "ok": True})
-        except Exception as exc:
-            accounts.append({**base, "error": safe_error_text(str(exc))})
-    return accounts
-
-
-def strategy_exchange_settings_payload(user_id: int) -> dict[str, Any]:
-    exchanges = []
-    for name, definition in STRATEGY_EXCHANGE_DEFINITIONS.items():
-        personal = strategy_user_exchange_credentials(user_id, name)
-        effective = strategy_exchange_credentials(name, user_id)
-        available = strategy_credentials_complete(name, effective)
-        personal_stored = any(
-            clean_exchange_credential(personal.get(key)) for key in ("key", "secret", "passphrase")
-        )
-        missing_fields = []
-        if not clean_exchange_credential(effective.get("key")):
-            missing_fields.append("API Key")
-        if not clean_exchange_credential(effective.get("secret")):
-            missing_fields.append("API Secret")
-        if name == "okx" and not clean_exchange_credential(effective.get("passphrase")):
-            missing_fields.append("API 密码")
-        exchanges.append(
-            {
-                "id": name,
-                "label": definition["label"],
-                "configured": personal_stored,
-                "available": available,
-                "source": "user" if personal_stored else "server" if available else "none",
-                "keyHint": mask_api_key(personal.get("key") or effective.get("key")),
-                "requiresPassphrase": name == "okx",
-                "passphraseConfigured": bool(clean_exchange_credential(effective.get("passphrase"))),
-                "missingFields": missing_fields,
-                "updatedAt": int(personal.get("updatedAt") or 0),
-            }
-        )
-    return {"ok": True, "liveTradingEnabled": strategy_live_enabled(), "exchanges": exchanges}
-
-
-def save_strategy_exchange_settings(user: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
-    action = str(payload.get("action") or "save").strip().lower()
-    exchange = clean_strategy_exchange(payload.get("exchange"))
-    user_id = int(user["id"])
-    if action == "remove":
-        with AUTH_DB_LOCK, auth_db() as conn:
-            conn.execute(
-                "DELETE FROM user_exchange_credentials WHERE user_id = ? AND exchange = ?",
-                (user_id, exchange),
-            )
-        strategy_clear_exchange_cache(user_id, exchange)
-        write_audit_log(
-            "strategy_exchange_credentials_removed",
-            actor=user,
-            object_type="exchange_credentials",
-            object_id=exchange,
-        )
-        return strategy_exchange_settings_payload(user_id)
-    if action != "save":
-        raise ValueError("不支持该操作")
-
-    existing = strategy_user_exchange_credentials(user_id, exchange)
-    api_key = clean_exchange_credential(payload.get("apiKey") or payload.get("api_key")) or existing.get("key", "")
-    api_secret = clean_exchange_credential(payload.get("apiSecret") or payload.get("api_secret")) or existing.get("secret", "")
-    passphrase = clean_exchange_credential(payload.get("passphrase") or payload.get("apiPassphrase")) or existing.get("passphrase", "")
-    candidate = {"key": api_key, "secret": api_secret, "passphrase": passphrase}
-    if not strategy_credentials_complete(exchange, candidate):
-        if exchange == "okx":
-            raise ValueError("OKX 账户读取需要完整填写 API Key、Secret 和创建 API 时设置的 API 密码")
-        raise ValueError("请完整填写 API Key 和 Secret")
-    now = int(time.time())
-    with AUTH_DB_LOCK, auth_db() as conn:
-        conn.execute(
-            """
-            INSERT INTO user_exchange_credentials (user_id, exchange, api_key, api_secret, passphrase, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_id, exchange) DO UPDATE SET
-                api_key = excluded.api_key,
-                api_secret = excluded.api_secret,
-                passphrase = excluded.passphrase,
-                updated_at = excluded.updated_at
-            """,
-            (
-                user_id,
-                exchange,
-                encrypt_field(api_key),
-                encrypt_field(api_secret),
-                encrypt_field(passphrase) if passphrase else "",
-                now,
-            ),
-        )
-    strategy_clear_exchange_cache(user_id, exchange)
-    write_audit_log(
-        "strategy_exchange_credentials_saved",
-        actor=user,
-        object_type="exchange_credentials",
-        object_id=exchange,
-        metadata={"exchange": exchange, "key_hint": mask_api_key(api_key)},
-    )
-    return strategy_exchange_settings_payload(user_id)
-
-
-def strategy_exchange_availability(symbol: str, provider: str = "", user_id: int | None = None) -> list[dict[str, Any]]:
-    order = ["binance", "okx", "bitget"]
-    exchanges = [
-        {
-            "id": name,
-            "label": STRATEGY_EXCHANGE_DEFINITIONS[name]["label"],
-            "priority": index + 1,
-            "recommended": False,
-            "marketKnown": True,
-            "liveConfigured": strategy_exchange_configured(name, user_id),
-        }
-        for index, name in enumerate(order)
-    ]
-    preferred = next((item for item in exchanges if item["liveConfigured"]), exchanges[0])
-    preferred["recommended"] = True
-    return exchanges
-
-
-def strategy_order_preview(payload: dict[str, Any], user: dict[str, Any] | None = None) -> dict[str, Any]:
-    asset = strategy_asset_row(payload.get("symbol"))
-    symbol = asset.get("symbol") or ""
-    entry_price = safe_float(asset.get("current_price"))
-    if entry_price <= 0:
-        raise ValueError("当前价格尚未就绪，暂时不能计算仓位")
-    account_equity = max(0.0, safe_float(payload.get("totalCapital") or payload.get("accountEquity")))
-    if account_equity <= 0:
-        raise ValueError("请输入有效的账户权益")
-    current_exposure = max(0.0, safe_float(payload.get("currentGrossExposure")))
-    daily_loss = max(0.0, safe_float(payload.get("dailyLoss")))
-    tier = strategy_risk_tier(account_equity)
-    leverage = strategy_clamp(payload.get("leverage"), 1.0, 3.0, 3.0)
-    strategy_signal = asset.get("strategy_signal") if isinstance(asset.get("strategy_signal"), dict) else None
-    strategy_pending = asset.get("strategy_pending") if isinstance(asset.get("strategy_pending"), dict) else None
-    effective_strategy_signal = strategy_signal or strategy_pending or {}
-    breakout_price = safe_float(
-        effective_strategy_signal.get("triggerPrice")
-        or effective_strategy_signal.get("price")
-        or asset.get("week_high")
-    )
-    if breakout_price <= 0:
-        raise ValueError("策略突破位尚未就绪，暂时不能计算突破仓位")
-    stop_plan = strategy_stop_loss_plan(
-        entry_price,
-        effective_strategy_signal.get("breakoutLow"),
-    )
-    stop_loss_price = safe_float(stop_plan.get("stopLossPrice"), 0)
-    effective_stop_distance_pct = safe_float(stop_plan.get("stopDistancePct"), 0)
-    requested_risk_pct = strategy_clamp(
-        payload.get("riskExposurePct"),
-        0.01,
-        100.0,
-        tier["riskDefaultPct"],
-    )
-    recommended_risk_budget = account_equity * requested_risk_pct / 100
-    daily_loss_limit = account_equity * tier["dailyLossLimitPct"] / 100
-    risk_based_notional = recommended_risk_budget / ((effective_stop_distance_pct + STRATEGY_FEE_BUFFER_PCT) / 100)
-    requested_exposure = max(0.0, safe_float(payload.get("orderExposure")))
-    requested_margin = max(0.0, safe_float(payload.get("orderMargin")))
-    sizing_mode = str(payload.get("sizingMode") or "risk").strip().lower()
-    if sizing_mode not in {"risk", "notional", "margin"}:
-        sizing_mode = "risk"
-    if sizing_mode == "margin":
-        requested_exposure = requested_margin * leverage
-    elif sizing_mode == "notional":
-        requested_exposure = max(0.0, requested_exposure)
-    else:
-        sizing_mode = "risk"
-        requested_exposure = risk_based_notional
-    exchange = str(payload.get("exchange") or "").strip().lower()
-    user_id = int(user["id"]) if user else None
-    exchanges = strategy_exchange_availability(symbol, asset.get("provider") or "", user_id)
-    if exchange not in {item["id"] for item in exchanges}:
-        exchange = exchanges[0]["id"]
-    mode = str(payload.get("mode") or "paper").strip().lower()
-    if mode not in {"paper", "live"}:
-        mode = "paper"
-    exchange_account: dict[str, Any] | None = None
-    exchange_account_error = ""
-    if user_id and strategy_exchange_configured(exchange, user_id):
-        try:
-            exchange_account = strategy_exchange_account(exchange, user_id)
-        except Exception as exc:
-            exchange_account_error = safe_error_text(str(exc))
-    notional = min(requested_exposure, strategy_max_notional())
-    projected_margin = notional / leverage if leverage > 0 else notional
-    blocked_reason = ""
-    available_balance = (
-        safe_float(exchange_account.get("availableBalance"))
-        if isinstance(exchange_account, dict)
-        else None
-    )
-    breakout_candle_low = safe_float(effective_strategy_signal.get("breakoutLow"), 0)
-    structure_invalidated = bool(
-        strategy_signal
-        and breakout_candle_low > 0
-        and entry_price <= breakout_candle_low
-    )
-    if structure_invalidated:
-        blocked_reason = "现价已跌破突破K低点，该买点只保留复盘，不能继续开仓"
-        notional = 0.0
-    elif mode == "live" and exchange_account is None:
-        blocked_reason = exchange_account_error or f"无法核验 {exchange.upper()} 合约账户可用余额"
-        notional = 0.0
-    elif (
-        mode == "live"
-        and available_balance is not None
-        and projected_margin > available_balance + 1e-8
-    ):
-        blocked_reason = (
-            f"试算保证金 {projected_margin:.4f} USDT 超过 {exchange.upper()} 合约账户可用余额 "
-            f"{available_balance:.4f} USDT"
-        )
-        notional = 0.0
-    elif daily_loss >= daily_loss_limit:
-        blocked_reason = "已触及当日最大亏损，禁止新增仓位"
-        notional = 0.0
-    elif entry_price <= stop_loss_price or effective_stop_distance_pct <= 0:
-        blocked_reason = "当前价格已经进入止损区间，不应按该突破信号开仓"
-        notional = 0.0
-    elif notional < 5:
-        blocked_reason = "可用风险预算不足以形成最小仓位"
-        notional = 0.0
-    quantity = notional / entry_price if entry_price > 0 else 0.0
-    margin_required = notional / leverage if leverage > 0 else notional
-    risk_budget = notional * (effective_stop_distance_pct + STRATEGY_FEE_BUFFER_PCT) / 100
-    risk_pct = risk_budget / account_equity * 100 if account_equity > 0 else 0.0
-    warning = ""
-    if risk_pct > tier["riskMaxPct"]:
-        warning = f"当前敞口对应单笔风险 {risk_pct:.2f}%，高于该资金档建议上限 {tier['riskMaxPct']:.2f}%"
-    strategy_episode = int(safe_float(
-        effective_strategy_signal.get("decisionTime") or effective_strategy_signal.get("time"),
-        0,
-    ))
-    legacy_signal_confirmed = bool(asset.get("first_valid_episode") and asset.get("first_valid_confirmed_at"))
-    signal_confirmed = bool(strategy_signal or legacy_signal_confirmed)
-    return {
-        "ok": True,
-        "symbol": symbol,
-        "name": asset.get("name") or symbol,
-        "icon": asset.get("icon") or crypto_icon_url(symbol),
-        "signalEpisode": strategy_episode or int(asset.get("first_valid_episode") or asset.get("latest_alert_episode") or 0),
-        "signalConfirmed": signal_confirmed,
-        "setupType": effective_strategy_signal.get("pattern") or asset.get("setup_type") or asset.get("first_valid_setup_type") or "",
-        "strategyEngine": asset.get("strategy_engine") or ("dragon-wave-engine" if strategy_signal or strategy_pending else "prior-high-monitor"),
-        "strategyVersion": asset.get("strategy_version") or "",
-        "strategySignalId": clean_feed_text(effective_strategy_signal.get("id"), 180),
-        "strategySignalInterval": clean_feed_text(effective_strategy_signal.get("interval"), 10),
-        "strategySignalGrade": clean_feed_text(effective_strategy_signal.get("grade"), 8),
-        "strategySignalPattern": clean_feed_text(effective_strategy_signal.get("pattern"), 100),
-        "strategySignalPending": bool(strategy_pending and not strategy_signal),
-        "provider": asset.get("provider") or "",
-        "exchange": exchange,
-        "exchanges": exchanges,
-        "exchangeAccount": (
-            {**exchange_account, "ok": True, "configured": True}
-            if exchange_account
-            else {
-                "exchange": exchange,
-                "ok": False,
-                "configured": bool(user_id and strategy_exchange_configured(exchange, user_id)),
-                "availableBalance": None,
-                "currency": "USDT",
-                "error": exchange_account_error,
-            }
-        ),
-        "tier": tier,
-        "accountEquity": round(account_equity, 4),
-        "currentGrossExposure": round(current_exposure, 4),
-        "dailyLoss": round(daily_loss, 4),
-        "riskPct": risk_pct,
-        "requestedRiskPct": requested_risk_pct,
-        "dailyLossLimitPct": tier["dailyLossLimitPct"],
-        "exposureCapPct": 0.0,
-        "leverage": leverage,
-        "entryPrice": entry_price,
-        "breakoutPrice": breakout_price,
-        "suggestedStopPrice": stop_loss_price,
-        "stopLossPrice": stop_loss_price,
-        "stopDistancePct": round(effective_stop_distance_pct, 4),
-        "breakoutCandleLow": stop_plan.get("breakoutCandleLow"),
-        "breakoutCandleDistancePct": stop_plan.get("breakoutCandleDistancePct"),
-        "stopLossSource": stop_plan.get("stopLossSource"),
-        "stopLossSourceLabel": stop_plan.get("stopLossSourceLabel"),
-        "stopLossReason": stop_plan.get("stopLossReason"),
-        "defaultStopPct": STRATEGY_DEFAULT_STOP_PCT,
-        "riskBudget": round(risk_budget, 4),
-        "recommendedRiskBudget": round(recommended_risk_budget, 4),
-        "dailyLossLimit": round(daily_loss_limit, 4),
-        "exposureCap": 0.0,
-        "remainingExposure": 0.0,
-        "riskBasedNotional": round(risk_based_notional, 4),
-        "recommendedNotional": round(risk_based_notional, 4),
-        "requestedExposure": round(requested_exposure, 4),
-        "requestedMargin": round(requested_margin, 4),
-        "sizingMode": sizing_mode,
-        "notional": round(notional, 4),
-        "marginRequired": round(margin_required, 4),
-        "quantity": round(quantity, 10),
-        "feeBufferPct": STRATEGY_FEE_BUFFER_PCT,
-        "blocked": bool(blocked_reason),
-        "blockedReason": blocked_reason,
-        "warning": warning,
-    }
-
-
-def strategy_board_signals(user_id: int | None = None) -> list[dict[str, Any]]:
-    items_by_symbol = {
-        item["symbol"]: item
-        for item in (price_watch_public_item(row) for row in price_watch_active_rows())
-        if item.get("symbol") and item.get("priorHighEnabled")
-    }
-    structure_items = strategy_dragon_wave_items()
-    for symbol, structure_item in structure_items.items():
-        context = strategy_dragon_wave_context(structure_item)
-        strategy_signal = context.get("signal")
-        strategy_pending = context.get("pending")
-        strategy_frame = context.get("frame")
-        has_engine_context = bool(strategy_signal or strategy_pending or strategy_frame)
-        item = items_by_symbol.get(symbol)
-        # The independent recent-new-coin pool joins Strategy Board only once
-        # the shared engine has a prediction or buy signal; it never floods the
-        # board with every low-position observation.
-        if item is None and not (strategy_signal or strategy_pending):
-            continue
-        if item is None:
-            item = {
-                "symbol": symbol,
-                "name": structure_item.get("name") or symbol,
-                "icon": structure_item.get("icon") or crypto_icon_url(symbol),
-                "currentPrice": safe_float(structure_item.get("currentPrice"), 0) or None,
-                "weekHigh": None,
-                "distancePct": 999,
-                "setupType": "",
-                "provider": structure_item.get("provider") or "",
-                "isFirstCandidate": False,
-                "hasConfirmedFirst": False,
-            }
-            items_by_symbol[symbol] = item
-        structure_price = safe_float(structure_item.get("currentPrice"), 0)
-        effective = strategy_signal or strategy_pending or {}
-        trigger_price = safe_float(effective.get("triggerPrice") or effective.get("price"), 0)
-        if structure_price > 0:
-            item["currentPrice"] = structure_price
-        if trigger_price > 0:
-            item["weekHigh"] = trigger_price
-            if structure_price > 0:
-                item["distancePct"] = round((trigger_price - structure_price) / structure_price * 100, 4)
-        stop_plan = (
-            strategy_stop_loss_plan(structure_price, effective.get("breakoutLow"))
-            if structure_price > 0 and effective
-            else {}
-        )
-        breakout_low = safe_float(effective.get("breakoutLow"), 0)
-        signal_actionable = bool(
-            strategy_signal
-            and structure_price > 0
-            and (breakout_low <= 0 or structure_price > breakout_low)
-        )
-        item.update({
-            "strategyEngine": (
-                structure_item.get("strategy") or "dragon-wave-engine"
-                if has_engine_context
-                else item.get("strategyEngine") or "prior-high-monitor"
-            ),
-            "strategyVersion": (
-                structure_item.get("strategyVersion") or "shared-live"
-                if has_engine_context
-                else item.get("strategyVersion") or ""
-            ),
-            "strategyMonitorPool": (
-                structure_item.get("monitorPool") or "aicoin-personal-x"
-                if has_engine_context
-                else item.get("strategyMonitorPool") or ""
-            ),
-            "strategySignal": strategy_signal,
-            "strategyPending": strategy_pending,
-            "strategyFrame": strategy_frame,
-            "strategyInterval": clean_feed_text(effective.get("interval") or (strategy_frame or {}).get("key"), 10),
-            "strategyGrade": clean_feed_text(effective.get("grade"), 8),
-            "strategyPattern": clean_feed_text(effective.get("pattern") or (strategy_frame or {}).get("pattern"), 100),
-            "strategyBreakoutLow": safe_float(effective.get("breakoutLow"), 0) or None,
-            "strategyStopLossPrice": safe_float(stop_plan.get("stopLossPrice"), 0) or None,
-            "strategyStopDistancePct": safe_float(stop_plan.get("stopDistancePct"), 0) or None,
-            "strategyStopLossSource": stop_plan.get("stopLossSource") or "",
-            "strategyStopLossSourceLabel": stop_plan.get("stopLossSourceLabel") or "",
-            "strategyStopLossReason": stop_plan.get("stopLossReason") or "",
-            "strategySignalActionable": signal_actionable,
-            "strategySignalInvalidReason": (
-                "现价已跌破突破K低点，信号只保留复盘"
-                if strategy_signal and breakout_low > 0 and structure_price <= breakout_low
-                else ""
-            ),
-            "provider": structure_item.get("provider") or item.get("provider") or "",
-        })
-
-    signals: list[dict[str, Any]] = []
-    for item in items_by_symbol.values():
-        phase = 1
-        if item.get("strategyFrame") or item.get("setupType"):
-            phase = 2
-        if item.get("strategyPending") or item.get("isFirstCandidate"):
-            phase = 3
-        if item.get("strategySignal") or item.get("hasConfirmedFirst"):
-            phase = 4
-        item["phase"] = phase
-        item["strategyReady"] = bool(
-            item.get("strategySignalActionable")
-            or (not item.get("strategySignal") and item.get("hasConfirmedFirst"))
-        )
-        item["strategyPredicted"] = bool(item.get("strategyPending") and not item.get("strategySignal"))
-        item["exchanges"] = strategy_exchange_availability(
-            item.get("symbol") or "",
-            item.get("provider") or "",
-            user_id,
-        )
-        signals.append(item)
-    signals.sort(
-        key=lambda item: (
-            not bool(item.get("strategyReady")),
-            not bool(item.get("strategyPredicted") or item.get("isFirstCandidate")),
-            -safe_float((item.get("strategySignal") or item.get("strategyPending") or {}).get("certainty"), 0),
-            safe_float(item.get("distancePct"), 999),
-            -int(item.get("lastSeenAt") or 0),
-        )
-    )
-    return signals
-
-
-def strategy_paper_positions(user_id: int) -> list[dict[str, Any]]:
-    with AUTH_DB_LOCK, auth_db() as conn:
-        rows = conn.execute(
-            """
-            SELECT orders.*, assets.current_price AS live_mark_price, assets.icon, assets.name
-            FROM strategy_orders AS orders
-            LEFT JOIN price_watch_assets AS assets ON assets.symbol = orders.symbol
-            WHERE orders.user_id = ? AND orders.status IN ('paper_open', 'live_submitted')
-            ORDER BY orders.created_at DESC
-            """,
-            (user_id,),
-        ).fetchall()
-    positions = []
-    for row in rows:
-        item = dict(row)
-        mark_price = safe_float(item.get("live_mark_price")) or safe_float(item.get("mark_price")) or safe_float(item.get("entry_price"))
-        entry = safe_float(item.get("entry_price"))
-        quantity = safe_float(item.get("quantity"))
-        pnl = (mark_price - entry) * quantity
-        positions.append(
-            {
-                "key": f"paper:{item['id']}",
-                "id": int(item["id"]),
-                "symbol": item.get("symbol") or "",
-                "name": item.get("name") or item.get("symbol") or "",
-                "icon": item.get("icon") or crypto_icon_url(item.get("symbol")),
-                "exchange": item.get("exchange") or "",
-                "mode": item.get("mode") or "paper",
-                "side": item.get("side") or "long",
-                "entryPrice": entry,
-                "markPrice": mark_price,
-                "quantity": quantity,
-                "notional": mark_price * quantity,
-                "margin": safe_float(item.get("margin_required")),
-                "leverage": safe_float(item.get("leverage")),
-                "stopLossPrice": safe_float(item.get("stop_loss_price")),
-                "unrealizedPnl": round(pnl, 4),
-                "unrealizedPnlPct": round(pnl / safe_float(item.get("margin_required")) * 100, 3) if safe_float(item.get("margin_required")) > 0 else 0,
-                "breakEvenAt": int(item.get("break_even_at") or 0),
-                "canBreakEven": bool(pnl > 0 and not int(item.get("break_even_at") or 0)),
-                "createdAt": int(item.get("created_at") or 0),
-            }
-        )
-    return positions
-
-
-def strategy_live_positions(user_id: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    positions: list[dict[str, Any]] = []
-    sync_state: list[dict[str, Any]] = []
-    readers = {
-        "binance": ("Binance 合约", "币安 U 本位合约", binance_futures_positions),
-        "okx": ("OKX 合约", "OKX USDT 永续合约", okx_futures_positions),
-    }
-    for exchange, (label, market_label, reader) in readers.items():
-        configured = strategy_exchange_configured(exchange, user_id)
-        if not configured:
-            credential_hint = (
-                "尚未完整配置 OKX API Key、Secret 与 API 密码"
-                if exchange == "okx"
-                else "尚未配置 Binance API Key 与 Secret"
-            )
-            sync_state.append(
-                {
-                    "exchange": exchange,
-                    "label": label,
-                    "configured": False,
-                    "ok": False,
-                    "count": 0,
-                    "message": credential_hint,
-                    "updatedAt": int(time.time() * 1000),
-                }
-            )
-            continue
-        try:
-            exchange_positions = reader(user_id)
-            positions.extend(exchange_positions)
-            sync_state.append(
-                {
-                    "exchange": exchange,
-                    "label": label,
-                    "configured": True,
-                    "ok": True,
-                    "count": len(exchange_positions),
-                    "message": f"已读取{market_label}持仓",
-                    "updatedAt": int(time.time() * 1000),
-                }
-            )
-        except Exception as exc:
-            sync_state.append(
-                {
-                    "exchange": exchange,
-                    "label": label,
-                    "configured": True,
-                    "ok": False,
-                    "count": 0,
-                    "message": safe_error_text(str(exc)),
-                    "updatedAt": int(time.time() * 1000),
-                }
-            )
-    return positions, sync_state
-
-
 def merge_strategy_positions(
     exchange_positions: list[dict[str, Any]],
     local_positions: list[dict[str, Any]],
@@ -47770,127 +47271,6 @@ def merge_strategy_positions(
             continue
         merged.append(item)
     return merged
-
-
-def strategy_orders_payload(user: dict[str, Any] | None) -> dict[str, Any]:
-    user_id = int(user["id"]) if user else None
-    signals = strategy_board_signals(user_id)
-    local_positions = strategy_paper_positions(user_id) if user_id else []
-    exchange_positions, position_sync = strategy_live_positions(user_id) if user_id else ([], [])
-    exchange_accounts = strategy_exchange_accounts(user_id) if user_id else []
-    positions = merge_strategy_positions(exchange_positions, local_positions)
-    return {
-        "ok": True,
-        "updatedAt": int(time.time() * 1000),
-        "authenticated": bool(user),
-        "liveTradingEnabled": strategy_live_enabled(),
-        "signals": signals,
-        "positions": positions,
-        "positionSync": position_sync,
-        "exchangeAccounts": exchange_accounts,
-        "summary": {
-            "watching": len(signals),
-            "structured": sum(1 for item in signals if int(item.get("phase") or 0) >= 2),
-            "awaitingConfirmation": sum(
-                1 for item in signals if item.get("strategyPredicted") or item.get("isFirstCandidate")
-            ),
-            "ready": sum(1 for item in signals if item.get("strategyReady")),
-            "openPositions": len(positions),
-        },
-    }
-
-
-def strategy_submit_order(payload: dict[str, Any], user: dict[str, Any]) -> dict[str, Any]:
-    if str(payload.get("acknowledgement") or "").strip() != "确认下单":
-        raise ValueError("请完成二次确认后再下单")
-    preview = strategy_order_preview(payload, user)
-    if preview.get("blocked"):
-        raise ValueError(preview.get("blockedReason") or "风控阻止下单")
-    if not preview.get("signalConfirmed"):
-        raise ValueError("该信号尚未被人工标记为首次有效突破")
-    mode = str(payload.get("mode") or "paper").strip().lower()
-    if mode not in {"paper", "live"}:
-        raise ValueError("下单模式无效")
-    if mode == "live":
-        if not strategy_live_enabled():
-            raise ValueError("真实交易尚未在服务端启用；请先使用模拟确认")
-        if not strategy_exchange_configured(preview["exchange"], int(user["id"])):
-            raise ValueError(f"{preview['exchange']} 的交易 API 尚未配置")
-        raise ValueError("真实下单适配器处于保护状态；完成交易所 API 权限核验后才能启用")
-    now_ms = int(time.time() * 1000)
-    with AUTH_DB_LOCK, auth_db() as conn:
-        existing = conn.execute(
-            "SELECT id, status FROM strategy_orders WHERE user_id = ? AND symbol = ? AND signal_episode = ?",
-            (int(user["id"]), preview["symbol"], int(preview["signalEpisode"])),
-        ).fetchone()
-        if existing:
-            raise ValueError("该首次信号已经确认过订单，不能重复下单")
-        cursor = conn.execute(
-            """
-            INSERT INTO strategy_orders (
-                user_id, symbol, signal_episode, exchange, mode, side, order_type, status,
-                account_equity, current_gross_exposure, daily_loss, risk_pct,
-                daily_loss_limit_pct, exposure_cap_pct, leverage, entry_price, mark_price,
-                stop_loss_price, stop_distance_pct, risk_budget, notional, margin_required,
-                quantity, created_at, confirmed_at, submitted_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, 'long', 'market', 'paper_open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                int(user["id"]), preview["symbol"], int(preview["signalEpisode"]), preview["exchange"], mode,
-                preview["accountEquity"], preview["currentGrossExposure"], preview["dailyLoss"], preview["riskPct"],
-                preview["dailyLossLimitPct"], preview["exposureCapPct"], preview["leverage"], preview["entryPrice"],
-                preview["entryPrice"], preview["stopLossPrice"], preview["stopDistancePct"], preview["riskBudget"],
-                preview["notional"], preview["marginRequired"], preview["quantity"], now_ms, now_ms, now_ms, now_ms,
-            ),
-        )
-        order_id = int(cursor.lastrowid)
-    write_audit_log(
-        "strategy_order_confirmed",
-        actor=user,
-        object_type="strategy_order",
-        object_id=order_id,
-        metadata={"symbol": preview["symbol"], "exchange": preview["exchange"], "mode": mode, "notional": preview["notional"]},
-    )
-    return {**strategy_orders_payload(user), "order": {"id": order_id, "status": "paper_open", "preview": preview}}
-
-
-def strategy_break_even(payload: dict[str, Any], user: dict[str, Any]) -> dict[str, Any]:
-    if str(payload.get("acknowledgement") or "").strip() != "确认保本":
-        raise ValueError("请完成二次确认后再调整止损")
-    key = str(payload.get("positionKey") or "")
-    match = re.fullmatch(r"paper:(\d+)", key)
-    if not match:
-        raise ValueError("当前版本只允许对模拟仓位执行保本演练")
-    order_id = int(match.group(1))
-    now_ms = int(time.time() * 1000)
-    with AUTH_DB_LOCK, auth_db() as conn:
-        row = conn.execute(
-            "SELECT * FROM strategy_orders WHERE id = ? AND user_id = ? AND status = 'paper_open'",
-            (order_id, int(user["id"])),
-        ).fetchone()
-        if not row:
-            raise ValueError("仓位不存在或已经关闭")
-        asset = conn.execute("SELECT current_price FROM price_watch_assets WHERE symbol = ?", (row["symbol"],)).fetchone()
-        entry_price = safe_float(row["entry_price"])
-        mark_price = safe_float(asset["current_price"] if asset else row["mark_price"])
-        quantity = safe_float(row["quantity"])
-        if mark_price <= entry_price or (mark_price - entry_price) * quantity <= 0:
-            raise ValueError("仓位尚无浮盈，不能设置保本止损")
-        break_even_price = entry_price * (1 + STRATEGY_FEE_BUFFER_PCT / 100)
-        if break_even_price >= mark_price:
-            raise ValueError("当前浮盈不足以覆盖手续费缓冲")
-        conn.execute(
-            "UPDATE strategy_orders SET stop_loss_price = ?, break_even_at = ?, updated_at = ? WHERE id = ?",
-            (break_even_price, now_ms, now_ms, order_id),
-        )
-    write_audit_log(
-        "strategy_break_even_set",
-        actor=user,
-        object_type="strategy_order",
-        object_id=order_id,
-        metadata={"break_even_price": break_even_price},
-    )
-    return {**strategy_orders_payload(user), "breakEven": {"id": order_id, "stopLossPrice": break_even_price}}
 
 
 def load_site_alert_state() -> dict[str, Any]:
@@ -49413,25 +48793,6 @@ def sync_rank_monitor_feed() -> None:
             },
         )
 
-def parse_site_brief_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    briefs = payload.get("briefs") if isinstance(payload.get("briefs"), list) else []
-    return [
-        {
-            "key": js_stable_key("brief", brief.get("id"), brief.get("completedAt"), brief.get("name")),
-            "kind": "自动简报",
-            "source": brief.get("name") or "自动化简报",
-            "sourceLabel": "AI",
-            "title": brief.get("name") or "新的自动化简报",
-            "body": alert_text(brief.get("content"), 180),
-            "url": "./briefs.html",
-            "time": brief.get("completedAt") or int(time.time() * 1000),
-            "priority": "简报",
-        }
-        for brief in briefs
-        if brief.get("completedAt")
-    ]
-
-
 def parse_site_x_kol_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
     items = payload.get("items") if isinstance(payload.get("items"), list) else []
     sources = payload.get("sources") if isinstance(payload.get("sources"), list) else []
@@ -49542,6 +48903,48 @@ def parse_site_x_kol_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return events
 
 
+#: 本地 LibreTranslate 对 X 圈黑话的硬错译（只放**明确无歧义**的固定短语，
+#: 别做单词级替换——「演奏」单独换会把正常语义也改掉）。
+_X_KOL_TRANSLATION_FIXES: tuple[tuple[str, str], ...] = (
+    ("R/R 演奏", "R/R 机会"),
+    ("r/r 演奏", "R/R 机会"),
+    ("R/R演奏", "R/R 机会"),
+)
+
+
+def _x_kol_fix_translation(text: str) -> str:
+    fixed = text
+    for wrong, right in _X_KOL_TRANSLATION_FIXES:
+        fixed = fixed.replace(wrong, right)
+    return fixed
+
+
+def x_kol_auto_translate_text(text: str, *, timeout_seconds: int = 8) -> str:
+    """弹窗路径的自动英译中：只翻明显英文，短超时，失败静默返回空串。
+
+    弹窗在后台线程里构建，**不能为翻译长时间阻塞**（LibreTranslate 服务半死时
+    ``requests`` 会挂满 timeout）。所以这里 ``wait_seconds=0``（不拉起服务）+
+    短 ``timeout_seconds``，任何失败都返回空串让调用方回退原文——
+    翻译失败绝不能让这条弹窗不弹。中文/中英混排由 ``x_kol_text_looks_english`` 挡掉。
+    """
+
+    if not env_flag("X_KOL_AUTO_TRANSLATE", default=True):
+        return ""
+    value = clean_feed_text(text, 1800)
+    if not x_kol_text_looks_english(value):
+        return ""
+    try:
+        result = x_kol_translate_payload(
+            {"text": value}, wait_seconds=0, timeout_seconds=timeout_seconds
+        )
+    except Exception:
+        return ""
+    if not isinstance(result, dict) or not result.get("ok"):
+        return ""
+    translation = simplified_chinese_text(clean_feed_text(result.get("translation"), 1800))
+    return _x_kol_fix_translation(translation)
+
+
 def send_x_kol_direct_alert(event: dict[str, Any]) -> dict[str, Any]:
     """Pop one desktop alert for a tracked X account's brand-new post.
 
@@ -49553,12 +48956,16 @@ def send_x_kol_direct_alert(event: dict[str, Any]) -> dict[str, Any]:
     handle = normalize_x_handle(event.get("authorHandle") or event.get("handle"))
     display = clean_feed_text(event.get("source"), 80) or handle or "X 追踪"
     original = simplified_chinese_text(clean_feed_text(event.get("originalText"), 1800))
+    # 英文推文自动翻成中文再弹（用户点名账号 @juesaiquan / @AbyssGang 都是英文号）。
+    # 翻译失败静默回退英文原文 —— 绝不因为翻译不可用而漏弹。
+    translated_text = x_kol_auto_translate_text(original)
+    display_text = translated_text or original
     # Same extractor the personal-X monitor already trusts: it only reads an
     # explicit chain+contract and never guesses from a ticker.  Passing both
     # through is what renders the ✦ 币安 AI 叙事 button when the post carries a CA.
     identity = personal_x_onchain_identity_from_text(original)
-    headline = clean_feed_text(original, 60) or "新的 X 动态"
-    speech_text = clean_feed_text(original, 90)
+    headline = clean_feed_text(display_text, 60) or "新的 X 动态"
+    speech_text = clean_feed_text(display_text, 90)
     return launch_desktop_alert({
         # Prefix matters: ``price_watch_alert_board`` maps ``x-kol:`` to the
         # ``personalx`` board, so this popup answers to the same switch as the
@@ -49574,7 +48981,11 @@ def send_x_kol_direct_alert(event: dict[str, Any]) -> dict[str, Any]:
         "authorHandle": handle,
         "xCategory": clean_feed_text(event.get("xCategory"), 48),
         "title": f"{display} 新帖：{headline}",
-        "body": simplified_chinese_text(clean_feed_text(event.get("body"), 300)),
+        # body 带「/ 赞 12」这类元信息，只有翻译成功（英文号）才换成译文；
+        # 非英文/翻译失败时保持原 body 不动。
+        "body": simplified_chinese_text(
+            clean_feed_text(translated_text or event.get("body"), 300)
+        ),
         "url": clean_feed_text(event.get("url"), 600) or "./xwatch.html",
         "contractAddress": clean_feed_text(identity.get("contractAddress"), 180),
         "chain": clean_feed_text(identity.get("chain"), 50),
@@ -49584,6 +48995,7 @@ def send_x_kol_direct_alert(event: dict[str, Any]) -> dict[str, Any]:
         "queuePriority": 300,
         "speech": f"{display} 发新帖：{speech_text}" if speech_text else "",
         "originalText": original,
+        "translatedText": translated_text,
         "quoteText": simplified_chinese_text(clean_feed_text(event.get("quoteText"), 1200)),
     })
 
@@ -51650,7 +51062,6 @@ def event_monitor_meme_opportunity(row: dict[str, Any], title: str, body: str) -
 
 def news_trade_execution_readiness(user_id: int | None = None, *, wallet_authorized: bool = False) -> dict[str, Any]:
     checks = {
-        "交易所划转权限": strategy_exchange_configured("okx", user_id),
         "链上聚合交易权限": all(env_value(name) for name in ("OKX_DEX_API_KEY", "OKX_DEX_SECRET_KEY", "OKX_DEX_PASSPHRASE")),
         "签名钱包": wallet_authorized or all(env_value(name) for name in ("NEWS_TRADE_WALLET_ADDRESS", "NEWS_TRADE_SIGNER_URL")),
     }
@@ -57407,7 +56818,6 @@ def site_alert_feeds() -> list[dict[str, Any]]:
         {"name": "binance-alpha-new", "interval": 60, "maxAgeMs": ALPHA_NEW_ALERT_TTL_MS, "fetch": binance_alpha_new_feed_payload, "parse": parse_binance_alpha_new_events},
         {"name": "market", "interval": 30, "maxAgeMs": 15 * 60 * 1000, "fetch": market_payload, "parse": parse_site_market_events},
         {"name": "gainers", "interval": 30, "maxAgeMs": 15 * 60 * 1000, "fetch": gainers_rankings_payload, "parse": parse_site_gainers_events},
-        {"name": "briefs", "interval": 60, "maxAgeMs": 24 * 60 * 60 * 1000, "fetch": automation_briefs_payload, "parse": parse_site_brief_events},
         {"name": "x-kol", "interval": 2, "maxAgeMs": X_KOL_DESKTOP_ALERT_MAX_AGE_MS, "fetch": lambda: x_kol_realtime_snapshot(None, wait_seconds=6)[0], "parse": parse_site_x_kol_events},
         {"name": "event-monitor", "interval": 15, "maxAgeMs": 24 * 60 * 60 * 1000, "fetch": event_monitor_payload, "parse": parse_site_event_monitor_events},
         {
@@ -57935,7 +57345,9 @@ class Handler(SimpleHTTPRequestHandler):
         if isinstance(payload, dict) and "error" in payload:
             payload = {**payload, "error": safe_error_text(payload.get("error"))}
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        should_gzip = "gzip" in (self.headers.get("Accept-Encoding") or "").lower() and len(body) > 1024
+        # 油猴 GM_xmlhttpRequest 不自动解 gzip，/api/gigax/* 禁用压缩（否则返回压缩字节导致 JSON.parse 失败）
+        _is_gigax = getattr(self, "path", "").split("?", 1)[0].startswith("/api/gigax/")
+        should_gzip = (not _is_gigax) and "gzip" in (self.headers.get("Accept-Encoding") or "").lower() and len(body) > 1024
         if should_gzip:
             body = gzip.compress(body, compresslevel=5)
         self.send_response(status)
@@ -58538,6 +57950,18 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
 
+    def do_OPTIONS(self):
+        # 仅 GIGA X 桥接路由需要 CORS 预检；其它路径保持 SimpleHTTPRequestHandler 默认行为
+        if urlparse(self.path).path.startswith("/api/gigax/"):
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "*")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        super().do_OPTIONS()
+
     def do_GET(self):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
@@ -58554,6 +57978,56 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path in {"/api/health", "/healthz"}:
             payload = health_payload()
             self.send_json(payload, status=200 if payload.get("ok") else 503)
+            return
+        # GIGA X 叙事桥接（油猴脚本跨域调用，带 CORS 头）
+        if parsed.path.startswith("/api/gigax/"):
+            cors = {
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+            if parsed.path == "/api/gigax/health":
+                self.send_json(gigax_api.health(), headers=cors)
+                return
+            if parsed.path == "/api/gigax/refresh":
+                address = (query.get("address") or ["0x47a40095e473df5bac45e4016900f0b502c56666"])[0]
+                ok, msg = gigax_api.refresh_token(address)
+                self.send_json({"ok": ok, "msg": msg}, headers=cors)
+                return
+            if parsed.path == "/api/gigax/narrative":
+                address = (query.get("address") or [""])[0].strip()
+                chain = (query.get("chain") or ["bsc"])[0].strip()
+                if not address:
+                    self.send_json({"ok": False, "error": "缺少 address"}, status=400, headers=cors)
+                    return
+                self.send_json(gigax_api.fetch_narrative(chain, address), headers=cors)
+                return
+            if parsed.path == "/api/gigax/narratives":
+                # 批量：?items=sol:CA1,bsc:0x...&workers=6
+                # 一屏 20 个币走一个请求，服务端 6 路并发去问 GIGA X
+                raw = (query.get("items") or [""])[0]
+                items = []
+                for part in raw.split(","):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    if ":" not in part:
+                        continue
+                    chain, _, addr = part.partition(":")
+                    if addr.strip():
+                        items.append((chain.strip(), addr.strip()))
+                if not items:
+                    self.send_json({"ok": False, "error": "缺少 items"}, status=400, headers=cors)
+                    return
+                if len(items) > 40:
+                    items = items[:40]
+                try:
+                    workers = int((query.get("workers") or ["6"])[0])
+                except ValueError:
+                    workers = 6
+                self.send_json(gigax_api.fetch_narratives(items, max_workers=workers), headers=cors)
+                return
+            self.send_json({"ok": False, "error": "unknown gigax route"}, status=404, headers=cors)
             return
         if parsed.path.startswith("/api/dragon-wave-candles/"):
             provider = parsed.path.rsplit("/", 1)[-1]
@@ -58671,6 +58145,66 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json(mem_census.census())
             except Exception as exc:  # 诊断工具坏了也不能影响主服务
                 self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        if parsed.path == "/api/new-token-feed":
+            # 诊断用：看油猴脚本有没有在回传、每链多少行、多久之前。
+            query = parse_qs(parsed.query)
+            if (query.get("rows") or [""])[0] in ("1", "true", "yes"):
+                # 「这条为什么没弹」的现场快照：逐行给出命中词 / 年龄 / 用哪个时钟 /
+                # 是否已报过。不做任何判定、不入库、不弹窗。
+                snapshot: dict[str, list[dict[str, Any]]] = {}
+                compiled = NEW_TOKEN_ALERTS.compiled_keywords()
+                now_seconds = int(time.time())
+                for chain_name in NEW_TOKEN_ALERTS.chains:
+                    items = []
+                    for row in NEW_TOKEN_FEED.rows(chain_name, None, include_stale=True):
+                        if not isinstance(row, dict):
+                            continue
+                        hits = NEW_TOKEN_ALERTS_MODULE.match_row(row, compiled)
+                        ctx = NEW_TOKEN_ALERTS_MODULE.new_token_context(
+                            chain_name, row, hits, now_seconds=now_seconds
+                        )
+                        items.append({
+                            "symbol": ctx["symbol"],
+                            "name": ctx["name"],
+                            "address": ctx["tokenAddress"],
+                            "segment": ctx["segment"],
+                            "ageSeconds": ctx["ageSeconds"],
+                            "ageLimit": ctx["ageLimit"],
+                            "freshKind": ctx["freshKind"],
+                            "hits": hits,
+                            "alerted": NEW_TOKEN_ALERTS.store.was_alerted(
+                                chain_name, ctx["tokenAddress"]
+                            ),
+                            "rawText": str(row.get("raw_text") or "")[:100],
+                            "ageText": str(row.get("age_text") or ""),
+                        })
+                    items.sort(key=lambda item: item["ageSeconds"])
+                    snapshot[chain_name] = items
+                self.send_json({
+                    "ok": True,
+                    "feed": NEW_TOKEN_FEED.status(),
+                    "keywordCount": len(compiled),
+                    "rows": snapshot,
+                })
+                return
+            self.send_json({
+                "ok": True,
+                "feed": NEW_TOKEN_FEED.status(),
+                "source": NEW_TOKEN_ALERTS.source,
+                "lastSource": NEW_TOKEN_ALERTS.last_source,
+                "lastPollAt": NEW_TOKEN_ALERTS.last_poll_at * 1000,
+                "lastError": NEW_TOKEN_ALERTS.last_error,
+            })
+            return
+        if parsed.path == "/api/new-token-keywords":
+            self.send_json({
+                "ok": True,
+                "alertsEnabled": NEW_TOKEN_ALERTS.alerts_enabled(),
+                "keywords": NEW_TOKEN_ALERTS.keywords(),
+                "recent": NEW_TOKEN_ALERTS.store.recent(20),
+                "feed": NEW_TOKEN_FEED.status(),
+            })
             return
         if parsed.path == "/api/smart-money-monitor":
             if force_refresh and self.request_is_local_or_admin():
@@ -59200,35 +58734,55 @@ class Handler(SimpleHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 after = max(0, int(query["after"][0])) if "after" in query else None
                 before = (int(query["beforeTime"][0]), int(query["beforeId"][0])) if "beforeTime" in query and "beforeId" in query else None
-                reconcile_price_watch_flow_signals()
-                self.send_json(EVENT_FLOW_STORE.read(after=after, before=before, limit=int(query.get("limit", [30])[0]), category=query.get("category", ["all"])[0], live=True))
+                # `live=0` 用来取「不看存活期」的原始流水。事件流窗口首屏必须用它：
+                # live 的过滤条件里只有 news/signal，**没有 popup 分支**，所以
+                # `live=1&category=popup` 恒为空 —— 窗口每次重启后都要等新事件才有内容。
+                live = query.get("live", ["1"])[0] != "0"
+                # 这里**只读**。前高对账会全量读监控池（10~20 秒），原先挂在请求里，
+                # 2 秒一轮的浮窗轮询直接被拖到超时 —— 现在由
+                # `ensure_price_watch_flow_reconcile_worker()` 在后台做。
+                self.send_json(EVENT_FLOW_STORE.read(after=after, before=before, limit=int(query.get("limit", [30])[0]), category=query.get("category", ["all"])[0], live=live))
             except (ValueError, TypeError):
                 self.send_json({"ok": False, "error": "事件流游标无效"}, status=400)
             except Exception:
                 self.send_json({"ok": False, "error": "事件记录暂不可用，稍后自动重连"}, status=503)
-            return
-        if parsed.path == "/api/strategy-board":
-            try:
-                if force_refresh:
-                    sync_price_watch_monitor()
-                self.send_json(strategy_orders_payload(self.current_user()))
-            except Exception as exc:
-                self.send_json({"ok": False, "signals": [], "positions": [], "error": str(exc)}, status=502)
-            return
-        if parsed.path == "/api/strategy-exchanges":
-            user = self.require_auth()
-            if not user:
-                return
-            try:
-                self.send_json(strategy_exchange_settings_payload(int(user["id"])))
-            except Exception as exc:
-                self.send_json({"ok": False, "error": str(exc)}, status=502)
             return
         if parsed.path == "/api/gainers-rankings":
             self.send_json(cached_api_payload("gainers-rankings", gainers_rankings_payload, 60, force_refresh=force_refresh))
             return
         if parsed.path == "/api/turnover-rankings":
             self.send_json(cached_api_payload("turnover-rankings", turnover_rankings_payload, 60, force_refresh=force_refresh))
+            return
+        if parsed.path == "/api/icodrops-airdrops":
+            # 热门榜「空投榜」（ICODrops ACTIVE 列表，46 条）。
+            # CryptoRank Drophunting 端点实测 403 ENDPOINT_NOT_AVAILABLE（需 Advanced
+            # $149/月），网页端又被 Cloudflare 拦，故改用免费的 ICODrops。
+            # 缓存 TTL 走模块常量（30 分钟），force 时重抓。失败会带 error/stale，
+            # 绝不伪装成空榜。
+            try:
+                import icodrops_source
+                payload = icodrops_source.fetch_active_airdrops(force=bool(force_refresh))
+            except Exception as exc:
+                payload = {"ok": False, "error": clean_feed_text(exc, 200), "items": [], "total": 0}
+            self.send_json(payload)
+            # ACTIVE 列表页有 20/46 行「融资额/估值」是空的（上游本身没收录）。这批行的
+            # 详情页还能再补到一部分估值，但抓 20 个页面要十几秒 —— 响应已经发完，这里
+            # 起一个后台线程串行补、结果落盘，下次请求自然就带上了。
+            try:
+                icodrops_source.schedule_detail_enrichment(payload.get("items") or [])
+            except Exception:
+                pass
+            return
+        if parsed.path == "/api/airdrops-overview":
+            # 空投猎手概览（airdrops.io，替代抓不到的 CryptoRank Drophunting）。
+            # 缓存 TTL 走模块自己的常量（30 分钟），force 时重抓。懒 import 避免
+            # 缺 curl_cffi 时把整个 server 拖垮。
+            try:
+                import airdrops_source
+                payload = airdrops_source.fetch_airdrops_overview(force=bool(force_refresh))
+            except Exception as exc:
+                payload = {"ok": False, "error": clean_feed_text(exc, 200)}
+            self.send_json(payload)
             return
         if parsed.path == "/api/newsflash":
             try:
@@ -59269,12 +58823,6 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json(payload)
             except Exception as exc:
                 self.send_json({"items": [], "error": str(exc)}, status=502)
-            return
-        if parsed.path == "/api/automation-briefs":
-            try:
-                self.send_json(cached_api_payload("automation-briefs", automation_briefs_payload, 60, force_refresh=force_refresh))
-            except Exception as exc:
-                self.send_json({"briefs": [], "error": str(exc)}, status=502)
             return
         if parsed.path == "/api/listing-events":
             try:
@@ -59385,6 +58933,74 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         route = parsed.path.rstrip("/")
         if not self.validate_post_request(route):
+            return
+        if route == "/api/new-token-feed":
+            # 油猴脚本把 GMGN 战壕页自己拿到的那批「新创建」原样递过来（用户 2026-11-25）。
+            # 收到就**立刻判一轮**，不排队等后台的 20 秒轮询 —— 这才是「第一时间」。
+            if not self.request_is_local_or_admin():
+                self.send_json({"ok": False, "error": "仅限本机回传战壕数据"}, status=403)
+                return
+            try:
+                payload = self.read_json()
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            if not isinstance(payload, dict):
+                self.send_json({"ok": False, "error": "payload 必须是对象"}, status=400)
+                return
+            rows = payload.get("rows") or payload.get("newCreation") or []
+            if not isinstance(rows, list):
+                self.send_json({"ok": False, "error": "rows 必须是数组"}, status=400)
+                return
+            chain = clean_feed_text(payload.get("chain"), 30).lower()
+            if not chain and rows and isinstance(rows[0], dict):
+                chain = clean_feed_text(rows[0].get("chain"), 30).lower()
+            accepted = NEW_TOKEN_FEED.ingest(
+                chain, rows, source_url=clean_feed_text(payload.get("sourceUrl"), 300)
+            )
+            hits = NEW_TOKEN_ALERTS.poll_now() if accepted else []
+            self.send_json({
+                "ok": True,
+                "chain": chain,
+                "accepted": accepted,
+                "alerts": len(hits),
+                "skipped": bool(NEW_TOKEN_ALERTS.last_poll_skipped and not hits),
+                "symbols": [clean_feed_text(item.get("symbol"), 40) for item in hits],
+            })
+            return
+        if route == "/api/new-token-keywords":
+            if not self.request_is_local_or_admin():
+                self.send_json({"ok": False, "error": "仅限本机管理关键词"}, status=403)
+                return
+            try:
+                payload = self.read_json()
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            payload = payload if isinstance(payload, dict) else {}
+            action = clean_feed_text(payload.get("action"), 20).casefold() or "list"
+            word = payload.get("word")
+            try:
+                if action == "add":
+                    NEW_TOKEN_ALERTS.store.add_keyword(word)
+                elif action == "remove":
+                    NEW_TOKEN_ALERTS.store.remove_keyword(word)
+                elif action in {"enable", "disable"}:
+                    NEW_TOKEN_ALERTS.store.set_keyword_enabled(word, action == "enable")
+                elif action in {"alerts_on", "alerts_off"}:
+                    NEW_TOKEN_ALERTS.set_alerts_enabled(action == "alerts_on")
+                elif action not in {"list", ""}:
+                    self.send_json({"ok": False, "error": f"未知 action：{action}"}, status=400)
+                    return
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            self.send_json({
+                "ok": True,
+                "action": action,
+                "alertsEnabled": NEW_TOKEN_ALERTS.alerts_enabled(),
+                "keywords": NEW_TOKEN_ALERTS.keywords(),
+            })
             return
         if route == "/api/trench-overlay-preference":
             # 战壕榜切链时前端把选择写进来，桌面悬浮窗（独立进程）轮询读它，
@@ -60504,43 +60120,6 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"ok": False, "error": safe_error_text(str(exc))}, status=502)
             return
-        if route == "/api/strategy-board" or route.endswith("/api/strategy-board"):
-            try:
-                payload = self.read_json()
-                action = str(payload.get("action") or "").strip().lower()
-                if action == "preview":
-                    self.send_json(strategy_order_preview(payload, self.current_user()))
-                elif action == "refresh":
-                    sync_price_watch_monitor()
-                    self.send_json(strategy_orders_payload(self.current_user()))
-                elif action == "submit":
-                    user = self.require_auth()
-                    if not user:
-                        return
-                    self.send_json(strategy_submit_order(payload, user))
-                elif action in {"break_even", "breakeven"}:
-                    user = self.require_auth()
-                    if not user:
-                        return
-                    self.send_json(strategy_break_even(payload, user))
-                else:
-                    self.send_json({"ok": False, "error": "unsupported action"}, status=400)
-            except ValueError as exc:
-                self.send_json({"ok": False, "error": str(exc)}, status=400)
-            except Exception as exc:
-                self.send_json({"ok": False, "error": str(exc)}, status=502)
-            return
-        if route == "/api/strategy-exchanges" or route.endswith("/api/strategy-exchanges"):
-            user = self.require_auth()
-            if not user:
-                return
-            try:
-                self.send_json(save_strategy_exchange_settings(user, self.read_json()))
-            except ValueError as exc:
-                self.send_json({"ok": False, "error": str(exc)}, status=400)
-            except Exception as exc:
-                self.send_json({"ok": False, "error": str(exc)}, status=502)
-            return
         if route == "/api/ai/news-trade" or route.endswith("/api/ai/news-trade"):
             try:
                 user = self.current_user()
@@ -60572,9 +60151,6 @@ class Handler(SimpleHTTPRequestHandler):
 
 def warm_api_response_cache() -> None:
     for key, fetcher in (
-        ("newsflash", fetch_aggregated_newsflash),
-        ("automation-briefs", automation_briefs_payload),
-        ("listing-events", listing_events_payload),
         ("new-coin-rankings", new_coin_rankings_payload),
         ("market-hot", market_payload),
         ("gainers-rankings", gainers_rankings_payload),
@@ -60677,22 +60253,30 @@ def stop_discord_newsflash_bridge() -> None:
             pass
 
 
-def market_worker_loop(interval: float) -> int:
-    """微服务化：market 12 源抓取下沉到独立子进程（market-worker）。
+def market_worker_loop(interval: float, in_thread: bool = False) -> int:
+    """market 12 源抓取循环。
+
+    **默认跑在 HTTP 进程内的后台线程里**（2026-11-19 用户：「把这两个进程写进 server.py，
+    不要单独跑」）—— 以前是 ``server.py`` + ``server.py --worker-market`` 两个裸进程、
+    两个黑窗口（``xingyunshe-http`` / ``xingyunshe-worker``）。
 
     复用主进程完全相同的 ``market_payload()``，把结果写到 ``api_cache_path("market-hot")``
     （各源在 ``cached_or_fallback_source`` 内仍各自写独立 ``source_cache_path``）。
     主进程 ``market_hot_response_payload`` 改为读这个磁盘快照，从而把 12 源并发抓取的
-    网络/GIL 压力从 HTTP 进程剥离。本函数只在 ``--worker-market`` 模式下运行，正常
-    主进程启动路径不受影响（零行为变化）。
+    网络/GIL 压力从请求线程剥离（快照仍是磁盘文件，所以进程内/进程外都同样读得到）。
 
-    通信协议：结果 → 磁盘快照（原子 tmp+rename）；退出 → stop 文件 / SIGTERM；
-    心跳 → status.json 的 ``workers.market`` 段。
+    通信协议：结果 → 磁盘快照（原子 tmp+rename）；退出 → stop 文件 / SIGTERM /
+    进程内关服（``SERVER_SHUTDOWN_EVENT``）；心跳 → status.json 的 ``workers.market`` 段。
+
+    ``in_thread=True`` 表示跑在 HTTP 进程的线程里：此时**不能**装信号处理器
+    （Python 只允许主线程装），关服改看 ``SERVER_SHUTDOWN_EVENT``。
     """
     stop_file = os.environ.get("XINGYUN_SERVICE_STOP_FILE")
     SERVICE_DIR = PERSIST_CACHE_DIR / "service"
 
     def _stop_requested() -> bool:
+        if SERVER_SHUTDOWN_EVENT.is_set():
+            return True
         if stop_file and Path(stop_file).exists():
             return True
         return (SERVICE_DIR / "manual-stop").exists()
@@ -60720,14 +60304,18 @@ def market_worker_loop(interval: float) -> int:
         except OSError:
             pass  # 心跳是遥测，绝不应终止 worker
 
-    print(f"[market-worker] start pid={os.getpid()} interval={interval}s", flush=True)
+    print(f"[market-worker] start pid={os.getpid()} interval={interval}s"
+          f"{' mode=in-process-thread' if in_thread else ' mode=subprocess'}", flush=True)
     stopping = threading.Event()
 
     def _handle_term(_signum, _frame):
         stopping.set()
 
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, _handle_term)
+    if not in_thread and hasattr(signal, "SIGTERM"):
+        try:
+            signal.signal(signal.SIGTERM, _handle_term)
+        except (ValueError, OSError):
+            pass  # 线程里装不了信号处理器：关服看 SERVER_SHUTDOWN_EVENT
 
     _write_heartbeat("starting")
     while not stopping.is_set() and not _stop_requested():
@@ -60757,14 +60345,78 @@ def market_worker_loop(interval: float) -> int:
     return 0
 
 
+def inprocess_market_worker_enabled() -> bool:
+    """market 12 源抓取是否跑在 HTTP 进程内的线程里（默认**是**）。
+
+    2026-11-19 之前是两个裸进程 —— ``server.py`` 和 ``server.py --worker-market``，
+    桌面上两个黑窗口（``xingyunshe-http`` / ``xingyunshe-worker``）。用户要求
+    「把这两个进程写进 server.py，不要单独跑」，所以默认并进主进程。
+
+    要退回进程级拆分（12 源把 GIL 压得页面发涩时）：``XINGYUN_INPROC_MARKET_WORKER=0``
+    或命令行 ``--no-inproc-worker``，再用 ``--worker-market`` 单独起那个 worker。
+    """
+    return env_value("XINGYUN_INPROC_MARKET_WORKER", "1") not in {"0", "false", "no", "off"}
+
+
+def start_inprocess_market_worker(interval: float = 60.0) -> threading.Thread | None:
+    """在 HTTP 进程里起 market-worker 线程 —— 那个「第二个进程/黑窗口」就此消失。
+
+    **必须先置 ``XINGYUN_MARKET_WORKER=1``**：``market_hot_response_payload()`` 靠它
+    决定「只读磁盘快照」而不是在请求线程里重建 12 源（那是首页卡死的老元凶）。
+    线程是 daemon：关服（``SERVER_SHUTDOWN_EVENT``）或进程退出即随之结束。
+    """
+    os.environ["XINGYUN_MARKET_WORKER"] = "1"
+    thread = threading.Thread(
+        target=market_worker_loop, args=(interval,), kwargs={"in_thread": True},
+        daemon=True, name="market-worker",
+    )
+    thread.start()
+    print(f"[market-worker] 已在主进程内启动线程（间隔 {interval:.0f}s），不再单独开窗口", flush=True)
+    return thread
+
+
+#: Alt+Q 战壕悬浮窗（`trench_overlay.py`）要不要跟着服务一起拉起。
+#: 用户 2026-11-26：「把那个战壕悬浮窗给取消掉吧，不用了」—— **默认关**。
+#: 想恢复：`XINGYUN_TRENCH_OVERLAY=1`，或直接双击 `启动战壕悬浮窗.cmd` 手动起。
+TRENCH_OVERLAY_ENABLED = str(
+    os.getenv("XINGYUN_TRENCH_OVERLAY", "0") or "0"
+).strip().lower() not in ("0", "false", "off", "no", "")
+
+
+def start_alert_stream_overlay(port: int | None = None) -> None:
+    """把「左下角固定事件流窗口」作为独立 GUI 进程拉起来。
+
+    用户 2026-11-26 把「一直弹来弹去」的弹窗换成了这一个常驻窗口
+    （投递侧由 `DESKTOP_ALERT_STREAM_ONLY` 关掉系统通知），所以它现在是**主**的
+    提醒入口，不再是附加装饰 —— 但拉不起来也不能影响服务启动，故一律 fire-and-forget。
+
+    与战壕悬浮窗（默认关）相反，这个默认开。`XINGYUN_ALERT_STREAM_OVERLAY=0` 可关。
+    """
+    if os.name != "nt":
+        return
+    try:
+        import alert_stream_overlay
+
+        result = alert_stream_overlay.spawn_detached(source="server", port=port)
+        if result.get("started"):
+            print(f"Alert stream overlay spawned (pid {result.get('pid')}).", flush=True)
+        else:
+            print(f"Alert stream overlay not started: {result.get('reason')}", file=sys.stderr, flush=True)
+    except Exception as exc:
+        print(f"Alert stream overlay launch failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+
+
 def start_trench_overlay() -> None:
     """把 Alt+Q 战壕悬浮窗作为独立进程拉起来。
 
     悬浮窗与 server.py 是两个进程，重启本服务并不会自动带上它，所以由这里负责拉起，
     这样 service_guard、直接 `python server.py`、打包版都走同一条路。
     纯附加功能：任何异常只写日志，绝不影响服务启动。
+
+    **默认不再拉起**（见 `TRENCH_OVERLAY_ENABLED`）。用户已经不用它了，但代码和
+    `启动战壕悬浮窗.cmd` 都留着 —— 哪天想用，双击那个 .cmd 就行。
     """
-    if os.name != "nt":
+    if os.name != "nt" or not TRENCH_OVERLAY_ENABLED:
         return
     try:
         import trench_overlay
@@ -60788,8 +60440,9 @@ def main():
         default_port = 8765
     parser.add_argument("--host", default=default_host)
     parser.add_argument("--port", type=int, default=default_port)
-    parser.add_argument("--worker-market", action="store_true", help="以 market-worker 子进程模式运行（不监听 HTTP，只抓 12 源写快照）")
+    parser.add_argument("--worker-market", action="store_true", help="以 market-worker 子进程模式运行（不监听 HTTP，只抓 12 源写快照）；默认已并入主进程线程，只有 XINGYUN_INPROC_MARKET_WORKER=0 / --no-inproc-worker 时才需要单独起")
     parser.add_argument("--worker-market-interval", type=float, default=60.0, help="market-worker 抓取间隔（秒）")
+    parser.add_argument("--no-inproc-worker", action="store_true", help="不在本进程里跑 market worker（退回「两个裸进程」的旧部署方式）")
     args = parser.parse_args()
     if args.worker_market:
         # 子进程模式：绕过 HTTP 绑定与全部监控循环，只跑 market 抓取循环。
@@ -60827,6 +60480,11 @@ def main():
     start_chain_ecosystem_monitor()
     start_ai_startup_reconnect()
     SERVER_RUNTIME_ACTIVE = True
+    # GIGA X token 保活：每 30 分钟用 refresh token 续一次（Privy refresh token 30 天不用即失效）
+    try:
+        gigax_api.start_keepalive()
+    except Exception as exc:
+        print(f"GIGA X token keepalive disabled: {safe_error_text(str(exc))[:160]}", file=sys.stderr)
     threading.Thread(target=ensure_local_translation_service, kwargs={"wait_seconds": 180}, daemon=True).start()
     print(f"Market hot dashboard: http://{args.host}:{args.port}/")
     print(f"Aggregated newsflash: http://{args.host}:{args.port}/newsflash.html")
@@ -60854,6 +60512,9 @@ def main():
     SMART_MONEY_MONITOR.set_intake_guard(lambda: price_watch_board_intake_enabled("smartmoney"))
     if args.port == primary_monitor_port:
         SMART_MONEY_MONITOR.start()
+        # 战壕新币的关键词弹窗（用户 2026-11-25）：20 秒一轮、只盯 BSC/Solana/Robinhood
+        # 的「新创建」列。只让主端口扫，多端口并存时不要双倍烧 GMGN 配额。
+        NEW_TOKEN_ALERTS.start()
     # 被夹检测只做「自己钱包的交易记录」回链取证。它不在榜单页的卡片名单里
     # （那是 12 个行情榜单），所以静音不走榜单开关，而是子板块自己的弹窗总开关，
     # 在 send_sandwich_detected_desktop_alert 入口拦。多端口并存时只有主端口扫链。
@@ -60899,6 +60560,14 @@ def main():
     if args.port == primary_monitor_port:
         MARKET_MAKER_MONITOR.start()
 
+    # market 12 源抓取：默认跑在**本进程**的后台线程里 —— 桌面上不再有第二个黑窗口
+    # （以前是 `server.py --worker-market` 那个 `xingyunshe-worker` 进程）。
+    # 只在主端口起：快照是共享磁盘文件，多个端口各跑一个只会互相覆盖。
+    # 想退回旧部署：--no-inproc-worker（或 XINGYUN_INPROC_MARKET_WORKER=0）+ 单独起 worker。
+    if args.port == primary_monitor_port and not args.no_inproc_worker \
+            and inprocess_market_worker_enabled():
+        start_inprocess_market_worker(args.worker_market_interval)
+
     def bootstrap_noncritical_monitors() -> None:
         """Restore slower feeds without delaying HTTP or real-time price alerts."""
 
@@ -60906,6 +60575,9 @@ def main():
         # server has to spawn it - restarting the service otherwise looks like it
         # does nothing. Fire-and-forget; it can never delay or break startup.
         start_trench_overlay()
+        # 事件流窗口：只在主端口起一个，别让多端口调试时满屏都是窗口。
+        if args.port == primary_monitor_port:
+            start_alert_stream_overlay(args.port)
         # The outbound webhook bridge is independent of the slower market-cache
         # warmup below. Start it first so push delivery is not delayed by remote
         # feeds, while keeping all inbound Discord monitoring permanently absent.
@@ -60914,6 +60586,8 @@ def main():
         # watcher before the slower market cache warmup so it cannot be delayed
         # by GMGN/Binance refreshes during startup.
         start_trench_person_watch_monitor()
+        # 前高对账（全量读监控池，单次 10~20 秒）：后台低频跑，绝不进请求路径。
+        ensure_price_watch_flow_reconcile_worker()
         threading.Thread(target=warm_runtime_cache, daemon=True).start()
         warm_api_response_cache()
         start_x_kol_priority_monitor()

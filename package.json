@@ -93,7 +93,6 @@
           "docs/**",
           "go/prior-high-monitor/**",
           "tools/dragon_wave_monitor_bridge.js",
-          "tools/publish_automation_briefs.py",
           ".env.production.example",
           "!node_modules/**",
           "!release/**",

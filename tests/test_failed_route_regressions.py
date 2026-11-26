@@ -95,14 +95,6 @@ class FailedRouteRegressionTests(unittest.TestCase):
             kwargs={"sync_candidates": False},
         )
 
-    def test_strategy_board_failure_and_empty_result(self):
-        self.check_route(
-            "/api/strategy-board", "strategy_orders_payload",
-            {"ok": True, "authenticated": False, "signals": [], "positions": []},
-            {"ok": False, "signals": [], "positions": []},
-            args=(None,),
-        )
-
     def test_binance_wallet_hot_refresh_failure_and_empty_result(self):
         self.check_route(
             "/api/binance-wallet-hot?period=4h&refresh=1", "binance_wallet_hot_source",
