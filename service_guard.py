@@ -257,7 +257,10 @@ def supervise(host="127.0.0.1", port=8765):
         # 进程级拆分：market 12 源抓取由独立子进程承担（仅当显式 opt-in）。
         # 只启动一次（放在主进程重启循环之外），避免主进程崩溃重启时叠加出
         # 第二个 market-worker 并发写同一份快照。STOP 文件会一并终止 worker 监督线程。
-        if os.environ.get("XINGYUN_MARKET_WORKER", "0") in {"1", "true", "yes", "on"}:
+        # 2026-11-19 起 market worker 默认跑在主进程的线程里，守卫**不要再拉第二个进程**
+        # （两个写同一份快照会互相覆盖）。只有显式退回进程级拆分时才拉起。
+        if (os.environ.get("XINGYUN_MARKET_WORKER", "0") in {"1", "true", "yes", "on"}
+                and os.environ.get("XINGYUN_INPROC_MARKET_WORKER", "1") in {"0", "false", "no", "off"}):
             market_interval = float(os.environ.get("XINGYUN_MARKET_WORKER_INTERVAL", "60") or "60")
             threading.Thread(
                 target=supervise_market_worker,

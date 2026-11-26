@@ -78,9 +78,16 @@ class TrenchPersonSignalTests(unittest.TestCase):
         rows = important_official_sources()
         by_handle = {row["handle"].casefold(): row for row in rows}
 
-        self.assertEqual(len(rows), 66)
+        # 66 → 68：2026-11-09 用户点名加入 Elysium / Vulcan Forged 两个官方号
+        # （见 DEFAULT_IMPORTANT_PROJECTS 末尾）。这里刻意用精确数字，是为了在
+        # 名录被意外插入重复项 / 被误删时立刻炸，而不是慢慢漂移。
+        self.assertEqual(len(rows), 68)
         for handle in ("nearprotocol", "solana", "ethereum", "layerzero_core"):
             self.assertIn(handle, by_handle)
+        # 用户 2026-11-09 点名监控的两个号，必须真的进官方源（否则抓都抓不到）。
+        for handle in ("enter_elysium", "vulcanforged"):
+            self.assertIn(handle, by_handle)
+            self.assertEqual(by_handle[handle]["category"], "project_official")
         for handle in ("binance", "coinbase", "okx", "krakenfx", "robinhoodapp"):
             self.assertNotIn(handle, by_handle)
         self.assertTrue(all(row["category"] == "project_official" for row in rows))

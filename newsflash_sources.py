@@ -12,6 +12,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -366,7 +367,7 @@ def configured_feed_sources() -> list[dict[str, Any]]:
 PROXY_CANDIDATE_PORTS = (7890, 7897, 7899, 10809, 2080, 53000)
 NEWSFLASH_ROUTE_WORKERS = max(
     2,
-    min(8, int(os.getenv("NEWSFLASH_ROUTE_WORKERS", "4") or "4")),
+    min(8, int(os.getenv("NEWSFLASH_ROUTE_WORKERS", "6") or "6")),
 )
 NEWSFLASH_ROUTE_POOL = ThreadPoolExecutor(
     max_workers=NEWSFLASH_ROUTE_WORKERS,
@@ -393,9 +394,11 @@ def _candidate_routes() -> list[str]:
 
 def _get_via_route(url: str, headers: dict[str, str], timeout: float, proxy: str) -> requests.Response:
     # One retry per route: transient TLS resets (VPN tunnel handoff, CDN edge)
-    # must not disqualify an otherwise healthy route.
+    # must not disqualify an otherwise healthy route. 已经记过失败的路由只试一次
+    # —— 第二次重试只是把「这条路是死的」这个结论再花一个 timeout 验证一遍。
+    attempt_budget = 2 if _route_strikes(url, proxy) == 0 else 1
     last_error: Exception | None = None
-    for attempt in range(2):
+    for attempt in range(attempt_budget):
         try:
             if proxy:
                 return requests.get(
@@ -422,34 +425,135 @@ def _get_via_route(url: str, headers: dict[str, str], timeout: float, proxy: str
     raise last_error
 
 
+#: 命过「传输层超时」的 (域名, 路线) 冷却多久。现场（2026-11-17）：本机切到
+#: Proton VPN 后出口在日本，`www.theblockbeats.info` 的 TCP 能连、**TLS 握手被
+#: 丢包**，直连每轮都烧满 `timeout × 2 次重试 = 40.6 秒`（实测），把 12 秒一轮
+#: 的快讯弹窗线程按成 40 秒一轮。死路冷却后同一域名 <1 秒失败，上层改走
+#: 「回上一份快照」，弹窗节奏立刻回到 12 秒。
+ROUTE_TIMEOUT_BASE_COOLDOWN = max(
+    15.0,
+    float(os.getenv("NEWSFLASH_ROUTE_COOLDOWN_SECONDS", "60") or "60"),
+)
+ROUTE_TIMEOUT_MAX_COOLDOWN = max(
+    ROUTE_TIMEOUT_BASE_COOLDOWN,
+    # 上限压在 3 分钟：用户会在两个 VPN 之间来回切（2026-11-17），冷却太久
+    # 会让「切回能用的线路」之后还要干等。
+    float(os.getenv("NEWSFLASH_ROUTE_MAX_COOLDOWN_SECONDS", "180") or "180"),
+)
+_ROUTE_HEALTH_LOCK = threading.Lock()
+_ROUTE_HEALTH: dict[tuple[str, str], tuple[float, int]] = {}
+
+#: 一整轮竞速的**总时限**，与单路线 timeout 无关。有些「本机端口」会接受连接但
+#: 永不回应（实测 WorkBuddy 的沙箱代理就是这样），每条都要烧满
+#: ``timeout × 2 次重试``；8 条路线分两批跑，冷启动实测能到 **49 秒**。
+#: 有保底路线（律动走海外中转）之后，一个域名最多花 ``timeout × 1.5`` 去确认它死了。
+ROUTE_RACE_DEADLINE_FACTOR = max(1.0, float(os.getenv("NEWSFLASH_ROUTE_DEADLINE_FACTOR", "2.5") or "2.5"))
+
+
+def _route_key(url: str, proxy: str) -> tuple[str, str]:
+    try:
+        host = (urlsplit(url).netloc or "").lower()
+    except ValueError:
+        host = url
+    return (host, proxy or "direct")
+
+
+def _route_strikes(url: str, proxy: str) -> int:
+    """这条 (域名, 路线) 连续栽过几次（0 = 还没栽过）。"""
+    with _ROUTE_HEALTH_LOCK:
+        return int(_ROUTE_HEALTH.get(_route_key(url, proxy), (0.0, 0))[1])
+
+
+def route_cooldown_remaining(url: str, proxy: str) -> float:
+    """Seconds this (host, route) is still benched after transport timeouts."""
+    key = _route_key(url, proxy)
+    now = time.time()
+    with _ROUTE_HEALTH_LOCK:
+        entry = _ROUTE_HEALTH.get(key)
+        if not entry:
+            return 0.0
+        until, strikes = entry
+        if now >= until:
+            _ROUTE_HEALTH.pop(key, None)
+            return 0.0
+        return until - now
+
+
+def _remember_route_timeout(url: str, proxy: str) -> float:
+    """Bench a route after a transport-level failure; 连续失败指数退避到上限。"""
+    key = _route_key(url, proxy)
+    with _ROUTE_HEALTH_LOCK:
+        _, strikes = _ROUTE_HEALTH.get(key, (0.0, 0))
+        strikes = min(strikes + 1, 8)
+        cooldown = min(ROUTE_TIMEOUT_MAX_COOLDOWN, ROUTE_TIMEOUT_BASE_COOLDOWN * (2 ** (strikes - 1)))
+        _ROUTE_HEALTH[key] = (time.time() + cooldown, strikes)
+    return cooldown
+
+
+def _forget_route_timeout(url: str, proxy: str) -> None:
+    with _ROUTE_HEALTH_LOCK:
+        _ROUTE_HEALTH.pop(_route_key(url, proxy), None)
+
+
+def reset_route_health() -> None:
+    """Test hook: forget every benched route."""
+    with _ROUTE_HEALTH_LOCK:
+        _ROUTE_HEALTH.clear()
+
+
+def _is_transport_failure(exc: Exception) -> bool:
+    """True for 连不上/握手超时/读超时；HTTP 状态码错误不算（那说明路是通的）。"""
+    return isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout))
+
+
 def http_get_race(url: str, *, headers: dict[str, str] | None = None, timeout: float = 10.0) -> requests.Response:
     """GET via direct + local proxy routes in parallel; first healthy response wins.
 
     A half-dead local proxy can hold a news source until timeout while the same
     URL is fine direct (or via another proxy port). Racing the routes keeps the
     newsflash aggregation working whichever route is broken today.
+
+    传输层超时的路线会被短期禁赛（见 :data:`ROUTE_TIMEOUT_BASE_COOLDOWN`），
+    否则一个「TCP 通、TLS 被丢包」的域名会每轮都把超时烧满。
     """
     request_headers = dict(headers or {"User-Agent": "XingyunSocietyNewsflash/1.0"})
-    routes = _candidate_routes()
-    if len(routes) == 1:
-        return _get_via_route(url, request_headers, timeout, "")
+    routes = [proxy for proxy in _candidate_routes() if route_cooldown_remaining(url, proxy) <= 0]
+    if not routes:
+        raise requests.exceptions.ConnectionError(
+            f"all routes for {url} are cooling down after repeated transport failures"
+        )
     # All feed sources share one bounded route pool.  Previously every source
     # created up to seven threads of its own, so a six-source refresh could
     # briefly retain 40+ stacks whenever proxy routes timed out.
-    futures = [
-        NEWSFLASH_ROUTE_POOL.submit(_get_via_route, url, request_headers, timeout, proxy)
+    futures = {
+        NEWSFLASH_ROUTE_POOL.submit(_get_via_route, url, request_headers, timeout, proxy): proxy
         for proxy in routes
-    ]
+    }
     first_error: Exception | None = None
+    deadline = time.monotonic() + max(4.0, timeout * ROUTE_RACE_DEADLINE_FACTOR)
     try:
-        for future in as_completed(futures):
-            try:
-                response = future.result()
-                response.raise_for_status()
-            except Exception as exc:  # route failure: try the next completed route
-                first_error = first_error or exc
-                continue
-            return response
+        try:
+            completed = as_completed(futures, timeout=max(0.1, deadline - time.monotonic()))
+            for future in completed:
+                proxy = futures[future]
+                try:
+                    response = future.result()
+                    response.raise_for_status()
+                except Exception as exc:  # route failure: try the next completed route
+                    if _is_transport_failure(exc):
+                        _remember_route_timeout(url, proxy)
+                    first_error = first_error or exc
+                    continue
+                _forget_route_timeout(url, proxy)
+                return response
+        except (TimeoutError, FuturesTimeoutError):
+            # 总时限到点：还没回来的路线一律当失败，别再等它们。
+            # **必须顺手记进熔断表** —— 否则下一次调用又把整整一个 deadline 花在
+            # 同一批死路上（实测就是「每次都要 20 秒」）。
+            for future, proxy in futures.items():
+                if not future.done():
+                    _remember_route_timeout(url, proxy)
+            raise first_error or TimeoutError(f"race deadline exceeded for {url}")
         raise first_error or RuntimeError(f"all routes failed for {url}")
     finally:
         for future in futures:
@@ -1026,9 +1130,25 @@ def aggregate_newsflash(blockbeats_payload: dict[str, Any], headers: dict[str, s
         item.update({"sourceId": "blockbeats", "source": "BlockBeats 律动", "sourceLabel": "BB", "sourcePriority": 100})
         all_items.append(item)
     blockbeats_error = str(blockbeats_payload.get("error") or "").strip()
-    blockbeats_status = {"id": "blockbeats", "name": "BlockBeats 律动", "status": "error" if blockbeats_error else "ok", "count": len(blockbeats_items)}
+    # 有内容 + 有错误 = 上游挂了但我们端的是上一份快照（``stale``）。既不能写成
+    # ``ok``（会让人以为刚从律动抓到），也不能写成 ``error`` + count 0（那会让
+    # 「律动」整个源从快讯页消失 —— 现场就是这个症状）。
+    blockbeats_ok = bool(blockbeats_items)
+    blockbeats_status = {
+        "id": "blockbeats",
+        "name": "BlockBeats 律动",
+        "status": ("stale" if blockbeats_ok else "error") if blockbeats_error else "ok",
+        "count": len(blockbeats_items),
+    }
     if blockbeats_error:
         blockbeats_status["error"] = blockbeats_error[:180]
+    if blockbeats_error and blockbeats_ok:
+        blockbeats_status["stale"] = True
+        blockbeats_status["dataUpdatedAt"] = int(blockbeats_payload.get("updatedAt") or 0)
+    # 走海外中转拿到的要标出来：内容真实，但多了一跳第三方。
+    fetched_via = str(blockbeats_payload.get("fetchedVia") or "").strip()
+    if fetched_via and fetched_via != "direct":
+        blockbeats_status["fetchedVia"] = fetched_via
     source_status.append(blockbeats_status)
 
     jobs: dict[Any, dict[str, Any]] = {}
@@ -1051,8 +1171,9 @@ def aggregate_newsflash(blockbeats_payload: dict[str, Any], headers: dict[str, s
     return {
         "updatedAt": int(time.time() * 1000),
         "items": unique,
-        "sources": sorted(source_status, key=lambda row: (row["status"] != "ok", row["name"])),
-        "sourceCount": sum(1 for row in source_status if row["status"] == "ok"),
+        "sources": sorted(source_status, key=lambda row: (row["status"] not in {"ok", "stale"}, row["name"])),
+        # ``stale`` 也算「有内容接入」：面板上照样有它的条目，只是标了年龄。
+        "sourceCount": sum(1 for row in source_status if row["status"] in {"ok", "stale"}),
         "rawCount": len(all_items),
         "deduplicatedCount": removed,
     }

@@ -3,12 +3,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import time
 from contextlib import closing
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
+
+#: 子表 `event_id` 索引是否已就绪（一次成功就够，进程级）。
+_CHILD_INDEXES_READY = False
+
+#: 合并时允许从「被合并事件」接过来的身份条数上限。正常事件只有个位数身份；
+#: 超过这条线说明它是个被历史 bug 灌大的大杂烩，一条都不接，防止富者愈富。
+MERGE_IDENTITY_CARRY_MAX = 16
+
+log = logging.getLogger("event_flow")
 
 
 def article_alias(value: str) -> str:
@@ -36,7 +46,11 @@ class EventFlowStore:
 
     def _connect(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path, timeout=2)
+        # 2 秒太短：`force_restart.py` 会先拉起新进程再收旧进程，两个 server 会同时
+        # 往这张表写；撞上 WAL checkpoint 就 ``database is locked``，而
+        # ``record_event_flow_popup`` 的 except 只打印就丢——实测已丢了 2 条弹窗事件
+        # （`.runtime-cache/smart_money_restart_worker.log` 433/575 行）。
+        conn = sqlite3.connect(self.path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         if not self.initialized:
@@ -58,12 +72,53 @@ class EventFlowStore:
                     fingerprint TEXT NOT NULL, kind TEXT NOT NULL, stage TEXT NOT NULL,
                     happened_at INTEGER NOT NULL, summary TEXT NOT NULL,
                     UNIQUE(event_id,fingerprint));
+                -- 两张子表的 event_id **必须有索引**：`record()` 每次插完都会裁剪超出
+                -- max_events 的行，而 `ON DELETE CASCADE` 找子行时如果 event_id 没索引
+                -- 就是全表扫（1.4 万 + 1.5 万行 × 每次写入），全程还占着 self.lock，
+                -- 于是所有读请求排队 —— 2026-11-26 实测 /api/event-flow 会卡 20~25 秒。
+                CREATE INDEX IF NOT EXISTS flow_identities_event ON flow_identities(event_id);
+                CREATE INDEX IF NOT EXISTS flow_steps_event ON flow_steps(event_id);
             """)
             self.initialized = True
+        self._ensure_child_indexes(conn)
         return conn
+
+    def _ensure_child_indexes(self, conn) -> None:
+        """给**已有的库**补索引（老库不会重走上面的建表脚本）。
+
+        每个进程只需成功一次，失败就留着下次再试（比如那一刻库正好被写锁占着）。
+        """
+        global _CHILD_INDEXES_READY
+        if _CHILD_INDEXES_READY:
+            return
+        try:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS flow_identities_event ON flow_identities(event_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS flow_steps_event ON flow_steps(event_id)"
+            )
+            conn.commit()
+            _CHILD_INDEXES_READY = True
+        except sqlite3.Error:
+            pass
 
     def record(self, identity: str, kind: str, data: dict, stage: str, happened_at: int,
                *, aliases: list[str] | None = None) -> int:
+        """写入/合并一条事件。被锁占用时重试几次——弹窗事件丢一条就是永久丢。"""
+        for attempt in range(3):
+            try:
+                return self._record_once(identity, kind, data, stage, happened_at, aliases=aliases)
+            except sqlite3.OperationalError as exc:
+                if not any(word in str(exc).lower() for word in ("locked", "busy")):
+                    raise
+                if attempt == 2:
+                    raise
+                time.sleep(0.2 * (attempt + 1))
+        return 0
+
+    def _record_once(self, identity: str, kind: str, data: dict, stage: str, happened_at: int,
+                     *, aliases: list[str] | None = None) -> int:
         if not identity or kind not in {"news", "popup", "signal"}:
             return 0
         keys = list(dict.fromkeys([identity, *(key for key in aliases or [] if key)]))
@@ -83,9 +138,40 @@ class EventFlowStore:
                     (happened_at, now_ms, "{}"),
                 ).lastrowid
             # A later authoritative topic may link earlier separate source records.
-            # Keep their progress and aliases before consolidating the duplicate card.
+            # Keep their progress and payload before consolidating the duplicate card.
+            #
+            # **合并只搬「小事件」的身份表**（2026-11-26 事故）：旧写法是无条件
+            # ``UPDATE flow_identities SET event_id=? WHERE event_id=?``，于是
+            # 「A 和 B 因为同一个 article 别名合并」会顺手把 B 的**全部**身份改挂给
+            # A。这会富者愈富：B 当年也是靠吞别人长大的，它的 700 多个话题身份一起
+            # 搬到 A，之后每条相关记录继续往 A 里灌。实测 ``flow_events`` id=13
+            # 就这样吃到 7499 个身份（784 个不同 ``news:narrative:*`` 话题、1055 个
+            # ``popup:flash``），``revision`` 常年等于全局最大，事件流窗口每次启动
+            # 都把它当成新事件推出来。
+            #
+            # 现在：对方身份数 ≤ ``MERGE_IDENTITY_CARRY_MAX`` 才整套接过来（正常事件
+            # 只有个位数身份，去重语义不变）；超过就当它是个被污染的大杂烩，**一个
+            # 都不接**。这样被合并方不能再把自己的体量传给存活者，增长只能来自自己
+            # 直接记录的 key（下面那个 ``for key in keys`` 循环，不受此闸限制）。
             for duplicate in [row[0] for row in matches[1:]]:
-                conn.execute("UPDATE flow_identities SET event_id=? WHERE event_id=?", (event_id, duplicate))
+                carried = [item[0] for item in conn.execute(
+                    "SELECT identity FROM flow_identities WHERE event_id=? ORDER BY identity LIMIT ?",
+                    (duplicate, MERGE_IDENTITY_CARRY_MAX + 1),
+                )]
+                if len(carried) <= MERGE_IDENTITY_CARRY_MAX:
+                    # 必须用 UPDATE 搬，不能用 INSERT OR IGNORE：同一条身份此刻还挂在
+                    # 被合并方名下，主键冲突会被静默忽略，紧接着的级联删除再把它抹掉
+                    # （`two` 这条身份就是这么丢的，测试能抓住）。
+                    conn.execute(
+                        f"UPDATE OR IGNORE flow_identities SET event_id=? WHERE event_id=? "
+                        f"AND identity IN ({','.join('?' for _ in carried)})",
+                        (event_id, duplicate, *carried),
+                    )
+                else:
+                    log.warning(
+                        "event flow merge skipped %d identities from event %s into %s",
+                        len(carried), duplicate, event_id,
+                    )
                 conn.execute("""INSERT OR IGNORE INTO flow_steps(event_id,fingerprint,kind,stage,happened_at,summary)
                     SELECT ?,fingerprint,kind,stage,happened_at,summary FROM flow_steps WHERE event_id=?""", (event_id, duplicate))
                 old_data = json.loads(conn.execute("SELECT payload FROM flow_events WHERE id=?", (duplicate,)).fetchone()[0])

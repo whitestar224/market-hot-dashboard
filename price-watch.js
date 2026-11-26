@@ -107,7 +107,7 @@
   let devLaunchLoaded = false;
   let devLaunchActionLoading = false;
   let lastDevLaunchLoadAt = 0;
-  // 做市商监控：服务端按节奏轮询 8 家做市商的链上流水（Blockscout 标签地址簿），
+  // 做市商监控：服务端按节奏轮询 9 家做市商在 BSC/Base/SOL/Robinhood/Elysium 上的流水，
   // 页面只读快照；同一板块还并进「做市商控盘达标标的」（五条判据由 alpha_mm_monitor 判定）。
   let marketMakerPayload = {
     chains: [], firms: [], addresses: [], positions: [], crossToken: [],
@@ -1287,7 +1287,8 @@
 
   function smartMoneyChainLabel(chain) {
     return smartMoneyPayload.supportedChains?.find((row) => row.id === chain)?.label || ({
-      ethereum: "Ethereum", bsc: "BSC", base: "Base", solana: "Solana", robinhood: "Robinhood"
+      ethereum: "Ethereum", bsc: "BSC", base: "Base", solana: "Solana", robinhood: "Robinhood",
+      elysium: "Elysium"
     })[chain] || chain || "未知链";
   }
 
@@ -1296,7 +1297,19 @@
     return value.length > head + tail + 3 ? `${value.slice(0, head)}…${value.slice(-tail)}` : value || "--";
   }
 
+  // Elysium 的交易只能去 GMGN 站内页看：Kinetiq 自己的浏览器（elysium.kinetiq.xyz）
+  // 常态 429，打开就是「点不动的死链」。用户 2026-11-09 也明确要求「查看」落 GMGN。
+  // 返回的是代币交易页而不是交易详情页，所以调用处按 isGmgn 换文案，别挂「链上交易」。
+  function smartMoneyGmgnUrl(event) {
+    const chain = String(event?.chain || "").toLowerCase();
+    if (chain !== "elysium") return "";
+    const token = String(event?.tokenAddress || "");
+    return token ? `https://gmgn.ai/elysium/token/${token}` : "";
+  }
+
   function smartMoneyExplorerUrl(event) {
+    const gmgnUrl = smartMoneyGmgnUrl(event);
+    if (gmgnUrl) return gmgnUrl;
     const direct = safeExternalUrl(event?.transactionUrl);
     if (direct) return direct;
     const tx = encodeURIComponent(String(event?.transactionHash || ""));
@@ -1344,6 +1357,8 @@
 
   function smartMoneyEventTemplate(event) {
     const explorerUrl = smartMoneyExplorerUrl(event);
+    // 落 GMGN 时文案必须跟着改：那是代币交易页，不是「链上交易」详情。
+    const explorerLabel = explorerUrl.includes("gmgn.ai/") ? "GMGN 交易" : "查看链上交易";
     const payment = `${compactNative(event.paymentAmount, event.paymentAsset)} · ${compactUsd(event.paymentUsd)}`;
     const alertState = event.popupEligible ? (event.alertedAt ? "已弹窗" : "达到弹窗线") : "仅记录";
     const buyRow = {
@@ -1364,7 +1379,7 @@
         <span><em>成交均价</em><b>${escapeHtml(compactPrice(event.priceUsd))}</b></span>
       </div>
       <div class="smart-money-event-contract"><span><em>CA</em><code title="${escapeHtml(event.tokenAddress)}">${escapeHtml(smartMoneyShortAddress(event.tokenAddress, 12, 10))}</code></span><span><em>钱包</em><code title="${escapeHtml(event.walletAddress)}">${escapeHtml(smartMoneyShortAddress(event.walletAddress, 10, 8))}</code></span></div>
-      <footer><time>${escapeHtml(relativeTime(event.observedAt))}</time><span>${monitorBuyButton(buyRow)}${explorerUrl ? `<a href="${escapeHtml(explorerUrl)}" target="_blank" rel="noreferrer noopener">查看链上交易</a>` : ""}</span></footer>
+      <footer><time>${escapeHtml(relativeTime(event.observedAt))}</time><span>${monitorBuyButton(buyRow)}${explorerUrl ? `<a href="${escapeHtml(explorerUrl)}" target="_blank" rel="noreferrer noopener">${escapeHtml(explorerLabel)}</a>` : ""}</span></footer>
     </article>`;
   }
 
@@ -1585,7 +1600,7 @@
   }
 
   // ------------------------------------------------------------------------ //
-  // 做市商监控：8 家做市商的链上 ERC-20 流水（Blockscout 的标签地址簿），回答
+  // 做市商监控：9 家做市商的链上 ERC-20 流水（索引器 / 自建 RPC / Solana 三通道），回答
   // 「它们正在操作哪些标的」；同一板块还并进「做市商控盘达标标的」——热门榜 /
   // 涨幅榜里满足五条判据的币（控盘 ≥90% / Alpha 合约 / 市值 ≤3000 万 / 没拉完就砸 /
   // 上涨结构回踩支撑买点）。五条判据的判定只在 alpha_mm_monitor 里做，这里只读。
@@ -1780,21 +1795,31 @@
     ];
     const scopeNote = selectedFirm
       ? `已收窄到 <b>${escapeHtml(selectedFirm.label)}</b> · ${Number(selectedFirm.addressCount || 0)} 个地址 · ${Number(selectedFirm.activeTokens || 0)} 个活跃标的 · ${Number(selectedFirm.polled || 0)} 个地址已轮询过`
-      : "全部 8 家";
-    const gateText = gate.enabled === false
-      ? "进场弹窗未设闸（全部新标的都会弹）"
-      : gate.note
-        ? `进场弹窗闸门暂不可用：${escapeHtml(gate.note)}（宁可不弹，也不假报）`
-        : `进场弹窗只在<b>涨幅榜 ∩ AIcoin 热门榜同振</b>时发 —— 当前共振 <b>${Number(gate.resonance || 0)}</b> 只（涨幅榜 ${Number(gate.gainers || 0)} / AIcoin ${Number(gate.aicoin || 0)}）${Number(gate.filtered || 0) ? ` · 已因未共振暂缓 ${Number(gate.filtered)} 次` : ""}`;
+      : `全部 ${firms.length} 家`;
+    // 进场弹窗的口径（2026-11-15 改）：新标的**不再要求上榜共振**，改成「单笔 ≥$100」，
+    // 并且报红。共振信息只是顺带写进正文，不再当闸用 —— 做市商接新币通常在它上榜之前。
+    const gateMinUsd = Number(gate.minUsd || 0);
+    // 标的成熟度闸（2026-11-16，用户口径「以基线为准」）：光看「单笔金额」挡不住老币
+    // —— WIF / 稳定币 / xStocks 代币化股票都会从签名窗口外转回来被当成「新标的」。
+    // 判据是「标的**最早一个池子**建在这家的基线之后」，不用「多少天以内」的滚动窗口。
+    const gateText = gate.note
+      ? `榜单读不到：${escapeHtml(gate.note)}（新标的照弹，只是不带榜单排名）`
+      : `新标的<b>首次出现即报红</b>（单笔 ≥ <b>${gateMinUsd ? `$${gateMinUsd.toLocaleString("zh-CN")}` : "$100"}</b> 才弹，挡空投与骗局币；且必须是<b>基线之后才上线</b>、第一次出现在这家活动里的币 —— <b>基线之前就在流通的一律算老币</b>，稳定币与代币化股票不算）` +
+        ` · 此刻与涨幅榜 ∩ AIcoin 共振 <b>${Number(gate.resonance || 0)}</b> 只（涨幅榜 ${Number(gate.gainers || 0)} / AIcoin ${Number(gate.aicoin || 0)}）`;
     // 三方共振：大额异动 × 涨幅榜 × AIcoin。用户 2026-10-21 定：同标的 6 小时只提示一次。
     const cooldownHours = Math.round(Number(resonance.cooldownSeconds || 0) / 3600) || 6;
     const resonanceText = resonance.armed !== true
       ? "三方共振查询未接线（大额调仓只按普通档提示）"
       : `大额调仓的标的如果此刻<b>同时挂在涨幅榜与 AIcoin 热门榜</b>，弹窗会升级成<b>三方共振</b>（带榜单排名），同一标的 <b>${cooldownHours} 小时</b>内只提示一次${Number(resonance.blocked || 0) ? ` · 已静默 ${Number(resonance.blocked)} 次` : ""}${resonance.note ? ` · 当前读不到榜单：${escapeHtml(resonance.note)}` : ""}`;
+    // 「在抓的」与「地址簿里的」分开显示：Ethereum 那批 2026-11-15 起只留档不轮询，
+        // 混在一个数里会让人以为页面卡了（last_polled 永远不动）。
+    const pollChainLabels = (Array.isArray(summary.pollChains) ? summary.pollChains : [])
+      .map((id) => (marketMakerPayload.chains || []).find((row) => row.id === id)?.label || id)
+      .join(" / ");
     renderGrid(`<section class="smart-money-console mm-console">
       <div class="smart-money-summary">
         <span><b>${summary.running ? "轮询中" : "未运行"}</b><em>每 ${Math.round(Number(summary.intervalSeconds || 0) / 60) || "--"} 分钟一轮 · 每轮 ${Number(marketMakerPayload.addressesPerCycle || summary.addressesPerCycle || 0)} 个地址</em></span>
-        <span><b>${Number(summary.enabledAddresses || 0).toLocaleString("zh-CN")}</b><em>监控地址 / ${Number(summary.addresses || 0)} 个</em></span>
+        <span><b>${Number(summary.enabledAddresses || 0).toLocaleString("zh-CN")}</b><em>在抓地址${pollChainLabels ? `（${escapeHtml(pollChainLabels)}）` : ""}${Number(summary.archivedAddresses || 0) ? ` · 另 ${Number(summary.archivedAddresses)} 个已留档不扫` : ""}</em></span>
         <span><b>${positions.length.toLocaleString("zh-CN")}</b><em>${selectedFirm ? escapeHtml(selectedFirm.short || selectedFirm.label) + " 的标的" : "48h 内活跃标的"}</em></span>
         <span><b>${Number(control.total || 0).toLocaleString("zh-CN")}</b><em>控盘达标标的</em></span>
         <span><b>${Number(control.buyZone || 0).toLocaleString("zh-CN")}</b><em>回踩支撑到位</em></span>
@@ -1805,7 +1830,7 @@
         <button type="button" data-mm-refresh ${busy ? "disabled" : ""}>${busy ? "正在刷新…" : "立即刷新一轮"}</button>
         <span class="sandwich-cycle">${summary.lastCycleAt ? `上次刷新 ${escapeHtml(relativeTime(summary.lastCycleAt))}` : "尚未跑过轮询"}${summary.lastError ? ` · 上次出错：${escapeHtml(String(summary.lastError).slice(0, 80))}` : ""}</span>
       </div>
-      <p class="smart-money-readonly"><b>当前视角</b>：${scopeNote}。<b>数据来源</b>：地址簿来自 <b>Blockscout</b> 的公开标签（可逐条审计），流水走 <code>token-transfers</code>，金额用接口自带的美元单价折算 —— 全程不需要任何 Key。<b>弹窗只发两类</b>：某家开始操作一个新标的、单笔 <b>≥ ${escapeHtml(compactUsd(Number(summary.largeTransferUsd || 0)))}</b> 的调仓；其余只进列表，首次接线的历史流水一律记为「基线」不弹。</p>
+      <p class="smart-money-readonly"><b>当前视角</b>：${scopeNote}。<b>数据来源</b>：BSC / Elysium 走<b>自建 RPC</b> 扫 Transfer 日志、Solana 走 <code>getSignaturesForAddress</code> 差分、Base / Robinhood 走 <b>Blockscout</b>；金额用 DexScreener / 接口自带的美元单价折算 —— 全程不需要任何 Key。<b>弹窗只发三类</b>：某家开始操作一个<b>基线之后才上线</b>的新标的（<b style="color:#df3f35">报红</b>；基线之前就在流通的一律算老币，稳定币 / 代币化股票不算新盘）、单笔 <b>≥ ${escapeHtml(compactUsd(Number(summary.largeTransferUsd || 0)))}</b> 的调仓、以及上面那条大额调仓恰好与两张榜单共振；其余只进列表，首次接线的历史流水一律记为「基线」不弹。</p>
       <p class="smart-money-readonly mm-gate">${gateText}</p>
       <p class="smart-money-readonly mm-gate">${resonanceText}</p>
       <div class="mm-firm-chips">${firms.map((firm) => `<button type="button" class="mm-firm-chip${firm.id === marketMakerFirm ? " is-selected" : ""}${Number(firm.enabledCount || 0) ? "" : " is-idle"}" data-mm-pick="${escapeHtml(firm.id)}" title="${escapeHtml(firm.brief || "")}"><b>${escapeHtml(firm.short || firm.label)}</b><em>${escapeHtml(firm.label)}</em><i>${Number(firm.activeTokens || 0)} 标的 / ${Number(firm.addressCount || 0)} 地址</i></button>`).join("")}</div>
@@ -2979,12 +3004,15 @@
     const key = trenchAiKey(row);
     const pending = Boolean(key) && trenchAiPending.has(key);
     const providerKey = String(entry?.exchangeAiNarrativeProvider || "").toLowerCase();
-    const sourceLabel = providerKey === "binance" ? "币安 AI" : providerKey === "bitget" ? "Bitget AI" : "AI";
+    // 叙事已统一切到 GIGA X；binance / bitget 只作为 GIGA X 没覆盖时的兜底标签留着。
+    const sourceLabel = providerKey === "gigax"
+      ? "GIGA X"
+      : providerKey === "binance" ? "币安 AI" : providerKey === "bitget" ? "Bitget AI" : "GIGA X";
     const body = narrative
       ? escapeHtml(narrative)
       : pending
-        ? "正在向币安 AI 叙事接口请求这一条的中文叙事，返回后自动显示。"
-        : "币安 AI 叙事接口本次未返回该币的中文叙事，新币刚开盘时很常见；换页或点“刷新战壕”会重新请求。";
+        ? "正在向 GIGA X 叙事接口请求这一条的中文叙事，返回后自动显示。"
+        : "GIGA X 叙事接口本次未返回该币的中文叙事，新币刚开盘时很常见；换页或点“刷新战壕”会重新请求。";
     return `<span class="onchain-trench-social-tool is-ai ${narrative ? "has-native" : "is-unavailable"}" tabindex="0">
       <button type="button" class="onchain-trench-social-button" aria-label="查看 ${escapeHtml(sourceLabel)}叙事">${trenchSocialGlyph("AI")}</button>
       <span class="onchain-trench-hover-card is-ai-card" role="tooltip">
@@ -2995,7 +3023,7 @@
     </span>`;
   }
 
-  // Ask Binance's AI narrative endpoint for the rows currently on screen. The
+  // Ask the GIGA X narrative endpoint for the rows currently on screen. The
   // request is bounded to one page and cached per contract, so hovering a card
   // stays a pure local lookup.
   async function requestOnchainTrenchAi({ force = false } = {}) {
@@ -3066,7 +3094,7 @@
         const rows = Array.isArray(onchainTrenchesPayload?.items) ? onchainTrenchesPayload.items : [];
         const ready = rows.filter((row) => trenchAiNarrativeText(row)).length;
         if (statusNode && !onchainTrenchesLoading) {
-          statusNode.textContent = `GMGN 实时战壕已更新 · 本页币安 AI 叙事 ${ready}/${rows.length} · 悬停不请求接口`;
+          statusNode.textContent = `GMGN 实时战壕已更新 · 本页 GIGA X 叙事 ${ready}/${rows.length} · 悬停不请求接口`;
         }
         renderChainEcosystem();
       }
@@ -3079,8 +3107,8 @@
       const entry = trenchAiNarrativeFor(row);
       if (!entry) return;
       const narrative = gmgnChineseNarrativeText(entry.exchangeAiNarrative);
-      row.aiAnalysisProvider = entry.exchangeAiNarrativeProvider || "binance";
-      row.aiAnalysisSource = entry.exchangeAiNarrativeSource || "Binance AI";
+      row.aiAnalysisProvider = entry.exchangeAiNarrativeProvider || "gigax";
+      row.aiAnalysisSource = entry.exchangeAiNarrativeSource || "GIGA X";
       row.aiAnalysisStatus = narrative ? "ready" : "not-returned";
       row.exchangeAiNarrative = narrative;
     });
@@ -3181,11 +3209,11 @@
             <span><b>${total}</b><em>实时结果</em></span>
             <span><b>${Number(counts.gmgn) || 0}</b><em>GMGN</em></span>
             <span><b>${sourceTotal ? `${healthySources}/${sourceTotal}` : "等待"}</b><em>链已返回</em></span>
-            <span><b>${aiReadyCount}/${items.length || Number(aiCoverage.total) || 0}</b><em>币安 AI 叙事${aiPendingCount ? ` · ${aiPendingCount} 生成中` : ""}</em></span>
+            <span><b>${aiReadyCount}/${items.length || Number(aiCoverage.total) || 0}</b><em>GIGA X 叙事${aiPendingCount ? ` · ${aiPendingCount} 生成中` : ""}</em></span>
           </div>
         </header>
         <aside class="onchain-trenches-preset-note">
-          <span><b>GMGN API 只读${apiConfigured ? " · 已接入个人 Key" : ""}</b><em>同一请求 90 秒合并复用，各链错峰读取；GMGN 战壕接口本身不返回叙事，榜单按当前页向币安 AI 叙事接口取中文叙事并逐合约缓存，图标悬停零请求。429 冷却期间停止访问，不拿旧数据冒充实时。</em>${unsupportedSources.length ? `<small>${escapeHtml(unsupportedSources.map(onchainResearchNetworkLabel).join("、"))} 当前未获 GMGN 战壕接口支持</small>` : failedSources.length ? `<small>${escapeHtml(failedSources.map(onchainResearchNetworkLabel).join("、"))} 正在自动恢复${retryAfter ? `，约 ${retryAfter} 秒后可重试` : ""}</small>` : ""}</span>
+          <span><b>GMGN API 只读${apiConfigured ? " · 已接入个人 Key" : ""}</b><em>同一请求 90 秒合并复用，各链错峰读取；GMGN 战壕接口本身不返回叙事，榜单按当前页向 GIGA X 叙事接口取中文叙事并逐合约缓存，图标悬停零请求。429 冷却期间停止访问，不拿旧数据冒充实时。</em>${unsupportedSources.length ? `<small>${escapeHtml(unsupportedSources.map(onchainResearchNetworkLabel).join("、"))} 当前未获 GMGN 战壕接口支持</small>` : failedSources.length ? `<small>${escapeHtml(failedSources.map(onchainResearchNetworkLabel).join("、"))} 正在自动恢复${retryAfter ? `，约 ${retryAfter} 秒后可重试` : ""}</small>` : ""}</span>
           <i>${escapeHtml(relativeTime(payload?.updatedAt))}</i>
         </aside>
         <div class="onchain-trenches-filterbar">
@@ -4344,7 +4372,7 @@
       if (!quiet) {
         statusNode.textContent = payload.rateLimited
           ? `GMGN 请求已暂停，防止 IP 继续受限 · 约 ${Number(payload.retryAfterSeconds) || 60} 秒后自动恢复`
-          : `GMGN 实时战壕已更新 · ${Number(payload.counts?.gmgn) || 0} 条 · 正在向币安 AI 叙事接口补齐本页叙事`;
+          : `GMGN 实时战壕已更新 · ${Number(payload.counts?.gmgn) || 0} 条 · 正在向 GIGA X 叙事接口补齐本页叙事`;
       }
       void requestOnchainTrenchAi({ force: refresh });
       if (payload.rateLimited) {
@@ -5102,7 +5130,7 @@
         marketMakerPayload = await postMarketMakerAction("settings", { alertsEnabled: enabled });
         marketMakerLoaded = true;
         lastMarketMakerLoadAt = Date.now();
-        statusNode.textContent = enabled ? "做市商弹窗已开启（新标的 / 大额调仓）" : "做市商弹窗已关闭（列表照常记录）";
+        statusNode.textContent = enabled ? "做市商弹窗已开启（新标的报红 / 大额调仓 / 三方共振）" : "做市商弹窗已关闭（列表照常记录）";
       } catch (error) {
         statusNode.textContent = error.message;
       } finally {

@@ -80,6 +80,27 @@ class EventFlowTests(unittest.TestCase):
         self.assertEqual(len(result["items"][0]["history"]), 3)
         self.assertIn("two", result["items"][0]["identities"])
 
+    def test_merge_does_not_propagate_a_bloated_identity_table(self):
+        """2026-11-26 事故回归：被合并方若已是个大杂烩，一条身份都不许接过来。
+
+        旧写法 ``UPDATE flow_identities SET event_id=?`` 是无条件的，于是当年 id=13
+        吃到 7499 条身份、revision 常年最大，事件流窗口每次启动都把它当新事件弹出。
+        """
+        blob = [f"news:narrative:{index}" for index in range(40)]
+        self.store.record("target", "popup", {"title": "甲"}, "queued", self.now, aliases=["article:a"])
+        self.store.record("blob", "news", {"title": "乙"}, "news", self.now,
+                          aliases=["article:shared", *blob])
+        self.store.record("topic", "news", {"title": "同一事件研判"}, "analysis", self.now,
+                          aliases=["article:a", "article:shared"])
+        items = self.store.read()["items"]
+        self.assertEqual(len(items), 1)
+        identities = items[0]["identities"]
+        self.assertIn("article:shared", identities)
+        self.assertIn("topic", identities)
+        self.assertIn("target", identities)
+        # 40 条话题身份不该跟着搬家
+        self.assertEqual([key for key in identities if key.startswith("news:narrative:")], [])
+
     def test_cursor_does_not_skip_backlog_or_replay_initial_history(self):
         for index in range(5):
             self.store.record(str(index), "news", {"title": str(index)}, "news", self.now + index)

@@ -55,6 +55,20 @@ class PriceWatchTradeUrlTests(unittest.TestCase):
                 url = server.onchain_token_view_url(chain_id, "0xabc7777")
                 self.assertEqual(url, f"https://gmgn.ai/{slug}/token/0xabc7777")
 
+    def test_elysium_folds_into_the_gmgn_slug(self):
+        """Elysium（chainId 99901）在 GMGN 上就是 ``elysium``，别再拼死链。
+
+        铁证：GMGN 自己的 /v1/token/info 返回
+        ``link.gmgn = https://gmgn.ai/elysium/token/<CA>``。
+        """
+        contract = "0x32193afd14c53f12c45a4c04eca9f7ba98e3ec71"
+        for chain_id in ("elysium", "99901"):
+            with self.subTest(chain_id=chain_id):
+                self.assertEqual(
+                    server.onchain_token_view_url(chain_id, contract),
+                    f"https://gmgn.ai/elysium/token/{contract}",
+                )
+
     def test_unknown_chain_still_falls_back_to_binance_wallet(self):
         """GMGN 认不出的链不许吐死链，回落币安钱包页。"""
         self.assertEqual(

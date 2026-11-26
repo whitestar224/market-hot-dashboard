@@ -31,3 +31,13 @@ test("desktop package includes the smart-money monitor module", () => {
   const resource = pkg.build.extraResources.find((item) => item.to === "dashboard");
   assert.ok(resource.filter.includes("smart_money_monitor.py"));
 });
+
+test("elysium 的聪明钱事件「查看」落 GMGN 交易页（不再去 429 的浏览器 / 站外站）", () => {
+  const js = fs.readFileSync("price-watch.js", "utf8");
+  // 用户 2026-11-09：「点击查看要跳转到 GMGN 的交易页」「不要跳转到 dexscreener」。
+  assert.match(js, /function smartMoneyGmgnUrl/);
+  assert.ok(js.includes("https://gmgn.ai/elysium/token/"));
+  // 落 GMGN 时按钮文案必须改成「GMGN 交易」，别再冒充链上交易详情。
+  assert.match(js, /explorerUrl\.includes\("gmgn\.ai\/"\) \? "GMGN 交易" : "查看链上交易"/);
+  assert.doesNotMatch(js, /dexscreener\.com\/elysium/);
+});

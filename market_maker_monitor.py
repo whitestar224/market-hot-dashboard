@@ -1,8 +1,19 @@
-"""做市商监控：跟这 8 家做市商的链上地址，看它们**正在操作哪些标的**。
+"""做市商监控：跟这几家做市商的链上地址，看它们**正在操作哪些标的**。
 
-数据源只有一个：Blockscout v2 的 ``/api/v2/addresses/{addr}/token-transfers``。
-它连美元单价都自带（``token.exchange_rate``），所以不需要再外挂 DexScreener，
-也不吃 BscScan / Etherscan 那套 key 配额 —— 整个模块零密钥。
+**取数通道按链分三种**（`CHAIN_META[chain]["mode"]`）：
+
+* ``blockscout``（Base / Robinhood）—— v2 的
+  ``/api/v2/addresses/{addr}/token-transfers`` 一个请求拿回归一化好的转账，
+  连美元单价都自带（``token.exchange_rate``），零密钥。
+* ``rpc``（BSC / Elysium）—— 这两条链**没有能用的公共索引器**
+  （bsc.blockscout.com 404、BscScan V2 免费档不含 56、Elysium 的 explorer 无 v2），
+  所以自己 ``eth_getLogs`` 按 Transfer topic 扫（转出 ``[topic, 我方]``、
+  转入 ``[topic, null, 我方]``），美元价外挂 DexScreener。
+* ``solana`` —— ``getSignaturesForAddress`` + ``getTransaction``，
+  ``pre/postTokenBalances`` 差分**只认 owner == 本地址**的账户。
+
+2026-11-15 用户把范围收窄成 **BSC / SOL / Robinhood / Base / Elysium**
+（见 `POLL_CHAINS`）。Ethereum 的老地址留在库里当审计留档，但不再扫。
 
 **地址从哪来**：一律是可审计的公开来源，按证据等级标注（``MM_EVIDENCE``）：
 
@@ -17,14 +28,24 @@
 （``DWF Labs`` / ``B2C2`` / ``DRWHO`` / ``Drwn`` …）。判据是看标签 slug 与地址类型，
 不看名字里有没有那家公司的字 —— 这是唯一不会误收的办法。
 
-**两类弹窗**（用户拍板：新标的 + 大额调仓，其余只进列表）：
+**三类弹窗**（其余只进列表）：
 
-1. 新标的进场 —— 某家在它从没碰过的代币上第一次动钱
+1. 新标的进场 —— 某家在它从没碰过的代币上第一次动钱。**报红**（用户 2026-11-15），
+   金额闸 ``MM_NEW_TOKEN_MIN_USD``（$100）挡掉空投 / 同形字骗局币，
+   标的成熟度闸（**以基线为准**）挡掉老币 —— 后者见下。
 2. 大额调仓   —— 单笔折合美元 ≥ ``MM_LARGE_TRANSFER_USD``（默认 100 万）
+3. 三方共振   —— 上面那笔大额调仓的标的恰好也挂在涨幅榜 + AIcoin 热门榜
 
-**首次建基不弹窗**：新地址第一次拉到的 50 条是历史流水，只会写进库供列表展示，
+**首次建基不弹窗**：新地址第一次拉到的流水是历史，只会写进库供列表展示，
 带 ``baseline=1`` 标记，一律不弹。而且「新标的」还要等这家完成**首轮全量扫街**
 （``sweep_complete``）才算数 —— 否则分几轮才扫完的地址会把几百年的老仓全报成新标的。
+
+**「新标的」为什么还要查标的年龄**（2026-11-16）：上面两道闸只保证「这是我们第一次
+见到这个 (厂家, 币) 组合」，跟「币是不是新盘」毫无关系。基线只覆盖每个地址最近
+几十条签名，任何老币只要从窗口外转回来就会被判成新标的 —— 2026-11-15 夜里 10 小时
+弹了 8 条，全是 ``WIF``（2023 年上线）、``USD1``（稳定币）和 5 只 xStocks 代币化股票。
+所以现在金额闸过了还要过 ``token_maturity()``：最早池子必须建在 14 天内，
+稳定币 / 代币化股票一律否决，查不到上市时间的一律不弹。
 """
 from __future__ import annotations
 
@@ -44,18 +65,76 @@ import requests
 # --------------------------------------------------------------------------- #
 # 链
 # --------------------------------------------------------------------------- #
-#: 只保留**有可用 Blockscout** 的链。Base 的标签库几乎为空、BSC 根本没有公开实例
-#: （与「Dev 发币」那边同一个限制），硬加进来只会得到一片空白。
+#: ``mode`` 决定取数通道：
+#:   * ``blockscout`` —— 有公共实例，一个请求拿回归一化好的转账（base / robinhood）。
+#:   * ``rpc``        —— 没有索引器的链，自己 ``eth_getLogs`` 扫 Transfer（bsc / elysium）。
+#:
+#: 2026-11-15 用户改了监控范围：「只看 BSC、SOL、ROBINHOOD 和新链（Elysium）」，
+#: 随后追加 BASE。**Ethereum 不再轮询**（历史流水与标的仍留在库里，只是不再扫）。
+#:
+#: 实测（2026-11-15）：base.blockscout.com 正常；**bsc.blockscout.com 与
+#: avalanche.blockscout.com 都是 404**，BscScan V2 免费档不含 56 → BSC 只能自建 RPC。
+#: BSC 的公共端点里只有 ``bsc.rpc.blxrbdn.com`` 允许「只给 topics 不给 address」的
+#: ``eth_getLogs`` 且范围能到 1000+ 块（binance/defibit 报 limit exceeded、
+#: 1rpc 限 0-50 块、meowrpc 直接不支持、publicnode 强制要求 address）。
 CHAIN_META = {
     "ethereum": {
         "label": "Ethereum",
+        "mode": "blockscout",
         "blockscout": "https://eth.blockscout.com",
         "explorerTx": "https://etherscan.io/tx/{}",
         "explorerToken": "https://etherscan.io/token/{}",
         "gmgn": "eth",
     },
+    "base": {
+        "label": "Base",
+        "mode": "blockscout",
+        "blockscout": "https://base.blockscout.com",
+        "explorerTx": "https://basescan.org/tx/{}",
+        "explorerToken": "https://basescan.org/token/{}",
+        "gmgn": "base",
+    },
+    "bsc": {
+        "label": "BSC",
+        "mode": "rpc",
+        "dex": "bsc",
+        "rpcs": (
+            "https://bsc.rpc.blxrbdn.com",
+            "https://bsc-dataseed.bnbchain.org",
+            "https://bsc-dataseed-public.bnbchain.org",
+        ),
+        # 公开端点对 topics-only 查询最宽只给到 ~1000 块；留一半余量，缺口由下一轮补。
+        "maxBlocks": 600,
+        "explorerTx": "https://bscscan.com/tx/{}",
+        "explorerToken": "https://bscscan.com/token/{}",
+        "gmgn": "bsc",
+    },
+    "elysium": {
+        "label": "Elysium",
+        "mode": "rpc",
+        "dex": "elysium",
+        "rpcs": ("https://rpc.elysium.kinetiq.xyz",),
+        # 出块 ~100ms，不带 address 的 getLogs 卡 2000 块上限 → 1500 留余量。
+        "maxBlocks": 1500,
+        "explorerTx": "https://elysium.kinetiq.xyz/explorer/tx/{}",
+        "explorerToken": "https://elysium.kinetiq.xyz/explorer/token/{}",
+        "gmgn": "elysium",
+    },
+    "solana": {
+        "label": "Solana",
+        "mode": "solana",
+        "dex": "solana",
+        "rpcs": (
+            "https://api.mainnet-beta.solana.com",
+            "https://solana-rpc.publicnode.com",
+        ),
+        "explorerTx": "https://solscan.io/tx/{}",
+        "explorerToken": "https://solscan.io/token/{}",
+        "gmgn": "sol",
+    },
     "robinhood": {
         "label": "Robinhood",
+        "mode": "blockscout",
         "blockscout": "https://robinhoodchain.blockscout.com",
         "explorerTx": "https://robinhoodchain.blockscout.com/tx/{}",
         "explorerToken": "https://robinhoodchain.blockscout.com/token/{}",
@@ -63,8 +142,18 @@ CHAIN_META = {
     },
 }
 CHAINS = tuple(CHAIN_META)
+#: **真正会被轮询的链**（2026-11-15 用户定的范围：BSC / SOL / Robinhood / Base / Elysium）。
+#:
+#: Ethereum 的 168 个老地址**留在库里当审计留档**，但不再扫 —— 用户明确说「只看
+#: BSC，SOL，ROBINHOOD 和新链的」。要和 `enabled` 分开看：`enabled` 是用户在页面上
+#: 拨的开关，这里是模块级的取数范围；两者都为真才会进 `addresses_due()`。
+POLL_CHAINS: tuple[str, ...] = ("bsc", "base", "elysium", "solana", "robinhood")
 CHAIN_ALIASES = {
     "ethereum": "ethereum", "eth": "ethereum", "以太坊": "ethereum", "1": "ethereum",
+    "base": "base", "8453": "base",
+    "bsc": "bsc", "bnb": "bsc", "56": "bsc", "币安链": "bsc", "币安智能链": "bsc",
+    "elysium": "elysium", "99901": "elysium",
+    "solana": "solana", "sol": "solana",
     "robinhood": "robinhood", "hood": "robinhood", "4663": "robinhood",
 }
 
@@ -75,6 +164,9 @@ CHAIN_LABELS = {
     "ethereum": "Ethereum", "eth": "Ethereum", "1": "Ethereum",
     "bsc": "BSC", "bnb": "BSC", "56": "BSC",
     "base": "Base", "8453": "Base",
+    "arbitrum": "Arbitrum", "arb": "Arbitrum", "42161": "Arbitrum",
+    "optimism": "Optimism", "op": "Optimism", "10": "Optimism",
+    "avalanche": "Avalanche", "avax": "Avalanche", "43114": "Avalanche",
     "solana": "Solana", "sol": "Solana",
     "robinhood": "Robinhood", "4663": "Robinhood",
 }
@@ -82,6 +174,8 @@ GMGN_SLUGS = {
     "ethereum": "eth", "eth": "eth",
     "bsc": "bsc", "bnb": "bsc",
     "base": "base",
+    "arbitrum": "arb", "arb": "arb",
+    "optimism": "op", "op": "op",
     "solana": "sol", "sol": "sol",
     "robinhood": "robinhood",
 }
@@ -94,7 +188,7 @@ EVIDENCE_LABELS = {
 }
 
 # --------------------------------------------------------------------------- #
-# 八家做市商（顺序照用户给的截图）
+# 九家做市商（前八家照用户 2026-10-20 的截图，Galaxy 是 2026-11-15 名单里补的）
 # --------------------------------------------------------------------------- #
 MM_FIRMS: tuple[tuple[str, str, str, str], ...] = (
     (
@@ -138,6 +232,13 @@ MM_FIRMS: tuple[tuple[str, str, str, str], ...] = (
         "欧洲知名的交易所交易产品（ETP）做市商，在加密 ETF 和传统金融产品与加密市场的"
         "连接中扮演重要角色。",
     ),
+    (
+        # 2026-11-15 用户名单里新增的一家：之前 8 家名单里没有它，链上标签也很少
+        # （Blockscout 搜 "Galaxy Digital" 拿到的是 OTC 与几个持仓地址）。
+        "galaxy", "Galaxy Digital", "GLXY",
+        "老牌加密投行与做市机构（纳斯达克上市），OTC 台与自营交易并行，"
+        "常以大额场外承接与项目做市的方式介入。",
+    ),
 )
 MM_FIRM_LABELS = {firm: label for firm, label, _short, _brief in MM_FIRMS}
 MM_FIRM_SHORTS = {firm: short for firm, _label, short, _brief in MM_FIRMS}
@@ -147,7 +248,7 @@ MM_FIRM_SHORTS = {firm: short for firm, _label, short, _brief in MM_FIRMS}
 #: 2026-10-20 用 Blockscout 公共标签接口逐家核实（``/api/v2/search?q=<厂家名>``，
 #: 只收 ``type == "metadata_tag"``，并把标签原文留在 ``tag`` 里以便随时复核）。
 #: ``sourceUrl`` 是标签自带的 tooltip（多为公司官网），能一眼看出这个标签是谁标的。
-MM_SEED_ADDRESSES: tuple[tuple[str, str, str, str, str, str], ...] = (
+MM_LEGACY_SEED_ADDRESSES: tuple[tuple[str, str, str, str, str, str], ...] = (
     # ---- Wintermute ----
     ("ethereum", "wintermute", "0xDBF5E9c5206d0dB70a90108bf936DA60221dC080", "Wintermute: 0xdbf...080", "tag", "https://wintermute.com/"),
     ("ethereum", "wintermute", "0x0000006daea1723962647b7e189d311d757Fb793", "Wintermute 1", "tag", ""),
@@ -245,6 +346,73 @@ MM_SEED_ADDRESSES: tuple[tuple[str, str, str, str, str, str], ...] = (
     ("ethereum", "flow", "0xAeA6291CB48d9675B120F74E2F0b0De01dB47a00", "Flow Traders（研报标注）", "report", "https://arbitragescanner.io/blog/how-funds-and-market-makers-profited-from-the-market-downturn"),
 )
 
+# --------------------------------------------------------------------------- #
+# 2026-11-15 用户给的「热钱包」名单（BSC / SOL / Robinhood / Base / Elysium）
+# --------------------------------------------------------------------------- #
+#: EVM 侧**一个地址在这些链上通用**（用户原话：「EVM 链共用同一个地址」），
+#: 所以下面只写一遍，再按 `MM_EVM_CHAINS` 展开成多行 —— 手抄 4 遍迟早抄错一位。
+#:
+#: ``(firm, address, tag, evidence, sourceUrl)``
+MM_EVM_WALLETS: tuple[tuple[str, str, str, str, str], ...] = (
+    # Wintermute：0xf819…3AA 是用户点名的「最活跃」，0xDBF5…080 是基金
+    ("wintermute", "0xf8191D98ae98d2f7aBDFB63A9b0b812b93C873AA", "Wintermute 4（最活跃）", "tag", "https://www.wintermute.com/"),
+    ("wintermute", "0x0000006daea1723962647b7e189d311d757Fb793", "Wintermute 1", "tag", ""),
+    ("wintermute", "0x000002Cba8DfB0a86A47a415592835E17fac080a", "Wintermute 2", "tag", "https://www.wintermute.com/"),
+    ("wintermute", "0x5cddEbd8a7b3BC60156550187BF5465b1c3290f5", "Wintermute 3", "tag", "https://wintermute.com/"),
+    ("wintermute", "0xCe84449A8Ebec019AC110a4b6662E55d0fD9f228", "Wintermute 5", "tag", "https://www.wintermute.com/"),
+    ("wintermute", "0xDBF5E9c5206d0dB70a90108bf936DA60221dC080", "Wintermute 基金", "tag", "https://wintermute.com/"),
+    # Jump Trading
+    ("jump", "0xf584F8728B874a6a5c7A8d4d387C9aae9172D621", "Jump Trading", "tag", "https://www.jumptrading.com/"),
+    # DWF Labs：第一个有浏览器标签，第二个是官方自报（无第三方标签，如实降档）
+    ("dwf", "0xD4B69e8D62C880E9DD55d419d5E07435C3538342", "DWF Labs: 0xD4B...342", "tag", ""),
+    ("dwf", "0xF0984860f1F31a784c0FF0bb4d1322e377f97631", "DWF Labs（官方自报）", "manual", "https://www.dwf-labs.com/"),
+    # GSR：用户特别提示「BSC 上持仓比 ETH 多」
+    ("gsr", "0xD8D6fFE342210057BF4DCc31DA28D006f253cEF0", "GSR: 0xD8D...EF0", "tag", ""),
+    # Amber Group
+    ("amber", "0xE11970f2F3dE9d637Fb786f2d869F8FeA44195AC", "Amber Group", "tag", "https://www.ambergroup.io/"),
+    ("amber", "0x5b990C664aE7E759763ACfEC76E11c289c53Be77", "Amber Group: 0x5b9...e77", "tag", ""),
+    # B2C2
+    ("b2c2", "0xC333E80eF2deC2805F239E3f1e810612D294F771", "B2C2 Group 1", "tag", "https://www.b2c2.com/"),
+    # Cumberland (DRW)：0xad6e…862 用户标注「Base 上持仓最大」
+    ("cumberland", "0x87b49A99CbCe4A9030e67919B776AA97d538aDda", "Cumberland: 0x87b...Dda", "tag", ""),
+    ("cumberland", "0xad6eaa735D9dF3D7696fd03984379dAE02eD8862", "Cumberland: 0xad6...862", "tag", ""),
+    # Galaxy Digital：公共标签库几乎没有，全部按用户名单手动添加
+    ("galaxy", "0x33566c9D8BE6Cf0B23795E0d380E112Be9d75836", "Galaxy Digital OTC", "manual", ""),
+    ("galaxy", "0x4ADF44961a7CBe8EE46B2bf04E7198e879677825", "Galaxy Digital（名单）", "manual", ""),
+    ("galaxy", "0xcaf66b3c3c343064f19c697e53b126cbb9e7ad99", "Galaxy Digital（名单）", "manual", ""),
+    ("galaxy", "0x5797f722b1fee36e3d2c3481d938d1372bcd99a7", "Galaxy Digital（名单）", "manual", ""),
+)
+#: Keyrock 的 ``0x1855f41B8A86e701E33199DE7C25d3e3830698ba`` **故意不收**：
+#: 用户原话「这是治理地址，不是交易钱包」—— 治理地址的流水是投票与国库，不是做市。
+
+#: Solana 侧。``evidence`` 的差别是对的：用户原话「全名单里只有 Wintermute 的
+#: SOL 地址明确标了 Hot Wallet」，所以只有 Wintermute 那三个算链上标签，
+#: Jump 与 DWF 只能是「手动添加」。
+MM_SOL_WALLETS: tuple[tuple[str, str, str, str, str], ...] = (
+    ("wintermute", "44P5Ct5JkPz76Rs2K6juC65zXMpFRDrHatxcASJ4Dyra", "Wintermute Hot Wallet", "tag", "https://wintermute.com/"),
+    ("wintermute", "MfDuWeqSHEqTFVYZ7LoexgAK9dxk7cy4DFJWjWMGVWa", "Wintermute AMM Bot", "tag", "https://wintermute.com/"),
+    ("wintermute", "5sTQ5ih7xtctBhMXHr3f1aWdaXazWrWfoehqWdqWnTFP", "Wintermute（名单）", "tag", "https://wintermute.com/"),
+    ("jump", "GtxgnRiSfBzahR9xb7hvYbWq3Uzez7hpCz2BJbCLxKdq", "Jump Trading（名单）", "manual", ""),
+    ("dwf", "HwDkuDCUipJHHKodBBCjffFvrjhmd4iVVh7fq25fShvt", "DWF Labs（官方自报）", "manual", "https://www.dwf-labs.com/"),
+)
+
+#: 新名单要落到哪几条 EVM 链上（用户要盯的 4 条 EVM 链；Solana 单独展开）。
+MM_EVM_CHAINS: tuple[str, ...] = ("bsc", "base", "elysium", "robinhood")
+
+#: 最终地址簿 = 老名单（Ethereum/Robinhood 已核实标签，留档）+ 用户新名单展开。
+MM_SEED_ADDRESSES: tuple[tuple[str, str, str, str, str, str], ...] = (
+    *MM_LEGACY_SEED_ADDRESSES,
+    *(
+        (chain, firm, address, tag, evidence, source)
+        for firm, address, tag, evidence, source in MM_EVM_WALLETS
+        for chain in MM_EVM_CHAINS
+    ),
+    *(
+        ("solana", firm, address, tag, evidence, source)
+        for firm, address, tag, evidence, source in MM_SOL_WALLETS
+    ),
+)
+
 DEFAULT_POLL_SECONDS = 300.0
 #: 一轮最多轮询多少个地址。8 家一共 80+ 个地址，一次全扫会把公共实例惹毛；
 #: 按 ``last_polled_at`` 升序轮转，几轮之内自然铺满全部地址。
@@ -252,8 +420,61 @@ DEFAULT_ADDRESSES_PER_CYCLE = 30
 #: 只有新地址的第一次拉取才多翻一页，之后每轮只取最近 50 条。
 FIRST_POLL_PAGES = 2
 STEADY_POLL_PAGES = 1
+#: Solana 一个地址一轮取多少签名。每笔还要再 getTransaction（1~1.5 秒），
+#: 40 笔 ≈ 1 分钟，再多会把一整轮拖死（与聪明钱那边的预算同一个道理）。
+SOLANA_SIG_LIMIT = 40
 #: 单笔折合多少美元算「大额调仓」。
 MM_LARGE_TRANSFER_USD = 1_000_000.0
+#: 「新标的」弹窗的金额闸（用户 2026-11-15 要求这类事件**报红**，报红就得先挡噪音）。
+#:
+#: 硬数据（`.runtime-cache/market_maker_monitor.sqlite`，近 7 天新建的 247 个
+#: ``(firm, chain, token)`` 仓位）：``usd_in = 0`` 的 240 个，≥$100 的只有 6 个。
+#: 那 240 个是空投／同形字骗局币（``Е⁯ΤН⁯`` / ``U⁯S⁯DΤ`` 之类），DexScreener 查不到价
+#: → ``usd`` 算出来是 0。**不设闸就是每天三十几条红色噪音**，设了闸一天 1~3 条。
+#:
+#: 门槛取 $100 而不是 $1000：做市商进场常常先小额试单，$1000 会把「试单→加仓」
+#: 的整个开头漏掉；而 $100 已经能把灰尘和骗局币全部挡住。
+MM_NEW_TOKEN_MIN_USD = 100.0
+#: 「新标的」的**标的成熟度闸**（用户 2026-11-16 定，起因见下）。
+#:
+#: 老判据是「这个 (厂家, 币) 组合在**我们库里**第一次出现」——它根本不是「币是新盘」：
+#: 基线只覆盖每个地址最近几十条签名（``FIRST_POLL_PAGES`` / ``SOLANA_SIG_LIMIT``），
+#: 任何落在窗口之外、下一轮又被碰到的**老币**都会被判成新标的。2026-11-15 22:18 ~
+#: 11-16 08:13 十个小时里连弹 8 条，全是老币：
+#:
+#:   * ``WIF``  —— 2023-11-21 上线（1091 天）
+#:   * ``USD1`` —— World Liberty 稳定币（442 天）
+#:   * ``METAX`` / ``EWYx`` / ``SNDKx`` / ``INTCx`` / ``SKHYx`` —— xStocks 代币化股票
+#:
+#: 所以现在「新标的」必须**三条同时成立**（用户 2026-11-16 拍板「以基线为准」）：
+#:   1. 标的在**基线之后**才上线 —— 基线之前就在流通的，一律算老币；
+#:   2. 第一次出现在这家的钱包活动里（原有判据，`newToken`）；
+#:   3. 标的不是结构性品种：稳定币、代币化股票/ETF 永远不算新盘。
+#:
+#: **为什么不用「多少天以内」的滚动窗口**（第一版用过 14 天，被用户否掉）：滚动窗口
+#: 会随时间漂移，同一个币今天算新、明天算老，说不清凭什么；而且它挡不住「比 14 天
+#: 更早、但确实是基线之后才发」的币。基线是**固定参照系**：只要它在我们开始盯这批
+#: 地址之前就存在，就是老币，永远不会被重新当成新盘。
+#:
+#: 基线时刻 = 这家在这条链上**首轮全量扫街**写下 ``baseline=1`` 流水里最早的那条
+#: ``seen_at``（见 ``MarketMakerStore.baseline_at``）。当天文观测里「之前上线的」判定
+#: 就靠它和标的**最早一个 DEX 池子的创建时间**比大小。
+#:
+#: 查不到上市时间的**一律不弹**（宁可漏，不可吵）：这类「查不到」绝大多数是没被
+#: 任何索引器收录的灰尘/骗局币，而真正刚建池的新币十几分钟内就会被 DexScreener 收录。
+#: 成熟度结论的缓存寿命。老币的结论不会变，查一次用一个月；
+#: 查不到的只缓存一天 —— 刚建的池子随时可能被索引器补上。
+TOKEN_META_TTL_SECONDS = 30 * 86400
+TOKEN_META_MISS_TTL_SECONDS = 86400
+#: 稳定币不是新盘（命中即静音，不再查任何外部接口）。
+MM_STABLE_SYMBOLS = frozenset({
+    "USD1", "USDC", "USDT", "USDG", "USDE", "USDS", "USDY", "USDX", "DAI",
+    "PYUSD", "FDUSD", "TUSD", "BUSD", "RLUSD", "EURC", "USDP", "GUSD", "USDL",
+})
+#: xStocks（代币化股票/ETF）的铸造地址前缀。发行方 Backed 用的是 vanity 前缀，
+#: 实测 AAPLx / TSLAx / NVDAx / SPYx / QQQx 五个全部以 ``Xs`` 开头（2026-11-16）。
+#: **base58 区分大小写**，这里只做前缀归类、不参与地址存取，所以统一按小写比对。
+MM_XSTOCKS_MINT_PREFIX = "xs"
 #: 三方共振（大额异动 × 涨幅榜 × AIcoin 热门榜）同一标的的静默窗口。
 #: 共振是**持续状态**而不是一次性事件，6 小时内重复弹没有新信息（用户 2026-10-21 定）。
 RESONANCE_COOLDOWN_SECONDS = 6 * 3600
@@ -299,6 +520,18 @@ def default_db_path() -> Path:
 def normalize_chain(value: Any) -> str:
     key = " ".join(str(value or "").split()).casefold().replace("_", " ").replace("-", " ")
     return CHAIN_ALIASES.get(key.strip(), "")
+
+
+def wallet_key(chain: Any, address: Any) -> str:
+    """地址簿的键。**EVM 忽略大小写，Solana 绝对不能**。
+
+    base58 是区分大小写的：``MfDuWeqS…VWa`` 全小写之后是一个**不存在的地址**，
+    节点直接回 ``-32602 Invalid param``。2026-11-15 加 Solana 钱包时踩过这个坑
+    （``_seed_addresses`` 原来对所有地址无条件 ``.lower()``，EVM 一直是没事的，
+    因为 EVM 地址本来就大小写不敏感）。
+    """
+    text = str(address or "").strip()
+    return text if normalize_chain(chain) == "solana" else text.lower()
 
 
 def chain_label(value: Any) -> str:
@@ -405,6 +638,28 @@ def is_evm_address(value: Any) -> bool:
     return len(text) == 42 and text[:2].lower() == "0x" and all(
         ch in "0123456789abcdefABCDEF" for ch in text[2:]
     )
+
+
+BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def is_solana_address(value: Any) -> bool:
+    """base58 且解码后正好 32 字节 —— 与聪明钱那边同一个判据。
+
+    不能只看「长度 32~44 + 都是 base58 字符」：那会把一堆随机字符串放过，
+    然后在 `getSignaturesForAddress` 上换来一个 -32602。
+    """
+    text = str(value or "").strip()
+    if not 32 <= len(text) <= 44:
+        return False
+    number = 0
+    for character in text:
+        position = BASE58_ALPHABET.find(character)
+        if position < 0:
+            return False
+        number = number * 58 + position
+    size = (number.bit_length() + 7) // 8 if number else 0
+    return size + len(text) - len(text.lstrip("1")) == 32
 
 
 def money_text(value: Any) -> str:
@@ -795,6 +1050,542 @@ def normalize_transfer(chain: str, address: str, item: Any) -> dict[str, Any] | 
 
 
 # --------------------------------------------------------------------------- #
+# 自建取数通道：BSC / Elysium（没有索引器，自己 eth_getLogs）
+#                 Solana（getSignaturesForAddress + getTransaction）
+#
+# 2026-11-15 用户把监控范围收到「BSC / SOL / ROBINHOOD / BASE / Elysium」，
+# 其中 BSC 与 Elysium 一个公开索引器都没有（bsc.blockscout.com 404、BscScan V2
+# 免费档不含 56），只能自己扫链。这两条路返回的行与 Blockscout 那条**同构**，
+# 下游 record_transfer 完全不用改。
+# --------------------------------------------------------------------------- #
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+#: 链上的「现金」不是标的。BSC / Solana 的稳定币与包装原生币地址和以太坊完全不同，
+#: 不单列一份，USDT/WBNB/USDC 会被当成「这家从没碰过的新标的」天天爆红。
+CASH_TOKENS_BY_CHAIN: dict[str, frozenset[str]] = {
+    "bsc": frozenset({
+        "0x55d398326f99059ff775485246999027b3197955",  # USDT
+        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",  # USDC
+        "0xe9e7cea3dedca5984780bafc599bd69add087d56",  # BUSD
+        "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",  # WBNB
+    }),
+    "solana": frozenset({
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+        "So11111111111111111111111111111111111111112",   # WSOL
+    }),
+    "elysium": frozenset(),
+}
+
+_META_CACHE: dict[tuple[str, str], tuple[str, int]] = {}
+_PRICE_CACHE: dict[tuple[str, str], tuple[float, str, float]] = {}
+_BLOCK_TS_CACHE: dict[tuple[str, int], int] = {}
+_CACHE_LOCK = threading.Lock()
+PRICE_CACHE_SECONDS = 600.0
+
+
+def _chain_rpc(chain: str, method: str, params: list[Any]) -> Any:
+    """按 ``CHAIN_META[chain]['rpcs']`` 顺序打 JSON-RPC，全挂了才抛。"""
+    meta = CHAIN_META.get(chain) or {}
+    urls = meta.get("rpcs") or ()
+    if not urls:
+        raise IndexerError(f"{chain} 没有配置 RPC")
+    errors: list[str] = []
+    for url in urls:
+        try:
+            response = _session().post(
+                url,
+                json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+                timeout=(5, 20),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("error"):
+                raise RuntimeError(str(payload["error"])[:140])
+            return payload.get("result")
+        except Exception as exc:
+            errors.append(f"{url}: {str(exc)[:100]}")
+    raise IndexerError(f"{chain} {method} 失败：{'；'.join(errors)[:260]}")
+
+
+def _decode_abi_string(value: Any) -> str:
+    raw = str(value or "").removeprefix("0x")
+    try:
+        data = bytes.fromhex(raw)
+    except ValueError:
+        return ""
+    if len(data) >= 64:
+        offset = int.from_bytes(data[:32], "big")
+        if offset + 32 <= len(data):
+            length = int.from_bytes(data[offset:offset + 32], "big")
+            return data[offset + 32:offset + 32 + length].decode("utf-8", "ignore").strip("\x00 ")
+    return data[:32].decode("utf-8", "ignore").strip("\x00 ")
+
+
+def token_metadata(chain: str, token: str) -> tuple[str, int]:
+    """``(symbol, decimals)``。没索引器可问，只能 ``eth_call``；结果常驻缓存。
+
+    取不到就返回 ``("", 18)`` —— 精度错会让金额差几个数量级，所以宁可给 18，
+    再让价格为 0（分母对不上时不会算出天价）。
+    """
+    key = (chain, str(token or "").lower())
+    with _CACHE_LOCK:
+        if key in _META_CACHE:
+            return _META_CACHE[key]
+    symbol, decimals = "", 18
+    try:
+        symbol = _decode_abi_string(_chain_rpc(chain, "eth_call", [{"to": key[1], "data": "0x95d89b41"}, "latest"]))
+    except Exception:
+        symbol = ""
+    try:
+        raw = _chain_rpc(chain, "eth_call", [{"to": key[1], "data": "0x313ce567"}, "latest"])
+        decimals = max(0, min(36, int(str(raw or "0x12"), 16)))
+    except Exception:
+        decimals = 18
+    value = (symbol[:40], decimals)
+    with _CACHE_LOCK:
+        _META_CACHE[key] = value
+    return value
+
+
+def token_price_usd(chain: str, token: str) -> tuple[float, str]:
+    """DexScreener 单币价：``(priceUsd, symbol)``，失败返回 ``(0.0, "")``。
+
+    自建通道没有 Blockscout 那种现成的 ``exchange_rate``，只能走这条 —— 与聪明钱
+    那边同一个接口同一套口径（一次请求顺带把符号也拿回来）。
+    """
+    meta = CHAIN_META.get(chain) or {}
+    dex = str(meta.get("dex") or "")
+    key = (chain, str(token or "").lower())
+    now = time.time()
+    with _CACHE_LOCK:
+        cached = _PRICE_CACHE.get(key)
+        if cached and now - cached[2] < PRICE_CACHE_SECONDS:
+            return cached[0], cached[1]
+    price, symbol = 0.0, ""
+    if dex:
+        for attempt in range(2):
+            try:
+                response = _session().get(
+                    f"https://api.dexscreener.com/tokens/v1/{dex}/{key[1]}",
+                    headers={"Accept": "application/json"},
+                    timeout=(4, 8),
+                )
+                response.raise_for_status()
+                rows = response.json()
+                if isinstance(rows, list) and rows:
+                    best = max(
+                        (row for row in rows if isinstance(row, dict)),
+                        key=lambda row: to_float((row.get("liquidity") or {}).get("usd")),
+                        default={},
+                    )
+                    price = to_float(best.get("priceUsd"))
+                    symbol = clean_text((best.get("baseToken") or {}).get("symbol"), 40)
+                break
+            except Exception:
+                if attempt == 0:
+                    time.sleep(0.5)
+    with _CACHE_LOCK:
+        _PRICE_CACHE[key] = (price, symbol, now)
+    return price, symbol
+
+
+def _block_timestamp_ms(chain: str, block: int) -> int:
+    key = (chain, int(block))
+    with _CACHE_LOCK:
+        if key in _BLOCK_TS_CACHE:
+            return _BLOCK_TS_CACHE[key]
+    stamp = 0
+    try:
+        data = _chain_rpc(chain, "eth_getBlockByNumber", [hex(key[1]), False]) or {}
+        stamp = int(str(data.get("timestamp") or "0x0"), 16) * 1000
+    except Exception:
+        stamp = 0
+    with _CACHE_LOCK:
+        if len(_BLOCK_TS_CACHE) > 4000:
+            _BLOCK_TS_CACHE.clear()
+        _BLOCK_TS_CACHE[key] = stamp
+    return stamp
+
+
+#: 一次 ``eth_getLogs`` 里最多为多少个**不同的块**去查真实时间戳。
+#: 超过就走「锚点 + 按块高线性插值」—— 不这么干的话，一个被空投刷屏的地址
+#: 一轮能触发几百次 ``eth_getBlockByNumber``，把整轮拖成十几分钟。
+BLOCK_TIMESTAMP_PROBE_LIMIT = 24
+
+
+def _block_timestamps_ms(chain: str, blocks: list[int]) -> dict[int, int]:
+    """批量把块高换成毫秒时间戳（带缓存 + 超量降级插值）。
+
+    BSC / Elysium 的出块间隔是固定的，锚点之间按块高线性插值误差在秒级，
+    对「这条流水发生在几分钟前」这种展示绰绰有余；而块内精确到毫秒没有意义。
+    """
+    out: dict[int, int] = {}
+    pending: list[int] = []
+    for block in sorted({int(b) for b in blocks if int(b) > 0}):
+        with _CACHE_LOCK:
+            cached = _BLOCK_TS_CACHE.get((chain, block))
+        if cached:
+            out[block] = cached
+        else:
+            pending.append(block)
+    if not pending:
+        return out
+    if len(pending) <= BLOCK_TIMESTAMP_PROBE_LIMIT:
+        for block in pending:
+            out[block] = _block_timestamp_ms(chain, block)
+        return out
+    # 超量：取首尾 + 中间均匀几个锚点，其余插值。
+    step = max(1, len(pending) // BLOCK_TIMESTAMP_PROBE_LIMIT)
+    anchors = pending[::step]
+    if pending[-1] not in anchors:
+        anchors.append(pending[-1])
+    for block in anchors:
+        out[block] = _block_timestamp_ms(chain, block)
+    known = sorted((b, ts) for b, ts in out.items() if ts > 0)
+    if not known:
+        return out
+    for block in pending:
+        if out.get(block):
+            continue
+        left = max((item for item in known if item[0] <= block), default=known[0])
+        right = min((item for item in known if item[0] >= block), default=known[-1])
+        if right[0] == left[0]:
+            out[block] = left[1]
+        else:
+            ratio = (block - left[0]) / (right[0] - left[0])
+            out[block] = int(left[1] + (right[1] - left[1]) * ratio)
+        with _CACHE_LOCK:
+            _BLOCK_TS_CACHE[(chain, block)] = out[block]
+    return out
+
+
+def evm_transfers_via_rpc(
+    chain: str, address: str, *, from_block: int, to_block: int, max_logs: int = 400
+) -> list[dict[str, Any]]:
+    """``eth_getLogs`` 扫一个地址的 ERC-20 进出（Transfer 事件的 from / to 两侧）。
+
+    公开端点**不接受只给 address 关键字**（那是 token 合约地址，这里要的是任意代币），
+    所以只能按 topics 过滤：``[Transfer, 我方地址]`` = 转出，``[Transfer, null, 我方]`` = 转入。
+
+    ``max_logs`` 是**噪音闸不是精度闸**：被空投刷屏的地址一轮能吐 6000+ 条日志，
+    每条都要查 symbol/decimals/价格，不截断会把整轮拖死。正常做市商地址一轮
+    只有个位数到几十条，碰不到这个上限。
+    """
+    holder = str(address or "").lower()
+    if not is_evm_address(holder):
+        raise IndexerError(f"{holder[:12]} 不是合法 EVM 地址")
+    padded = "0x" + "0" * 24 + holder[2:]
+    rows: list[dict[str, Any]] = []
+    cash = CASH_TOKENS_BY_CHAIN.get(chain, frozenset())
+    for direction, topics in (("out", [TRANSFER_TOPIC, padded]), ("in", [TRANSFER_TOPIC, None, padded])):
+        logs = _chain_rpc(chain, "eth_getLogs", [{
+            "fromBlock": hex(int(from_block)),
+            "toBlock": hex(int(to_block)),
+            "topics": topics,
+        }]) or []
+        for log in logs:
+            if len(rows) >= max_logs:
+                break
+            if not isinstance(log, dict):
+                continue
+            token = str(log.get("address") or "").lower()
+            if not token or token in cash:
+                continue
+            topics_in = log.get("topics") or []
+            if len(topics_in) < 3:
+                continue
+            sender = "0x" + str(topics_in[1])[-40:]
+            receiver = "0x" + str(topics_in[2])[-40:]
+            if sender == receiver:
+                continue
+            try:
+                raw_amount = int(str(log.get("data") or "0x0"), 16)
+            except ValueError:
+                continue
+            if raw_amount <= 0:
+                continue
+            symbol, decimals = token_metadata(chain, token)
+            amount = raw_amount / (10 ** decimals)
+            if amount <= 0:
+                continue
+            price, dex_symbol = token_price_usd(chain, token)
+            block = int(str(log.get("blockNumber") or "0x0"), 16)
+            rows.append({
+                "chain": chain,
+                "tx_hash": str(log.get("transactionHash") or "").lower(),
+                "log_index": int(str(log.get("logIndex") or "0x0"), 16),
+                "address": holder,
+                "token": token,
+                "symbol": symbol or dex_symbol,
+                "name": "",
+                "decimals": decimals,
+                "amount": amount,
+                "direction": direction,
+                "counterparty": receiver if direction == "out" else sender,
+                "price_usd": price,
+                "usd": amount * price if price > 0 else 0.0,
+                "block": block,
+                "occurred_at": 0,
+            })
+    # 时间戳**统一在最后补**：一个地址可能有上百条分散在不同块里的流水，
+    # 逐条查 `eth_getBlockByNumber` 会把一轮拖死（见 `_block_timestamps_ms`）。
+    stamps = _block_timestamps_ms(chain, [row["block"] for row in rows])
+    for row in rows:
+        row["occurred_at"] = stamps.get(row.pop("block"), 0)
+    return rows
+
+
+def solana_transfers_via_rpc(
+    address: str, *, until: str = "", limit: int = 40, extend: bool = True
+) -> tuple[list[dict[str, Any]], str]:
+    """Solana 地址的代币进出（返回 ``(rows, 最新签名)``）。
+
+    判据与聪明钱那边同源：``pre/postTokenBalances`` 差分，**只认 owner == 本地址**
+    的账户 —— Solana 的一笔交易里会带一堆别人的账户，按账户下标算会把别人的仓
+    记到这家头上。没有净变化的交易（失败的、纯 SOL 转账）直接跳过。
+
+    ``extend``：一页签名满了要不要再往前翻一页。**首次建基线时关掉** ——
+    基线只是「现在有什么仓」的快照，多翻 40 笔等于多花一分多钟的
+    ``getTransaction``，对结果没有任何影响。
+    """
+    holder = str(address or "").strip()
+    if not holder:
+        return [], until
+    params: dict[str, Any] = {"limit": max(1, min(200, int(limit)))}
+    if until:
+        params["until"] = until
+    try:
+        signatures = _chain_rpc("solana", "getSignaturesForAddress", [holder, params]) or []
+        # **一页满就说明可能还有更早的没扫到**。游标记的是「最新签名」，跨过去
+        # 中间那段就永久丢了（MEMORY-solana 里那条「签名窗口被灌满」）。
+        # Wintermute 的热钱包 5 分钟能出几十笔，所以这里再往前翻一页，
+        # 宁可多花 40 次 getTransaction，也不让游标跳过没处理过的签名。
+        if extend and len(signatures) >= params["limit"]:
+            more_params = {"limit": params["limit"], "before": signatures[-1].get("signature")}
+            if until:
+                more_params["until"] = until
+            signatures = signatures + (_chain_rpc(
+                "solana", "getSignaturesForAddress", [holder, more_params]
+            ) or [])
+    except Exception as exc:
+        raise IndexerError(f"solana 拉 {holder[:8]}… 签名失败：{str(exc)[:140]}") from exc
+    newest = str((signatures[0] or {}).get("signature") or "") if signatures else until
+    cash = CASH_TOKENS_BY_CHAIN.get("solana", frozenset())
+    rows: list[dict[str, Any]] = []
+    for item in reversed(signatures):  # 从旧到新，游标才不会跳
+        if not isinstance(item, dict) or item.get("err"):
+            continue
+        signature = str(item.get("signature") or "")
+        if not signature:
+            continue
+        try:
+            tx = _chain_rpc("solana", "getTransaction", [
+                signature,
+                {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1},
+            ])
+        except Exception:
+            continue
+        if not isinstance(tx, dict):
+            continue
+        block_time = int(to_float(tx.get("blockTime")))
+        occurred = block_time * 1000 if block_time else 0
+        deltas: dict[str, float] = {}
+        meta = tx.get("meta") if isinstance(tx.get("meta"), dict) else {}
+        for bucket, sign in (("preTokenBalances", -1.0), ("postTokenBalances", 1.0)):
+            for entry in meta.get(bucket) or []:
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("owner") or "") != holder:
+                    continue
+                mint = str(entry.get("mint") or "")
+                if not mint or mint in cash:
+                    continue
+                amount = to_float((entry.get("uiTokenAmount") or {}).get("uiAmount"))
+                deltas[mint] = deltas.get(mint, 0.0) + sign * amount
+        for mint, delta in deltas.items():
+            if abs(delta) <= 0:
+                continue
+            price, symbol = token_price_usd("solana", mint)
+            rows.append({
+                "chain": "solana",
+                "tx_hash": signature,
+                "log_index": 0,
+                "address": holder,
+                "token": mint,
+                "symbol": symbol,
+                "name": "",
+                "decimals": 0,
+                "amount": abs(delta),
+                "direction": "in" if delta > 0 else "out",
+                "counterparty": "",
+                "price_usd": price,
+                "usd": abs(delta) * price if price > 0 else 0.0,
+                "occurred_at": occurred,
+            })
+    return rows, newest
+
+
+# --------------------------------------------------------------------------- #
+# 标的成熟度（「新标的」判定的第二/三个条件，详见 MM_NEW_TOKEN_MIN_USD 上面那段）
+# --------------------------------------------------------------------------- #
+DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{token}"
+
+#: 我们的 chain 名 → DexScreener 的 chainId（用来在同名地址跨链时只认本链）。
+DEXSCREENER_CHAIN_IDS = {
+    "solana": "solana",
+    "bsc": "bsc",
+    "base": "base",
+    "ethereum": "ethereum",
+    "robinhood": "robinhood",
+    "elysium": "elysium",
+}
+
+
+def is_stable_symbol(symbol: Any) -> bool:
+    """稳定币：永远不是「新盘」。
+
+    注意用的是**上面那个** ``symbol_key``（会剥 ``USDT`` / ``USD`` 后缀）——
+    ``USDC`` 因为「长度必须大于后缀」的规则不会被剥掉，正好。
+    """
+    return symbol_key(symbol) in MM_STABLE_SYMBOLS
+
+
+def looks_like_tokenized_equity(chain: Any, token: Any, symbol: Any) -> bool:
+    """代币化股票 / ETF：同一个资产的又一个上市载体，不是新盘。
+
+    两个判据，命中任一即算：
+
+    * **mint 前缀**（只对 Solana）：xStocks 的铸造地址一律 ``Xs`` 开头；
+    * **符号形状**：``[A-Z][A-Z0-9]{0,5}X`` —— ``METAX`` / ``EWYx`` / ``SNDKx`` /
+      ``INTCx`` / ``SKHYx`` 全部命中。这一条会连带把 ``TRX`` / ``AVAX`` 这类
+      以 X 结尾的老币也算进来，但它们本来就过不了年龄闸，实际没有影响。
+    """
+    address = str(token or "").strip()
+    if normalize_chain(chain) == "solana" and address.lower().startswith(MM_XSTOCKS_MINT_PREFIX):
+        return True
+    text = symbol_key(symbol)
+    return 2 <= len(text) <= 6 and text.endswith("X")
+
+
+def dexscreener_first_pool_at(chain: str, token: str) -> int:
+    """这个标的最早一个 DEX 池子的创建时间（毫秒）。
+
+    返回值有三种含义，**绝不能混**（抓取失败不许伪装成空榜）：
+
+    * ``> 0`` —— 最早的池子；
+    * ``0``   —— 接口明确回答「这个 token 没有任何池子」（灰尘 / 骗局币 / 还没上市）；
+    * 抛 ``IndexerError`` —— **请求失败**，什么都不知道，调用方不许缓存这个结论。
+
+    取「最早」而不是「最深」：上市时间由第一个池子决定，后来再开的池子只说明
+    它现在有多少流动性，不说明它多老。``pairCreatedAt`` 缺失的池子直接跳过。
+    """
+    url = DEXSCREENER_TOKEN_URL.format(token=token)
+    try:
+        response = _session().get(
+            url,
+            headers={"User-Agent": BROWSER_UA, "Accept": "application/json"},
+            timeout=HTTP_TIMEOUT,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        raise IndexerError(f"DexScreener 查 {token[:12]}… 失败：{str(exc)[:120]}") from exc
+    if not isinstance(payload, dict):
+        raise IndexerError("DexScreener 返回了非对象响应")
+    pairs = payload.get("pairs")
+    if not isinstance(pairs, list) or not pairs:
+        return 0
+    wanted = DEXSCREENER_CHAIN_IDS.get(normalize_chain(chain) or chain, "")
+    stamps: list[int] = []
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            continue
+        if wanted and str(pair.get("chainId") or "").casefold() != wanted:
+            continue
+        created = pair.get("pairCreatedAt")
+        if isinstance(created, (int, float)) and created > 0:
+            stamps.append(int(created))
+    if stamps:
+        return min(stamps)
+    # 本链一个都没有（比如 elysium 没被收录）：退回全链最早，聊胜于无。
+    fallback = [
+        int(pair["pairCreatedAt"])
+        for pair in pairs
+        if isinstance(pair, dict)
+        and isinstance(pair.get("pairCreatedAt"), (int, float))
+        and pair["pairCreatedAt"] > 0
+    ]
+    return min(fallback) if fallback else 0
+
+
+def solana_mint_first_seen_ms(token: str) -> int:
+    """Solana 兜底：用 mint 的**最早一条签名**的区块时间当上线时间。
+
+    * ``-1`` —— 一页 1000 条签名还满，说明这个 mint 至少上千笔交易 → 直接判老；
+    * ``0``  —— 这个 mint 一条签名都没有（刚创建，还没动过）；
+    * ``>0`` —— 最早那条签名的 ``blockTime``（``getSignaturesForAddress`` 默认倒序，
+      所以取最后一条）；
+    * 抛 ``IndexerError`` —— RPC 失败，什么都不知道，调用方不许缓存。
+    """
+    mint = str(token or "").strip()
+    if not mint:
+        return 0
+    try:
+        rows = _chain_rpc("solana", "getSignaturesForAddress", [mint, {"limit": 1000}]) or []
+    except Exception as exc:
+        raise IndexerError(f"solana 查 mint {mint[:10]}… 签名失败：{str(exc)[:120]}") from exc
+    if not isinstance(rows, list):
+        raise IndexerError("solana 返回了非列表响应")
+    if len(rows) >= 1000:
+        return -1
+    stamps = [
+        int(row["blockTime"]) * 1000
+        for row in rows
+        if isinstance(row, dict) and isinstance(row.get("blockTime"), (int, float))
+    ]
+    return min(stamps) if stamps else 0
+
+
+def resolve_token_listed_at(chain: str, token: str) -> tuple[int, str]:
+    """查一个标的的上市时间，返回 ``(毫秒, 来源)``。
+
+    来源取值：
+
+    * ``dexscreener`` —— 最早一个池子的 ``pairCreatedAt``，最可靠；
+    * ``sigs``       —— Solana 兜底，mint 最早签名的时间；
+    * ``sigs-full``  —— Solana 兜底翻满 1000 条仍不停 → 确定是老币，``listed_at=0``；
+    * ``unknown``    —— 查不到（``listed_at=0``），调用方按「不弹」处理。
+    """
+    chain_key = normalize_chain(chain) or str(chain)
+    token_key = str(token or "").strip()
+    if not token_key:
+        return 0, "unknown"
+    failed = False
+    try:
+        listed_at = dexscreener_first_pool_at(chain_key, token_key)
+    except IndexerError:
+        # 请求失败 = 什么都不知道。**不许**当成「没有池子」（那条会被缓存一天）。
+        listed_at, failed = 0, True
+    if listed_at and listed_at > 0:
+        return listed_at, "dexscreener"
+    if chain_key == "solana":
+        try:
+            probe = solana_mint_first_seen_ms(token_key)
+        except IndexerError:
+            probe, failed = 0, True
+        if probe == -1:
+            return 0, "sigs-full"
+        if probe and probe > 0:
+            return probe, "sigs"
+    if failed:
+        return 0, "error"
+    # DexScreener 明确回答「没有池子」，Solana 那边也没签名记录 → 确实查不到。
+    return 0, "unknown"
+
+
+# --------------------------------------------------------------------------- #
 # 存储
 # --------------------------------------------------------------------------- #
 class MarketMakerStore:
@@ -835,6 +1626,9 @@ class MarketMakerStore:
                     enabled INTEGER NOT NULL DEFAULT 1,
                     last_polled_at INTEGER NOT NULL DEFAULT 0,
                     last_error TEXT NOT NULL DEFAULT '',
+                    -- 自建通道的游标：RPC 链记「已扫到哪一块」，Solana 记「已扫到哪个签名」。
+                    cursor_block INTEGER NOT NULL DEFAULT 0,
+                    cursor_value TEXT NOT NULL DEFAULT '',
                     created_at INTEGER NOT NULL DEFAULT 0,
                     updated_at INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (chain, address)
@@ -882,6 +1676,17 @@ class MarketMakerStore:
                     PRIMARY KEY (firm, chain, token)
                 );
                 CREATE INDEX IF NOT EXISTS idx_mm_pos_seen ON mm_positions (last_seen_at DESC);
+                -- 标的成熟度的查询缓存：同一只币只问一次 DexScreener / RPC。
+                -- listed_at 是「最早一个池子的创建时间」毫秒；0 表示查过但没查到，
+                -- 靠 source 区分「未知」（unknown）和「上千笔签名→确定是老币」（sigs-full）。
+                CREATE TABLE IF NOT EXISTS mm_token_meta (
+                    chain TEXT NOT NULL,
+                    token TEXT NOT NULL,
+                    listed_at INTEGER NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL DEFAULT '',
+                    checked_at INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (chain, token)
+                );
                 CREATE TABLE IF NOT EXISTS mm_settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -895,6 +1700,7 @@ class MarketMakerStore:
                     PRIMARY KEY (chain, token)
                 );
             """)
+            self._ensure_cursor_columns(conn)
             self._seed_addresses(conn)
 
     def _seed_addresses(self, conn: sqlite3.Connection) -> None:
@@ -914,7 +1720,7 @@ class MarketMakerStore:
                     source_url = CASE WHEN mm_addresses.source_url = ''
                                       THEN excluded.source_url ELSE mm_addresses.source_url END
                 """,
-                (chain, address.lower(), firm, tag, evidence, source, now, now),
+                (chain, wallet_key(chain, address), firm, tag, evidence, source, now, now),
             )
 
     # -- 地址簿 ------------------------------------------------------------- #
@@ -934,7 +1740,7 @@ class MarketMakerStore:
 
     def address(self, chain: Any, address: Any) -> dict[str, Any] | None:
         chain_key = normalize_chain(chain)
-        key = str(address or "").strip().lower()
+        key = wallet_key(chain_key, address)
         with self._lock, self._session() as conn:
             row = conn.execute(
                 "SELECT * FROM mm_addresses WHERE chain = ? AND address = ?",
@@ -961,8 +1767,11 @@ class MarketMakerStore:
         chain_key = normalize_chain(chain)
         if not chain_key:
             raise ValueError("不支持的链")
-        key = str(address or "").strip().lower()
-        if not is_evm_address(key):
+        key = wallet_key(chain_key, address)
+        if chain_key == "solana":
+            if not is_solana_address(key):
+                raise ValueError("地址不是合法的 Solana 地址")
+        elif not is_evm_address(key):
             raise ValueError("地址不是合法的 EVM 地址")
         firm_key = str(firm or "").strip()
         if firm_key not in MM_FIRM_LABELS:
@@ -994,7 +1803,7 @@ class MarketMakerStore:
 
     def set_enabled(self, chain: Any, address: Any, enabled: Any) -> bool:
         chain_key = normalize_chain(chain)
-        key = str(address or "").strip().lower()
+        key = wallet_key(chain_key, address)
         with self._lock, self._session() as conn:
             cursor = conn.execute(
                 "UPDATE mm_addresses SET enabled = ?, updated_at = ? WHERE chain = ? AND address = ?",
@@ -1004,7 +1813,7 @@ class MarketMakerStore:
 
     def remove_address(self, chain: Any, address: Any) -> bool:
         chain_key = normalize_chain(chain)
-        key = str(address or "").strip().lower()
+        key = wallet_key(chain_key, address)
         with self._lock, self._session() as conn:
             cursor = conn.execute(
                 "DELETE FROM mm_addresses WHERE chain = ? AND address = ?", (chain_key, key)
@@ -1012,33 +1821,65 @@ class MarketMakerStore:
             return bool(cursor.rowcount)
 
     def addresses_due(self, limit: int) -> list[dict[str, Any]]:
-        """轮转：最久没被轮询的地址优先。"""
+        """轮转：最久没被轮询的地址优先。
+
+        **只返回 `POLL_CHAINS` 里的链**（2026-11-15 起 Ethereum 停扫）：老地址不删，
+        但既不占每轮的 30 个名额，也不会把 `last_error` 刷成以太坊那堆 429。
+        """
+        placeholders = ",".join("?" for _ in POLL_CHAINS)
         with self._lock, self._session() as conn:
             rows = conn.execute(
-                """
-                SELECT * FROM mm_addresses WHERE enabled = 1
+                f"""
+                SELECT * FROM mm_addresses WHERE enabled = 1 AND chain IN ({placeholders})
                 ORDER BY last_polled_at ASC, firm ASC, address ASC LIMIT ?
                 """,
-                (max(1, int(limit)),),
+                (*POLL_CHAINS, max(1, int(limit))),
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def mark_polled(self, chain: str, address: str, *, error: str = "") -> None:
+    def _ensure_cursor_columns(self, conn: sqlite3.Connection) -> None:
+        """老库补列：``CREATE TABLE IF NOT EXISTS`` 不会给已存在的表加字段。"""
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(mm_addresses)")}
+        for name, ddl in (
+            ("cursor_block", "ALTER TABLE mm_addresses ADD COLUMN cursor_block INTEGER NOT NULL DEFAULT 0"),
+            ("cursor_value", "ALTER TABLE mm_addresses ADD COLUMN cursor_value TEXT NOT NULL DEFAULT ''"),
+        ):
+            if name not in columns:
+                conn.execute(ddl)
+        conn.commit()
+
+    def mark_polled(
+        self,
+        chain: str,
+        address: str,
+        *,
+        error: str = "",
+        cursor_block: int | None = None,
+        cursor_value: str | None = None,
+    ) -> None:
         now = int(time.time() * 1000)
         with self._lock, self._session() as conn:
             if error:
                 # 索引器失败**不推进** last_polled_at：否则这条地址会被排到队尾，
-                # 一次抖动就等于几十分钟没有覆盖。
+                # 一次抖动就等于几十分钟没有覆盖。游标同理，绝不前进。
                 conn.execute(
                     "UPDATE mm_addresses SET last_error = ?, updated_at = ?"
                     " WHERE chain = ? AND address = ?",
-                    (clean_text(error, 200), now, chain, address.lower()),
+                    (clean_text(error, 200), now, chain, wallet_key(chain, address)),
                 )
             else:
+                sets = ["last_polled_at = ?", "last_error = ''", "updated_at = ?"]
+                params: list[Any] = [now, now]
+                if cursor_block is not None:
+                    sets.append("cursor_block = ?")
+                    params.append(int(cursor_block))
+                if cursor_value is not None:
+                    sets.append("cursor_value = ?")
+                    params.append(str(cursor_value)[:200])
+                params.extend([chain, wallet_key(chain, address)])
                 conn.execute(
-                    "UPDATE mm_addresses SET last_polled_at = ?, last_error = '', updated_at = ?"
-                    " WHERE chain = ? AND address = ?",
-                    (now, now, chain, address.lower()),
+                    f"UPDATE mm_addresses SET {', '.join(sets)} WHERE chain = ? AND address = ?",
+                    params,
                 )
 
     def sweep_complete(self, firm: str, chain: str) -> bool:
@@ -1176,6 +2017,46 @@ class MarketMakerStore:
                 (int(time.time() * 1000), firm, chain, token.lower()),
             )
 
+    # -- 标的成熟度缓存 ------------------------------------------------------ #
+    def baseline_at(self, firm: str, chain: str) -> int:
+        """这家在这条链上的**基线时刻**（毫秒）。没有基线返回 0。
+
+        取首轮全量扫街写下的 ``baseline=1`` 流水里**最早**的那条 ``seen_at``：
+        那之后的流水才是「新发生的事」，之前的一切都是建基时就存在的历史。
+        新加地址也会写一批 ``baseline=1``，但它们的 ``seen_at`` 更晚，不影响 MIN。
+        """
+        with self._lock, self._session() as conn:
+            row = conn.execute(
+                "SELECT MIN(seen_at) AS at FROM mm_transfers"
+                " WHERE firm = ? AND chain = ? AND baseline = 1 AND seen_at > 0",
+                (str(firm), normalize_chain(chain) or str(chain)),
+            ).fetchone()
+        return int((row["at"] if row else 0) or 0)
+
+    def token_meta(self, chain: str, token: str) -> dict[str, Any]:
+        """读一只币的上市时间缓存；没有就返回空字典。"""
+        with self._lock, self._session() as conn:
+            row = conn.execute(
+                "SELECT * FROM mm_token_meta WHERE chain = ? AND token = ?",
+                (normalize_chain(chain) or str(chain), str(token)),
+            ).fetchone()
+        return dict(row) if row else {}
+
+    def save_token_meta(self, chain: str, token: str, listed_at: int, source: str) -> None:
+        with self._lock, self._session() as conn:
+            conn.execute(
+                "INSERT INTO mm_token_meta (chain, token, listed_at, source, checked_at)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(chain, token) DO UPDATE SET"
+                "   listed_at = excluded.listed_at,"
+                "   source = excluded.source,"
+                "   checked_at = excluded.checked_at",
+                (
+                    normalize_chain(chain) or str(chain), str(token),
+                    int(listed_at), str(source), int(time.time()),
+                ),
+            )
+
     def resonance_announced_at(self, chain: str, token: str) -> int:
         """这只标的上次三方共振提示的时间（毫秒），0 = 从没提示过。"""
         with self._lock, self._session() as conn:
@@ -1220,11 +2101,25 @@ class MarketMakerStore:
                 row = conn.execute(sql, args).fetchone()
                 return int((row[0] if row else 0) or 0)
 
+            # **在册数（地址簿）与在抓数分开数**：Ethereum 那 168 个老地址
+            # 2026-11-15 起不再轮询，算进「监控中」会让人以为页面卡了。
+            placeholders = ",".join("?" for _ in POLL_CHAINS)
             return {
                 "addresses": one("SELECT COUNT(*) FROM mm_addresses"),
-                "enabledAddresses": one("SELECT COUNT(*) FROM mm_addresses WHERE enabled = 1"),
+                "enabledAddresses": one(
+                    f"SELECT COUNT(*) FROM mm_addresses WHERE enabled = 1 AND chain IN ({placeholders})",
+                    *POLL_CHAINS,
+                ),
+                "archivedAddresses": one(
+                    f"SELECT COUNT(*) FROM mm_addresses WHERE chain NOT IN ({placeholders})",
+                    *POLL_CHAINS,
+                ),
                 "firms": one("SELECT COUNT(DISTINCT firm) FROM mm_addresses"),
-                "polled": one("SELECT COUNT(*) FROM mm_addresses WHERE last_polled_at > 0"),
+                "polled": one(
+                    "SELECT COUNT(*) FROM mm_addresses"
+                    f" WHERE last_polled_at > 0 AND chain IN ({placeholders})",
+                    *POLL_CHAINS,
+                ),
                 "transfers": one("SELECT COUNT(*) FROM mm_transfers"),
                 "positions": one("SELECT COUNT(*) FROM mm_positions"),
                 "cashTransfers": one(
@@ -1248,6 +2143,7 @@ class MarketMakerMonitor:
         interval: float | None = None,
         addresses_per_cycle: int | None = None,
         large_usd: float | None = None,
+        new_token_min_usd: float | None = None,
         alert_callback=None,
     ):
         self.store = store or MarketMakerStore()
@@ -1263,6 +2159,14 @@ class MarketMakerMonitor:
             large_usd if large_usd is not None
             else (os.getenv("MM_LARGE_TRANSFER_USD") or MM_LARGE_TRANSFER_USD)
         )
+        # 「新标的」报红的金额闸（用户 2026-11-15 要求报红）。见 `MM_NEW_TOKEN_MIN_USD`。
+        self.new_token_min_usd = float(
+            new_token_min_usd if new_token_min_usd is not None
+            else (os.getenv("MM_NEW_TOKEN_MIN_USD") or MM_NEW_TOKEN_MIN_USD)
+        )
+        # 「新标的」被标的成熟度闸挡掉的计数（基线前上线 / 稳定币 / 代币化股票 / 查不到）。
+        self.new_token_filtered = 0
+        self.new_token_filter_note = ""
         self.on_event = alert_callback
         self.stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -1353,6 +2257,11 @@ class MarketMakerMonitor:
         """进场弹窗放行与否。**不放行时绝不能写 ``announced_at``** ——
 
         先标记再判断的话，一只币今天不共振、明天共振了就永远不会再弹（墓碑效应）。
+
+        **2026-11-15 起这条闸不再挂在新标的弹窗上**（用户要「首次出现就报红」，
+        见 `_maybe_announce`）。保留方法是为了：
+        1. server 仍会把 `entry_qualifier` 注入进来，`payload.entryGate` 要用它报状态；
+        2. 以后若要恢复「只报上榜标的」，接回来是一行的事。
         """
         if self.entry_qualifier is None:
             return True
@@ -1421,14 +2330,53 @@ class MarketMakerMonitor:
         finally:
             self._cycle_lock.release()
 
+    def _fetch_transfers(self, row: dict[str, Any], *, first_poll: bool) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """按链的取数通道拉一次流水，返回 ``(rows, 新游标)``。
+
+        * ``blockscout`` —— Base / Robinhood / Ethereum 走索引器，一页就够。
+        * ``rpc``        —— BSC / Elysium 自己扫日志：首扫回看 ``maxBlocks``，
+          之后从上次的 ``cursor_block`` 接着扫；缺口超过上限时**只补最近的**
+          （宁可漏一段，也不让一轮卡死；``last_error`` 会写清楚）。
+        * ``solana``     —— 签名游标 ``cursor_value``，从旧到新处理，避免漏单。
+        """
+        chain = str(row["chain"])
+        address = str(row["address"])
+        meta = CHAIN_META.get(chain) or {}
+        mode = str(meta.get("mode") or "blockscout")
+        if mode == "solana":
+            cursor = str(row.get("cursor_value") or "")
+            rows, newest = solana_transfers_via_rpc(
+                address,
+                until=cursor,
+                limit=SOLANA_SIG_LIMIT,
+                # 首扫（还没游标）不翻页：基线只是快照，省一半 getTransaction。
+                extend=bool(cursor),
+            )
+            return rows, {"cursor_value": newest or cursor}
+        if mode == "rpc":
+            span = int(meta.get("maxBlocks") or 600)
+            head = int(str(_chain_rpc(chain, "eth_blockNumber", []) or "0x0"), 16)
+            cursor = int(row.get("cursor_block") or 0)
+            if not cursor:
+                from_block = max(0, head - span)
+            else:
+                from_block = cursor + 1
+                if head - from_block > span:
+                    from_block = head - span
+            if from_block > head:
+                return [], {"cursor_block": head}
+            rows = evm_transfers_via_rpc(chain, address, from_block=from_block, to_block=head)
+            return rows, {"cursor_block": head}
+        pages = FIRST_POLL_PAGES if first_poll else STEADY_POLL_PAGES
+        return address_token_transfers(chain, address, pages=pages), {}
+
     def poll_address(self, row: dict[str, Any]) -> int:
         """拉一个地址的转账并入库。返回本轮新写入的流水条数。"""
         chain = str(row["chain"])
         address = str(row["address"])
         firm = str(row["firm"])
         first_poll = not int(row.get("last_polled_at") or 0)
-        pages = FIRST_POLL_PAGES if first_poll else STEADY_POLL_PAGES
-        items = address_token_transfers(chain, address, pages=pages)
+        items, cursor = self._fetch_transfers(row, first_poll=first_poll)
         # 「新标的」要等这家把这批地址**全扫过一遍**才算数，否则第一次拉到的
         # 陈年老仓会被当成今天刚开的新标的。
         announce_ok = self.store.sweep_complete(firm, chain)
@@ -1436,7 +2384,8 @@ class MarketMakerMonitor:
         for item in items:
             payload = dict(item)
             payload["firm"] = firm
-            payload["address"] = address.lower()
+            # Solana 的 base58 地址**不能降大小写**，否则流水表里会存一个不存在的地址。
+            payload["address"] = wallet_key(chain, address)
             result = self.store.record_transfer(payload, baseline=first_poll)
             if not result.get("inserted"):
                 continue
@@ -1444,8 +2393,89 @@ class MarketMakerMonitor:
             if first_poll:
                 continue
             self._maybe_announce(payload, result, announce_ok=announce_ok)
-        self.store.mark_polled(chain, address)
+        self.store.mark_polled(chain, address, **cursor)
         return inserted
+
+    def token_maturity(
+        self, chain: str, token: str, symbol: str = "", *, baseline_at: int = 0
+    ) -> dict[str, Any]:
+        """判定一个标的是不是「基线之后才上线的新盘」。
+
+        返回 ``{ok, reason, ageDays, listedAt, baselineAt, source}``。``ok=True`` 才允许
+        发「新标的」弹窗。否决原因四种：
+
+        * ``stablecoin`` / ``tokenized-equity`` —— 结构性否决，永不成立（不查网络）；
+        * ``too-old`` —— 标的**最早一个池子**建在基线之前（= 基线前就在流通）；
+        * ``unknown`` —— 查不到上市时间，或这家还没有基线，**按不弹处理**（宁可漏，不可吵）。
+
+        ``ageDays`` 只是给人看的展示值（距最早建池多少天），**不参与判定** ——
+        判定只比 ``listed_at`` 和 ``baseline_at`` 的大小（用户 2026-11-16：不要滚动窗口）。
+
+        结论落 ``mm_token_meta`` 缓存：有结论一个月有效，查不到的一天后再问。
+        """
+        chain_key = normalize_chain(chain) or str(chain)
+        token_key = str(token or "").strip()
+        if is_stable_symbol(symbol):
+            return {"ok": False, "reason": "stablecoin", "ageDays": None,
+                    "listedAt": 0, "baselineAt": int(baseline_at or 0), "source": "symbol"}
+        if looks_like_tokenized_equity(chain_key, token_key, symbol):
+            return {"ok": False, "reason": "tokenized-equity", "ageDays": None,
+                    "listedAt": 0, "baselineAt": int(baseline_at or 0), "source": "symbol"}
+        listed_at = 0
+        source = ""
+        cached = self.store.token_meta(chain_key, token_key) if token_key else {}
+        if cached:
+            listed_at = int(cached.get("listed_at") or 0)
+            source = str(cached.get("source") or "")
+            # 有结论的按长 TTL，查不到的按短 TTL —— 刚建池的币随时可能被索引。
+            ttl = TOKEN_META_TTL_SECONDS if (listed_at or source == "sigs-full") else TOKEN_META_MISS_TTL_SECONDS
+            age_seconds = time.time() - float(cached.get("checked_at") or 0)
+            if age_seconds < ttl:
+                return self._maturity_from_listed(listed_at, source, baseline_at)
+        listed_at, source = resolve_token_listed_at(chain_key, token_key)
+        # 请求失败不落缓存：否则一次 429 就让这只币静音一整天（抓取失败≠查不到）。
+        if token_key and source != "error":
+            try:
+                self.store.save_token_meta(chain_key, token_key, listed_at, source)
+            except Exception:
+                # 缓存写失败不影响判定本身。
+                pass
+        return self._maturity_from_listed(listed_at, source, baseline_at)
+
+    def _maturity_from_listed(
+        self, listed_at: int, source: str, baseline_at: int
+    ) -> dict[str, Any]:
+        """把 ``(listed_at, source)`` 和基线时刻折算成判定结果。
+
+        核心只有一句：**标的的最早池子是不是建在基线之后**。基线之前就在流通的，
+        无论它有多新，都是老币（用户 2026-11-16）。
+        """
+        baseline = int(baseline_at or 0)
+        age_days = (
+            max(0.0, (time.time() * 1000 - float(listed_at)) / 86_400_000.0)
+            if listed_at and listed_at > 0 else None
+        )
+        if source == "sigs-full":
+            # 一页 1000 条签名仍然翻满 → 这个 mint 早就有上千笔交易，必在基线之前。
+            return {"ok": False, "reason": "too-old", "ageDays": age_days,
+                    "listedAt": 0, "baselineAt": baseline, "source": source}
+        if not listed_at or listed_at <= 0:
+            reason = "lookup-failed" if source == "error" else "unknown"
+            return {"ok": False, "reason": reason, "ageDays": None,
+                    "listedAt": 0, "baselineAt": baseline, "source": source or "unknown"}
+        if baseline <= 0:
+            # 还没有基线（这家刚接线/首轮没扫完）：没有参照系就不判「新」。
+            return {"ok": False, "reason": "no-baseline", "ageDays": age_days,
+                    "listedAt": int(listed_at), "baselineAt": 0, "source": source}
+        ok = int(listed_at) > baseline
+        return {
+            "ok": ok,
+            "reason": "fresh" if ok else "too-old",
+            "ageDays": round(age_days, 1) if age_days is not None else None,
+            "listedAt": int(listed_at),
+            "baselineAt": baseline,
+            "source": source,
+        }
 
     def _maybe_announce(
         self, payload: dict[str, Any], result: dict[str, Any], *, announce_ok: bool
@@ -1455,6 +2485,18 @@ class MarketMakerMonitor:
         「三方共振」不是第四类事件，而是**大额调仓的升级版**：同一笔流水如果同时满足
         「标的挂在涨幅榜」和「标的挂在 AIcoin 热门榜」，就发共振那一条，不再发普通大额，
         所以同一个动作永远不会出现两条弹窗（用户 2026-10-21 定）。
+
+        **新标的（2026-11-15 改口径）**：用户要求「出现了之前从来没有操盘过的代币就
+        报红」，所以这条路**不再走 2026-10-21 那道「必须与涨幅榜 / AIcoin 共振」的闸**
+        —— 那道闸会把最有价值的那批漏掉：做市商接一个新币，通常在它上榜之前。
+        替代的护栏是金额闸 `new_token_min_usd`（$100），把空投 / 同形字骗局币挡在外面。
+        闸门（`entry_qualifier`）现在只用于把共振信息写进正文，不再拦弹窗。
+
+        **标的成熟度闸（2026-11-16 补，**以基线为准**）**：「库里第一次见」不等于
+        「币是新盘」—— 基线只覆盖最近几十条签名，老币从窗口外转回来就会被当成新标的。
+        所以金额闸过了以后还要过 `token_maturity()`：标的**最早一个池子必须建在这家的
+        基线之后**（基线之前就在流通的一律老币；不用「多少天以内」的滚动窗口），
+        稳定币和代币化股票直接否决，查不到上市时间的不弹。
         """
         if self.on_event is None or not self.store.alerts_enabled():
             return
@@ -1463,10 +2505,27 @@ class MarketMakerMonitor:
         token = str(payload["token"])
         symbol = str(payload.get("symbol") or "未知代币")
         position = result.get("position") or {}
-        if result.get("newToken") and announce_ok and not int(position.get("announced_at") or 0):
-            if not self.entry_allowed(symbol):
-                return
+        if (
+            result.get("newToken")
+            and announce_ok
+            and not int(position.get("announced_at") or 0)
+            and float(payload.get("usd") or 0) >= self.new_token_min_usd
+        ):
+            maturity = self.token_maturity(
+                chain, token, symbol,
+                baseline_at=self.store.baseline_at(firm, chain),
+            )
+            # 不管放不放行都落 announced_at：结论不会变（基线固定、币只会越来越老），
+            # 否则同一只老币每来一笔新流水都要再问一次外部接口。
             self.store.mark_announced(firm, chain, token)
+            if not maturity.get("ok"):
+                self.new_token_filtered += 1
+                self.new_token_filter_note = (
+                    f"{symbol} 未报「新标的」：{maturity.get('reason')}"
+                    f"（上市 {maturity.get('ageDays')} 天 · 基线早于它 "
+                    f"{maturity.get('baselineAt')} / {maturity.get('source')}）"
+                )[:200]
+                return
             self._emit({
                 "reason": "new-token",
                 "firm": firm,
@@ -1479,6 +2538,10 @@ class MarketMakerMonitor:
                 "counterparty": payload["counterparty"],
                 "txHash": payload["tx_hash"],
                 "occurredAt": payload["occurred_at"],
+                # 顺手带上共振信息：上榜的就在正文里标一行，没上榜也不影响弹窗。
+                "resonance": self.resonance_info(symbol) or {},
+                # 上市年龄进弹窗正文，用户一眼能看出「这盘有多新」。
+                "maturity": maturity,
             })
             return
         if float(payload.get("usd") or 0) >= self.large_usd:
@@ -1773,6 +2836,13 @@ class MarketMakerMonitor:
             "intervalSeconds": self.interval,
             "addressesPerCycle": self.addresses_per_cycle,
             "largeTransferUsd": self.large_usd,
+            # 实际在抓哪几条链（Ethereum 2026-11-15 起只留档不轮询）。
+            "pollChains": list(POLL_CHAINS),
+            "newTokenMinUsd": self.new_token_min_usd,
+            # 标的成熟度闸的口径：**以基线为准**（不是滚动窗口），页面按这个写文案。
+            "newTokenBaselineMode": "baseline",
+            "newTokenFiltered": self.new_token_filtered,
+            "newTokenFilterNote": self.new_token_filter_note,
             "activeWindowHours": ACTIVE_WINDOW_HOURS,
             "lastCycleAt": last_cycle_at,
             "lastError": self.last_error,
@@ -1793,6 +2863,10 @@ class MarketMakerMonitor:
                 "firms": len(MM_FIRMS),
                 "addresses": int(counts.get("addresses") or 0),
                 "enabledAddresses": int(counts.get("enabledAddresses") or 0),
+                "archivedAddresses": int(counts.get("archivedAddresses") or 0),
+                "pollChains": list(POLL_CHAINS),
+                "newTokenMinUsd": self.new_token_min_usd,
+                "newTokenBaselineMode": "baseline",
                 "polled": int(counts.get("polled") or 0),
                 "transfers": int(counts.get("transfers") or 0),
                 "cashTransfers": int(counts.get("cashTransfers") or 0),

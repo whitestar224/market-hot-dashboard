@@ -1191,6 +1191,58 @@ DEFAULT_SMART_MONEY_SEEDS = DEFAULT_SMART_MONEY_SEEDS + (
     },
 )
 
+# ---------------------------------------------------------------------------
+# TIGER（用户 2026-11-23：「BSC KOL链上买入监控再加一个：KOL TIGER的钱包：
+#   0x57825f68fc7b32eaaa1e90db1fd6cd997b5a4035」）
+#
+# 全新地址（库里 `wallets` 没这一行、`TRACKED_KOL_AUX_WALLETS` 里也没有），
+# 所以阈值只能靠 GMGN 的真实成交定 —— 和 leslie / 区块日记同一套流程。
+#
+# 链上核验（2026-11-23，BSC 公共 RPC）：
+#   nonce **13,479** / 余额 **12.8066 BNB**；
+#   `eth_getCode` = `0xef0100` + `63c0c19a282a1b52b07dd5a65b58948a07dae32b`
+#   —— 23 字节的 **EIP-7702 委托 EOA**（智能钱包），既不是空地址也不是合约。
+#   委托不影响扫描：买入交易的 `from` 仍是这个地址本身，日志过滤照旧。
+#   ETH 无活动；Base 近 128 天只有 60 笔买（0.5 笔/天），所以**只挂 BSC**。
+#
+# 成交画像（GMGN openapi `wallet_activity`，BSC 300 笔 /
+# 2026-11-20 18:44 → 11-23 16:57 = 2.93 天，买 159 笔 = **54.3 笔/天**）：
+#   中位 $72 / p75 $136 / p90 $540 / 最大 $1,629。
+#   金额是**双峰**的：$60~136 的试探单 130 笔（每天约 44 笔，机器人式扫单），
+#   然后直接跳到 **$520~550 的固定仓 24 笔**（每天约 8 笔）；中间 $200~400 只有 5 笔。
+#   各档命中：≥100U → 23.9/天；≥150U → 10.6/天；≥200U → 9.9/天；
+#            ≥300U → 8.5/天；≥500U → 8.2/天；≥800U → 0.7/天（只有 2 笔）。
+# 阈值 **100U**（用户 2026-11-23 定，先前我给的是 300U）：代价是 ~24 条/天 ——
+# 其中约 14 条来自 $100~199 那档（他只买 ~$530 固定仓时的间隙单），其余是固定仓本身。
+# 用户要的就是「别漏掉他中等仓的动作」，噪音知情。
+# 想收回去：150U（10.6/天）、300U（8.5/天，等于只看固定仓）、800U（0.7/天）。
+# ---------------------------------------------------------------------------
+TIGER_WALLET = "0x57825f68fc7b32eaaa1e90db1fd6cd997b5a4035"
+
+DEFAULT_SMART_MONEY_SEEDS = DEFAULT_SMART_MONEY_SEEDS + (
+    {
+        "address": TIGER_WALLET,
+        "nickname": "TIGER",
+        "sourceName": "用户点名 · KOL",
+        "sourceUrl": f"https://gmgn.ai/bsc/address/{TIGER_WALLET}",
+        "sourceEvidence": (
+            "用户 2026-11-23：「BSC KOL链上买入监控再加一个：KOL TIGER的钱包："
+            "0x57825f68fc7b32eaaa1e90db1fd6cd997b5a4035」。"
+            "链上核验：BSC nonce 13,479 / 12.8066 BNB；eth_getCode 是 23 字节的 "
+            "EIP-7702 委托（0xef0100…），属智能钱包但仍是 EOA 发起交易；ETH 无活动，"
+            "Base 128 天只有 60 笔买，故只挂 BSC。"
+            "GMGN 成交画像：BSC 159 笔买 / 2.93 天 = 54.3 笔/天，中位 $72 / p90 $540；"
+            "双峰 —— $60~136 试探单 130 笔、$520~550 固定仓 24 笔，中间只有 5 笔。"
+            "阈值演变：2026-11-23 先按 300U 开（≈8.5 条/天，等于只放行固定仓），"
+            "用户当天要求改成 100U（≈23.9 条/天，把 $100~199 的间隙单一起放行，噪音知情）。"
+        ),
+        # 用户点名的是「BSC KOL」：只挂 BSC。ETH 没活动，Base 一个季度才 60 笔买，
+        # 挂上去纯白占扫描窗口（BSC 还要走「按区块扫 from」的兜底路径）。
+        "chains": ("bsc",),
+        "alertThresholdUsd": 100.0,
+    },
+)
+
 DEFAULT_SMART_MONEY_SEED_ADDRESSES = tuple(row["address"] for row in DEFAULT_SMART_MONEY_SEEDS)
 
 # ---------------------------------------------------------------------------
@@ -1237,7 +1289,38 @@ KOL_SYNC_REALERT_SECONDS = 12 * 3600
 #: 过了窗口就不再骚扰 —— 一个币的同车故事讲 24 小时够了。
 KOL_SYNC_JOIN_WINDOW_SECONDS = 24 * 3600
 
-#: 「同车增加」看的人 = 用户的 20 个追踪钱包（含核心三人）。
+#: 「任意 N 个追踪钱包同车即成立」的链（目前只有 Solana）。
+#:
+#: EVM 侧成立要求「含核心 ≥2」（:data:`KOL_SYNC_MIN_CORE_WALLETS`），因为那 20 多个
+#: 外围地址是给「同车增加」凑人数的、不配单独成立一次共振。Solana 没有这个层级 ——
+#: 用户 2026-11-23：「SOL链的KOL和买入监控也做一个同车提示弹窗」——那边启用的 23 个
+#: 钱包**都是**他点名的 KOL（cowboy 的 sol 钱包 / 8kz / Dior / Latuche / cented /
+#: zrool / Hyin / DV …），彼此平权，所以只数人数、不设核心。
+#:
+#: 之所以敢用「≥3 人」这么松的口径，是拿库回测过的（2026-11-23，14 天、23 个启用
+#: solana 钱包、24h 窗口、按 mint 聚：「24h 内最多同时几个人买过」的分布）：
+#:   1 人 1512 个 mint / 2 人 162 / **3 人 19** / **4 人 2** / ≥5 人 0
+#: 也就是说 ≥3 人 ≈ **1.5 条/天**，和 EVM 侧 cluster_ready 的 1.1 条/天同一量级，
+#: 不会炸屏。8kz 一个人出现在 19/21 组里（他 14 天 2400 笔买单），但每组另外两人
+#: 各不相同，所以照样是「多 KOL 撞同一个新币」的信号。
+KOL_SYNC_ANY_TRACKED_CHAINS = ("solana",)
+
+#: 上一条那些链的「钱闸」：至少这么多人、各自的合计 ≥ 这个金额。
+#:
+#: Solana 的 ``paymentUsd`` 常常算不出来（pump.fun 内盘 bonding curve、非稳定币报价），
+#: 会留下 ``$0`` 的记账。只数人数的话，「1 个人真买 + 2 个人 $0」也会算同车 —— 而那种
+#: 情况单笔弹窗早就报过了，同车再报一次纯噪音。回测：21 组里 19 组能过（1.36 条/天），
+#: 只挡掉「7bn $0 + 8kz $0 + Dior $34k」这类伪同车。
+#: 调松就设 ``KOL_SYNC_FUNDED_MIN_USD=0``（退化成纯数人数）。
+KOL_SYNC_FUNDED_MIN_BUYERS = 2
+KOL_SYNC_FUNDED_MIN_USD = 10.0
+
+#: Solana 的同车观察面直接从 ``wallets`` 表现取（那边的钱包是用户随时在加的），
+#: 缓存这么久，免得每笔买入都查一次钱包表。
+KOL_SYNC_SOLANA_TRACK_TTL_SECONDS = 60.0
+
+#: 「同车增加」看的人：用户 10-27 给的 20 个追踪钱包（含核心三人），加上后来点名
+#: 要进同车监控的（区块日记 / TIGER）= 23 人。
 #: 名字对得上的写人名，其余用短地址 —— 用户没给昵称，编一个反而会认错人。
 KOL_SYNC_TRACK_LABELS: dict[str, str] = {
     "0xcc291dcd83bd9f2600cca4d65ae3b724eaf4f5a9": "CryptoCharming",
@@ -1257,6 +1340,14 @@ KOL_SYNC_TRACK_LABELS: dict[str, str] = {
     # 用户 2026-11-20 点名要弹窗（原本也在 aux 清单里，移出后名字在这里补上，
     # 否则同车观察面会从 20 人变成 19 人）
     QUKUAI_RIJI_WALLET: "区块日记",
+    # 用户 2026-11-23 点名加监控的 TIGER（BSC），当天追加「也要加入同车监控中」。
+    # 他不在 aux 清单里，所以要在这里单独登记名字，否则同车观察面会漏掉他。
+    # **只进观察面、不进核心三人**（:data:`KOL_SYNC_WALLET_LABELS`）—— 核心名单是
+    # 用户最初点的那三个人，口径没变。效果：TIGER + 任意两个核心 = 同车成立
+    # （cluster_ready 的「含核心 ≥2」够得着），成立后他再上车会单独弹一条「同车增加」；
+    # 「TIGER + 1 核心 + 1 外围」仍然静默，那是挡辅助钱包凑数的既有设计。
+    # 回归：`tests/test_kol_sync.py::TigerKolSyncParticipationTests`。
+    TIGER_WALLET: "TIGER",
     **{address: f"追踪 {_short_wallet(address)}" for address in TRACKED_KOL_AUX_WALLETS},
 }
 
@@ -1276,9 +1367,9 @@ def active_kol_sync_wallets() -> dict[str, str]:
 
 
 def active_kol_sync_track_wallets() -> dict[str, str]:
-    """「同车增加」的观察面：用户那 20 个追踪钱包。
+    """「同车增加」的观察面：目前 23 人（核心三人 + 20 个外围追踪钱包）。
 
-    比核心三人宽 —— 核心三人负责「判定同车成立」，其余追 17 个负责「还有谁上车」。
+    比核心三人宽 —— 核心三人负责「判定同车成立」，其余 20 个负责「还有谁上车」。
     同样允许用 `XINGYUN_KOL_SYNC_TRACK_WALLETS`（格式同上）整表覆盖。
     """
     raw = str(os.getenv("XINGYUN_KOL_SYNC_TRACK_WALLETS", "") or "").strip()
@@ -2445,6 +2536,8 @@ class SmartMoneyMonitor:
         self.kol_sync_wallets: dict[str, str] = active_kol_sync_wallets()
         # 「同车增加」看的全量追踪钱包（含核心三人）。测试里可以替换。
         self.kol_sync_track_wallets: dict[str, str] = active_kol_sync_track_wallets()
+        # Solana 的观察面来自 wallets 表（见 :meth:`_solana_track_wallets`），(取数时刻, 表)。
+        self._solana_track_cache: tuple[float, dict[str, str]] = (0.0, {})
         self._sync_sent: dict[str, float] = {}
         # 每个标的的同车「剧集」：{announced: set(已在车上并已播报过的地址), trioAt, episodeStart}
         self._sync_episodes: dict[str, dict[str, Any]] = {}
@@ -2489,6 +2582,51 @@ class SmartMoneyMonitor:
         """「KOL 共振」弹窗回调；不设就只统计不提醒（测试/离线脚本默认不设）。"""
         self.sync_alert_callback = callback
 
+    def _solana_track_wallets(self) -> dict[str, str]:
+        """Solana 的同车观察面 = ``wallets`` 表里启用的 solana 地址（60 秒缓存）。
+
+        为什么动态取：Solana 那边的钱包是用户随口在加的（「这个 KOL 也加一下」），
+        写死成 :data:`KOL_SYNC_TRACK_LABELS` 那样一张常量表必然漂移 —— 加完钱包发现
+        同车不认他，就是漏在这一步。EVM 侧仍用显式名单（那边有「核心 / 外围」之分，
+        不能把随机新地址算进共振）。
+
+        名字优先取 ``KOL_SYNC_TRACK_LABELS`` 里的：CryptoCharming 的两个 sol 钱包在库里
+        都叫 CryptoCharming，卡片上就分不清谁是谁（那份名单写的是 ·2 / ·3），再退回库里的
+        nickname。
+
+        注意 key 一律 ``lower()``：这只在内存里当匹配键，**不回写数据库、不做身份判断**
+        —— base58 一旦落库成小写就是另一个地址（见 :func:`wallet_key` 那条铁律）。
+        判定侧本来就把事件的 ``walletAddress`` 小写后再比，两边一致即可。
+        """
+        now = time.time()
+        cached_at, cached = getattr(self, "_solana_track_cache", (0.0, {}))
+        if cached_at and now - cached_at < KOL_SYNC_SOLANA_TRACK_TTL_SECONDS:
+            return cached
+        explicit = {
+            str(address).lower(): str(label)
+            for address, label in (self.kol_sync_track_wallets or {}).items()
+        }
+        try:
+            rows = self.store.list_wallets(enabled_only=True)
+        except Exception:
+            # 读不到库就退回显式名单里的 sol 地址 —— 同车不能因为一次查询失败整条哑掉。
+            return {a: l for a, l in explicit.items() if not a.startswith("0x")}
+        wallets: dict[str, str] = {}
+        for row in rows:
+            if normalize_chain(row.get("chain")) != "solana":
+                continue
+            address = str(row.get("address") or "").strip()
+            if not address:
+                continue
+            name = explicit.get(address.lower()) or str(row.get("nickname") or "").strip()
+            wallets[address.lower()] = name or _short_wallet(address)
+        # 显式名单里有、库里没有的 sol 地址也要算（测试库 / 换库时）。
+        for address, label in explicit.items():
+            if not address.startswith("0x"):
+                wallets.setdefault(address, label)
+        self._solana_track_cache = (now, wallets)
+        return wallets
+
     def _maybe_emit_kol_sync(self, event: dict[str, Any]) -> dict[str, Any] | None:
         """刚记录的一笔买入，能不能触发「同车」提醒。两种模式：
 
@@ -2500,15 +2638,28 @@ class SmartMoneyMonitor:
 
         判定全部基于**事件表里的真实买入记录**，不看谁弹过窗 —— 金额可能都没过自己的
         门槛，但「都上车了」这件事本身才是信号。
+
+        「成立」的口径**按链分**：EVM 要「含核心 ≥2」（核心三人是用户最初点的
+        CryptoCharming / 阿峰 / cowboy）；Solana 不设核心，任意 ``minimum`` 个启用钱包
+        撞同一个 mint 就成立，另加一道钱闸挡 ``$0`` 伪同车。见
+        :data:`KOL_SYNC_ANY_TRACKED_CHAINS` 的注释（含 14 天回测数据）。
         """
         callback = self.sync_alert_callback
         core = self.kol_sync_wallets
-        track = self.kol_sync_track_wallets or core
-        if callback is None or not core:
+        if callback is None:
             return None
         chain = normalize_chain(event.get("chain"))
         token = str(event.get("tokenAddress") or "").strip()
         if not chain or not token:
+            return None
+        # 观察面：EVM 走显式名单（核心 + 外围）；Solana 走 wallets 表里启用的那批
+        # （用户随时在加钱包，见 :meth:`_solana_track_wallets`）。
+        any_tracked = chain in KOL_SYNC_ANY_TRACKED_CHAINS
+        track = (
+            self._solana_track_wallets() if any_tracked
+            else (self.kol_sync_track_wallets or core)
+        )
+        if not track:
             return None
         token_key = f"{chain}:{token.lower() if token.lower().startswith('0x') else token}"
         now_ms = _now_ms()
@@ -2546,6 +2697,20 @@ class SmartMoneyMonitor:
             os.getenv("XINGYUN_KOL_SYNC_MIN_CORE", "") or KOL_SYNC_MIN_CORE_WALLETS
         ))
         cluster_ready = len(on_board) >= minimum and core_count >= min_core_for_cluster
+        # 「有真金白银买单的人」有几个 —— 只有 Solana 那条口径才用它（见常量注释：
+        # 那边 paymentUsd 常算不出来，会留下 $0 记账，光数人数会把伪同车也报出来）。
+        funded_buyers = sum(
+            1 for item in on_board.values()
+            if float(item.get("usd") or 0) >= KOL_SYNC_FUNDED_MIN_USD
+        )
+        if any_tracked:
+            # Solana：不设核心，只数人 + 钱闸（用户 2026-11-23「SOL 链也做一个同车弹窗」）。
+            settled = (
+                len(on_board) >= minimum
+                and funded_buyers >= max(0, KOL_SYNC_FUNDED_MIN_BUYERS)
+            )
+        else:
+            settled = core_count >= minimum or cluster_ready
         episode = self._sync_episodes.get(token_key)
         base_context = {
             "chain": chain,
@@ -2555,11 +2720,14 @@ class SmartMoneyMonitor:
             "minBuyers": minimum,
             "coreCount": core_count,
             "requiredCore": min_core_for_cluster,
+            # 卡片/测试用它区分口径：True = 这条链要求「含核心」，False = 只数人数。
+            "requiresCore": not any_tracked,
+            "fundedBuyers": funded_buyers,
             "observedAt": now_ms,
         }
 
         # ---- 1) 同车成立：所有人记为已播报 ----
-        if core_count >= minimum or cluster_ready:
+        if settled:
             if episode is None:
                 episode = {
                     "trioAt": now_ms,

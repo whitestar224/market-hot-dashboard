@@ -336,10 +336,11 @@ def fetch_translation(endpoint: str, text: str) -> str:
     return clamp_text(payload.get("translation") or "", 360)
 
 
-def fetch_binance_ai_narrative(port: int, source_id: str, chain: str, contract_address: str, key: str) -> dict:
-    """Ask the monitor service for a token's Binance AI narrative via the shared
-    exchange-AI endpoint.  Positive and negative results are cached server-side,
-    so this is a cheap read for already-analyzed contracts."""
+def fetch_token_ai_narrative(port: int, source_id: str, chain: str, contract_address: str, key: str) -> dict:
+    """Ask the monitor service for a token's narrative via the shared exchange-AI
+    endpoint.  The server tries GIGA X first and only falls back to Binance AI /
+    Bitget when GIGA X has no narrative for that contract.  Positive and negative
+    results are cached server-side, so this is a cheap read for analyzed tokens."""
     data = json.dumps(
         {"items": [{"key": key, "sourceId": source_id, "chain": chain, "contractAddress": contract_address}]},
         ensure_ascii=False,
@@ -827,7 +828,7 @@ def show_popup(payload: dict, slot: int) -> int:
         if url:
             open_external_url(url)
         # Opening the target must not dismiss the popup: the user may still want
-        # to read the Binance AI narrative or copy the CA from the same card.
+        # to read the token narrative (GIGA X first) or copy the CA from the same card.
 
     close_btn = tk.Button(
         top,
@@ -843,7 +844,7 @@ def show_popup(payload: dict, slot: int) -> int:
     )
     close_btn.pack(side="right", padx=(4, 14), pady=(12, 7))
 
-    # Binance AI narrative: a small icon that lights up once the token's
+    # Token narrative (GIGA X first): a small icon that lights up once the
     # narrative is available, hovered to reveal the text in a floating tooltip.
     ai_narrative_state = {"text": ai_narrative, "tooltip": None}
     ai_btn = None
@@ -900,7 +901,7 @@ def show_popup(payload: dict, slot: int) -> int:
 
         def load_ai_narrative() -> None:
             try:
-                result = fetch_binance_ai_narrative(
+                result = fetch_token_ai_narrative(
                     ai_narrative_port, source_id, chain, contract_address, payload.get("key") or ""
                 )
                 text_value = chinese_ai_narrative(

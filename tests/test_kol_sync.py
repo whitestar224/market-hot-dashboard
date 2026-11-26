@@ -231,6 +231,227 @@ class KolSyncJoinTests(unittest.TestCase):
         self.assertEqual([ctx["mode"] for ctx in self.contexts], ["trio"])
 
 
+class TigerKolSyncParticipationTests(unittest.TestCase):
+    """用户 2026-11-23 第二句话：「并且也要加入同车监控中」。
+
+    TIGER 不在「核心三人」里（核心名单是 CryptoCharming / 阿峰 / cowboy，见
+    :data:`KOL_SYNC_WALLET_LABELS` 的注释 —— 只有用户最初那三个人算核心），
+    他进的是 :data:`KOL_SYNC_TRACK_LABELS`，也就是**同车观察面**。落到判定上：
+
+    1. 他买过就会进 ``on_board``，既算「车上人数」（凑满 3 人）也参与
+       ``cluster_ready`` 的「含核心 ≥2」计数 —— 所以「TIGER + 任一两个核心」成立；
+    2. 同车成立之后他再上车，会单独播一条 ``join``（同车增加），卡片上写 TIGER。
+
+    这里用**生产名单的地址**跑判定（不联网：地址只当字符串键），确认他没被漏掉。
+    """
+
+    CORE_BY_LABEL = {label: address for address, label in SMM.KOL_SYNC_WALLET_LABELS.items()}
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.monitor = SMM.SmartMoneyMonitor(Path(self.tmp.name) / "tiger.sqlite")
+        self.addCleanup(self.monitor.close)
+        # 生产口径：核心三人 + 观察面（含 TIGER 和那批 aux 追踪钱包）。
+        self.monitor.kol_sync_wallets = {
+            address.lower(): label for address, label in SMM.KOL_SYNC_WALLET_LABELS.items()
+        }
+        self.monitor.kol_sync_track_wallets = {
+            address.lower(): label for address, label in SMM.KOL_SYNC_TRACK_LABELS.items()
+        }
+        self.contexts = []
+        self.monitor.set_sync_alert_callback(self.contexts.append)
+        self.t0 = int(time.time() * 1000)
+
+    def buy(self, wallet, *, usd=100.0, at=None, token=TOKEN, symbol="西瓜"):
+        return self.monitor.record_buy({
+            "chain": "bsc",
+            "walletAddress": wallet,
+            "transactionHash": f"0x{wallet[-6:]}{int(at if at is not None else self.t0)}{usd:g}",
+            "tokenAddress": token,
+            "symbol": symbol,
+            "paymentUsd": usd,
+            "paymentAsset": "BNB",
+            "observedAt": int(at if at is not None else self.t0),
+        })
+
+    def test_tiger_is_in_the_sync_observation_set(self):
+        self.assertIn(SMM.TIGER_WALLET.lower(), self.monitor.kol_sync_track_wallets)
+        self.assertEqual(
+            self.monitor.kol_sync_track_wallets[SMM.TIGER_WALLET.lower()], "TIGER"
+        )
+        # 观察面 = 核心三人 + 其余追踪钱包；TIGER 不在核心（沿用「只有最初三人算核心」）。
+        self.assertNotIn(SMM.TIGER_WALLET.lower(), self.monitor.kol_sync_wallets)
+        self.assertEqual(len(self.monitor.kol_sync_wallets), 3)
+
+    def test_tiger_plus_two_core_wallets_settle_a_sync(self):
+        """TIGER + 阿峰 + cowboy：3 人、其中 2 个核心 → 同车成立，卡片上有 TIGER。"""
+        self.buy(SMM.TIGER_WALLET, usd=120, at=self.t0 - 3_000)
+        self.buy(self.CORE_BY_LABEL["阿峰_Afeng"], usd=400, at=self.t0 - 2_000)
+        self.buy(self.CORE_BY_LABEL["cowboy"], usd=470, at=self.t0 - 1_000)
+        self.assertEqual([ctx["mode"] for ctx in self.contexts], ["trio"])
+        labels = [item["label"] for item in self.contexts[0]["buyers"]]
+        self.assertIn("TIGER", labels)
+        self.assertEqual(self.contexts[0]["coreCount"], 2)
+        self.assertEqual(len(self.contexts[0]["buyers"]), 3)
+
+    def test_tiger_counts_as_a_joiner_after_the_sync_is_settled(self):
+        """同车成立后 TIGER 再上车 → 「同车增加」一条，newcomers 就是他。"""
+        for index, label in enumerate(("CryptoCharming", "阿峰_Afeng", "cowboy")):
+            self.buy(self.CORE_BY_LABEL[label], usd=300, at=self.t0 - (3 - index) * 1_000)
+        self.assertEqual([ctx["mode"] for ctx in self.contexts], ["trio"])
+        self.buy(SMM.TIGER_WALLET, usd=150, at=self.t0 + 1_000)
+        self.assertEqual([ctx["mode"] for ctx in self.contexts], ["trio", "join"])
+        join = self.contexts[1]
+        self.assertEqual([item["label"] for item in join["newcomers"]], ["TIGER"])
+        self.assertEqual(join["onBoardCount"], 4)
+
+
+class SolanaKolSyncTests(unittest.TestCase):
+    """Solana 专属的同车口径（用户 2026-11-23：「SOL链的KOL和买入监控也做一个同车提示弹窗」）。
+
+    和 EVM 的差别只有两条，都在 :data:`SMM.KOL_SYNC_ANY_TRACKED_CHAINS` 的注释里：
+
+    1. **观察面动态取**：Solana 那边用户随时在加 KOL，所以看 ``wallets`` 表里启用的
+       solana 地址，而不是写死的 ``KOL_SYNC_TRACK_LABELS``；
+    2. **不设核心**：那边启用的钱包彼此平权，任意 3 人撞同一个 mint 就成立；
+       EVM 那条「含核心 ≥2」的口径一个字都没动（下面有回归）。
+
+    另加一道钱闸：至少 2 个人各自的合计 ≥ $10 —— Solana 的 paymentUsd 常算不出来
+    （pump.fun 内盘），不然「1 个人真买 + 2 个人 $0」也会被当同车。
+    """
+
+    # 库里的 solana 钱包（真实的 32 字节 base58，`normalize_wallet_address` 会校验）。
+    S1 = "So11111111111111111111111111111111111111112"
+    S2 = "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
+    S3 = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+    S4 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    MINT = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"
+    OTHER_MINT = "9msk9ehERMECbvsp3mvNfMZ4vUq2mBtAW7iTNasAcxNf"
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.monitor = SMM.SmartMoneyMonitor(Path(self.tmp.name) / "sol.sqlite")
+        self.addCleanup(self.monitor.close)
+        # EVM 核心名单原样保留：Solana 的判定不能借到它。
+        self.monitor.kol_sync_wallets = {A: "甲", B: "乙", C: "丙"}
+        for address, name in (
+            (self.S1, "8kz"), (self.S2, "Dior"), (self.S3, "Latuche"),
+        ):
+            self.monitor.store.upsert_wallet(
+                "solana", address, nickname=name, source_name="用户点名 · KOL",
+                source_kind="seed", alert_threshold_usd=300.0, enabled=True,
+            )
+        self.monitor._solana_track_cache = (0.0, {})
+        self.contexts = []
+        self.monitor.set_sync_alert_callback(self.contexts.append)
+        self.t0 = int(time.time() * 1000)
+
+    def buy(self, wallet, *, usd=100.0, at=None, chain="solana", token=None, symbol="MCAT"):
+        return self.monitor.record_buy({
+            "chain": chain,
+            "walletAddress": wallet,
+            "transactionHash": f"0x{wallet[-8:]}{int(at if at is not None else self.t0)}{usd:g}",
+            "tokenAddress": token or self.MINT,
+            "symbol": symbol,
+            "paymentUsd": usd,
+            "paymentAsset": "SOL",
+            "observedAt": int(at if at is not None else self.t0),
+        })
+
+    # -- 观察面 --------------------------------------------------------
+    def test_track_set_comes_from_the_wallets_table(self):
+        track = self.monitor._solana_track_wallets()
+        self.assertEqual(track[self.S1.lower()], "8kz")
+        self.assertEqual(track[self.S2.lower()], "Dior")
+        # EVM 核心那三个 0x 地址不能混进 solana 观察面。
+        self.assertNotIn(A.lower(), track)
+
+    # -- 成立条件 ------------------------------------------------------
+    def test_three_solana_kols_settle_a_sync(self):
+        self.buy(self.S1, usd=1800, at=self.t0 - 3_000)
+        self.buy(self.S2, usd=1250, at=self.t0 - 2_000)
+        self.buy(self.S3, usd=760, at=self.t0 - 1_000)
+        self.assertEqual(len(self.contexts), 1, self.contexts)
+        context = self.contexts[0]
+        self.assertEqual(context["chain"], "solana")
+        self.assertEqual(context["mode"], "trio")
+        self.assertFalse(context["requiresCore"])
+        self.assertEqual(context["coreCount"], 0)      # 没核心概念
+        self.assertEqual([item["label"] for item in context["buyers"]], ["8kz", "Dior", "Latuche"])
+        self.assertAlmostEqual(context["totalUsd"], 3810.0)
+
+    def test_two_solana_kols_are_not_a_sync(self):
+        self.buy(self.S1, usd=1800, at=self.t0 - 2_000)
+        self.buy(self.S2, usd=1250, at=self.t0 - 1_000)
+        self.assertEqual(self.contexts, [])
+
+    def test_zero_usd_bookkeeping_does_not_fake_a_sync(self):
+        """3 个人都「买」了，但只有 1 个人金额过得去 → 不算同车（单笔弹窗早报过了）。"""
+        self.buy(self.S1, usd=34_000, at=self.t0 - 3_000)
+        self.buy(self.S2, usd=0, at=self.t0 - 2_000)
+        self.buy(self.S3, usd=0, at=self.t0 - 1_000)
+        self.assertEqual(self.contexts, [])
+
+    def test_money_gate_is_about_counts_not_one_whale(self):
+        # 两个人各 $30 就能过闸（哪怕第三个人是 $0）—— 闸门是「几个人真买」，不是总额。
+        self.buy(self.S1, usd=30, at=self.t0 - 3_000)
+        self.buy(self.S2, usd=30, at=self.t0 - 2_000)
+        self.buy(self.S3, usd=0, at=self.t0 - 1_000)
+        self.assertEqual(len(self.contexts), 1)
+        self.assertEqual(self.contexts[0]["fundedBuyers"], 2)
+
+    def test_newcomer_after_the_sync_gets_a_join(self):
+        for index, wallet in enumerate((self.S1, self.S2, self.S3)):
+            self.buy(wallet, usd=500, at=self.t0 - (3 - index) * 1_000)
+        self.assertEqual([ctx["mode"] for ctx in self.contexts], ["trio"])
+        # 第四个 sol 钱包是成立之后才加进监控的，也要能报「同车增加」。
+        self.monitor.store.upsert_wallet(
+            "solana", self.S4, nickname="cowboy", source_name="用户点名 · KOL",
+            source_kind="seed", alert_threshold_usd=250.0, enabled=True,
+        )
+        self.monitor._solana_track_cache = (0.0, {})
+        self.buy(self.S4, usd=900, at=self.t0 + 1_000)
+        self.assertEqual([ctx["mode"] for ctx in self.contexts], ["trio", "join"])
+        self.assertEqual([item["label"] for item in self.contexts[1]["newcomers"]], ["cowboy"])
+        self.assertEqual(self.contexts[1]["onBoardCount"], 4)
+
+    def test_a_different_mint_is_a_different_car(self):
+        self.buy(self.S1, usd=500, at=self.t0 - 3_000)
+        self.buy(self.S2, usd=500, at=self.t0 - 2_000)
+        self.buy(self.S3, usd=500, at=self.t0 - 1_000, token=self.OTHER_MINT)
+        self.assertEqual(self.contexts, [])
+
+    def test_wallet_added_after_the_cache_expires_joins_in(self):
+        self.buy(self.S1, usd=500, at=self.t0 - 3_000)
+        self.buy(self.S2, usd=500, at=self.t0 - 2_000)
+        self.assertEqual(self.contexts, [])
+        # 用户又加了一个 sol 钱包 → 过期缓存后应当算进观察面。
+        self.monitor.store.upsert_wallet(
+            "solana", self.S4, nickname="zrool", source_name="用户点名 · KOL",
+            source_kind="seed", alert_threshold_usd=80.0, enabled=True,
+        )
+        self.monitor._solana_track_cache = (0.0, {})
+        self.buy(self.S4, usd=500, at=self.t0 - 1_000)
+        self.assertEqual(len(self.contexts), 1)
+        self.assertEqual(self.contexts[0]["coreCount"], 0)
+
+    def test_evm_still_requires_two_core_wallets(self):
+        """回归：Solana 那条松口径不能漏到 EVM 上。
+
+        三个外围钱包（在观察面、都不是核心）撞同一个 BSC 币 —— 老口径下必须是静默的。
+        """
+        outsider = "0xffffffffffffffffffffffffffffffffffffffff"
+        self.monitor.kol_sync_track_wallets = {
+            A: "甲", B: "乙", C: "丙", D: "丁", E: "戊", outsider: "己",
+        }
+        self.buy(D, usd=500, at=self.t0 - 3_000, chain="bsc", token=TOKEN, symbol="西瓜")
+        self.buy(E, usd=500, at=self.t0 - 2_000, chain="bsc", token=TOKEN, symbol="西瓜")
+        self.buy(outsider, usd=500, at=self.t0 - 1_000, chain="bsc", token=TOKEN, symbol="西瓜")
+        self.assertEqual(self.contexts, [])
+
+
 class KolSyncTrackedSeedTests(unittest.TestCase):
     """用户 2026-10-27 给的 20 个追踪钱包里，15 个是为此新接入的。
 
@@ -365,6 +586,24 @@ class NamedKolSeedTests(unittest.TestCase):
         self.assertNotIn(SMM.LESLIE_WALLET, SMM.KOL_SYNC_TRACK_LABELS)
         self.assertGreaterEqual(len(SMM.KOL_SYNC_TRACK_LABELS), 20)
 
+
+    def test_tiger_is_monitored_on_bsc_at_100u(self):
+        """用户 2026-11-23：「BSC KOL链上买入监控再加一个：KOL TIGER的钱包」。
+
+        GMGN 实测（BSC 300 笔 / 2.93 天，159 笔买 = 54.3 笔/天）：中位 $72 / p90 $540，
+        双峰 —— $60~136 试探单 130 笔、$520~550 固定仓 24 笔，中间只有 5 笔。
+        我先按 300U 开（≈8.5 条/天，等于只放行固定仓），用户当天要求改 **100U**
+        （≈23.9 条/天，把 $100~199 的空隙单一起放行，噪音知情）。
+        链上核验：nonce 13,479 / 12.8066 BNB，`eth_getCode` 是 EIP-7702 委托（0xef0100…）。
+        """
+        rows = self._wallet_rows(SMM.TIGER_WALLET)
+        self.assertEqual([row["chain"] for row in rows], ["bsc"])
+        self.assertEqual(rows[0]["nickname"], "TIGER")
+        self.assertEqual(rows[0]["alertThresholdUsd"], 100.0)
+        self.assertTrue(rows[0]["enabled"])
+        # 用户点名的 KOL 也要算进「同车增加」的观察面
+        self.assertEqual(SMM.KOL_SYNC_TRACK_LABELS[SMM.TIGER_WALLET], "TIGER")
+        self.assertGreaterEqual(len(SMM.KOL_SYNC_TRACK_LABELS), 20)
 
     def test_kuzuo_is_promoted_on_three_chains_at_400u(self):
         """用户 2026-11-11：「0x2ce9…3373，KOL枯坐P小将」。
@@ -528,6 +767,40 @@ class KolSyncPopupTests(unittest.TestCase):
             result = server.send_kol_sync_desktop_alert(context)
         self.assertTrue(result.get("skipped"))
         self.assertEqual(captured, {})
+
+    def test_solana_popup_keeps_the_mint_case_and_links_to_gmgn_sol(self):
+        """Solana 的同车卡片（用户 2026-11-23）：
+
+        * 去重 key 里必须是**原样**的 mint —— base58 小写就成另一个币了；
+        * 「查看」落在 ``gmgn.ai/sol/token/<mint>``；
+        * 算不出金额（$0）的那笔写「小额」，别让人以为他没买。
+        """
+        mint = SolanaKolSyncTests.MINT
+        context = {
+            "chain": "solana",
+            "tokenAddress": mint,
+            "symbol": "MCAT",
+            "requiresCore": False,
+            "coreCount": 0,
+            "buyers": [
+                {"address": SolanaKolSyncTests.S1, "label": "8kz", "usd": 1860, "firstAt": 1, "count": 3},
+                {"address": SolanaKolSyncTests.S2, "label": "Dior", "usd": 1251, "firstAt": 2, "count": 1},
+                {"address": SolanaKolSyncTests.S3, "label": "Latuche", "usd": 0, "firstAt": 3, "count": 1},
+            ],
+            "totalUsd": 3111,
+            "windowHours": 24,
+        }
+        captured = {}
+        with patch.object(server, "launch_desktop_alert", side_effect=lambda p: captured.update(p) or {"ok": True}):
+            server.send_kol_sync_desktop_alert(context)
+        self.assertEqual(captured["key"], f"kol-sync:solana:{mint}")
+        self.assertIn("三人同时上车", captured["title"])
+        self.assertIn("Solana", captured["body"])
+        self.assertIn("8kz $1,860", captured["body"])
+        self.assertIn("Latuche 小额", captured["body"])
+        self.assertIn(f"/sol/token/{mint}", captured["url"])
+        self.assertEqual(captured["chain"], "solana")
+        self.assertEqual(captured["queuePriority"], 130)
 
     def test_join_popup_payload_only_lists_newcomers(self):
         context = self._context()

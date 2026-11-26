@@ -137,7 +137,11 @@ def health_payload() -> dict[str, Any]:
         "monitors": {
             "siteAlerts": server.SITE_ALERT_MONITOR_ACTIVE,
             "wechatAuth": server.WECHAT_AUTH_MONITOR_ACTIVE,
-            "desktopAlerts": not env_flag("XINGYUN_DISABLE_DESKTOP_ALERT", default=is_production_mode()),
+            # 事件流只读模式下「弹窗」已经是关的（提醒改走左下角常驻窗口），
+            # 别让这里继续报 true，否则排查时会被误导。
+            "desktopAlerts": (not server.DESKTOP_ALERT_STREAM_ONLY)
+            and not env_flag("XINGYUN_DISABLE_DESKTOP_ALERT", default=is_production_mode()),
+            "alertStreamWindow": server.DESKTOP_ALERT_STREAM_ONLY,
             "priceWatch": server.PRICE_WATCH_MONITOR_ACTIVE,
             "structureSignals": server.PRICE_STRUCTURE_MONITOR_ACTIVE,
             "structureMonitorMode": "parallel-priority",

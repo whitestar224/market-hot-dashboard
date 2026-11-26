@@ -26,7 +26,6 @@
 
 | 文件 | 角色 |
 |---|---|
-| `publish_automation_briefs.py` | 发布自动化简报（被 electron 打包引用） |
 | `upgrade_research_xmind_v48.py` | 研报 xmind 升级迁移 |
 | `render_static_kline.py` | 静态 K 线渲染 |
 | `check_monitor_buy_quotes.py` | 校验 monitor-buy 报价 |

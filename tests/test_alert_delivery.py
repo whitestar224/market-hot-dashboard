@@ -216,6 +216,10 @@ class DeliveryIntegrationTests(DurableDeliveryTests):
             ('DESKTOP_ALERT_GENERAL_PROCESSES', {}), ('DESKTOP_ALERT_STRUCTURE_PROCESSES', {}),
             ('DESKTOP_ALERT_ACTIVE_PROCESS', None), ('DESKTOP_ALERT_LAST_LAUNCHED_AT', 0),
             ('DESKTOP_ALERT_LAST_LAUNCHED_PRIORITY', 0), ('DESKTOP_ALERT_SEEN', {}), ('DESKTOP_ALERT_SEEN_LOADED', True),
+            # 这一组测的是**投递机制本身**（谁先弹、槽位、重试、回执），必须在
+            # 真弹窗模式下跑。事件流只读模式默认开启后，这里不关掉就一个窗口都起不来。
+            # 「只进事件流」的行为另有 test_stream_only_* 专门覆盖。
+            ('DESKTOP_ALERT_STREAM_ONLY', False),
         ):
             p=patch.object(server,name,value);p.start();self.addCleanup(p.stop)
         for name in ('record_event_flow_popup','record_desktop_alert_news_trade_intake','ensure_desktop_alert_worker'):
@@ -359,6 +363,90 @@ class DeliveryIntegrationTests(DurableDeliveryTests):
         with patch.object(server,'SITE_ALERT_STATE',state),patch.object(server,'load_site_alert_state',return_value=state),patch.object(server,'save_site_alert_state'),patch.object(server,'launch_desktop_alert',return_value={'ok':False}):
             server.sync_site_alert_feed(feed)
         self.assertNotIn('upstream',state['seen'])
+
+
+class StreamOnlyTests(unittest.TestCase):
+    """事件流只读模式：**所有原本会弹窗的消息都必须进事件流**（用户 2026-11-26
+    「原先会触发弹窗的东西都要做进事件流里，别漏了」）。
+
+    这里钉三件事：
+      1. 走 `launch_desktop_alert()` 的：不 spawn 窗口，但 record 一次；
+      2. 走 `launch_price_watch_alert(persist_only=True)` 的（原来绕过统一入口、
+         只 admit 不记录，关掉弹窗后会整条消失）：同样要 record；
+      3. 后台投递线程每 0.5 秒调一次的 `desktop_alert_delivery_tick()`：绝不 spawn。
+    """
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        store = AlertDeliveryStore(Path(temp.name) / 'alerts.sqlite')
+        for name, value in (
+            ('ALERT_DELIVERY_STORE', store),
+            ('DESKTOP_ALERT_STREAM_ONLY', True),
+            ('DESKTOP_ALERT_SEEN', {}),
+            ('DESKTOP_ALERT_SEEN_LOADED', True),
+            ('DESKTOP_ALERT_DELIVERIES', {}),
+        ):
+            patcher = patch.object(server, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name in (
+            'record_event_flow_popup',
+            'record_desktop_alert_news_trade_intake',
+            'prefetch_popup_explanations',
+            'ingest_smart_money_text',
+            'ensure_desktop_alert_worker',
+            'spawn_desktop_alert_process',
+        ):
+            patcher = patch.object(server, name)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        # 这两个是「在 payload 上打注解再返回」，patch 成直通，别让它变成 Mock 对象
+        # （Mock 进 payload 会让 admit 的 JSON 序列化直接炸）。
+        for name in ('annotate_desktop_alert_top10', 'annotate_desktop_alert_mcap'):
+            patcher = patch.object(server, name, side_effect=lambda payload: payload)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name, value in (
+            ('price_structure_symbol_excluded', False),
+            ('desktop_alert_source_is_muted', False),
+            ('price_watch_alert_board_muted', ''),
+            ('desktop_alert_political_military_reason', ''),
+            ('env_flag', False),
+        ):
+            patcher = patch.object(server, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_launch_desktop_alert_feeds_the_stream_instead_of_a_popup(self):
+        result = server.launch_desktop_alert({
+            'key': 'stream:1', 'title': '测试消息', 'source': '单元测试',
+            'time': int(time.time() * 1000),
+        })
+        self.assertTrue(result.get('streamOnly'))
+        server.spawn_desktop_alert_process.assert_not_called()
+        server.record_event_flow_popup.assert_called_once()
+        self.assertEqual(server.record_event_flow_popup.call_args[0][1], 'stream')
+
+    def test_price_watch_persist_only_path_also_lands_in_the_stream(self):
+        result = server.launch_price_watch_alert({
+            'eventType': 'prior_high',
+            'symbol': 'BTCUSDT',
+            'currentPrice': 100.0,
+            'weekHigh': 99.0,
+            'distancePct': 1.0,
+            'provider': 'Binance',
+            'episode': 1,
+            'checkedAt': int(time.time() * 1000),
+        }, persist_only=True)
+        self.assertTrue(result.get('ok'), result)
+        self.assertTrue(result.get('streamOnly'), result)
+        server.record_event_flow_popup.assert_called()
+        self.assertEqual(server.record_event_flow_popup.call_args[0][1], 'stream')
+
+    def test_delivery_tick_never_spawns_a_window(self):
+        server.desktop_alert_delivery_tick()
+        server.spawn_desktop_alert_process.assert_not_called()
 
 
 if __name__ == '__main__':unittest.main()

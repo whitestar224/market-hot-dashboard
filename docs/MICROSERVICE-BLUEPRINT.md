@@ -1,5 +1,10 @@
 # 微服务化设计蓝图（进程级拆分）
 
+> **2026-11-19 变更**：market-worker 默认**并回主进程的线程**（`start_inprocess_market_worker()`，
+> `--no-inproc-worker` / `XINGYUN_INPROC_MARKET_WORKER=0` 可退回本文描述的子进程布局）。
+> 原因是用户不接受桌面上两个黑窗口。写入/读取协议（磁盘快照 + status.json 心跳）完全不变，
+> 所以两种布局可以随时切换。下面描述的是**子进程布局**的原始设计，仍然有效。
+
 > 状态：**阶段 2/3 已落地**（market 12 源已下沉为独立 market-worker 子进程）；阶段 4（ingest）待做
 > 日期：2026-09-29
 > 约束：进程级拆分 + 保持桌面端单机部署（不引入 Docker/K8s/云服务/消息中间件）

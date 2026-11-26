@@ -98,6 +98,32 @@ class DirectAlertHandleSetTests(unittest.TestCase):
             os.environ.pop("X_KOL_DIRECT_ALERT_HANDLES", None)
             self.assertIn("cryptocharming", server.x_kol_direct_alert_handles())
 
+    def test_official_source_accounts_pop_without_a_roster_row(self):
+        """用户 2026-11-09：官方源（非手动名册）里的账号也要能直连弹窗。
+
+        @enter_elysium / @vulcanforged 登记在 ``trench_person_signals`` 的官方源里，
+        不在 ``load_x_kol_sources`` 的名册中 —— 那条「名册行缺失 → 回落点名默认」的
+        逻辑根本走不到它们。所以必须靠 ``X_KOL_DIRECT_ALERT_OFFICIAL_HANDLES`` 兜住：
+        名册为空（这两个号本来就不在里面）时也要出现在 handle 集合里。
+        """
+
+        handles = self._handles(sources=[])
+        self.assertIn("enter_elysium", handles)
+        self.assertIn("vulcanforged", handles)
+
+    def test_official_accounts_reach_the_popup_path(self):
+        # 有了 handle 还不够：事件必须被判成 x-kol 直连，才走 send_x_kol_direct_alert。
+        handles = server.x_kol_direct_alert_handles()
+        for handle in ("enter_elysium", "vulcanforged"):
+            event = {
+                **sample_event("Elysium mainnet is live"),
+                "authorHandle": handle,
+                "key": f"x-kol-status:x:{handle}:1791545000000",
+            }
+            self.assertTrue(
+                server.x_kol_direct_alert_allowed(event, handles), f"{handle} 没进弹窗通道"
+            )
+
     def test_normalize_x_source_keeps_the_flag(self):
         # merge_x_kol_manual_source_payloads re-normalises every stored row on
         # load, so an unknown key is dropped here and the flag would vanish
@@ -185,6 +211,32 @@ class DirectAlertPopupPayloadTests(unittest.TestCase):
         self.assertIn("$MarsCoin", payload["title"])
         self.assertEqual(payload["originalText"], "行情被我前几天一讲还真就冷炸了，这个车头真的猛 $MarsCoin")
         self.assertIn("这个车头真的猛", payload["speech"])
+
+    def test_english_post_is_translated_into_chinese_for_the_popup(self):
+        """英文号（@AbyssGang / @juesaiquan）的推文要翻成中文再弹。"""
+        english = "Digging out good R/R plays and asymmetric opportunities as a hobby."
+        with patch.object(
+            server, "x_kol_translate_payload",
+            return_value={"ok": True, "translation": "爱好是挖掘风险回报比好的机会和不对称机会。"},
+        ):
+            payload = self._payload(sample_event(english))
+        self.assertIn("挖掘", payload["title"])
+        self.assertNotIn("Digging out", payload["title"])
+        self.assertIn("挖掘", payload["body"])
+        self.assertEqual(payload["originalText"], english)
+        self.assertIn("挖掘", payload["translatedText"])
+
+    def test_translation_failure_falls_back_to_the_original_english(self):
+        """翻译不可用绝不能漏弹：回退英文原文，弹窗照发。"""
+        english = "Digging out good R/R plays and asymmetric opportunities as a hobby."
+        with patch.object(
+            server, "x_kol_translate_payload",
+            side_effect=RuntimeError("libretranslate down"),
+        ):
+            payload = self._payload(sample_event(english))
+        self.assertIn("Digging out", payload["title"])
+        self.assertEqual(payload["translatedText"], "")
+        self.assertTrue(payload["key"].startswith("x-kol:"))
 
     def test_popup_is_not_muted_by_source_or_board_rules(self):
         normalized = server.normalize_desktop_alert(self._payload())

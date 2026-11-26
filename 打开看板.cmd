@@ -16,7 +16,8 @@ rem probe() talks to /api/service-liveness with proxies disabled: exit 0 = up.
 
 if errorlevel 3 (
   echo The service is not running. Starting it in the background...
-  powershell.exe -NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath '%XINGYUN_PYTHONW%' -ArgumentList 'service_guard.py','start' -WorkingDirectory '%CD%'"
+  rem 2026-11-15: no supervisor any more - launch the two bare processes.
+  start "" /min "%~dp0.runtime-cache\_start_service.cmd"
   echo Waiting for port 8765 to open, up to 60 seconds...
   powershell.exe -NoProfile -WindowStyle Hidden -Command "$d=(Get-Date).AddSeconds(60); while((Get-Date) -lt $d){ if(Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue){ break }; Start-Sleep -Milliseconds 1000 }"
 )

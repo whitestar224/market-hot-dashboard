@@ -110,5 +110,66 @@ class BlockbeatsFlashParseTests(unittest.TestCase):
         self.assertEqual(server.clean_feed_text(field), "标题里有 } 和 { 花括号")
 
 
+class BlockbeatsRelayFallbackTests(unittest.TestCase):
+    """直连被拒时经海外中转取同一页（2026-11-18）。
+
+    现场：用户要求「不开 Clash、也不断开 Proton」。Proton 全隧道下
+    `www.theblockbeats.info` 的 TCP 能连、TLS 握手被丢包，直连彻底不可用。
+    中转（r.jina.ai）回的是服务端渲染后的整页 HTML，`window.__NUXT__` 原始脚本
+    还在，所以解析器完全复用 —— 这两条测试钉住「路由切换」这一层。
+    """
+
+    def _html(self) -> str:
+        return _page(",".join([
+            _card(219115, "最新一条带标记", 1790778182, is_sup=True, url="https://a"),
+            _card(219113, "中间一条无标记", 1790777456, url="https://b"),
+        ]))
+
+    def _run(self, direct_ok: bool):
+        html = self._html()
+        calls = []
+
+        def fake_race(url, *, headers=None, timeout=10.0):
+            calls.append({"url": url, "headers": dict(headers or {}), "timeout": timeout})
+            if url == server.BLOCKBEATS_URL:
+                if direct_ok:
+                    return type("R", (), {"text": html, "raise_for_status": lambda self=None: None})()
+                raise OSError("TLS handshake timed out")
+            return type("R", (), {"text": html, "raise_for_status": lambda self=None: None})()
+
+        with patch.object(server, "http_get_race", side_effect=fake_race), patch.object(
+            server, "spawn_background_news_ingest"
+        ), patch.object(server, "remember_blockbeats_last_good"):
+            payload = server.fetch_blockbeats_flash()
+        return payload, calls
+
+    def test_direct_failure_falls_back_to_relay_and_keeps_the_parser(self):
+        payload, calls = self._run(direct_ok=False)
+        self.assertEqual(payload["fetchedVia"], "relay")
+        self.assertEqual({str(item["id"]) for item in payload["items"]}, {"219115", "219113"})
+        # 中转请求必须显式要 HTML，否则 Jina 回 markdown，解析器一条也解不出。
+        self.assertEqual(calls[-1]["headers"].get("X-Return-Format"), "html")
+        self.assertIn("r.jina.ai", calls[-1]["url"])
+
+    def test_direct_success_never_touches_the_relay(self):
+        payload, calls = self._run(direct_ok=True)
+        self.assertEqual(payload["fetchedVia"], "direct")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["url"], server.BLOCKBEATS_URL)
+
+    def test_relay_url_builder_accepts_both_template_shapes(self):
+        target = "https://www.theblockbeats.info/newsflash"
+        self.assertEqual(
+            server.blockbeats_relay_url("https://r.jina.ai/{url}", target),
+            f"https://r.jina.ai/{target}",
+        )
+        self.assertEqual(
+            server.blockbeats_relay_url("https://r.jina.ai/", target),
+            f"https://r.jina.ai/{target}",
+        )
+        # 空模板 = 关闭中转（原样抛直连错误，不许拼出半个 URL）
+        self.assertEqual(server.blockbeats_relay_url("  ", target), "")
+
+
 if __name__ == "__main__":
     unittest.main()

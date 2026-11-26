@@ -107,7 +107,7 @@ test("price watch exposes chain ecosystem mode and API", () => {
   assert.match(js, /sniperHoldingPercent/);
   assert.match(js, /bundlerHoldingPercent/);
   assert.match(js, /smartMoneyHolders/);
-  assert.match(js, /币安 AI 叙事/);
+  assert.match(js, /GIGA X 叙事/);
   assert.match(js, /function trenchPersonSignalTemplate/);
   assert.match(js, /已进入 V4\.9 快速投研/);
   assert.match(js, /图标悬停零请求/);

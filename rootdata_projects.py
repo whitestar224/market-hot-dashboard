@@ -56,6 +56,9 @@ PROJECT_WATCH_LIMIT = max(
 #: 详情页在 WAF 后面，抓密了会按出口 IP 封全站 —— 所以单轮只补几个、串行、失败即停，
 #: 宁可慢一点把 30 行补全，也不要为了快把整站撞进验证码。
 FUNDRAISING_DETAIL_BATCH = max(0, int(float(os.getenv("ROOTDATA_FUNDRAISING_DETAIL_BATCH", "3") or 3)))
+#: 每轮最多用 SoSoValue 补抓几个详情。SoSoValue 是 Cloudflare 基础防护（chrome110 稳定过）、
+#: 不像 RootData 有「抓密封 IP」的滑块 WAF，所以可以放宽到一整轮把缺的都补齐。
+SOSOVALUE_DETAIL_BATCH = max(0, int(float(os.getenv("SOSOVALUE_DETAIL_BATCH", "20") or 20)))
 
 _HEADERS = {
     "User-Agent": (
@@ -781,14 +784,16 @@ def refresh(datasets: tuple[str, ...] = ("projects", "fundraising")) -> dict[str
             seen = [str(key) for key in (previous.get("seenKeys") or [])]
             seen_set = set(seen)
             first_run = not previous
+            # 详情字段（详情/标签/生态/成立时间）增量补齐：把上一轮已经抓到的详情并回
+            # 本轮，再对「还没有详情」的事件逐个补抓（每轮最多几个、串行、失败即停）。
+            # 必须在算 ``fresh`` 之前跑：这样新进事件交给弹窗时已经带上详情字段，
+            # 否则弹窗只会拿到「还没补详情」的裸事件（浅拷贝在 enrich 之前就冻结了）。
+            events = _enrich_fundraising_details(events, previous)
             fresh = [
                 {**event, "key": _fundraising_key(event)}
                 for event in events
                 if _fundraising_key(event) not in seen_set
             ]
-            # 详情字段（详情/标签/生态/成立时间）增量补齐：把上一轮已经抓到的详情并回
-            # 本轮，再对「还没有详情」的事件逐个补抓（每轮最多几个、串行、失败即停）。
-            events = _enrich_fundraising_details(events, previous)
             # 首跑只建账本（一次弹 30 条是灾难）；之后每轮把「新出现的」交给弹窗。
             # **没注册回调 = 没人听**（例如 tools/rootdata_login.py --pull 手动拉一次、
             # 或跑在没有 main() 的 worker 进程里）：这种情况下绝不能把这些 key 记成
@@ -820,6 +825,11 @@ def _enrich_fundraising_details(
         return events
     previous_events = previous.get("events") if isinstance(previous.get("events"), list) else []
     detail_by_key: dict[str, dict[str, Any]] = {}
+    # 兜底索引：RootData 重抓时同一项目的 round/date 可能被改（round 从「并购」变「--」、
+    # 日期精度变化），导致 ``name|round|date`` 键失配、详情并不过来。用 name 兜底匹配，
+    # 但只在 name 全局唯一时才生效（重名项目宁可 miss 也别错配详情）。
+    detail_by_name: dict[str, dict[str, Any]] = {}
+    _name_counts: dict[str, int] = {}
     for item in previous_events:
         if not isinstance(item, dict):
             continue
@@ -828,21 +838,47 @@ def _enrich_fundraising_details(
             _text(item.get("intro"), 240)
             or (item.get("tags") or item.get("ecosystem") or item.get("founded"))
         ):
-            detail_by_key[_fundraising_key(item)] = {
+            name = _text(item.get("name"), 60).casefold()
+            detail = {
                 "intro": item.get("intro") or "",
                 "tags": item.get("tags") or [],
                 "ecosystem": item.get("ecosystem") or [],
                 "founded": item.get("founded") or "",
             }
+            detail_by_key[_fundraising_key(item)] = detail
+            if name:
+                _name_counts[name] = _name_counts.get(name, 0) + 1
+                detail_by_name[name] = detail
+
+    def _detail_for(event: dict[str, Any]) -> dict[str, Any] | None:
+        """按 key 精确匹配；失配时回落到 name（仅当 name 唯一）。"""
+        detail = detail_by_key.get(_fundraising_key(event))
+        if detail:
+            return detail
+        name = _text(event.get("name"), 60).casefold()
+        if name and _name_counts.get(name) == 1:
+            return detail_by_name.get(name)
+        return None
 
     missing = [
         event for event in events
-        if _fundraising_key(event) not in detail_by_key and _text(event.get("url"), 40)
+        if _detail_for(event) is None and _text(event.get("url"), 40)
     ]
+
+    # 先把 SoSoValue 能解决的缺详情事件补上（零 RootData 详情页压力，无封禁风险）。
+    # 回落顺序：SoSoValue 优先 → RootData 详情页兜底。SoSoValue 拿不到（未收录/名字
+    # 不同）的才去敲 RootData 的门，让 RootData 详情页请求量降到最低。
+    _enrich_from_sosovalue(events, missing, detail_by_key)
+
+    missing = [
+        event for event in events
+        if _detail_for(event) is None and _text(event.get("url"), 40)
+    ]
+
     if FUNDRAISING_DETAIL_BATCH <= 0 or not missing:
         # 没得抓：直接把缓存里的详情并回来，然后返回。
         for event in events:
-            detail = detail_by_key.get(_fundraising_key(event))
+            detail = _detail_for(event)
             if detail:
                 event.update(detail)
         return events
@@ -855,7 +891,7 @@ def _enrich_fundraising_details(
     if not proxy:
         # 代理都不可用，别硬抓详情；缓存详情照常并回。
         for event in events:
-            detail = detail_by_key.get(_fundraising_key(event))
+            detail = _detail_for(event)
             if detail:
                 event.update(detail)
         return events
@@ -883,12 +919,55 @@ def _enrich_fundraising_details(
         patched += 1
 
     for event in events:
-        detail = detail_by_key.get(_fundraising_key(event))
+        detail = _detail_for(event)
         if detail:
             event.update(detail)
     if patched:
         print(f"RootData fundraising details enriched: {patched}", file=sys.stderr)
     return events
+
+
+def _enrich_from_sosovalue(
+    events: list[dict[str, Any]],
+    missing: list[dict[str, Any]],
+    detail_by_key: dict[str, dict[str, Any]],
+) -> None:
+    """用 SoSoValue 按项目名交叉补详情（RootData 详情页的零风险兜底）。
+
+    - 每个缺详情的事件按 ``name`` 解析 SoSoValue 详情页（Cloudflare 基础防护，稳定过）；
+    - 每轮最多 ``SOSOVALUE_DETAIL_BATCH`` 个；单个失败静默跳过，绝不拖垮融资刷新；
+    - 拿到的详情写回 ``detail_by_key``，供后面统一 ``event.update`` 并回。
+    """
+    if SOSOVALUE_DETAIL_BATCH <= 0:
+        return
+    try:
+        import sosovalue_projects as soso
+    except Exception:
+        return
+
+    patched = 0
+    for event in missing[:SOSOVALUE_DETAIL_BATCH]:
+        name = _text(event.get("name"), 60)
+        if not name:
+            continue
+        try:
+            detail = soso.resolve_detail_by_name(name)
+        except Exception:
+            continue
+        if not detail or not (
+            detail.get("intro") or detail.get("tags") or detail.get("ecosystem") or detail.get("founded")
+        ):
+            continue
+        event.update(detail)
+        detail_by_key[_fundraising_key(event)] = {
+            "intro": detail.get("intro") or "",
+            "tags": detail.get("tags") or [],
+            "ecosystem": detail.get("ecosystem") or [],
+            "founded": detail.get("founded") or "",
+        }
+        patched += 1
+    if patched:
+        print(f"SoSoValue fundraising details enriched: {patched}", file=sys.stderr)
 
 
 _THUMB_SIZED = re.compile(r"\.(?:png|jpe?g|webp|gif)$", re.I)

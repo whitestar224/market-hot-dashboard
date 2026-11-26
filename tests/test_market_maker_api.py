@@ -10,6 +10,8 @@ test_dev_launch_api.py / test_sandwich_detector_api.py 同一套手法。
 
 import ast
 import json
+import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -18,6 +20,13 @@ import market_maker_monitor as mm
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVER_SOURCE = ROOT.joinpath("server.py").read_text(encoding="utf-8")
+# server.py 里 `from app.core.state import (...)`，所以 `src` 必须在 sys.path 上。
+for _entry in (str(ROOT), str(ROOT / "src")):
+    if _entry not in sys.path:
+        sys.path.insert(0, _entry)
+
+# 报红档位的唯一真源（server.py 也是从这里取）。
+from src.app.core.state import DESKTOP_ALERT_CRITICAL_PRIORITY
 
 TOKEN = "0x39dbed3a2bd333467115de4566f8d8b0e4a4f2f1"
 OTHER_TOKEN = "0x" + "5f" * 20
@@ -83,6 +92,7 @@ def load_alert_sender(*, alerts_enabled=True):
         "mm_gmgn_token_url": mm.gmgn_token_url,
         "mm_explorer_tx_url": mm.explorer_tx_url,
         "launch_desktop_alert": launch,
+        "DESKTOP_ALERT_CRITICAL_PRIORITY": DESKTOP_ALERT_CRITICAL_PRIORITY,
     }
     exec(alert_sender_code(), namespace)
     return namespace["send_market_maker_desktop_alert"], sent
@@ -119,9 +129,44 @@ class AlertSenderTest(unittest.TestCase):
         self.assertIn("PONS", alert["title"])
         self.assertEqual(alert["chain"], "robinhood")
         self.assertEqual(alert["contractAddress"], TOKEN)
-        self.assertEqual(alert["queuePriority"], 78)
         self.assertIn("$16.9K", alert["body"])
         self.assertIn("Robinhood", alert["body"])
+
+    def test_a_new_token_pops_red_at_critical_priority(self):
+        """用户 2026-11-15：新标的要「报红」。"""
+        send, sent = load_alert_sender()
+        send(event())
+        alert = sent[0]
+        self.assertEqual(alert["alertTone"], "red")
+        self.assertEqual(alert["queuePriority"], DESKTOP_ALERT_CRITICAL_PRIORITY + 40)
+        self.assertEqual(alert["priority"], "做市商新标的")
+        self.assertIn("首次出现", alert["body"])
+
+    def test_the_alert_says_how_new_the_token_is(self):
+        """2026-11-16：正文要带「上线 N 天」—— 既证明它过了成熟度闸，也让人一眼看出盘多新。"""
+        send, sent = load_alert_sender()
+        send(event(maturity={"ok": True, "reason": "fresh", "ageDays": 3.4,
+                             "listedAt": 1_792_000_000_000, "source": "dexscreener"}))
+        body = sent[0]["body"]
+        self.assertIn("上线 3 天", body)
+        self.assertIn("首次出现", body)
+        # 刚建池的写「今天刚建池」，不写「上线 0 天」。
+        sent.clear()
+        send(event(maturity={"ok": True, "reason": "fresh", "ageDays": 0.2,
+                             "listedAt": 1_792_000_000_000, "source": "dexscreener"}))
+        self.assertIn("今天刚建池", sent[0]["body"])
+
+    def test_only_the_new_token_alert_is_red(self):
+        send, sent = load_alert_sender()
+        send(event(reason="large-transfer", usd=4_200_000.0))
+        self.assertNotIn("alertTone", sent[0], "大额调仓不该跟着报红")
+
+    def test_a_new_token_carries_board_ranks_when_it_is_also_on_a_board(self):
+        send, sent = load_alert_sender()
+        send(event(resonance={"ok": True, "gainersRank": 3, "gainersChangePct": 18.2, "aicoinRank": 12}))
+        body = sent[0]["body"]
+        self.assertIn("涨幅榜第 3", body)
+        self.assertIn("AIcoin 热门第 12", body)
 
     def test_the_view_button_opens_the_gmgn_token_page(self):
         send, sent = load_alert_sender()
@@ -207,7 +252,9 @@ class TripleResonanceAlertTest(unittest.TestCase):
         self.assertIn("AIcoin 热门第 12", alert["body"])
         self.assertIn("Robinhood", alert["body"])
 
-    def test_it_outranks_a_plain_large_rebalance_and_a_new_token(self):
+    def test_it_outranks_a_plain_large_rebalance(self):
+        # 注意：**不再**比「新标的」高 —— 2026-11-15 起新标的报红，档位是 940，
+        # 因为做市商接新币通常发生在它上榜之前，那才是最早的信号。
         alert = self.send()
         self.assertEqual(alert["queuePriority"], 90)
         self.assertGreater(alert["queuePriority"], 84)
@@ -361,6 +408,61 @@ class CadenceTest(unittest.TestCase):
         self.assertIn("remaining = self.interval - (time.time() - started)", loop)
         # 跑完直接 wait(interval) 是旧的（错的）写法：实测 5 分钟间隔变成 14 分钟。
         self.assertNotIn("self.stop_event.wait(self.interval)", loop)
+
+
+class SolanaAddressBookTest(unittest.TestCase):
+    """base58 区分大小写：地址簿不能无条件 ``.lower()``（2026-11-15 实际踩过）。
+
+    现象：5 个 Solana 钱包入库时被降成小写，其中 3 个直接变成非法 pubkey，
+    ``getSignaturesForAddress`` 回 ``-32602 Invalid param``，另外 2 个凑巧还能解码，
+    但查到的是一个**不存在的地址** → 永远 0 笔流水，看着像「这钱包没动静」。
+    """
+
+    SOL_HOT = "44P5Ct5JkPz76Rs2K6juC65zXMpFRDrHatxcASJ4Dyra"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = mm.MarketMakerStore(Path(self._tmp.name) / "mm.sqlite")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_evm_keys_are_case_insensitive_but_solana_ones_are_not(self):
+        self.assertEqual(mm.wallet_key("bsc", "0xF8191D98ae98d2f7aBDFB63A9b0b812b93C873AA"),
+                         "0xf8191d98ae98d2f7abdfb63a9b0b812b93c873aa")
+        self.assertEqual(mm.wallet_key("solana", self.SOL_HOT), self.SOL_HOT)
+
+    def test_the_lowercased_hot_wallet_is_not_the_same_address(self):
+        self.assertTrue(mm.is_solana_address(self.SOL_HOT))
+        # 这个恰恰说明「语法合法 ≠ 同一个地址」：`44p5ct5j…` 也能解码成 32 字节，
+        # 所以 RPC 不报错、安安静静返回 0 笔流水 —— 看着像「这钱包没动静」，
+        # 实际盯的是一个不存在的地址。真正判「是不是同一个」只能靠原样保留大小写。
+        self.assertNotEqual(mm.wallet_key("solana", self.SOL_HOT.lower()), self.SOL_HOT)
+        # 而有的地址小写之后连解码都不是 32 字节，直接 -32602（MfDuWeq… 就是这样）。
+        amm = "MfDuWeqSHEqTFVYZ7LoexgAK9dxk7cy4DFJWjWMGVWa"
+        self.assertTrue(mm.is_solana_address(amm))
+        self.assertFalse(mm.is_solana_address(amm.lower()))
+        self.assertFalse(mm.is_solana_address("0x" + "ab" * 20))
+
+    def test_seeding_keeps_the_solana_case(self):
+        rows = {row["address"] for row in self.store.addresses() if row["chain"] == "solana"}
+        self.assertIn(self.SOL_HOT, rows)
+        self.assertNotIn(self.SOL_HOT.lower(), rows)
+
+    def test_a_solana_wallet_can_be_added_from_the_page(self):
+        other = "HwDkuDCUipJHHKodBBCjffFvrjhmd4iVVh7fq25fShvt"
+        saved = self.store.save_address("solana", other, "dwf", tag="手加")
+        self.assertEqual(saved["address"], other)
+        self.assertIsNotNone(self.store.address("solana", other))
+        with self.assertRaises(ValueError):
+            self.store.save_address("solana", "not-a-wallet", "dwf")
+
+    def test_only_the_polled_chains_are_ever_handed_out(self):
+        for row in self.store.addresses_due(500):
+            self.assertIn(row["chain"], mm.POLL_CHAINS)
+        # Ethereum 的 168 个老地址仍然在册，只是永远不会被排队。
+        self.assertTrue(any(row["chain"] == "ethereum" for row in self.store.addresses()))
+        self.assertNotIn("ethereum", mm.POLL_CHAINS)
 
 
 if __name__ == "__main__":

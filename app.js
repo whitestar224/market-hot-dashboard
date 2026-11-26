@@ -14,10 +14,16 @@ const GMGN_PERIOD_KEY = "xingyunshe:gmgn-hot-search:period:v1";
 const GMGN_CHAIN_OPTIONS = new Set(["all", "sol", "bsc", "base", "eth", "robinhood", "arc", "stable"]);
 const GMGN_PERIODS = new Set(["1m", "5m", "1h", "6h", "24h"]);
 const TRENCH_CHAIN_KEY = "xingyunshe:gmgn-trenches:chain:v1";
-const MARKET_CACHE_KEY = "xingyunshe:market-hot:payload:v15";
+// RootData 项目榜的「机构」视图：空字符串 = 原来的 RD 热度榜。
+// 切机构是**纯客户端换板**（服务端把 investorBoards 一起发下来），因为背后是
+// RootData 的签名接口、一轮 3 秒，不能挂在 60 秒轮询的请求路径上。
+const ROOTDATA_INVESTOR_KEY = "xingyunshe:rootdata-projects:investor:v1";
+const MARKET_CACHE_KEY = "xingyunshe:market-hot:payload:v16";
 const MARKET_PRIORITY_VIEW_KEY = "xingyunshe:market-hot:priority-view:v1";
 const MARKET_PRIORITY_PERIOD_KEY = "xingyunshe:market-hot:priority-period:v1";
 const MARKET_PRIORITY_PERIODS = new Set(["1h", "6h", "24h"]);
+//: 空投榜「按融资额排序」的三态偏好（none / desc / asc），跟着浏览器记住。
+const AIRDROP_SORT_KEY = "xingyunshe:market-hot:airdrop-sort:v1";
 const TOTAL_BOARD_PAGE_SIZE = 10;
 const TRENCH_PAGE_SIZE = 50;
 const EXCHANGE_AI_REQUEST_LIMIT = 24;
@@ -75,6 +81,13 @@ function normalizePriorityView(value) {
 function normalizePriorityPeriod(value) {
   const period = String(value || "24h").toLowerCase();
   return MARKET_PRIORITY_PERIODS.has(period) ? period : "24h";
+}
+
+const AIRDROP_SORTS = new Set(["none", "desc", "asc"]);
+
+function normalizeAirdropSort(value) {
+  const mode = String(value || "none").toLowerCase();
+  return AIRDROP_SORTS.has(mode) ? mode : "none";
 }
 
 function normalizeBinanceWalletPeriod(value) {
@@ -184,6 +197,8 @@ const state = {
   gmgnChain: normalizeGmgnChain(readLocalPreference(GMGN_CHAIN_KEY, "all")),
   gmgnPeriod: normalizeGmgnPeriod(readLocalPreference(GMGN_PERIOD_KEY, "1h")),
   trenchChain: normalizeTrenchChain(readLocalPreference(TRENCH_CHAIN_KEY, "all")),
+  // 机构视图：值是服务端 investorOptions 里的 value（如 "yzi-labs"），空 = 热度榜。
+  rootdataInvestor: String(readLocalPreference(ROOTDATA_INVESTOR_KEY, "") || "").trim(),
   gmgnHotLoading: false,
   priorityPeriod: normalizePriorityPeriod(readLocalPreference(MARKET_PRIORITY_PERIOD_KEY, "24h")),
   smartPriority: {},
@@ -192,7 +207,13 @@ const state = {
   // Per-board switches (入池 / 弹窗), keyed by market source id.  Loaded once
   // from /api/price-watch/boards; a board missing here renders no switch.
   boardToggles: {},
-  boardTogglePending: ""
+  boardTogglePending: "",
+  // 空投榜（ICODrops ACTIVE）：作为一张榜单卡渲染在 RootData 项目热门榜后面。
+  // 数据由 fetchAirdropBoard() 单独拉，不混进 /api/market-hot 的 sources 主链路。
+  airdropBoard: null,
+  airdropBoardError: "",
+  // 空投榜排序：none（上游原始顺序，最近活动优先）/ desc（融资额从大到小）/ asc（小到大）。
+  airdropSort: normalizeAirdropSort(readLocalPreference(AIRDROP_SORT_KEY, "none"))
 };
 
 // Two switches per board card, mirroring the server-side roster in
@@ -567,7 +588,42 @@ function rowsForSourceView(source) {
   if (sourceId === "gmgn-hot-search") return gmgnRowsForSource(source);
   if (sourceId === "gmgn-trenches") return trenchRowsForSource(source);
   if (sourceId === "binance-wallet-hot") return binanceWalletRowsForSource(source);
+  if (sourceId === "rootdata-projects") return rootdataRowsForSource(source);
   return source?.rows || [];
+}
+
+// RootData 项目榜的机构视图：服务端把「未发行 + 运营中」按机构筛好塞进
+// investorBoards，这里只挑板。选中的机构在 payload 里找不到（机构下线 / 旧缓存）
+// 就退回热度榜，宁可显示别的也不要一张空白卡。
+function rootdataInvestorBoard(source) {
+  const selected = String(state.rootdataInvestor || "").trim();
+  if (!selected) return null;
+  const board = (Array.isArray(source?.investorBoards) ? source.investorBoards : [])
+    .find((item) => String(item?.investor || "") === selected);
+  return board && Array.isArray(board.rows) && board.rows.length ? board : null;
+}
+
+function rootdataRowsForSource(source) {
+  const fallback = Array.isArray(source?.rows) ? source.rows : [];
+  const board = rootdataInvestorBoard(source);
+  return board ? board.rows : fallback;
+}
+
+// 切到机构视图后，卡片标题/副标题必须跟着换 —— 否则一张写着「按 RD 热度指数倒排」
+// 的卡片里躺着 BitGo / CertiK，读起来就是错的。
+function rootdataInvestorHeadline(source) {
+  const board = rootdataInvestorBoard(source);
+  if (!board) return null;
+  const label = String(board.label || "机构");
+  const total = Number(board.total || 0);
+  return {
+    title: `${label} 在投项目`,
+    // 卡片头只有 ~150px 宽（右边被「机构」下拉占着），写长了会挂省略号，
+    // 所以只留「筛选口径 + 总数」；「还能往下滑」交给滚动条本身表达。
+    subtitle: total
+      ? `未发行 + 运营中 · ${total} 个${board.status === "stale" ? " · 快照偏旧" : ""}`
+      : "未发行 + 运营中"
+  };
 }
 
 // 币安钱包热门榜按链切换：链视图直接取服务端 chainBoards 里那一条链自己的榜
@@ -618,11 +674,20 @@ function visibleSources() {
     .filter(matchesFilter)
     .map((source) => {
       const rows = rowsForSourceView(source).filter(matchesQuery);
+      // 机构视图连标题一起换（只是渲染用的浅拷贝，不动 state.sources）。
+      const investorHeadline = String(source?.id || "") === "rootdata-projects"
+        ? rootdataInvestorHeadline(source)
+        : null;
+      // 战壕榜 / 空投榜 / 机构在投 的行不是「标的」，没有 heat/change 可比，原样保留顺序。
+      // 机构视图尤其不能进 sortRows：默认「智能」排序会按叙事分把某几个项目提到最前，
+      // 上游「最近投的靠前」的顺序就没了（实测 Alta 被顶到第 1 行）。
+      const passthrough = source?.id === "gmgn-trenches"
+        || source?.id === "icodrops-airdrops"
+        || Boolean(investorHeadline);
       return {
         ...source,
-        rows: String(source?.id || "") === "gmgn-trenches"
-          ? rows
-          : sortRows(rows, priorityScores)
+        ...(investorHeadline || {}),
+        rows: passthrough ? rows : sortRows(rows, priorityScores)
       };
     });
 }
@@ -693,6 +758,20 @@ function syncPriorityControls() {
   }
 }
 
+// 空投榜数据留在 state.airdropBoard 里（由 fetchAirdropBoard 拉取），
+// 卡片和榜单卡都读同一份，不会出现「卡片一个数 / 榜单另一个数」。
+function airdropSummaryCard() {
+  const payload = state.airdropBoard;
+  if (payload && payload.total) {
+    const sale = payload.saleCount || 0;
+    return {
+      value: `${payload.total} 个活动`,
+      meta: `${payload.airdropCount || 0} 空投${sale ? ` · ${sale} 销售` : ""}`
+    };
+  }
+  return { value: "…", meta: state.airdropBoardError || "正在读取空投活动" };
+}
+
 function renderSummary(sources) {
   const rows = sources.flatMap((source) =>
     (source.summaryRows || source.rows).map((row) => ({
@@ -709,7 +788,6 @@ function renderSummary(sources) {
   const positiveRatio = rows.length
     ? Math.round((rows.filter((row) => parseSignedNumber(row.change) > 0).length / rows.length) * 100)
     : 0;
-  const maxAmount = [...rows].sort((a, b) => (b.amount || 0) - (a.amount || 0))[0];
 
   const cards = [
     {
@@ -728,16 +806,16 @@ function renderSummary(sources) {
       meta: `${rows.length} 个标的纳入当前视图`
     },
     {
-      label: "成交/交易龙头",
-      value: maxAmount ? displayAssetName(maxAmount, maxAmount.group) : "--",
-      meta: maxAmount ? maxAmount.turnover || maxAmount.metricLabel || "交易热度" : "暂无可用数据"
+      label: "空投榜",
+      value: airdropSummaryCard().value,
+      meta: airdropSummaryCard().meta
     }
   ];
 
   renderLive(summaryEl, cards
     .map(
-      (card) => `
-        <article class="summary-card">
+      (card, index) => `
+        <article class="summary-card${index === 3 ? " summary-card--airdrop" : ""}" ${index === 3 ? 'data-airdrop-card title="查看空投榜"' : ""}>
           <p>${card.label}</p>
           <strong>${card.value}</strong>
           <span>${card.meta}</span>
@@ -745,6 +823,36 @@ function renderSummary(sources) {
       `
     )
     .join(""));
+}
+
+/**
+ * 空投榜（ICODrops ACTIVE）取数。
+ *
+ * CryptoRank Drophunting 的 `/v3/drophunting/list` 需 Advanced($149/月) 套餐，
+ * 免费 Sandbox key 实测 403 ENDPOINT_NOT_AVAILABLE，网页端又被 Cloudflare 拦，
+ * 所以改抓免费的 ICODrops ACTIVE 分类页（服务端 icodrops_source.py 负责解析+缓存）。
+ *
+ * 失败语义：留 state.airdropBoardError 让卡片和榜单卡都能说出真实原因，
+ * 不生成空卡、不假装「今天没活动」。
+ */
+async function fetchAirdropBoard(force = false) {
+  const url = force ? "/api/icodrops-airdrops?refresh=1&force=1" : "/api/icodrops-airdrops";
+  try {
+    const response = await fetch(url, { headers: { Accept: "application/json" } });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json();
+    if (!payload || payload.ok === false || !Array.isArray(payload.items) || !payload.items.length) {
+      state.airdropBoard = null;
+      state.airdropBoardError = payload?.error || "空投榜暂时没有数据";
+    } else {
+      state.airdropBoard = payload;
+      state.airdropBoardError = "";
+    }
+  } catch (error) {
+    state.airdropBoard = null;
+    state.airdropBoardError = `空投榜暂时不可用：${error?.message || error}`;
+  }
+  renderBoards();
 }
 
 function renderTicker() {
@@ -971,7 +1079,8 @@ function renderGmgnTrenchRow(row, source, index) {
   const aiKey = exchangeAiIdentity(row, source);
   const aiPending = exchangeAiNarrativePending.has(aiKey);
   const chain = String(row?.chain || row?.network || "").trim().toLowerCase();
-  const binanceAiSupported = ["eth", "ethereum", "bsc", "bnb", "base", "robinhood", "sol", "solana"].includes(chain);
+  // GIGA X 桥接认的链（app/api/gigax.py CHAIN_CODES）。不在这张表里的链不会发请求。
+  const narrativeSupported = ["eth", "ethereum", "bsc", "bnb", "base", "robinhood", "sol", "solana", "elysium", "99901", "arc"].includes(chain);
   const xHandle = String(socials.original?.handle || "").replace(/^@/, "");
   const xStatusId = String(socials.original?.statusId || "").trim();
   const xPublishedAt = Number(socials.original?.publishedAt || 0);
@@ -1022,17 +1131,17 @@ function renderGmgnTrenchRow(row, source, index) {
     ? `<i class="gmgn-trench-backfill-badge" title="外部线索补录 · ${escapeHtml(backfillSources.length ? backfillSources.join(" / ") : backfillLabel)}：该币在榜窗口内开盘，但 GMGN 战壕接口的短窗口没有采到，因此由外部线索通道补录展示">补录</i>`
     : "";
   const aiCopy = narrative
-    || (!binanceAiSupported
-      ? "币安 AI 叙事接口当前不支持这条链，因此不会发送无效请求。"
+    || (!narrativeSupported
+      ? "GIGA X 叙事接口当前不支持这条链，因此不会发送无效请求。"
       : aiPending
-        ? "币安 AI 叙事正在按限速队列读取，请稍候。"
+        ? "GIGA X 叙事正在按限速队列读取，请稍候。"
         : aiResult.status === "UNAVAILABLE"
-          ? "币安 AI 当前未返回该合约的叙事；空结果已缓存，短时间内不会重复请求。"
-          : "将通过热门榜同款币安 AI 叙事接口读取；只处理首屏最新标的。");
+          ? "GIGA X 当前未返回该合约的叙事；空结果已缓存，短时间内不会重复请求。"
+          : "将通过 GIGA X 叙事接口读取；只处理首屏最新标的。");
   const aiTooltip = `
-    <b>${escapeHtml(symbol)} · 币安 AI 叙事</b>
+    <b>${escapeHtml(symbol)} · GIGA X 叙事</b>
     <p>${escapeHtml(aiCopy)}</p>
-    <small>${narrative ? "来源：热门榜同款 Binance AI 接口" : "最新 10 个按需读取 · 正负结果均缓存"}</small>`;
+    <small>${narrative ? `来源：${escapeHtml(aiResult.source || "GIGA X")}` : "最新 10 个按需读取 · 正负结果均缓存"}</small>`;
   const xTooltip = socials.x ? renderGmgnTrenchXTooltip(symbol, socials.original) : "";
   const tools = [
     personSignal ? renderGmgnTrenchTool({
@@ -1041,7 +1150,7 @@ function renderGmgnTrenchRow(row, source, index) {
       href: safeExternalUrl(personSignal.postUrl),
       tooltip: personTooltip
     }) : "",
-    renderGmgnTrenchTool({ kind: "ai", label: `查看 ${symbol} 的币安 AI 叙事`, tooltip: aiTooltip }),
+    renderGmgnTrenchTool({ kind: "ai", label: `查看 ${symbol} 的 GIGA X 叙事`, tooltip: aiTooltip }),
     binanceWallet ? renderGmgnTrenchTool({
       kind: "wallet",
       label: `在币安钱包交易 ${symbol}`,
@@ -1218,18 +1327,243 @@ function queueGmgnTrenchXPost(tool) {
   void drainGmgnTrenchXPostQueue();
 }
 
+// ── 空投榜（ICODrops ACTIVE）─────────────────────────────────────────────
+// 作为一张普通榜单卡渲染在「RootData 项目热门榜」后面，复用 .board-card 外壳，
+// 所以标题/分组标签/配色/间距与其它榜单完全一致；只有内部表格是空投专用列。
+const AIRDROP_BOARD_ID = "icodrops-airdrops";
+//: 卡片内默认露出多少行（单行 54px，与其它榜单行高一致），多的在卡片内下滑。
+const AIRDROP_VISIBLE_ROWS = 10;
+
+/** 排序按钮三态循环 none → desc → asc → none。 */
+const AIRDROP_SORT_ORDER = ["none", "desc", "asc"];
+
+/** 融资额字符串 → 可比较的数值（美元）。``$61.8 M`` → 61800000。 */
+function airdropAmountValue(item) {
+  const raw = String(item?.raised || "").trim();
+  if (!raw) return null;
+  const match = raw.match(/([\d][\d.,]*)\s*([KMB])?/i);
+  if (!match) return null;
+  const num = Number.parseFloat(match[1].replace(/,/g, ""));
+  if (!Number.isFinite(num)) return null;
+  const unit = String(match[2] || "").toUpperCase();
+  const scale = unit === "B" ? 1e9 : unit === "M" ? 1e6 : unit === "K" ? 1e3 : 1;
+  return num * scale;
+}
+
+/**
+ * 按融资额排序（不改原数组）。
+ *
+ * 口径：**「未披露」无论正排还是倒排都垫底** —— 那些行不是 0，是上游没收录，
+ * 让它按「0」插到升序最前面会误导成「融了 0 块钱」。同额时保持上游原顺序。
+ */
+function sortAirdropItems(items, mode) {
+  const list = Array.isArray(items) ? items : [];
+  if (mode !== "desc" && mode !== "asc") return list;
+  const direction = mode === "desc" ? -1 : 1;
+  return list
+    .map((item, index) => ({ item, index, value: airdropAmountValue(item) }))
+    .sort((a, b) => {
+      if (a.value === null && b.value === null) return a.index - b.index;
+      if (a.value === null) return 1;
+      if (b.value === null) return -1;
+      if (a.value === b.value) return a.index - b.index;
+      return (a.value - b.value) * direction;
+    })
+    .map((entry) => entry.item);
+}
+
+/** 点表头「融资 / 估值」：循环切换排序并立刻重渲染（滚动条回到顶部）。 */
+function cycleAirdropSort() {
+  const current = normalizeAirdropSort(state.airdropSort);
+  state.airdropSort = AIRDROP_SORT_ORDER[(AIRDROP_SORT_ORDER.indexOf(current) + 1) % AIRDROP_SORT_ORDER.length];
+  saveLocalPreference(AIRDROP_SORT_KEY, state.airdropSort);
+  renderBoards();
+  requestAnimationFrame(() => {
+    const scroller = boardsEl.querySelector(".airdrop-scroll");
+    if (scroller) scroller.scrollTop = 0;
+  });
+}
+
+function buildAirdropSource() {
+  const payload = state.airdropBoard;
+  if (!payload || payload.ok === false) return null;
+  const items = Array.isArray(payload.items) ? payload.items : [];
+  if (!items.length) return null;
+  const total = payload.total || items.length;
+  const airdropCount = payload.airdropCount || 0;
+  const saleCount = payload.saleCount || 0;
+  const stale = Boolean(payload.stale);
+  const sort = normalizeAirdropSort(state.airdropSort);
+  return {
+    id: AIRDROP_BOARD_ID,
+    group: "crypto",
+    title: "ICODrops 空投榜",
+    subtitle: `ACTIVE 活动 · 显示前 ${AIRDROP_VISIBLE_ROWS} · 共 ${total} 个（${airdropCount} 空投）`,
+    accent: "#f6bb48",
+    sourceLabel: "ICODrops",
+    sourceName: stale
+      ? `ICODrops ACTIVE · 缓存${payload.error ? `（${payload.error}）` : ""}`
+      : "ICODrops ACTIVE · 实时",
+    status: stale ? "stale" : "ok",
+    rows: [],
+    airdropItems: sortAirdropItems(items, sort),
+    airdropSort: sort,
+    airdropSummary: { total, airdropCount, saleCount },
+    empty_title: "空投榜暂无可展示的活动",
+    empty_message: "ICODrops ACTIVE 页面没有解析到活动，等一下会自动重抓。"
+  };
+}
+
+/** 把空投榜插到 RootData 项目热门榜后面；拿不到数据就原样返回，不留空卡。 */
+function withAirdropSource(sources) {
+  const list = Array.isArray(sources) ? sources : [];
+  const rest = list.filter((source) => String(source?.id || "") !== AIRDROP_BOARD_ID);
+  const board = buildAirdropSource();
+  if (!board) return rest;
+  const anchor = rest.findIndex((source) => String(source?.id || "") === "rootdata-projects");
+  if (anchor < 0) return [...rest, board];
+  return [...rest.slice(0, anchor + 1), board, ...rest.slice(anchor + 1)];
+}
+
+/** 活动类型压成短标签：卡片只有三分之一屏宽，长英文会撑爆列。原文进 title。 */
+const AIRDROP_ROUND_LABELS = {
+  "possible retrodrop": "潜在空投",
+  "genesis airdrop": "创世空投",
+  "airdrop": "空投",
+  "incentivized activities": "激励活动",
+  "early incentives": "早期激励",
+  "testnet": "测试网",
+  "point system activity": "积分活动",
+  "points farming": "积分农场",
+  "presale": "预售",
+  "pre-sale phase 3": "预售",
+  "public sale": "公募"
+};
+
+function shortRoundLabel(round) {
+  const text = String(round || "").trim();
+  if (!text) return "";
+  const key = text.toLowerCase();
+  if (AIRDROP_ROUND_LABELS[key]) return AIRDROP_ROUND_LABELS[key];
+  const head = key.match(/^(icm|ido|iko|ieo)\b/);
+  if (head) return head[1].toUpperCase();
+  if (/pre-?sale/.test(key)) return "预售";
+  if (/public sale/.test(key)) return "公募";
+  if (/private sale/.test(key)) return "私募";
+  if (/token sale|token launch/.test(key)) return "代币销售";
+  return text.length > 8 ? `${text.slice(0, 7)}…` : text;
+}
+
+function renderAirdropRow(item, rank) {
+  const kind = item.kind === "sale" ? "sale" : item.kind === "airdrop" ? "airdrop" : "unknown";
+  const name = escapeHtml(item.name || "--");
+  const ticker = String(item.ticker || "").trim();
+  const round = escapeHtml(shortRoundLabel(item.round) || (kind === "sale" ? "代币销售" : kind === "airdrop" ? "空投" : "其它"));
+  const roundTitle = escapeHtml(item.round || round);
+  const date = escapeHtml(item.date || "");
+  const raised = String(item.raised || "").trim();
+  const preval = String(item.preval || "").trim();
+  const href = String(item.url || "");
+  const tag = href ? "a" : "div";
+  const linkAttrs = href
+    ? ` href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener" title="打开 ICODrops 的 ${name} 详情"`
+    : "";
+  const sub = date ? `<span class="airdrop-sub" title="${date}">${date}</span>` : "";
+
+  return `
+    <${tag} class="airdrop-rank-row airdrop-rank-row--${kind}"${linkAttrs}>
+      <div class="rank-badge">${escapeHtml(rank)}</div>
+      <div class="airdrop-asset-cell">
+        ${renderAssetIcon(
+          { icon: item.icon || "", symbol: item.ticker || "", name: item.name || "" },
+          { group: "crypto" }
+        )}
+        <div class="airdrop-asset-line">
+          <div class="airdrop-asset-title">
+            <strong title="${name}">${name}</strong>
+            ${ticker ? `<em class="airdrop-ticker">${escapeHtml(ticker)}</em>` : ""}
+          </div>
+          ${sub}
+        </div>
+      </div>
+      <div class="airdrop-kind-cell">
+        <span class="airdrop-kind airdrop-kind--${kind}" title="${roundTitle}">${round}</span>
+      </div>
+      <div class="airdrop-money-cell">
+        ${raised
+          ? `<b title="${escapeHtml(raised)}">${escapeHtml(raised)}</b>`
+          : `<b class="airdrop-money-empty" title="ICODrops 未收录该项目的融资金额">未披露</b>`}
+        ${preval
+          ? `<span title="估值 ${escapeHtml(preval)}${item.fundingSource === "detail" ? "（取自 ICODrops 项目详情页）" : ""}">${escapeHtml(preval)}</span>`
+          : ""}
+      </div>
+    </${tag}>
+  `;
+}
+
+function renderAirdropRows(source) {
+  const items = Array.isArray(source?.airdropItems) ? source.airdropItems : [];
+  if (!items.length) return renderEmpty(source);
+  const summary = source.airdropSummary || {};
+  const staleNote = source.status === "stale"
+    ? `<p class="airdrop-stale">数据源刷新失败，显示上次缓存${summary.error ? `（${escapeHtml(summary.error)}）` : ""}</p>`
+    : "";
+  const sort = normalizeAirdropSort(source?.airdropSort);
+  const sortArrow = sort === "desc" ? "↓" : sort === "asc" ? "↑" : "↕";
+  const sortHint = sort === "desc"
+    ? "当前：融资额从大到小。点击改为从小到大"
+    : sort === "asc"
+      ? "当前：融资额从小到大。点击改回原始顺序"
+      : "当前：上游原始顺序（最近活动优先）。点击按融资额从大到小排序";
+  return `
+    <div class="rows airdrop-rows">
+      <div class="airdrop-table-head">
+        <span>#</span><span>项目 / 时间</span><span>类型</span>
+        <button type="button" class="airdrop-sort${sort === "none" ? "" : " is-active"}"
+                data-airdrop-sort="${sort}" aria-label="按融资金额排序（${sort === "desc" ? "从大到小" : sort === "asc" ? "从小到大" : "原始顺序"}）"
+                title="${escapeHtml(sortHint)}">融资 / 估值<span class="airdrop-sort-arrow" aria-hidden="true">${sortArrow}</span></button>
+      </div>
+      <div class="airdrop-scroll" role="region" aria-label="空投活动列表，可滚动查看全部">
+        ${items.map((item, index) => renderAirdropRow(item, index + 1)).join("")}
+      </div>
+      ${staleNote}
+    </div>`;
+}
+
 function renderBoardRows(source) {
   if (String(source?.id || "") === "gmgn-trenches") return renderGmgnTrenchBoard(source);
+  if (String(source?.id || "") === AIRDROP_BOARD_ID) return renderAirdropRows(source);
+  if (!source.rows.length) {
+    return `
+    <div class="rows">
+      ${renderEmpty(source)}
+    </div>`;
+  }
+  const head = `<div class="board-table-head"><span>#</span><span>名称</span><span>价格/热度</span><span>涨跌幅</span></div>`;
+  const body = source.rows.map((row, rowIndex) => renderRow(row, source, rowIndex + 1)).join("");
+  // 机构视图有 80+ 条：卡片里固定露 10 行，其余在卡内下滑查看（用户 2026-11-14）。
+  // 做法照抄空投榜的 .airdrop-scroll —— **表头留在滚动区外**，滚的只有行。
+  if (rootdataInvestorBoard(source)) {
+    const label = String(source.title || "机构在投项目");
+    return `
+    <div class="rows">
+      ${head}
+      <div class="rootdata-scroll" role="region" aria-label="${escapeHtml(label)}，可滚动查看全部">
+        ${body}
+      </div>
+    </div>`;
+  }
   return `
     <div class="rows">
-      ${source.rows.length
-        ? `<div class="board-table-head"><span>#</span><span>名称</span><span>价格/热度</span><span>涨跌幅</span></div>${source.rows.map((row, rowIndex) => renderRow(row, source, rowIndex + 1)).join("")}`
-        : renderEmpty(source)}
+      ${head}${body}
     </div>`;
 }
 
 function renderBoards() {
   syncPriorityControls();
+  // 空投榜是独立联网取的，不在 /api/market-hot 的 sources 里；每次渲染前补进去，
+  // 这样 state.sources 被接口整体替换后也不会丢卡。
+  state.sources = withAirdropSource(state.sources);
   const sources = visibleSources();
   renderSummary(sources);
 
@@ -1452,6 +1786,32 @@ function renderBoardHeadActions(source) {
       ${boardHeadFootHtml(source)}
     `;
   }
+  if (String(source?.id || "") === "rootdata-projects") {
+    // 机构下拉：形态照抄 AVE / GMGN 热搜的链选择器（同一个 .board-period-control），
+    // 所以也挂 is-onchain-hot 拿到「≤400px 隐提示字、≤268px 隐标签」那套降级。
+    const investorOptions = Array.isArray(source.investorOptions) ? source.investorOptions : [];
+    if (investorOptions.length < 2) {
+      return `<div class="board-head-actions"><strong>${escapeHtml(source.sourceLabel || "RD")}</strong></div>${boardHeadFootHtml(source)}`;
+    }
+    const selected = String(state.rootdataInvestor || "").trim();
+    // 卡片只有 374~450px 宽：总数已经写在副标题（「共 82 个」）和选项文案里，
+    // 头部再挂一个「未发币 82 个」会把下拉框挤成一条，所以这里只保留下拉 + 标签。
+    return `
+      <div class="board-head-actions is-onchain-hot">
+        <label class="board-period-control">
+          <span>机构</span>
+          <select data-role="rootdata-investor" aria-label="选择 RootData 机构在投项目">
+            ${investorOptions.map((option) => {
+              const value = String(option?.value || "").trim();
+              return `<option value="${escapeHtml(value)}" ${value === selected ? "selected" : ""}>${escapeHtml(option?.label || value || "全部")}</option>`;
+            }).join("")}
+          </select>
+        </label>
+        <strong>${escapeHtml(source.sourceLabel || "RD")}</strong>
+      </div>
+      ${boardHeadFootHtml(source)}
+    `;
+  }
   if (String(source?.id || "") !== "binance-wallet-hot") {
     return `<div class="board-head-actions"><strong>${escapeHtml(source.sourceLabel || "--")}</strong></div>${boardHeadFootHtml(source)}`;
   }
@@ -1612,8 +1972,9 @@ function exchangeAiResult(row, source) {
   const cached = exchangeAiNarrativeCache.get(exchangeAiIdentity(row, source)) || {};
   return {
     narrative: exchangeAiChineseNarrative(row?.exchangeAiNarrative || row?.binanceAiNarrative || cached.exchangeAiNarrative || ""),
-    source: String(row?.exchangeAiNarrativeSource || row?.binanceAiNarrativeSource || cached.exchangeAiNarrativeSource || "Binance AI").trim(),
-    provider: String(row?.exchangeAiNarrativeProvider || cached.exchangeAiNarrativeProvider || "binance").trim(),
+    // 全系统叙事已切到 GIGA X（服务端 GIGA X 优先、币安 AI 仅作兜底），默认标签也跟着换。
+    source: String(row?.exchangeAiNarrativeSource || row?.binanceAiNarrativeSource || cached.exchangeAiNarrativeSource || "GIGA X").trim(),
+    provider: String(row?.exchangeAiNarrativeProvider || cached.exchangeAiNarrativeProvider || "gigax").trim(),
     status: String(row?.exchangeAiNarrativeStatus || row?.binanceAiNarrativeStatus || cached.exchangeAiNarrativeStatus || "").trim().toUpperCase()
   };
 }
@@ -1657,7 +2018,7 @@ function exchangeAiCandidate(row, source) {
   ].includes(sourceId)) return false;
   if (sourceId === "gmgn-trenches") {
     const chain = String(row?.chain || row?.network || "").trim().toLowerCase();
-    if (!["eth", "ethereum", "bsc", "bnb", "base", "robinhood", "sol", "solana"].includes(chain)) return false;
+    if (!["eth", "ethereum", "bsc", "bnb", "base", "robinhood", "sol", "solana", "elysium", "99901", "arc"].includes(chain)) return false;
   }
   return Boolean(String(row?.chain || "").trim() && exchangeAiContract(row));
 }
@@ -2061,6 +2422,18 @@ window.addEventListener("xingyun:rank-ai-toggle", () => {
   renderBoards();
 });
 
+summaryEl?.addEventListener("click", (event) => {
+  const card = event.target.closest?.("[data-airdrop-card]");
+  if (!card) return;
+  // 页面上已有「空投榜」区块，点卡片直接滚过去，比跳走更顺手。
+  const board = document.querySelector("#airdropBoard");
+  if (board) {
+    board.scrollIntoView({ behavior: "smooth", block: "start" });
+    return;
+  }
+  window.location.href = "./airdrop.html";
+});
+
 boardsEl.addEventListener("pointerover", (event) => {
   const tool = event.target.closest?.('.gmgn-trench-tool.is-x[data-status-id]');
   if (tool) queueGmgnTrenchXPost(tool);
@@ -2072,6 +2445,13 @@ boardsEl.addEventListener("focusin", (event) => {
 });
 
 boardsEl.addEventListener("click", (event) => {
+  const airdropSortButton = event.target.closest?.("[data-airdrop-sort]");
+  if (airdropSortButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    cycleAirdropSort();
+    return;
+  }
   const toggleButton = event.target.closest?.("[data-board-toggle]");
   if (toggleButton) {
     event.preventDefault();
@@ -2158,6 +2538,14 @@ boardsEl.addEventListener("change", (event) => {
     queueMicrotask(renderBoards);
     return;
   }
+  const rootdataInvestorSelect = event.target.closest('select[data-role="rootdata-investor"]');
+  if (rootdataInvestorSelect) {
+    state.rootdataInvestor = String(rootdataInvestorSelect.value || "").trim();
+    saveLocalPreference(ROOTDATA_INVESTOR_KEY, state.rootdataInvestor);
+    // 换机构就是换一份列表，纯客户端换板，不重新请求。
+    queueMicrotask(renderBoards);
+    return;
+  }
   const trenchChainSelect = event.target.closest('select[data-role="trench-chain"]');
   if (trenchChainSelect) {
     state.trenchChain = normalizeTrenchChain(trenchChainSelect.value);
@@ -2178,6 +2566,9 @@ publishTrenchChain(state.trenchChain);
 hydrateMarketCache();
 loadBoardToggles();
 loadMarketData();
+// 空投榜走独立端点（ICODrops），不跟 /api/market-hot 的 60 秒轮询；
+// 上游 30 分钟才更新一次，进页面拉一次就够。
+fetchAirdropBoard();
 setInterval(() => {
   if (document.visibilityState === "visible") loadMarketData();
 }, 60_000);

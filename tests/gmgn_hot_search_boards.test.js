@@ -35,7 +35,7 @@ test("wallet, AIcoin, and GMGN trenches occupy the first row in that order", () 
   assert.match(server, /RANK_MONITOR_SKIP_UPDATE_SOURCES = \{[\s\S]{0,300}"gmgn-hot-search"/);
 });
 
-test("GMGN trench history is scrollable and uses the cached Binance AI narrative route", () => {
+test("GMGN trench history is scrollable and uses the cached GIGA X narrative route", () => {
   assert.match(css, /\.board-head-actions\.is-onchain-hot/);
   assert.match(css, /\.gmgn-trench-hot-scroll/);
   assert.match(css, /\.gmgn-trench-popover/);
@@ -51,7 +51,7 @@ test("GMGN trench history is scrollable and uses the cached Binance AI narrative
   assert.match(js, /kind: "person"/);
   assert.match(js, /V4\.7 好标的/);
   assert.match(js, /is-research-pick/);
-  assert.match(js, /币安 AI 叙事/);
+  assert.match(js, /GIGA X 叙事/);
   assert.match(js, /sourceId === "gmgn-trenches"/);
   assert.match(js, /sourceRows\.slice\(0, Math\.min\(10/);
   assert.match(js, /const gmgnTrenchBatchLimit = 4/);

@@ -141,6 +141,11 @@ DEFAULT_IMPORTANT_PROJECTS: tuple[dict[str, Any], ...] = (
     {"handle": "SeiNetwork", "name": "Sei", "role": "Sei Network 官方", "category": "project_official", "tier": "official", "aliases": ("sei", "sei network")},
     {"handle": "berachain", "name": "Berachain", "role": "Berachain 官方", "category": "project_official", "tier": "official", "aliases": ("berachain", "bera")},
     {"handle": "monad_xyz", "name": "Monad", "role": "Monad 官方", "category": "project_official", "tier": "official", "aliases": ("monad", "mon")},
+    # 用户 2026-11-09 点名要监控并弹窗：Elysium（Kinetiq 的 HyperEVM L2）官方号，
+    # 以及 Elysium Blockchain 的开发方 Vulcan Forged。弹窗开关走 server.py 的
+    # ``X_KOL_DIRECT_ALERT_OFFICIAL_HANDLES``（只加进官方源不会自动弹）。
+    {"handle": "enter_elysium", "name": "Elysium", "role": "Elysium（Hyperliquid 生态 L2）官方", "category": "project_official", "tier": "official", "aliases": ("elysium", "ely", "kinetiq")},
+    {"handle": "vulcanforged", "name": "Vulcan Forged", "role": "Elysium Blockchain 开发方官方", "category": "project_official", "tier": "official", "aliases": ("vulcan forged", "vulcan", "pyr", "lava")},
 )
 
 

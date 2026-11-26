@@ -833,17 +833,25 @@ class PriceStructureRecognitionTests(unittest.TestCase):
         ), patch.object(server, "price_structure_alert_interval_allowed", return_value=True), patch.object(
             server, "claim_price_structure_observation_alert", return_value=True
         ), patch.object(
+            # 这枚币 provider 是 Binance Futures、只是被「币安钱包4H」带进池的 ——
+            # 它属于二级标的，结构监控照旧（2026-11-26 的准入只管链上内盘和股票代币）。
+            server, "price_watch_secondary_market_symbols", lambda: frozenset({"JACOB"})
+        ), patch.object(
+            server, "PRICE_STRUCTURE_TRADFI_SYMBOLS", frozenset()
+        ), patch.object(
             server, "launch_desktop_alert", return_value={"queued": True}
         ) as launch:
             count = server.launch_price_structure_first_observation_alerts(current, None)
 
         self.assertEqual(count, 1)
         alert_url = launch.call_args.args[0]["url"]
+        # 「查看」自 2026-11-07 起直接落 GMGN 交易页（原先跳币安钱包代币页）。
         self.assertIn(
-            "web3.binance.com/zh-CN/token/robinhood/0x3df3644bcf4ce0d993e18c86c3080e53bfea06f1",
+            "gmgn.ai/robinhood/token/0x3df3644bcf4ce0d993e18c86c3080e53bfea06f1",
             alert_url,
         )
         self.assertNotIn("/futures/", alert_url)
+        self.assertNotIn("web3.binance.com", alert_url)
 
     def test_closed_bar_signal_is_not_replayed_but_live_buy_trigger_is_alerted(self):
         base = {

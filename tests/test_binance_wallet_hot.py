@@ -12,6 +12,14 @@ class BinanceWalletHotTests(unittest.TestCase):
             server.BITGET_EXCHANGE_AI_CACHE.clear()
         with server.BITGET_COIN_IDENTITY_CACHE_LOCK:
             server.BITGET_COIN_IDENTITY_CACHE.clear()
+        # 叙事已改成 GIGA X 优先。这些用例验证的是「GIGA X 没叙事时的币安 / Bitget
+        # 兜底链路」，所以先把 GIGA X 这一层打成空结果：既不让单元测试真的去读
+        # token 打上游，也让断言仍然只盯币安那一次的请求参数。
+        self._gigax_patch = patch.object(
+            server, "fetch_gigax_exchange_ai_narrative", return_value={}
+        )
+        self._gigax_patch.start()
+        self.addCleanup(self._gigax_patch.stop)
 
     @staticmethod
     def payload():
@@ -355,7 +363,8 @@ class BinanceWalletHotTests(unittest.TestCase):
         )
         item = result["items"][0]
         self.assertEqual(item["exchangeAiNarrativeSource"], "Binance AI")
-        self.assertEqual(item["attemptedProviders"], ["Bitget AI", "Binance AI"])
+        # GIGA X 先被问过一次（没叙事），才轮到币安兜底。
+        self.assertEqual(item["attemptedProviders"], ["Bitget AI", "GIGA X", "Binance AI"])
 
     def test_native_exchange_and_aicoin_rows_use_only_verified_contract_metadata(self):
         for source_id in ("binance", "okx", "aicoin"):
@@ -395,7 +404,7 @@ class BinanceWalletHotTests(unittest.TestCase):
             self.assertEqual(item["exchangeAiNarrativeSource"], "Binance AI")
             self.assertEqual(
                 item["attemptedProviders"],
-                (["OKX AI", "Binance AI"] if source_id == "okx" else ["Binance AI"]),
+                (["OKX AI", "GIGA X", "Binance AI"] if source_id == "okx" else ["GIGA X", "Binance AI"]),
             )
 
     def test_bitget_native_html_parser_validates_symbol_before_accepting_summary(self):
@@ -513,7 +522,7 @@ class BinanceWalletHotTests(unittest.TestCase):
         self.assertEqual(fone["metrics"]["volumeH1Usd"], 22000000.0)
         self.assertEqual(sol["network"], "solana")
 
-    def test_gmgn_trench_narrative_reuses_binance_ai_endpoint(self):
+    def test_gmgn_trench_narrative_falls_back_to_binance_ai_endpoint(self):
         expected = {
             "binanceAiNarrative": "这是币安 AI 返回的战壕叙事。",
             "binanceAiNarrativeStatus": "GENERATED",
@@ -531,7 +540,8 @@ class BinanceWalletHotTests(unittest.TestCase):
         fetch.assert_called_once_with("CT_501", "So11111111111111111111111111111111111111112")
         self.assertEqual(result["exchangeAiNarrative"], expected["binanceAiNarrative"])
         self.assertEqual(result["exchangeAiNarrativeProvider"], "binance")
-        self.assertEqual(result["attemptedProviders"], ["Binance AI"])
+        # GIGA X 先被问过（setUp 里打成空结果），然后才回落币安。
+        self.assertEqual(result["attemptedProviders"], ["GIGA X", "Binance AI"])
 
 
 if __name__ == "__main__":

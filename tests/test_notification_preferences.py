@@ -462,6 +462,7 @@ class DeliveryPreferenceTests(unittest.TestCase):
             store.receipt(identity, lease["token"], "visible", visible_ms=5000, now=now)
             process = SimpleNamespace(poll=lambda: None, terminate=Mock())
             with patch.object(server, "ALERT_DELIVERY_STORE", store), \
+                 patch.object(server, "DESKTOP_ALERT_STREAM_ONLY", False), \
                  patch.dict(server.DESKTOP_ALERT_DELIVERIES, {identity: {"process": process, "slot": 0, "token": lease["token"]}}, clear=True), \
                  patch.object(server, "price_structure_symbol_excluded", return_value=True), \
                  patch.object(server, "record_event_flow_popup"):
@@ -486,6 +487,7 @@ class DeliveryPreferenceTests(unittest.TestCase):
             store.receipt(identity, lease["token"], "visible", visible_ms=5000, now=now)
             process = SimpleNamespace(poll=lambda: None, terminate=Mock())
             with patch.object(server, "ALERT_DELIVERY_STORE", store), \
+                 patch.object(server, "DESKTOP_ALERT_STREAM_ONLY", False), \
                  patch.dict(server.DESKTOP_ALERT_DELIVERIES, {identity: {"process": process, "slot": 0, "token": lease["token"]}}, clear=True), \
                  patch.object(server, "record_event_flow_popup"):
                 server.desktop_alert_delivery_tick()

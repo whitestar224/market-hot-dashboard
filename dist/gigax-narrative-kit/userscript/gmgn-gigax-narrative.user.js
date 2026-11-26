@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GMGN AI 叙事 → GIGA X 叙事
 // @namespace    https://github.com/whitestar224/market-hot-dashboard
-// @version      1.8.0
+// @version      1.10.5
 // @description  把 GMGN 网页端代币 AI 叙事悬浮窗内容替换为 GIGA X 对应代币的叙事分析
 // @author       market-hot-dashboard
 // @match        *://gmgn.ai/*
@@ -30,7 +30,7 @@
   const API = BRIDGE + '/api/gigax';
   // 版本号写死一份：诊断面板会显示它，用来确认「你装的到底是不是这一版」
   //（反复修同一个问题、结果用户还在跑旧脚本，已经踩过一次）。
-  const SCRIPT_VERSION = '1.8.0';
+  const SCRIPT_VERSION = '1.10.2';
 
   const POLL_MS = 1500;            // 轮询保底（快路径是 DOM 观察 + hover 预热；放宽以减轻主线程压力）
   const CACHE_TTL = 30 * 60 * 1000;// 同一 CA 叙事缓存 30 分钟（和服务端一致）
@@ -89,6 +89,49 @@
     if (v) { GM_setValue('bridge', v); location.reload(); }
   });
   GM_registerMenuCommand('打印悬浮窗 DOM（调试）', dumpFloating);
+  // 战壕「新创建」回传（1.10.0）：把页面筛过的新币递给本地，命中关键词就弹窗。
+  GM_registerMenuCommand('切换「战壕新币回传」（开/关）', () => {
+    NEW_TOKEN_FEED_ON = !NEW_TOKEN_FEED_ON;
+    GM_setValue('newTokenFeedOn', NEW_TOKEN_FEED_ON ? 'on' : 'off');
+    log('战壕新币回传：' + (NEW_TOKEN_FEED_ON ? '开' : '关'));
+  });
+  GM_registerMenuCommand('查看「战壕新币回传」状态', () => {
+    const chains = Object.keys(trenchFeedState.lastSentAt);
+    const chainLines = chains.length
+      ? chains.map(chain => {
+          const ago = Math.round((Date.now() - trenchFeedState.lastSentAt[chain]) / 1000);
+          return '  · ' + chain + '：' + ago + ' 秒前';
+        }).join('\n')
+      : '  · 还没发过任何一批';
+    alert(
+      '战壕新币回传：' + (NEW_TOKEN_FEED_ON ? '开' : '关') + '\n'
+      + '已回传批次：' + trenchFeedState.sent + '（累计 ' + trenchFeedState.rows + ' 行）\n'
+      + '最后一批：\n' + chainLines + '\n'
+      + '失败：' + trenchFeedState.failed
+      + (trenchFeedState.lastError ? '（' + trenchFeedState.lastError + '）' : '') + '\n'
+      + 'DOM 兜底扫描：' + trenchFeedState.domScans + ' 轮 / 收到卡片 ' + trenchFeedState.domCards + ' 张'
+      + (trenchDomScanTimer ? '' : '（未启动）') + '\n'
+      + '页面外过滤：' + trenchFeedState.dropped + ' 行'
+      + '（接口里有、但你页面没显示的币，一条都不传）\n'
+      + '战壕可见地址缓存：' + Object.keys(trenchDomVisibleAt).length + ' 个'
+      + '（15 分钟内有效，切到详情页也认）\n'
+      + '本页节点：trenches卡 ' + (() => {
+          try { return document.querySelectorAll('[data-trenches-token-address]').length; } catch (e) { return '?'; }
+        })() + ' 张 / recycler ' + (() => {
+          try { return document.querySelectorAll('[data-recycler-key],[data-row-key]').length; } catch (e) { return '?'; }
+        })() + ' 个\n'
+      + '节点样本：' + (() => {
+          try {
+            return Array.from(document.querySelectorAll('[data-recycler-key],[data-row-key]'))
+              .slice(0, 3)
+              .map(n => String(n.getAttribute('data-recycler-key') || n.getAttribute('data-row-key') || '').slice(0, 28))
+              .join(' | ') || '（无）';
+          } catch (e) { return '?'; }
+        })() + '\n'
+      + '本次页面：' + location.pathname + '\n'
+      + '桥接：' + BRIDGE,
+    );
+  });
   GM_registerMenuCommand(
     replacePopup ? '关闭「浮层正文替换」（只保留卡片标色）' : '开启「浮层正文替换」',
     () => {
@@ -192,18 +235,435 @@
       if (netEvents.length > 60) netEvents.shift();
     } catch (e) { /* ignore */ }
   }
+  // ===== 战壕「新创建」回传（1.10.0，用户 2026-11-25）=====
+  // 用户：「能用我页面的数据吗，通过油猴插件回传给项目」「不然币太多了」。
+  // 于是在页面自己请求 `/v1/trenches` 时，把响应里的 `new_creation` 段顺手递回本地：
+  // 报的是**按他页面筛选条件过滤之后**的币（目标设置 / P1 P2 P3 / 平台白名单），
+  // 不是后端全量 60 行/链 —— 既有零 GMGN 配额，也没有额外延迟。
+  //
+  // 纪律：这条链路是**纯旁路**。解析失败、桥接没开、超时，一律静默 ——
+  // 绝不让它影响叙事替换那条主链路，也绝不重复解析卡片 DOM。
+  let NEW_TOKEN_FEED_ON = GM_getValue('newTokenFeedOn', 'on') !== 'off';
+  // 只挑后端要用的字段：整包 60 行 × 80 字段会到几百 KB，裁完约 15KB。
+  const TRENCH_FEED_FIELDS = [
+    'address', 'chain', 'symbol', 'name', 'trans_symbol_zhcn', 'trans_name_zhcn',
+    'created_timestamp', 'open_timestamp', 'market_cap', 'usd_market_cap', 'liquidity',
+    'volume_24h', 'swaps_24h', 'holder_count', 'launchpad_platform', 'launchpad',
+    'launchpad_status', 'twitter', 'progress', 'price',
+  ];
+  const CHAIN_ALIAS = { sol: 'solana', solana: 'solana', bsc: 'bsc', eth: 'ethereum',
+                        ethereum: 'ethereum', base: 'base', robinhood: 'robinhood' };
+  // 只认这五条链。详情页的 `data-recycler-key` 是 UUID（`f54108b5-e7a7-...`），
+  // 旧逻辑会把 `f54108b5` 当链名收下 —— 实测详情页有 11 个这种节点，全会变成假卡片。
+  const KNOWN_FEED_CHAINS = new Set(['solana', 'bsc', 'ethereum', 'base', 'robinhood']);
+  const trenchFeedState = { lastAt: {}, lastKey: {}, lastSentAt: {}, sent: 0, failed: 0,
+                            lastError: '', rows: 0, domScans: 0, domCards: 0, dropped: 0 };
+
+  function feedChainOf(url, rows) {
+    for (const row of rows || []) {
+      const raw = String((row && row.chain) || '').toLowerCase();
+      if (raw) return CHAIN_ALIAS[raw] || raw;
+    }
+    const matched = /[?&]chain=([a-z0-9]+)/i.exec(String(url || ''));
+    if (matched) return CHAIN_ALIAS[matched[1].toLowerCase()] || matched[1].toLowerCase();
+    // 详情页的推荐请求 URL 常常是 `/bsc/token/<CA>` 这种形态，没有 `?chain=`。
+    const inPath = /\/(sol|solana|bsc|eth|ethereum|base|robinhood)\//i.exec(String(url || ''));
+    if (inPath) return CHAIN_ALIAS[inPath[1].toLowerCase()] || inPath[1].toLowerCase();
+    return '';
+  }
+
+  // 战壕页三列。1.10.0 只取 `new_creation`（新创建），结果用户截图的那只
+  // `grok / Grok Coin` 是「已开盘」列的（Pooled 28.84 SOL、age 1m）——
+  // 它压根不在 new_creation 段里，自然永远等不到。三段全收，新鲜度交给后端按
+  // 「创建 / 打满」两个时钟去筛。
+  const TRENCH_SEGMENTS = ['new_creation', 'near_completion', 'completed'];
+
+  function slimTrenchRow(row) {
+    const out = {};
+    TRENCH_FEED_FIELDS.forEach(key => {
+      if (row && row[key] !== undefined && row[key] !== null) out[key] = row[key];
+    });
+    return out;
+  }
+
+  // 嗅探和 DOM 兜底共用的唯一出口：清洗 → 节流 → 签名去重 → POST。
+  // 节流按链算：页面切列会并发打好几次接口，DOM 扫描是 5 秒一轮，两者不能互相挤掉。
+  function postFeedRows(chain, rows, sourceUrl) {
+    if (!NEW_TOKEN_FEED_ON) return;
+    try {
+      if (!chain || !Array.isArray(rows) || !rows.length) return;
+      const now = Date.now();
+      if (now - (trenchFeedState.lastAt[chain] || 0) < 1500) return;
+      const signature = chain + '|' + rows.map(row => (row.segment || '') + ':' + row.address).join(',');
+      // 内容没变就只在 60 秒心跳时才重发 —— 不发的话后端 3 分钟就判「页面关了」，
+      // 而行情安静三分钟没有新币是常态（2026-11-25：stale 之后整条链路等于瞎了）。
+      const unchanged = signature === trenchFeedState.lastKey[chain];
+      if (unchanged && now - (trenchFeedState.lastAt[chain] || 0) < 60000) return;
+      trenchFeedState.lastAt[chain] = now;
+      trenchFeedState.lastKey[chain] = signature;
+      trenchFeedState.lastSentAt[chain] = now;
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: BRIDGE + '/api/new-token-feed',
+        headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify({ chain, sourceUrl: sourceUrl || location.href, clientAt: now, rows }),
+        timeout: 5000,
+        onload: res => {
+          if (res.status >= 200 && res.status < 300) {
+            trenchFeedState.sent += 1;
+            trenchFeedState.rows += rows.length;
+          } else {
+            trenchFeedState.failed += 1;
+            trenchFeedState.lastError = 'HTTP ' + res.status;
+          }
+        },
+        onerror: () => { trenchFeedState.failed += 1; trenchFeedState.lastError = 'network'; },
+        ontimeout: () => { trenchFeedState.failed += 1; trenchFeedState.lastError = 'timeout'; },
+      });
+    } catch (e) { /* 旁路，绝不打断页面 */ }
+  }
+
+  // ===== 页面可见地址（DOM 真实渲染过的卡片）=====
+  // GMGN 战壕的「目标设置 / P1 P2 P3 / 平台白名单」是**前端过滤**：`/v1/trenches`
+  // 的响应里仍然带着被筛掉的币。只信响应就会弹用户页面上根本没有的币
+  // （2026-11-26 用户：「我页面是被过滤过的，根本没有这两个币」）。
+  // 所以 —— **DOM 决定「有哪些币」，嗅探只负责补 `created_timestamp` / 段位这些
+  // DOM 拿不到的字段**。页面上没渲染过的地址，一个字都不往上传。
+  // 有效期 15 分钟（= 后端 feed 的 TTL）。用户做单时会在详情页停留很久，
+  // 30 秒的话切过去就断；15 分钟足够覆盖一次交易，且不会把早上的旧币翻出来。
+  const TRENCH_DOM_VISIBLE_TTL_MS = 15 * 60 * 1000;
+  const trenchDomVisibleAt = {};   // 'chain:address' → 最后一次在页面上出现的时刻
+
+  function noteTrenchVisible(chain, address, nowMs) {
+    const key = String(chain || '') + ':' + String(address || '');
+    if (key === ':') return;
+    trenchDomVisibleAt[key] = nowMs;
+    // 顺手清掉过期键，别让这个表随着刷币无限长。
+    if (Object.keys(trenchDomVisibleAt).length > 400) {
+      Object.keys(trenchDomVisibleAt).forEach(k => {
+        if (nowMs - Number(trenchDomVisibleAt[k] || 0) > TRENCH_DOM_VISIBLE_TTL_MS) {
+          delete trenchDomVisibleAt[k];
+        }
+      });
+    }
+  }
+
+  function trenchRowIsOnPage(chain, address, nowMs) {
+    const key = String(chain || '') + ':' + String(address || '');
+    const seenAt = Number(trenchDomVisibleAt[key] || 0);
+    return Boolean(seenAt) && nowMs - seenAt <= TRENCH_DOM_VISIBLE_TTL_MS;
+  }
+
+  function reportTrenchRows(url, json) {
+    if (!NEW_TOKEN_FEED_ON) return;
+    try {
+      const data = (json && json.data) || json;
+      if (!data || typeof data !== 'object') return;
+      const nowMs = Date.now();
+      const rows = [];
+      TRENCH_SEGMENTS.forEach(segment => {
+        const list = data[segment];
+        if (!Array.isArray(list) || !list.length) return;
+        list.forEach(row => {
+          const slim = slimTrenchRow(row);
+          if (!slim || !slim.address) return;
+          // 行的 chain 缺失时用 URL 兜底（详情页的推荐请求偶尔不带 chain 字段）。
+          const chain = CHAIN_ALIAS[String(slim.chain || '').toLowerCase()]
+            || String(slim.chain || '').toLowerCase()
+            || feedChainOf(url, []);
+          // 页面上没渲染过 → 用户看不见它（被筛掉/已滚出）→ 不发。
+          if (!trenchRowIsOnPage(chain, slim.address, nowMs)) {
+            trenchFeedState.dropped += 1;
+            return;
+          }
+          slim.chain = chain;
+          slim.segment = segment;
+          rows.push(slim);
+        });
+      });
+      if (!rows.length) return;
+      postFeedRows(feedChainOf(url, rows), rows, url);
+    } catch (e) { /* 旁路，绝不打断页面 */ }
+  }
+
+  function tapTrenchFetch(url, response) {
+    try {
+      if (!/\/v1\/trenches/.test(String(url || ''))) return;
+      if (!response || typeof response.clone !== 'function') return;
+      // 必须 clone：原 body 还要给页面自己消费。
+      response.clone().json()
+        .then(json => reportTrenchRows(url, json))
+        .catch(() => {});
+    } catch (e) { /* ignore */ }
+  }
+
+  function tapTrenchXhr(xhr) {
+    try {
+      const url = (xhr && xhr.__gigaxUrl) || '';
+      if (!/\/v1\/trenches/.test(String(url))) return;
+      const raw = xhr.responseText;
+      if (!raw) return;
+      reportTrenchRows(url, JSON.parse(raw));
+    } catch (e) { /* ignore */ }
+  }
+
+  // ===== 战壕 DOM 兜底（1.10.1）=====
+  // 为什么需要：1.10.0 只 hook 了 fetch / XHR，装到线上后 `/api/new-token-feed` 的
+  // `batches` 一直是 **0** —— 一次都没回传过。要么他装的时机比页面发请求晚，
+  // 要么 GMGN 的战壕数据根本不走这两个通道（WebSocket / SSR 注水）。这条兜底
+  // **完全不依赖请求**：读页面上已经在渲染的卡片，5 秒一轮。
+  //
+  // 代价：DOM 里拿不到 created_timestamp，只有卡片上的「42s / 1m / 2h」，
+  // 所以把 `age_text` 递回去让后端反推（`age_seconds_from_text()`）。
+  // 也拿不到可靠的 symbol / name，尽力取，取不到就让后端用 raw_text 兜。
+  const TRENCH_DOM_SCAN_MS = 5000;
+  let trenchDomScanTimer = 0;
+
+  // 币名 = 卡片里**字号最大、字重最高**的那段叶子文本。
+  // 为什么不能靠 textContent：实测标题区是并列的 `<span>`，没有分隔符，
+  // `CiCi` + `Binance AI Act`(标签) 拼出来就是 `CiCiBinance AI Act` ——
+  // 弹窗里显示成那一长串（用户 2026-11-26：「要用前面这个，比如 CICI」）。
+  // 只取「无子元素」的节点，避免把整块容器的长串捞进来；过滤掉金额/税/地址。
+  function readCardName(node) {
+    try {
+      let best = '';
+      let bestScore = 0;
+      const nodes = node.querySelectorAll('span,div,a,p,h1,h2,h3,strong,b');
+      let inspected = 0;
+      for (const el of nodes) {
+        if (el.children && el.children.length) continue;
+        const text = (el.textContent || '').trim();
+        if (!text || text.length > 40) continue;
+        if (/^(tax|mc|liq|vol|\$|0x)/i.test(text)) continue;
+        if (/^[\d.,%$+\-\s]+$/.test(text)) continue;
+        if (!/[A-Za-z\u4e00-\u9fff\uac00-\ud7af]/.test(text)) continue;
+        // 每张卡最多看 12 个候选：币名永远在标题区靠前的位置，
+        // 后面的全是成交/人数，不值得为它们付 getComputedStyle 的代价。
+        if (++inspected > 12) break;
+        const style = getComputedStyle(el);
+        const size = parseFloat(style.fontSize) || 0;
+        const weight = parseInt(style.fontWeight, 10) || 400;
+        const score = size * 100 + weight;
+        if (score > bestScore) { bestScore = score; best = text; }
+      }
+      return best;
+    } catch (e) { return ''; }
+  }
+
+  function onTrenchPage() {
+    try {
+      // **先看 DOM，再看 URL。** 用户的实际布局是「详情页 + 战壕同屏」
+      // （2026-11-26 全景截图：左边战壕列、中间 K 线、右边又几列战壕）——
+      // 旧逻辑见到 `/token/` 就 return false，把旁边整列战壕全漏了，
+      // 菜单里显示「DOM 扫描 0 轮 / 卡片 0 张」，一条都不回传。
+      // `data-trenches-token-address` 是战壕卡片独有的属性，详情页的持仓面板用的是
+      // `data-row-key`，所以「有这个属性的卡片 ≥ 3 张」就足以说明战壕在屏上。
+      if (document.querySelectorAll('[data-trenches-token-address]').length >= 3) return true;
+      // 战壕页但还没渲染出卡片（刚打开/切换筛选）：照样放行，让扫描器下一轮再来。
+      if (/trench/i.test(String(location.pathname || ''))) return true;
+      return false;
+    } catch (e) { return false; }
+  }
+
+  // 详情页 URL 下**只认** `data-trenches-token-address`，绝不许退回 `data-row-key`：
+  // 那个属性在详情页是持仓面板，一卡一个不同 CA，扫了就是 30 个假新币（1.10.1 踩过）。
+  function onTokenDetailPage() {
+    try { return /\/token\//i.test(String(location.pathname || '')); } catch (e) { return false; }
+  }
+
+  // 卡片上的年龄徽标：「42s」「1m」「2h」「3d」「刚刚」，也认中文的「1分钟」「2小时」。
+  // 只认**整段就是年龄**的短文本，否则 MC / 成交量里的数字会被误读成年龄。
+  function readAgeTextFromCard(node) {
+    try {
+      const nodes = node.querySelectorAll('span,div,time');
+      for (const el of nodes) {
+        if (el.children && el.children.length) continue;
+        const text = (el.textContent || '').trim();
+        if (!text || text.length > 10) continue;
+        if (/^\d+\s*(s|m|h|d)$/i.test(text)) return text;
+        if (/^\d+\s*(秒|分钟|分|小时|时|天)$/.test(text)) return text;
+        if (/^(刚刚|刚才|just now)$/i.test(text)) return text;
+      }
+    } catch (e) { /* ignore */ }
+    return '';
+  }
+
+  // 见过的地址（GM 存储，刷新/重启都不丢）。用来区分「卡片刚冒出来」和「它一直在那」——
+  // 没有这层，页面一刷新就会把满屏老币当成新币（尤其 `age_text` 读不到的时候）。
+  const TRENCH_SEEN_KEY = 'newTokenSeen';
+  const TRENCH_SEEN_TTL_MS = 6 * 3600 * 1000;
+  const trenchBaselineDone = {};
+
+  function loadTrenchSeen() {
+    try {
+      const parsed = JSON.parse(GM_getValue(TRENCH_SEEN_KEY, '{}'));
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (e) { return {}; }
+  }
+
+  function saveTrenchSeen(map) {
+    try { GM_setValue(TRENCH_SEEN_KEY, JSON.stringify(map)); } catch (e) { /* ignore */ }
+  }
+
+  // 实测（gmgn_dom_probe 打真页面）：卡片上的 `img[alt]` 全是 `logo` / `Pancake Icon`，
+  // `a[href*="/token/"]` 是空串 —— **别在 DOM 里猜币名**。卡片正文才是唯一线索：
+  //   `\ue06e0xd4…7777 皮皮皮皮船长\ue032\ue058安全未知Tax ?%BNB53s…`
+  // 所以把 glyph 原样带上，交给后端 `card_text_name()` 按「短地址 + 空格 + 币名」解析。
+
+  function collectTrenchCards(allowRowKeyFallback = true) {
+    const cards = [];
+    const seen = new Set();
+    const push = (node, address, chainRaw) => {
+      const chain = CHAIN_ALIAS[String(chainRaw || '').toLowerCase()] || String(chainRaw || '').toLowerCase();
+      const clean = String(address || '').trim();
+      if (!clean || !KNOWN_FEED_CHAINS.has(chain)) return;
+      const key = chain + ':' + clean;
+      if (seen.has(key)) return;
+      seen.add(key);
+      cards.push({ node, address: clean, chain });
+    };
+    try {
+      document.querySelectorAll('[data-trenches-token-address]').forEach(node => {
+        const chainAttr = node.getAttribute('data-trenches-token-chain');
+        // 详情页（`allowRowKeyFallback=false`）再加一道保险：战壕卡片一定同时带
+        // `data-trenches-token-chain`，持仓面板不会。没有 chain 属性的一律不认，
+        // 免得把详情页的其它列表当成战壕。
+        if (!allowRowKeyFallback && !chainAttr) return;
+        push(node, node.getAttribute('data-trenches-token-address'), chainAttr);
+      });
+      if (!cards.length && allowRowKeyFallback) {
+        document.querySelectorAll('[data-recycler-key],[data-row-key]').forEach(node => {
+          const raw = String(node.getAttribute('data-recycler-key') || node.getAttribute('data-row-key') || '');
+          const matched = /^([a-z0-9]+)[:\-_](.+)$/i.exec(raw);
+          if (matched) push(node, matched[2], matched[1]);
+        });
+      }
+    } catch (e) { /* ignore */ }
+    return cards;
+  }
+
+  function scanTrenchDom() {
+    if (!NEW_TOKEN_FEED_ON) return;
+    try {
+      if (!onTrenchPage()) return;
+      const gap = Date.now() - lastTrenchScanAt;
+      if (gap < TRENCH_DOM_MIN_GAP_MS) return;   // 价格每跳都会触发 Mutation，别跟着炸
+      const cards = collectTrenchCards(!onTokenDetailPage());
+      if (!cards.length) return;
+      lastTrenchScanAt = Date.now();
+      trenchFeedState.domScans += 1;
+      trenchFeedState.domCards += cards.length;
+      const nowMs = Date.now();
+      const seen = loadTrenchSeen();
+      let seenDirty = false;
+      const byChain = {};
+      cards.forEach(card => {
+        try {
+          const node = card.node;
+          // **先记账再看别的**：哪怕这一轮因为读不到年龄不发，也要证明「这张卡在页面上」，
+          // 嗅探路径靠这张表判断这个币用户到底看不看得见。
+          noteTrenchVisible(card.chain, card.address, nowMs);
+          const ageText = readAgeTextFromCard(node);
+          const key = card.chain + ':' + card.address;
+          const firstTimeHere = !seen[key];
+          if (firstTimeHere) { seen[key] = nowMs; seenDirty = true; }
+          // 年龄徽标读不到时：只有「这一轮才冒出来的卡」能当刚出现，且**首轮扫描
+          // 只建基线不判定**（否则一进页面就把满屏历史卡片当新币炸一遍）。
+          // 读得到就用它，读不到又一直在屏上的老卡直接不发 —— 后端也会因没有时间戳丢掉。
+          let effectiveAge = ageText;
+          if (!effectiveAge) {
+            if (!firstTimeHere) return;         // 一直在屏上的老卡：没有时钟，不发
+            if (!trenchBaselineDone[card.chain]) return;   // 首轮只建基线
+            effectiveAge = '0s';
+          }
+          const rawText = String((node.textContent || '')).replace(/\s+/g, ' ').trim().slice(0, 200);
+          (byChain[card.chain] = byChain[card.chain] || []).push({
+            address: card.address,
+            chain: card.chain,
+            symbol: '',                       // DOM 里没有可靠的 symbol 字段，交给后端解析正文
+            name: '',
+            // 字号最大的那段叶子文本 ≈ 币名（`CiCi`），后端优先用它；
+            // 取不到才回落到 raw_text 解析。
+            name_text: readCardName(node),
+            age_text: effectiveAge,
+            age_guess: ageText ? '' : 'first-seen',
+            raw_text: rawText,
+            segment: 'dom',
+          });
+        } catch (e) { /* 单卡失败不影响其它卡 */ }
+      });
+      if (seenDirty) {
+        // 顺手清理 6 小时前的旧键，别让 GM 存储无限长大。
+        Object.keys(seen).forEach(key => {
+          if (nowMs - Number(seen[key] || 0) > TRENCH_SEEN_TTL_MS) delete seen[key];
+        });
+        saveTrenchSeen(seen);
+      }
+      // 这一轮见到的链都算建过基线了：下一轮冒出来的卡才允许用「首次出现」当年龄。
+      cards.forEach(card => { trenchBaselineDone[card.chain] = true; });
+      Object.keys(byChain).forEach(chain => {
+        postFeedRows(chain, byChain[chain], location.href);
+      });
+    } catch (e) { /* 旁路，绝不打断页面 */ }
+  }
+
+  function startTrenchDomScan() {
+    if (trenchDomScanTimer) return;
+    try {
+      trenchDomScanTimer = setInterval(() => { try { scanTrenchDom(); } catch (e) {} }, TRENCH_DOM_SCAN_MS);
+      setTimeout(() => { try { scanTrenchDom(); } catch (e) {} }, 3000);
+      watchTrenchDom();
+    } catch (e) { /* ignore */ }
+  }
+
+  // 「一识别命中就弹」：只靠 5 秒定时扫，最坏要等 5 秒才发出（用户 2026-11-25）。
+  // 战壕是虚拟列表，新币是**插进来的节点**，所以挂 MutationObserver 立刻扫一次。
+  // 页面每秒都在改价格，必须防抖 + 硬间隔，别把主线程吃掉。
+  const TRENCH_DOM_MIN_GAP_MS = 800;
+  let lastTrenchScanAt = 0;
+  let trenchMutationTimer = 0;
+
+  function watchTrenchDom() {
+    try {
+      if (!document.body || typeof MutationObserver !== 'function') return;
+      const observer = new MutationObserver(() => {
+        if (trenchMutationTimer) return;
+        const delay = Math.max(120, TRENCH_DOM_MIN_GAP_MS - (Date.now() - lastTrenchScanAt));
+        trenchMutationTimer = setTimeout(() => {
+          trenchMutationTimer = 0;
+          try { scanTrenchDom(); } catch (e) {}
+        }, delay);
+      });
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['data-trenches-token-address', 'data-recycler-key', 'data-row-key'],
+      });
+    } catch (e) { /* ignore */ }
+  }
+
   function installNetSniffer() {
     try {
       const f = W.fetch;
       if (typeof f === 'function' && !f.__gigaxPatched) {
         const patched = function (input, init) {
+          let requestUrl = '';
           try {
-            noteUrl(typeof input === 'string' ? input : (input && input.url));
+            requestUrl = typeof input === 'string' ? input : (input && input.url);
+            noteUrl(requestUrl);
             // 地址也可能在 POST body 里（GraphQL / JSON）
             const b = init && init.body;
             if (typeof b === 'string') noteUrl(b);
           } catch (e) {}
-          return f.apply(this, arguments);
+          const pending = f.apply(this, arguments);
+          // 战壕「新创建」旁路（1.10.0）：页面拿到这批数据的同时，顺手递一份回本地。
+          try {
+            if (/\/v1\/trenches/.test(String(requestUrl || '')) && pending && typeof pending.then === 'function') {
+              pending.then(res => tapTrenchFetch(requestUrl, res)).catch(() => {});
+            }
+          } catch (e) { /* ignore */ }
+          return pending;
         };
         patched.__gigaxPatched = true;
         W.fetch = patched;
@@ -226,6 +686,11 @@
             if (typeof data === 'string' && /narrative|analysis|ai_|ai-|social|story|insight/.test(low)) {
               noteUrl(data);
             }
+            // 战壕「新创建」旁路（1.10.0）：GMGN 有些路由走 axios（XHR），同样递一份回本地。
+            if (/\/v1\/trenches/.test(low) && typeof this.addEventListener === 'function') {
+              const xhr = this;
+              xhr.addEventListener('load', () => tapTrenchXhr(xhr));
+            }
           } catch (e) {}
           return send.apply(this, arguments);
         };
@@ -234,6 +699,9 @@
     } catch (e) { warn('XHR 嗅探失败', e); }
   }
   installNetSniffer();
+  // DOM 兜底与嗅探**同时**开着：嗅探先到（数据最完整），DOM 5 秒一轮补漏。
+  // 两条路都经 postFeedRows 出去，签名去重保证同一批不会发两次。
+  startTrenchDomScan();
 
   // ===== DOM 侧兜底 =====
   const lastPointer = { x: 0, y: 0 };

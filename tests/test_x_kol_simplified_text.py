@@ -13,6 +13,7 @@
 """
 
 import os
+import time
 import unittest
 from unittest.mock import patch
 
@@ -176,7 +177,9 @@ class PublishFunnelTests(unittest.TestCase):
                         "id": "t1",
                         "handle": "CryptoCharming",
                         "text": TRADITIONAL,
-                        "publishedAt": 1_791_545_000_000,
+                        # 必须用「相对当前时间」的时间戳：merge 会丢掉超过
+                        # X_KOL_RETENTION_MS（14 天）的条目，写死日期过一阵就必然红。
+                        "publishedAt": int(time.time() * 1000) - 60_000,
                     }],
                     "sources": [{"id": "x:cryptocharming", "handle": "CryptoCharming", "displayName": "中國奧茲"}],
                 },

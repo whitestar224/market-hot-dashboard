@@ -299,6 +299,13 @@ class RootdataFundingLedgerTests(unittest.TestCase):
 class RootdataFundingDetailTests(unittest.TestCase):
     """融资事件补「详情/标签/生态/成立时间」：增量、串行、失败不拖垮刷新。"""
 
+    def setUp(self):
+        # 默认关掉 SoSoValue 交叉补全：这些用例只测 RootData 详情页的纯逻辑，别被
+        # SoSoValue 的真实网络抓取干扰。要测 SoSoValue 的用例单独覆盖这个 patch。
+        self._soso_patcher = mock.patch.object(rp, "SOSOVALUE_DETAIL_BATCH", 0)
+        self._soso_patcher.start()
+        self.addCleanup(self._soso_patcher.stop)
+
     def _event(self, name="Avon", round_name="并购", date=1793937600000):
         return {
             "name": name, "symbol": "", "round": round_name, "amount": "", "valuation": "",
@@ -317,6 +324,62 @@ class RootdataFundingDetailTests(unittest.TestCase):
         self.assertEqual(result[0]["intro"], "借贷框架")
         self.assertEqual(result[0]["ecosystem"], ["MegaETH"])
         self.assertEqual(result[0]["founded"], "2024")
+
+    def test_details_survive_a_round_or_date_change_via_name_fallback(self):
+        """RootData 重抓时同一项目的 round/date 可能变（round 从「并购」变「--」），
+        此时 ``name|round|date`` 键失配，但 name 兜底仍能把上一轮的详情并回来。"""
+        previous = {"events": [{
+            **self._event(round_name="并购", date=1792728000000),
+            "intro": "借贷框架", "tags": ["DeFi"], "ecosystem": ["MegaETH"], "founded": "2024",
+        }]}
+        # 本轮 round 和 date 都变了（RootData 改口径），但 name 仍是 Avon。
+        events = [self._event(round_name="--", date=1792641600000)]
+        with mock.patch.object(rp, "FUNDRAISING_DETAIL_BATCH", 0):
+            result = rp._enrich_fundraising_details(events, previous)  # noqa: SLF001
+        self.assertEqual(result[0]["intro"], "借贷框架")
+        self.assertEqual(result[0]["ecosystem"], ["MegaETH"])
+        self.assertEqual(result[0]["founded"], "2024")
+
+    def test_name_fallback_does_not_misassign_on_duplicate_names(self):
+        """重名项目（同名、不同轮次）不能靠 name 兜底错配详情。"""
+        previous = {"events": [
+            {**self._event(name="Avon", round_name="种子轮"), "intro": "种子轮简介", "founded": "2024"},
+            {**self._event(name="Avon", round_name="A轮"), "intro": "A轮简介", "founded": "2025"},
+        ]}
+        # 本轮同名项目 round 失配（不再精确命中），name 兜底因重名（计数>1）应失效 → 留空。
+        events = [self._event(name="Avon", round_name="并购")]
+        with mock.patch.object(rp, "FUNDRAISING_DETAIL_BATCH", 0):
+            result = rp._enrich_fundraising_details(events, previous)  # noqa: SLF001
+        self.assertFalse(result[0].get("intro"))
+
+    def test_sosovalue_cross_fills_details_without_rootdata(self):
+        """SoSoValue 交叉补全：RootData 详情页不碰，也能按 name 补上四字段。"""
+        self._soso_patcher.stop()  # 重新开启 SoSoValue
+        events = [self._event(name="Avon")]
+        with mock.patch.object(rp, "SOSOVALUE_DETAIL_BATCH", 20), \
+             mock.patch.object(rp, "FUNDRAISING_DETAIL_BATCH", 0), \
+             mock.patch("sosovalue_projects.resolve_detail_by_name", return_value={
+                 "intro": "Avon 是一个可组合的基于订单簿的借贷框架。",
+                 "tags": ["DeFi", "借贷"], "ecosystem": ["MegaETH"], "founded": "2024",
+             }):
+            result = rp._enrich_fundraising_details(events, {})  # noqa: SLF001
+        self.assertEqual(result[0]["intro"], "Avon 是一个可组合的基于订单簿的借贷框架。")
+        self.assertEqual(result[0]["tags"], ["DeFi", "借贷"])
+        self.assertEqual(result[0]["ecosystem"], ["MegaETH"])
+        self.assertEqual(result[0]["founded"], "2024")
+
+    def test_sosovalue_failure_falls_back_to_rootdata(self):
+        """SoSoValue 拿不到时，回落 RootData 详情页（不因 SoSoValue 失败而丢详情）。"""
+        self._soso_patcher.stop()
+        events = [self._event(name="Avon")]
+        with mock.patch.object(rp, "SOSOVALUE_DETAIL_BATCH", 20), \
+             mock.patch.object(rp, "FUNDRAISING_DETAIL_BATCH", 3), \
+             mock.patch("sosovalue_projects.resolve_detail_by_name", return_value=None), \
+             mock.patch.object(rp, "_working_proxy", return_value="http://127.0.0.1:7890"), \
+             mock.patch.object(rp, "_fetch_detail", return_value=DETAIL_HTML):
+            result = rp._enrich_fundraising_details(events, {})  # noqa: SLF001
+        # RootData 兜底拿到了详情（DETAIL_HTML 解析出 DeFi/借贷）。
+        self.assertTrue(result[0].get("intro") or result[0].get("tags"))
 
     def test_fetches_at_most_the_batch_size_per_round(self):
         """每轮最多补 batch 个，串行；抓到的详情写回事件。"""
@@ -355,6 +418,34 @@ class RootdataFundingDetailTests(unittest.TestCase):
         self.assertIn("成立于 2024", row["note"])
         self.assertIn("DeFi", row["tags"])
         self.assertIn("生态 MegaETH", row["tags"])
+
+    def test_refresh_hands_details_to_the_alert(self):
+        """弹窗拿到的新进事件必须带详情：enrich 在算 fresh 之前跑，否则弹窗拿裸事件。"""
+        events = [self._event(name="Avon")]
+        received: list[dict] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot = Path(tmp) / "fundraising.json"
+            with mock.patch.object(rp, "FUNDRAISING_SNAPSHOT", snapshot), \
+                 mock.patch.object(rp, "FUNDRAISING_LOCK", snapshot.with_suffix(".lock")), \
+                 mock.patch.object(rp, "fetch_html", return_value="<html></html>"), \
+                 mock.patch.object(rp, "parse_fundraising", return_value=events), \
+                 mock.patch.object(rp, "_emit_fundraising_alerts", side_effect=lambda evs: (received.extend(evs), True)[1]):
+                # 上一轮快照里已有详情（供 _enrich 并回），但 seenKeys 为空 → 本轮这些事件是「新进」。
+                import json as _json
+                previous_payload = {
+                    "fetchedAtMs": 1,
+                    "events": [{
+                        **self._event(name="Avon"),
+                        "intro": "借贷框架", "tags": ["DeFi"], "ecosystem": ["MegaETH"], "founded": "2024",
+                    }],
+                    "seenKeys": [],
+                }
+                snapshot.write_text(_json.dumps(previous_payload, ensure_ascii=False), encoding="utf-8")
+                rp.refresh(("fundraising",))
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0]["intro"], "借贷框架")
+        self.assertEqual(received[0]["ecosystem"], ["MegaETH"])
+        self.assertEqual(received[0]["founded"], "2024")
 
 
 class RootdataProjectWatchTests(unittest.TestCase):

@@ -170,6 +170,8 @@ test("an empty chain says so instead of claiming the whole board is empty", () =
 });
 
 test("the static bundle is bumped for the new dropdown", () => {
-  assert.match(html, /app\.js\?v=48/);
-  assert.match(html, /styles\.css\?v=126/);
+  // 只断言「带 ?v=数字」，别钉死具体值 —— 每次改前端都要升版本号，钉死了每升一次
+  // 就得改一次测试（这条以前就是这么烂掉的：文件早到 v57 了，断言还停在 v48）。
+  assert.match(html, /app\.js\?v=\d+/);
+  assert.match(html, /styles\.css\?v=\d+/);
 });

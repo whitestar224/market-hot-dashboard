@@ -31,6 +31,24 @@ function setFlashStatus(text, mode = "normal") {
   flashStatus.dataset.mode = mode;
 }
 
+// `stale` = 上游抓不到、服务端端的是上一份快照。内容是真的，只是老；既不能当
+// 故障源从摘要里抹掉（那正是「律动快讯怎么没了」的来源），也不能冒充新鲜数据。
+function isLiveSourceEntry(entry) {
+  const status = String(entry?.status || "").toLowerCase();
+  return status === "ok" || status === "stale";
+}
+
+function sourceNameWithFreshness(source) {
+  const name = String(source?.name || "").trim();
+  if (!name) return "";
+  if (String(source?.status || "").toLowerCase() !== "stale") return name;
+  const at = Number(source?.dataUpdatedAt || 0);
+  if (!at) return `${name}(缓存)`;
+  const minutes = Math.max(0, Math.round((Date.now() - at) / 60000));
+  const age = minutes < 60 ? `${minutes} 分钟前` : `${Math.round(minutes / 60)} 小时前`;
+  return `${name}(缓存·${age})`;
+}
+
 function readCachedPayload(key) {
   try {
     const payload = JSON.parse(localStorage.getItem(key) || "null");
@@ -182,17 +200,31 @@ async function loadFlash(options = {}) {
     if (FLASH_IS_AIRDROP_PAGE) {
       const liveSources = (Array.isArray(payload.sources) ? payload.sources : [])
         .filter((entry) => FLASH_ONLY_SOURCE_IDS.includes(String(entry?.id || "").toLowerCase()))
-        .filter((entry) => entry?.status === "ok" && Number(entry?.count || 0) > 0);
+        .filter((entry) => isLiveSourceEntry(entry) && Number(entry?.count || 0) > 0);
       const liveCount = liveSources.length || FLASH_ONLY_SOURCE_IDS.length;
       setFlashStatus(`${liveCount} 个来源 · ${flashState.items.length} 条线报`, "ok");
     } else {
-      setFlashStatus(`${sourceCount} 个来源 · 已去重 ${deduplicatedCount} 条`, "ok");
+      // 有源整路抓不到时必须写在状态栏上：用户看到的只是「少了一家」，
+      // 不写原因就只能靠猜（2026-11-17「律动快讯怎么没了」）。
+      const offlineSources = (Array.isArray(payload.sources) ? payload.sources : [])
+        .filter((source) => String(source?.status || "").toLowerCase() === "error")
+        .map((source) => String(source?.name || "").trim())
+        .filter(Boolean);
+      setFlashStatus(
+        offlineSources.length
+          ? `${sourceCount} 个来源 · ${offlineSources.join("、")}未接入`
+          : `${sourceCount} 个来源 · 已去重 ${deduplicatedCount} 条`,
+        offlineSources.length ? "error" : "ok",
+      );
+      if (flashSourceSummary && offlineSources.length) {
+        flashSourceSummary.title = `${offlineSources.join("、")} 当前抓取失败（网络出口或上游故障），恢复后会自动重新接入`;
+      }
     }
     const activeSources = (Array.isArray(payload.sources) ? payload.sources : [])
-      .filter((source) => source?.status === "ok" && Number(source?.count || 0) > 0)
+      .filter((source) => isLiveSourceEntry(source) && Number(source?.count || 0) > 0)
       // 空投来源的条目已经搬到 airdrop.html，摘要里再列一遍会让人以为这页还有它们。
       .filter((source) => !AIRDROP_SOURCE_IDS.has(String(source?.id || "").toLowerCase()))
-      .map((source) => source.name)
+      .map((source) => sourceNameWithFreshness(source))
       .filter(Boolean);
     if (flashSourceSummary && activeSources.length && !FLASH_IS_AIRDROP_PAGE) {
       flashSourceSummary.textContent = `已接入 ${activeSources.join(" · ")}`;
