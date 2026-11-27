@@ -518,6 +518,14 @@ class AlertStreamWindow:
         self.preview = preview
         self.modifier_vks, self.main_vk, self.hotkey_label = parse_hotkey(hotkey)
         self.cards: list[dict] = []
+        # 本窗口生命周期内**出现过就永不重复加**的事件 id（卡片被裁掉也还在）。
+        # 用户 2026-11-27：「这个事件明明出现过了，现在居然还出现了一次」。根因不是
+        # "又来了新消息"，而是**同一个事件行被重新顶高 revision**：一条快讯 08:48 入库，
+        # 15:58 又被喂了一次（同一条 identity 命中同一行），`revision` 涨了，
+        # 增量轮询就把它当新事件推过来；而卡片显示的是 `activityAt`（还是 08:48）。
+        # 列表满 30 条后旧卡片早被裁掉，`_known_ids()` 只看当前卡片 → 于是又加了一张
+        # 9 小时前的卡在最上面。记忆必须活到窗口关掉，不能跟着卡片走。
+        self.seen_ids: set[int] = set()
         self.cursor: int | None = None
         # 事件流以「窗口启动那一刻」为基线：启动前的老事件一律不显示。
         # 用户 2026-11-26：「每次事件窗口启动它都在里面，很奇怪，事件流应该是以启动
@@ -967,7 +975,13 @@ class AlertStreamWindow:
         self.root.after(400, self._drain)
 
     def _known_ids(self) -> set:
-        return {card["id"] for card in self.cards}
+        """已经出现过的事件 id。**不是**「当前还在屏幕上的卡片 id」。
+
+        用 `self.cards` 会漏掉被 `MAX_CARDS` 裁掉的：老事件被重新顶 revision 时，
+        它的卡片早就不在了，于是又被当成新事件加一遍（2026-11-27 用户看到的
+        那条 08:48 快讯就是这么在 17:5x 冒出来的）。
+        """
+        return self.seen_ids
 
     def _chip_font(self):
         """来源胶囊 / 动作胶囊共用的字体。缓存一份，别每张卡片都新建 Font 对象。"""
@@ -1033,6 +1047,13 @@ class AlertStreamWindow:
         那圈黑边劝退的（「太粗了 / 很多黑边」）。
         """
         tk = self.tk
+        # 进过流就算"见过"，之后无论被裁掉多少次都不再加（见 __init__ 的说明）。
+        try:
+            self.seen_ids.add(int(item.get("id")))
+        except (TypeError, ValueError):
+            pass
+        if len(self.seen_ids) > 20000:
+            self.seen_ids = set(sorted(self.seen_ids)[-10000:])
         popup = item.get("popup") or {}
         title = str(popup.get("title") or "市场信息").strip()
         body = str(popup.get("thesis") or "").strip()

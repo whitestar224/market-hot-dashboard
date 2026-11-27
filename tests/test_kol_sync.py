@@ -226,10 +226,65 @@ class KolSyncJoinTests(unittest.TestCase):
     def test_join_window_expires(self):
         self.trio()
         # 把剧集的起点往前拨出窗口：再有人上车也不该再提醒。
-        episode = self.monitor._sync_episodes[f"bsc:{TOKEN.lower()}"]
-        episode["episodeStart"] = self.t0 - (SMM.KOL_SYNC_JOIN_WINDOW_SECONDS + 60) * 1000
+        # 剧集现在落在 sync_episodes 表里（重启不丢），所以从库里改。
+        key = f"bsc:{TOKEN.lower()}"
+        episode = self.monitor.store.sync_episode(key)
+        self.monitor.store.save_sync_episode(
+            key,
+            episode_start=self.t0 - (SMM.KOL_SYNC_JOIN_WINDOW_SECONDS + 60) * 1000,
+            announced=episode["announced"],
+            symbol=episode["symbol"],
+            sent_at=episode["sentAt"],
+        )
         self.buy(D, usd=860, at=self.t0 + 1000)
         self.assertEqual([ctx["mode"] for ctx in self.contexts], ["trio"])
+
+    def test_episode_survives_a_restart_so_the_fourth_kol_still_reports_as_join(self):
+        """用户 2026-11-28：「还有多个KOL同车的也没做」。
+
+        剧集以前只活在进程字典里，服务一晚重启好几次 → 「同车增加」永远弹不出来
+        （全库 56 条增加记录里没有一条是 solana 的），而重启后同一辆车还会把
+        「三人同时上车」重复弹一遍（12 小时冷静期也一起被清空）。落盘后就都对了。
+        """
+        self.trio()
+        self.monitor.close()
+
+        # 「重启」：同一个库、新进程。
+        revived = SMM.SmartMoneyMonitor(Path(self.tmp.name) / "join.sqlite")
+        self.addCleanup(revived.close)
+        revived.kol_sync_wallets = {A: "甲", B: "乙", C: "丙"}
+        revived.kol_sync_track_wallets = {A: "甲", B: "乙", C: "丙", D: "丁", E: "戊"}
+        contexts = []
+        revived.set_sync_alert_callback(contexts.append)
+        revived.record_buy({
+            "chain": "bsc", "walletAddress": D,
+            "transactionHash": "0xrestart-d", "tokenAddress": TOKEN, "symbol": "西瓜",
+            "paymentUsd": 860.0, "paymentAsset": "BNB", "paymentAmount": 1.0,
+            "observedAt": self.t0 + 60_000,
+        })
+
+        self.assertEqual([ctx["mode"] for ctx in contexts], ["join"])
+        self.assertEqual([item["label"] for item in contexts[0]["newcomers"]], ["丁"])
+
+    def test_restart_does_not_repeat_the_trio_alert(self):
+        """重启后同一辆车再来一笔买入，不能把「三人同时上车」重弹一遍。"""
+        self.trio()
+        self.monitor.close()
+
+        revived = SMM.SmartMoneyMonitor(Path(self.tmp.name) / "join.sqlite")
+        self.addCleanup(revived.close)
+        revived.kol_sync_wallets = {A: "甲", B: "乙", C: "丙"}
+        revived.kol_sync_track_wallets = {A: "甲", B: "乙", C: "丙", D: "丁", E: "戊"}
+        contexts = []
+        revived.set_sync_alert_callback(contexts.append)
+        revived.record_buy({
+            "chain": "bsc", "walletAddress": B,
+            "transactionHash": "0xrestart-b", "tokenAddress": TOKEN, "symbol": "西瓜",
+            "paymentUsd": 120.0, "paymentAsset": "BNB", "paymentAmount": 1.0,
+            "observedAt": self.t0 + 60_000,
+        })
+
+        self.assertEqual(contexts, [])
 
     def test_newcomer_on_a_different_token_does_not_leak(self):
         self.trio()

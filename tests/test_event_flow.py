@@ -88,6 +88,38 @@ class EventFlowTests(unittest.TestCase):
         self.assertEqual(len(result["items"][0]["history"]), 3)
         self.assertIn("two", result["items"][0]["identities"])
 
+    def test_replayed_popup_card_does_not_bump_revision(self):
+        """同一条快讯被来源重发时，卡片一样就不许 bump revision。
+
+        2026-11-27 用户：「这个事件明明出现过了，现在居然还出现了一次」。实际是同一
+        事件行被重复喂了一次，`revision` 涨了 → 窗口按增量游标把它当新事件又弹一张，
+        时间戳还是几小时前的 08:48。
+        """
+        card = {
+            "title": "Hyperliquid 生态回暖", "thesis": "BlockBeats 消息…",
+            "source": "聚合快讯", "kind": "聚合快讯 · 市场信息",
+            "url": "https://example.com/flash/1", "eventAt": self.now,
+        }
+        self.store.record("popup:replay", "popup", dict(card, explanationStatus="pending"),
+                          "stream", self.now)
+        cursor = self.store.read()["cursor"]
+        # 7 小时后同一条再来一次，只多了内部字段（叙事补上了）
+        self.store.record("popup:replay", "popup", dict(card, explanationStatus="ready"),
+                          "stream", self.now + 600_000)
+        result = self.store.read()
+        self.assertEqual(result["cursor"], cursor)          # 没有新 revision
+        self.assertEqual(result["total"], 1)                # 还是同一张卡
+        self.assertEqual(len(result["items"][0]["history"]), 1)  # 也没多记一步
+        # payload 仍要刷新：叙事这类后补字段不能丢
+        self.assertEqual(result["items"][0]["popup"]["explanationStatus"], "ready")
+
+    def test_changed_card_content_bumps_revision(self):
+        card = {"title": "标题", "thesis": "甲", "source": "聚合快讯", "kind": "聚合快讯"}
+        self.store.record("popup:change", "popup", dict(card), "stream", self.now)
+        cursor = self.store.read()["cursor"]
+        self.store.record("popup:change", "popup", dict(card, thesis="乙"), "stream", self.now + 1000)
+        self.assertGreater(self.store.read()["cursor"], cursor)
+
     def test_merge_does_not_propagate_a_bloated_identity_table(self):
         """2026-11-26 事故回归：被合并方若已是个大杂烩，一条身份都不许接过来。
 

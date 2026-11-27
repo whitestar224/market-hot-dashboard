@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import sys
 import threading
 import time
 from typing import Any, Callable
@@ -1425,6 +1426,32 @@ EVM_MAX_BLOCKS_PER_POLL_CEILING = 30000
 # and the actual buy gets pushed out, so the window widens on demand.
 SOLANA_SIGNATURE_LIMIT_DEFAULT = 200
 SOLANA_SIGNATURE_LIMIT_CEILING = 1000
+# 放大到 1000 还不够时，继续用 `before=` 往前翻页，直到真的回到自己的游标。
+#
+# 2026-11-27 事故：decu（4vw54Bm…x4rw9Ud9）被机器人刷到 **200 笔/秒**（全是失败交易），
+# 一页 1000 条只覆盖 **5 秒**。他 23:20 那笔 $209 的 sheeb 买入就落在这 5 秒之外 ——
+# 旧逻辑「放大到上限仍打满 = 跳游标并认亏」把那笔直接丢了，事件流里一条都没有
+# （health 里写着「7 个钱包的签名窗口被灌满，已取最新一段」）。
+#
+# solana 的轮询节奏是「跑完立刻再来」，所以**每轮要追的距离 ≈ 一轮耗时 × 洪水速率**。
+# 但实测公共 RPC 一页 1000 行要 **1.4~9 秒**（api.mainnet-beta 更是每次连接先超时
+# 4 秒），单钱包吞吐只有 100~500 行/秒；而当前 6 个被灌满的钱包合计约 **1200 笔/秒**
+# —— 靠翻页把洞全部补齐在数学上做不到，翻得越狠一轮越长，洞反而长得更快（正反馈）。
+# 所以翻页只当**有限兜底**（按时间封顶），真正的完整性交给下面的 GMGN 成交表。
+SOLANA_SIGNATURE_PAGE_BUDGET = max(1, int(os.getenv("XINGYUN_SOLANA_SIGNATURE_PAGES", "8") or 8))
+#: 翻页的时间预算（每个钱包每轮，秒）。光按页数封顶不够 —— 一页可能 9 秒，
+#: 8 页就是 72 秒，一个钱包就能把整轮拖成几分钟，别的链/别的钱包全被饿着。
+SOLANA_SIGNATURE_PAGE_SECONDS = max(
+    1.0, float(os.getenv("XINGYUN_SOLANA_SIGNATURE_PAGE_SECONDS", "15") or 15)
+)
+#: 一页里失败交易占比 ≥ 这条线就算「被洪水灌满」，改走 GMGN 成交表。
+SOLANA_FLOOD_ERR_RATIO = 0.9
+#: 洪水钱包每轮从 GMGN 拉多少条真实成交。GMGN 的 portfolio activity **只回成交**，
+#: 一次约 0.9 秒，不受签名洪水影响 —— 这就是 decu 那笔 $209 的正确入口。
+SOLANA_GMGN_FALLBACK_LIMIT = 30
+#: 只认「近这么多毫秒内」的 GMGN 成交。首次上线这条兜底时，否则会把半小时前的
+#: 老成交当成新买入一次性灌进事件流；而签名路径漏掉的洞本来就在这个窗口内。
+SOLANA_GMGN_FALLBACK_WINDOW_MS = 20 * 60 * 1000
 
 # ``getTransaction`` costs one RPC round-trip per signature and Solana has no
 # batch variant for jsonParsed payloads.  A spammed wallet can hand us hundreds
@@ -1579,7 +1606,12 @@ CHAIN_META = {
         # repeated 10054 resets and read timeouts), so a second endpoint is kept as a
         # fallback. publicnode answered both getSignaturesForAddress and getTransaction
         # reliably during the same outage.
-        "rpcs": ("https://api.mainnet-beta.solana.com", "https://solana-rpc.publicnode.com"),
+        #
+        # 顺序在 2026-11-27 调过来了：官方端点**每个请求都先连接超时 4 秒**（实测 3 次
+        # 全部 4.0s 失败，走本机代理根本连不上），而 ``rpc()`` 是「逐个端点轮着试」，
+        # 所以它排第一等于给每一次 Solana 请求都加了 4 秒固定开销 —— 一页 1000 条签名
+        # 实测变成 7~10 秒。publicnode 直连就有 1.4~3.2 秒，放第一位。
+        "rpcs": ("https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com"),
     },
 }
 CHAIN_ALIASES = {
@@ -1866,6 +1898,23 @@ class SmartMoneyStore:
                     cursor_value TEXT NOT NULL DEFAULT '',
                     last_checked_at INTEGER NOT NULL DEFAULT 0,
                     last_ok_at INTEGER NOT NULL DEFAULT 0
+                );
+                -- 「KOL 同车」的剧集状态必须落盘。
+                --
+                -- 2026-11-28 之前这两样（`_sync_episodes` / `_sync_sent`）只活在一个进程
+                -- 字典里，而服务一晚要重启好几次（改代码、看门狗、用户手动），于是：
+                --   a) 「同车成立」之后只要有 KOL 再上车，剧集就没了 → **同车增加永远不弹**
+                --      （全库 56 条「同车增加」没有一条是 solana 的，正是这个原因）；
+                --   b) 重启后同一个币只要再来一笔买入，就会**把「三人同时上车」重复弹一遍**
+                --      （12 小时冷静期也跟着字典一起被清空了）。
+                -- 判据落盘后：`episode_start` 决定剧集还有效多久，`sent_at` 决定冷静期，
+                -- `announced_json` 记住已经算过谁 —— 三者缺一个就会重复弹或漏掉。
+                CREATE TABLE IF NOT EXISTS sync_episodes (
+                    token_key TEXT PRIMARY KEY,
+                    episode_start INTEGER NOT NULL DEFAULT 0,
+                    announced_json TEXT NOT NULL DEFAULT '[]',
+                    symbol TEXT NOT NULL DEFAULT '',
+                    sent_at INTEGER NOT NULL DEFAULT 0
                 );
             """)
             self.conn.commit()
@@ -2251,6 +2300,62 @@ class SmartMoneyStore:
             ).fetchall()
         return [_row_dict(row) for row in rows]
 
+    # ---- 「KOL 同车」剧集状态（必须落盘，见 sync_episodes 建表注释）------------
+    def sync_episode(self, token_key: str) -> dict[str, Any] | None:
+        """读这个币的同车状态。没有就返回 None。
+
+        ``episodeStart == 0`` 表示「剧集已过期」，但 ``sentAt``（12 小时冷静期）
+        仍然有效 —— 两件事的生命周期不一样，别一起清掉，否则过期后又会重弹一次
+        「三人同时上车」。
+        """
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT episode_start, announced_json, symbol, sent_at "
+                "FROM sync_episodes WHERE token_key = ?", (str(token_key),)
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            announced = set(json.loads(row["announced_json"] or "[]"))
+        except ValueError:
+            announced = set()
+        return {
+            "episodeStart": int(row["episode_start"] or 0),
+            "announced": announced,
+            "symbol": str(row["symbol"] or ""),
+            "sentAt": int(row["sent_at"] or 0),
+        }
+
+    def save_sync_episode(self, token_key: str, *, episode_start: int, announced: Any,
+                          symbol: str = "", sent_at: int = 0) -> None:
+        """整行覆写剧集（``announced`` 传集合/列表都行）。"""
+        addresses = sorted({str(item) for item in (announced or [])})
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO sync_episodes (token_key, episode_start, announced_json, symbol, sent_at) "
+                "VALUES (?,?,?,?,?) ON CONFLICT(token_key) DO UPDATE SET "
+                "episode_start=excluded.episode_start, announced_json=excluded.announced_json, "
+                "symbol=excluded.symbol, sent_at=excluded.sent_at",
+                (str(token_key), int(episode_start), json.dumps(addresses, ensure_ascii=False),
+                 str(symbol or ""), int(sent_at)),
+            )
+            self.conn.commit()
+
+    def drop_sync_episode(self, token_key: str) -> None:
+        with self.lock:
+            self.conn.execute("DELETE FROM sync_episodes WHERE token_key = ?", (str(token_key),))
+            self.conn.commit()
+
+    def prune_sync_episodes(self, episode_before_ms: int, sent_before_ms: int) -> None:
+        """清掉早就过期的剧集 / 早就过了冷静期的空壳，别让这张表无限长。"""
+        with self.lock:
+            self.conn.execute(
+                "DELETE FROM sync_episodes WHERE (episode_start > 0 AND episode_start < ?) "
+                "OR (episode_start = 0 AND sent_at < ?)",
+                (int(episode_before_ms), int(sent_before_ms)),
+            )
+            self.conn.commit()
+
 
 def _hex_int(value: Any) -> int:
     if isinstance(value, int):
@@ -2489,6 +2594,157 @@ def classify_solana_buy(
     }
 
 
+# --------------------------------------------------------------------------- #
+# GMGN 成交表兜底（给被机器人灌满的钱包用）
+# --------------------------------------------------------------------------- #
+def _num(value: Any) -> float:
+    """GMGN 的数字**全是字符串**（``"314.35155756043"``），缺字段时是 ``null``。"""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return result if result == result else 0.0  # NaN 归零
+
+
+def _mint_abbreviation(mint: Any) -> str:
+    """铸币缩写，head 6 / tail 4，和 ``classify_solana_buy`` 同口径。"""
+    text = str(mint or "").strip()
+    return f"{text[:6]}…{text[-4:]}" if len(text) > 12 else (text or "未知代币")
+
+
+def classify_gmgn_buy_activity(
+    wallet_address: Any,
+    row: dict[str, Any],
+    *,
+    threshold_usd: float = DEFAULT_ALERT_THRESHOLD_USD,
+    now_ms: int | None = None,
+) -> dict[str, Any] | None:
+    """把 GMGN 的一条 portfolio activity 收敛成和 :func:`classify_solana_buy` 同构的买入事件。
+
+    为什么需要这条路（2026-11-27，用户：「SOL链KOL DECU的买入记录怎么没有出现在事件流里」，
+    「209.12U啊」）：decu 被机器人刷到 200 笔/秒**失败交易**，一页 1000 条签名只覆盖 5 秒，
+    真实买入被挤出窗口；而且公共 RPC 一页要 1.4~9 秒，翻页根本追不上洪水。GMGN 的
+    ``/v1/user/wallet_activity`` 只回**真实成交**、单次约 0.9 秒，所以洪水钱包改走它。
+
+    口径：
+    * 只认 ``event_type == "buy"``；卖出是另一个方向，买入监控不记账。
+    * ``cost_usd`` 是 GMGN 自己算好的美元规模，比「数量 × 单价」可靠（个别行价格为 0），
+      取不到就**丢弃**——绝不写一笔 0U 的假买入。
+    * ``observedAt`` 用成交本身的时间戳（不是收到的时间），事件流排序才对得上。
+    """
+    if str(row.get("event_type") or "").strip().casefold() != "buy":
+        return None
+    token = row.get("token") if isinstance(row.get("token"), dict) else {}
+    mint = str(token.get("address") or "").strip()
+    tx_hash = str(row.get("tx_hash") or "").strip()
+    if not mint or not tx_hash:
+        return None
+    cost_usd = _num(row.get("cost_usd"))
+    if cost_usd <= 0:
+        return None
+    stamp_ms = int(_num(row.get("timestamp")) * 1000) or int(now_ms or _now_ms())
+    symbol = str(token.get("symbol") or "").strip() or _mint_abbreviation(mint)
+    quote = row.get("quote_token") if isinstance(row.get("quote_token"), dict) else {}
+    quote_symbol = str(quote.get("symbol") or "").strip() or "SOL"
+    token_amount = _num(row.get("token_amount"))
+    return {
+        "chain": "solana",
+        "walletAddress": normalize_wallet_address("solana", wallet_address),
+        "transactionHash": tx_hash,
+        "tokenAddress": mint,
+        "symbol": symbol[:40],
+        "tokenAmount": token_amount,
+        "paymentAsset": quote_symbol[:40],
+        "paymentAmount": _num(row.get("quote_amount")),
+        "paymentUsd": cost_usd,
+        "priceUsd": cost_usd / token_amount if token_amount else _num(row.get("price_usd")),
+        "popupEligible": cost_usd >= float(threshold_usd),
+        "observedAt": stamp_ms,
+        "blockRef": "",
+        "details": {"classification": "gmgn-wallet-activity", "readOnly": True},
+    }
+
+
+_GMGN_ACTIVITY_SESSION: requests.Session | None = None
+_GMGN_ACTIVITY_SESSION_LOCK = threading.Lock()
+
+
+def _gmgn_activity_session() -> requests.Session:
+    """给 GMGN 成交表单开一个会话，代理**钉在系统设置上**。
+
+    服务器进程的 env 代理不一定能到 ``openapi.gmgn.ai``：本机实测会话里的
+    ``https_proxy=127.0.0.1:63995`` 打这个域名直接读超时，而系统 Clash 的
+    ``127.0.0.1:7890`` 只要 0.9 秒。所以这里不 trust_env，直接把系统代理写进会话。
+    """
+    global _GMGN_ACTIVITY_SESSION
+    with _GMGN_ACTIVITY_SESSION_LOCK:
+        if _GMGN_ACTIVITY_SESSION is not None:
+            return _GMGN_ACTIVITY_SESSION
+        session = requests.Session()
+        try:
+            from app.core.network_proxy import windows_proxy_candidates
+
+            candidates = windows_proxy_candidates()
+        except Exception:
+            candidates = []
+        if candidates:
+            url = str(candidates[0]).strip()
+            if "://" not in url:
+                url = f"http://{url}"
+            session.trust_env = False
+            session.proxies = {"http": url, "https": url}
+        _GMGN_ACTIVITY_SESSION = session
+        return session
+
+
+def fetch_solana_wallet_activity(address: str, *, limit: int = SOLANA_GMGN_FALLBACK_LIMIT) -> list[dict[str, Any]] | None:
+    """GMGN 上这个钱包最近的成交。**失败返回 None，不是空列表**。
+
+    两者必须分开：``None`` = 兜底不可用（继续翻页），``[]`` = 这个钱包确实没有成交。
+    混成空列表会让"GMGN 挂了"被当成"他没有买入"，兜底就静默失效了。
+    """
+    try:
+        from app.sources.gmgn_agentic import gmgn_readonly_get
+    except Exception:
+        return None
+    try:
+        payload = gmgn_readonly_get(
+            "/v1/user/wallet_activity",
+            cache_key=f"smart-money:sol-activity:{address}",
+            params={"chain": "sol", "wallet_address": address, "limit": int(limit)},
+            # 一轮只查一次；同一个钱包在高频轮询下不要重复打。
+            cache_ttl_seconds=30,
+            session=_gmgn_activity_session(),
+        )
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("code") not in (0, "0", None):
+        return None
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    rows = data.get("activities") or []
+    if not isinstance(rows, list):
+        return None
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _warn_sync_failure(mode: str, chain: str, token: str, exc: BaseException) -> None:
+    """同车弹窗构造失败时留一行线索（stderr）。
+
+    以前这里是 ``except Exception: pass``：弹窗构造函数一抛异常，用户看到的就是
+    「三个人都齐了却没弹」，而剧集和 12 小时冷静期已经落盘，后面不会再试 ——
+    完全查不到原因（2026-11-28 用户反馈「3 个 KOL 都在车上但没弹」时就是死胡同）。
+    只在失败路径上写一行，不会把 stderr 写满。
+    """
+    try:
+        sys.stderr.write(f"[kol-sync] {mode} alert failed on {chain}:{token[:20]}: "
+                         f"{type(exc).__name__}: {str(exc)[:200]}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 class SmartMoneyMonitor:
     def __init__(
         self,
@@ -2527,6 +2783,11 @@ class SmartMoneyMonitor:
         # 同一条链同一时刻只允许一个线程在跑（后台调度和手动「立即刷新」可能撞车）。
         self._chain_guard = threading.Lock()
         self._chain_running: set[str] = set()
+        # 被机器人灌满的钱包改问 GMGN 成交表（见 ``_solana_signature_batch``）。
+        # 挂成实例属性是为了测试能替换掉它 —— 否则每个「洪水」用例都会真去连网。
+        self.solana_activity_fetcher: Callable[[str], list[dict[str, Any]] | None] = (
+            fetch_solana_wallet_activity
+        )
         self.thread: threading.Thread | None = None
         self.running = False
         self.alert_callback: Callable[[dict[str, Any]], Any] | None = None
@@ -2538,9 +2799,8 @@ class SmartMoneyMonitor:
         self.kol_sync_track_wallets: dict[str, str] = active_kol_sync_track_wallets()
         # Solana 的观察面来自 wallets 表（见 :meth:`_solana_track_wallets`），(取数时刻, 表)。
         self._solana_track_cache: tuple[float, dict[str, str]] = (0.0, {})
-        self._sync_sent: dict[str, float] = {}
-        # 每个标的的同车「剧集」：{announced: set(已在车上并已播报过的地址), trioAt, episodeStart}
-        self._sync_episodes: dict[str, dict[str, Any]] = {}
+        # 同车的「剧集」和冷静期**都存在 sync_episodes 表里**（见建表注释）：
+        # 曾经放在这两个进程字典里，结果每重启一次就丢 —— 同车增加永远弹不出来。
         self._sync_lock = threading.Lock()
         # Optional host-supplied gate.  When it returns False the monitor stops
         # taking NEW buys in (the board's intake switch); already recorded buys
@@ -2634,7 +2894,8 @@ class SmartMoneyMonitor:
         * ``join``：同车已成立后，**别的追踪钱包**又上了同一辆车 → 每次新上车都提醒一次
           （用户 2026-10-27：「在这个基础上，如果在这个同车标的上还有其他的 KOL 再进来，
           继续做同车增加的提醒」）。已经在车上的人不重复播报，靠
-          ``_sync_episodes[token_key]["announced"]`` 记账。
+          ``sync_episodes.announced`` 记账（落盘，重启不丢 —— 曾经放在进程字典里，
+          结果每晚重启几次就把「同车增加」和 12 小时冷静期一起清空）。
 
         判定全部基于**事件表里的真实买入记录**，不看谁弹过窗 —— 金额可能都没过自己的
         门槛，但「都上车了」这件事本身才是信号。
@@ -2711,7 +2972,19 @@ class SmartMoneyMonitor:
             )
         else:
             settled = core_count >= minimum or cluster_ready
-        episode = self._sync_episodes.get(token_key)
+        # 剧集从**磁盘**读（不是进程字典）：重启一次就忘掉的话，「同车增加」永远弹不出来。
+        state = self.store.sync_episode(token_key)
+        episode = None
+        if state is not None and int(state.get("episodeStart") or 0) > 0:
+            if now_ms <= int(state["episodeStart"]) + KOL_SYNC_JOIN_WINDOW_SECONDS * 1000:
+                episode = state
+            else:
+                # 剧集过期：只清「谁在车上」，**保留 sentAt** —— 12 小时冷静期是另一件事，
+                # 一起清掉的话，过期之后同一辆车会立刻再弹一次「三人同时上车」。
+                self.store.save_sync_episode(
+                    token_key, episode_start=0, announced=[], symbol=state.get("symbol") or "",
+                    sent_at=int(state.get("sentAt") or 0),
+                )
         base_context = {
             "chain": chain,
             "tokenAddress": token,
@@ -2729,21 +3002,21 @@ class SmartMoneyMonitor:
         # ---- 1) 同车成立：所有人记为已播报 ----
         if settled:
             if episode is None:
-                episode = {
-                    "trioAt": now_ms,
-                    "episodeStart": min(item["firstAt"] for item in on_board.values()),
-                    "announced": set(on_board),
-                    "symbol": base_context["symbol"],
-                }
-                self._sync_episodes[token_key] = episode
-                self._prune_sync_episodes(now_ms)
+                ordered = sorted(on_board.values(), key=lambda item: item["firstAt"])
+                episode_start = min(item["firstAt"] for item in on_board.values())
                 with self._sync_lock:
                     # 双闸：并发轮询下同一辆车不能两条线程同时判定通过。
-                    last = self._sync_sent.get(token_key, 0.0)
+                    # 冷静期（`sentAt`）与剧集一起落盘 —— 进程重启不能把这两样清空，
+                    # 否则同一个币每重启一次就会把「三人同时上车」重弹一遍。
+                    previous = self.store.sync_episode(token_key) or {}
+                    last = int(previous.get("sentAt") or 0)
                     if last and now_ms - last < KOL_SYNC_REALERT_SECONDS * 1000:
                         return None
-                    self._sync_sent[token_key] = now_ms
-                ordered = sorted(on_board.values(), key=lambda item: item["firstAt"])
+                    self.store.save_sync_episode(
+                        token_key, episode_start=episode_start, announced=set(on_board),
+                        symbol=base_context["symbol"], sent_at=now_ms,
+                    )
+                    self._prune_sync_episodes(now_ms)
                 context = {
                     **base_context,
                     "mode": "trio",
@@ -2752,8 +3025,10 @@ class SmartMoneyMonitor:
                 }
                 try:
                     callback(context)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # 别静默吞掉：弹窗构造一旦抛异常，用户看到的就是「三人都齐了却没弹」，
+                    # 而剧集和冷静期已经落盘，12 小时内都不会再试。至少留一行线索。
+                    _warn_sync_failure("trio", chain, token, exc)
                 return context
             # 剧集已存在时**不要提前返回** —— 下面还要看有没有新人上车。
 
@@ -2762,7 +3037,7 @@ class SmartMoneyMonitor:
             return None
         join_deadline = episode["episodeStart"] + KOL_SYNC_JOIN_WINDOW_SECONDS * 1000
         if now_ms > join_deadline:
-            self._sync_episodes.pop(token_key, None)
+            self.store.drop_sync_episode(token_key)
             return None
         newcomers = [
             item for address, item in on_board.items()
@@ -2770,7 +3045,12 @@ class SmartMoneyMonitor:
         ]
         if not newcomers:
             return None
-        episode["announced"].update(item["address"] for item in newcomers)
+        announced = set(episode["announced"]) | {item["address"] for item in newcomers}
+        self.store.save_sync_episode(
+            token_key, episode_start=int(episode["episodeStart"]), announced=announced,
+            symbol=base_context["symbol"] or episode.get("symbol") or "",
+            sent_at=int(episode.get("sentAt") or now_ms),
+        )
         newcomers.sort(key=lambda item: item["firstAt"])
         context = {
             **base_context,
@@ -2784,16 +3064,16 @@ class SmartMoneyMonitor:
         }
         try:
             callback(context)
-        except Exception:
-            pass
+        except Exception as exc:
+            _warn_sync_failure("join", chain, token, exc)
         return context
 
     def _prune_sync_episodes(self, now_ms: int) -> None:
-        """清掉过了「同车增加」有效期的剧集，别让内存里的字典无限长。"""
-        cutoff = now_ms - (KOL_SYNC_JOIN_WINDOW_SECONDS + KOL_SYNC_WINDOW_SECONDS) * 1000
-        for key, episode in list(self._sync_episodes.items()):
-            if episode.get("episodeStart", 0) < cutoff:
-                self._sync_episodes.pop(key, None)
+        """清掉过期剧集 / 过了冷静期的空壳，别让 sync_episodes 表无限长。"""
+        self.store.prune_sync_episodes(
+            now_ms - (KOL_SYNC_JOIN_WINDOW_SECONDS + KOL_SYNC_WINDOW_SECONDS) * 1000,
+            now_ms - KOL_SYNC_REALERT_SECONDS * 1000,
+        )
 
     def set_intake_guard(self, guard: Callable[[], bool] | None) -> None:
         self.intake_guard = guard
@@ -3393,6 +3673,7 @@ class SmartMoneyMonitor:
             params["until"] = previous
         signatures = self.rpc("solana", "getSignaturesForAddress", [address, params]) or []
         limit_used = SOLANA_SIGNATURE_LIMIT_DEFAULT
+        gmgn_activities: list[dict[str, Any]] | None = None
         # Hitting the cap means the window was truncated — on a wallet that
         # bots spam with failing transactions, that silently drops real buys.
         # Retry once with the ceiling so the window still reaches back to the
@@ -3403,14 +3684,69 @@ class SmartMoneyMonitor:
             if len(widened) > len(signatures):
                 signatures = widened
                 limit_used = SOLANA_SIGNATURE_LIMIT_CEILING
+            # 1000 条还打满 = 洪水比窗口快（decu 实测 200 笔/秒，一页 1000 条只够 5 秒）。
+            #
+            # 这时候**先问 GMGN 的成交表**：它只回真实成交、一次约 0.9 秒，完全不受洪水影响。
+            # 拿到了就不翻页 —— 公共 RPC 一页 1.4~9 秒（100~500 行/秒），而 6 个被灌满的钱包
+            # 合计约 1200 笔/秒，翻页在数学上追不平，只会把一轮越拖越长、洞越挖越大。
+            if len(signatures) >= SOLANA_SIGNATURE_LIMIT_CEILING:
+                failed = sum(1 for row in signatures if row.get("err") is not None)
+                flooded = failed / max(1, len(signatures)) >= SOLANA_FLOOD_ERR_RATIO
+                if flooded:
+                    gmgn_activities = self.solana_activity_fetcher(address)
+                # GMGN 不可用（None）才退回翻页，并且按**时间**封顶：
+                # 光按页数封顶不够，一页 9 秒就是 8 页 72 秒，一个钱包能把整轮拖成几分钟。
+                if gmgn_activities is None:
+                    deadline = time.monotonic() + SOLANA_SIGNATURE_PAGE_SECONDS
+                    pages = 1
+                    while (pages < SOLANA_SIGNATURE_PAGE_BUDGET and signatures
+                           and time.monotonic() < deadline):
+                        oldest = str(signatures[-1].get("signature") or "")
+                        if not oldest:
+                            break
+                        more = self.rpc(
+                            "solana", "getSignaturesForAddress",
+                            [address, {**params, "before": oldest, "limit": SOLANA_SIGNATURE_LIMIT_CEILING}],
+                        ) or []
+                        if not more:
+                            break
+                        signatures = [*signatures, *more]
+                        pages += 1
+                        if len(more) < SOLANA_SIGNATURE_LIMIT_CEILING:
+                            break
+                    limit_used = SOLANA_SIGNATURE_LIMIT_CEILING * pages
         return {"wallet": wallet, "key": key, "previous": previous,
-                "signatures": signatures, "limitUsed": limit_used}
+                "signatures": signatures, "limitUsed": limit_used,
+                "gmgnActivities": gmgn_activities}
+
+    def _record_gmgn_activities(self, address: str, wallet: dict[str, Any],
+                                rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """把 GMGN 成交表里的近期买入记成事件（去重靠 ``event_key`` = 交易哈希）。
+
+        **只补近期那一段**：更老的成交要么早就记过，要么属于上游早就放弃的历史，
+        一次性灌进来只会刷屏（用户要的是「别漏了刚才那笔 209U」，不是补一整天的账）。
+        """
+        now = _now_ms()
+        oldest = now - SOLANA_GMGN_FALLBACK_WINDOW_MS
+        threshold = float(wallet.get("alertThresholdUsd") or DEFAULT_ALERT_THRESHOLD_USD)
+        recorded: list[dict[str, Any]] = []
+        for row in rows:
+            event = classify_gmgn_buy_activity(address, row, threshold_usd=threshold, now_ms=now)
+            if not event:
+                continue
+            if int(event.get("observedAt") or 0) < oldest:
+                continue
+            result = self.record_buy(event)
+            if result.get("created"):
+                recorded.append(result["event"])
+        return recorded
 
     def _poll_solana(self, wallets: list[dict[str, Any]]) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
         failed_total = 0
         backlog_total = 0
         truncated_total = 0
+        gmgn_covered_total = 0
         batches: list[dict[str, Any]] = []
         lookup_errors: list[str] = []
 
@@ -3455,8 +3791,14 @@ class SmartMoneyMonitor:
             # while fresh buys go unnoticed for hours, so walk newest-first and
             # jump the cursor forward, reporting the loss instead of hiding it.
             truncated = len(signatures) >= limit_used
+            gmgn_rows = batch.get("gmgnActivities")
             if truncated:
-                truncated_total += 1
+                if gmgn_rows is None:
+                    truncated_total += 1
+                else:
+                    # 洪水钱包：签名窗口没追平，但真实成交由 GMGN 成交表补上，
+                    # 所以这不是「认亏」，只是换了条更便宜的路。
+                    gmgn_covered_total += 1
             ordered = list(signatures) if truncated else list(reversed(signatures))
             # Oldest-first leaves a clean checkpoint: the cursor advances to the
             # newest signature we actually looked at and never jumps past work we
@@ -3473,6 +3815,11 @@ class SmartMoneyMonitor:
                 if row.get("err") is not None:
                     if not truncated:
                         cursor = signature
+                    continue
+                if gmgn_rows is not None:
+                    # 这个钱包的成交交给 GMGN 成交表（它还认得是哪个币）；签名行只用来
+                    # 推进游标。两条路都记账会把同一笔 tx 记成两行 —— 而且差额分类经常
+                    # 把「卖出 A / 买入 B」判成买入 A（实测 BQVz7fQ1 一处 tx 两个币名）。
                     continue
                 if watched_total >= SOLANA_TX_BUDGET_PER_ROUND:
                     backlog += 1
@@ -3498,6 +3845,8 @@ class SmartMoneyMonitor:
                 self.store.set_cursor(key, cursor)
             if backlog:
                 backlog_total += backlog
+            if gmgn_rows:
+                events.extend(self._record_gmgn_activities(address, wallet, gmgn_rows))
         notes = []
         if lookup_errors:
             notes.append(f"{len(lookup_errors)} 个钱包本轮取签名失败（限流/超时），下轮重试")
@@ -3505,6 +3854,8 @@ class SmartMoneyMonitor:
             notes.append(f"跳过 {failed_total} 笔失败交易")
         if backlog_total:
             notes.append(f"还有 {backlog_total} 笔待回追")
+        if gmgn_covered_total:
+            notes.append(f"{gmgn_covered_total} 个钱包被失败交易灌满，已改用 GMGN 成交表兜底")
         if truncated_total:
             notes.append(f"{truncated_total} 个钱包的签名窗口被灌满，已取最新一段")
         self.store.update_health(

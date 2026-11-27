@@ -2,7 +2,7 @@
 
 > Local-first cross-market trading intelligence dashboard for crypto, stocks, on-chain markets, RSS, X/KOL tracking, News Trade, AI insights, and desktop alerts.
 
-星云社是一个面向交易员和信息流研究者的本地优先交易情报工作台。它把中心化交易所、链上 DEX、币安钱包、港股、美股、A 股、交易所上新、News Trade、律动快讯、RSS/公众号、X/KOL 和群聊线索整合在同一套界面中，并将热榜标的继续送入多周期结构监控。
+星云社是一个面向交易员和信息流研究者的本地优先交易情报工作台。它把中心化交易所、链上 DEX、币安钱包、港股、美股、A 股、交易所上新、News Trade、律动快讯、RSS/公众号、X/KOL 和群聊线索整合在同一套界面中，并将热榜标的继续送入多周期结构监控；聪明钱地址、做市商、Dev 钱包和地址集群的异动与 KOL 同车事件，统一汇聚到桌面左下角的事件流浮窗。
 
 如果这个项目对你有帮助，欢迎点一个 Star 支持一下，也欢迎加入 [Discord 社群](https://discord.gg/mKyCwtHW) 交流数据源、交易信息流自动化和产品建议。
 
@@ -23,7 +23,7 @@
 - 免费免确认模式仍是单独的 Safe 限额方案，只允许预先配置的同链稳定币，不会自动扩大到原生币、其他代币或跨链调用。
 - 报价、步骤领取及交易哈希保存在独立订单库；刷新、重启或提交超时不自动重复付款，可查询原订单及退款状态。主网实盘成交未代用户验证，安全检测与 AI 不代表零风险。
 
-前端交易执行包按需加载。修改执行器后运行 `npm run monitor:build-buy`；后端新增 `monitor_buy.py`，无需额外配置交易所密钥。
+前端交易执行包按需加载。修改执行器后运行 `npm run monitor:build-buy`；后端在 `src/app/monitors/monitor_buy.py`，无需额外配置交易所密钥。
 
 ## 页面截图
 
@@ -49,7 +49,7 @@
 
 桌面版启动时会随项目服务一并启用守护：后端异常退出会在原端口自动恢复，退出桌面项目时守护和后端同时停止，不需要另装计划任务或单独运行守护。仅在不启动桌面端、需要浏览器模式时，才使用 `启动后台服务.cmd`；该窗口就是项目服务本身，关闭后不会遗留独立守护。`停止后台服务.cmd` 和 `查看服务状态.cmd` 分别用于停止与查看该模式。
 
-守护只管理自己启动的服务进程：意外退出按 2–60 秒退避恢复；启动宽限 180 秒后，连续 6 次存活探测失败才重启。探测不等待数据库、行情或 AI。重复启动会提示端口占用，不会抢占其他服务或重复启动监控。日志按大小轮换，保存在 `.runtime-cache/service/`。直接运行 `python server.py` 仍可用于前台调试，但不带进程守护。断电、系统休眠或外部终止守护本身仍会中断运行，不能保证绝对不停机。
+守护只管理自己启动的服务进程：意外退出按 2–60 秒退避恢复；启动宽限 180 秒后，连续 6 次存活探测失败才重启。探测不等待数据库、行情或 AI。重复启动会提示端口占用，不会抢占其他服务或重复启动监控。日志按大小轮换，保存在 `.runtime-cache/service/`。`python server.py` 只用于极短的前台调试：它的 stdout/stderr 一旦被重定向写满，进程会阻塞在写日志上，端口仍在监听但不再回包，浏览器就会拿到旧缓存——日常与长跑请一律走 `service_guard.py` 或桌面端。断电、系统休眠或外部终止守护本身仍会中断运行，不能保证绝对不停机。
 
 ### 页面入口
 
@@ -60,10 +60,14 @@
 | 成交额榜 | `/turnover.html` | 各市场成交额排行 |
 | 新币新股 | `/newboards.html` | 新币、新合约、Binance Alpha 与 IPO |
 | 上新播报 | `/listings.html` | 交易所和项目上新时间线 |
-| 监控中心 | `/price-watch.html` | News Trade、多周期结构、X、群聊、链上投研与 GMGN 战壕 |
-| GMGN 战壕 | `/price-watch.html?mode=chains&chainView=trenches&trenchChain=solana` | GMGN 已迁移项目实时榜与接收历史 |
-| 起爆台 | `/dragon-wave.html` | 起爆策略、独立前高监控分页与案例反馈 |
+| 聚合快讯 | `/newsflash.html` | 律动快讯、空投线报与资讯聚合 |
+| 空投线报 | `/airdrop.html` | 聚合快讯里只筛空投线索（Foresight 空投线报与空投标签），不混进主快讯流 |
 | RSS / 公众号 | `/rss.html` | 订阅源和公众号信息流 |
+| X 追踪 | `/xwatch.html` | 个人 X、项目官方与创始人动态 |
+| 监控中心 | `/price-watch.html` | News Trade、前高突破、结构、聪明钱、做市商、夹子等 16 个分页 |
+| GMGN 战壕 | `/price-watch.html?mode=chains&chainView=trenches&trenchChain=solana` | GMGN 已迁移项目实时榜与接收历史 |
+| 事件流 | `/event-flow.html` | 全部弹窗事件的落盘收件箱与历史回溯 |
+| 起爆台 | `/dragon-wave.html` | 起爆策略、独立前高监控分页与案例反馈 |
 | TodoList | `/todo.html` | 本地任务与提醒 |
 
 ## 功能概览
@@ -77,6 +81,8 @@
 - **市场主线**：每轮扫链先基于同一时间截面的跨资产强弱、成交与流动性迁移、链上资金、独立事件/产品催化和跨平台注意力，识别当下 1–3 条主线及 emerging / accelerating / consensus / crowded / rotating / fading 阶段；再判断每个新币是主线龙头、主线成员、分支扩散、补涨、独立催化、逆主线、蹭热点或尚不确定。主线不是白名单，独立强催化仍可入选，主线标的也不能绕过身份、龙头、买盘、生存率和执行风险。
 - **限频与故障恢复**：GMGN 公共只读请求使用全局最小间隔、按链缓存、过期缓存和 429 冷却；页面刷新、分页和多标签页不会重复请求同一份数据。网络或限频时，热搜榜可展示最后成功数据，战壕页面明确标记当前在线来源状态。
 - **播报策略**：GMGN 热门榜新进只更新榜单和历史，不触发桌面弹窗或语音播报；榜单数据、头像和手动查看功能不受影响。GMGN 战壕也不会因为单纯进入榜单就自动发出交易提醒。
+
+### 榜单与信息流
 
 - **热门榜**：Binance、OKX、Bitget、AIcoin、AVE.ai、GMGN 热搜、OKX DEX、币安钱包、港股、美股和 A 股热榜保持独立卡片；额外提供仅合并币圈标的的去重总榜，每页 10 个，不混入港美股或 A 股。AVE.ai 和 GMGN 热搜榜继续刷新和展示，但新进入榜不触发桌面弹窗或语音播报，也不因榜单来源直接进入监控池。
 - **叙事强弱排序**：支持近 1 小时、6 小时和 24 小时窗口，将近期热度与叙事证据结合后，在每个原始榜单内部重新排序，不改变各数据源的卡片布局。
@@ -95,8 +101,41 @@
 - **News Trade**：按时间倒序展示事件卡片，突出涉及标的；包含 AI 叙事强度、Meme 潜力、催化、风险和应对建议，以及独立的事件热度、链上可交易性、安全检查、手续费/滑点预估和人工确认流程。
 - **TodoList**：项目分组、任务增删改查、今日提醒，按用户隔离数据。
 - **账号系统**：账号密码、邮箱验证码、Google OAuth，支持用户资料和交易所 UID 绑定。
-- **桌面弹窗**：市场异动、结构信号、快讯、RSS、X 动态和 Todo 提醒可进入弹窗队列；新弹窗不会覆盖旧弹窗，过时信号不会在服务重启后集中补播。所有弹窗默认保留 2 分钟；鼠标停留时暂停计时，已经显示的价格弹窗不会因下一轮行情刷新或新弹窗到来而闪退。
+- **弹窗队列**：市场异动、结构信号、快讯、RSS、X 动态和 Todo 提醒都会进同一套队列；新事件不会覆盖旧事件，过时信号不会在服务重启后集中补播；卡片默认停留 2 分钟，鼠标悬停暂停计时，已显示的价格卡片不会因为下一轮行情刷新或新事件到来而闪退。投递到哪里见下一条。
+- **左下角事件流浮窗**：默认开启（`XINGYUN_DESKTOP_ALERT_STREAM_ONLY=1`），所有弹窗统一走屏幕左下角的**一个**固定窗口向下滚，不再逐条弹系统通知；设为 `0` 才恢复系统通知。窗口以启动那一刻为基线，启动前的旧事件不显示，最新的事件排在最上面；多显示器按每块屏的可用工作区贴边，副屏在上方时也不会跑到屏幕外；同一事件重复推送不会重复出卡片，被裁掉的旧卡片也不会重新出现。卡片保留原弹窗的语音、查看和叙事三件事，默认显示一条、可滚轮下翻。独立启动用 `启动事件流窗口.cmd`，实现见 `src/app/alerts/alert_stream_overlay.py`。
+- **事件流页面**：`/event-flow.html` 是弹窗事件的持久化收件箱，可在浮窗关掉之后回看、筛选每条弹窗当时的标的、链、金额与来源。
 - **AI 分析**：普通榜单与 News Trade 可接入 DeepSeek、OpenAI、Moonshot、Qwen、Claude、Gemini 等兼容模型；GMGN 热搜和战壕的标的叙事优先使用币安 AI 叙事接口，并按标的缓存结果。API 不可用时可切换到已登录的本机 Codex CLI，并在页面明确标出 `Binance AI`、`Codex`、`AI` 或 `规则` 来源。
+
+### 监控中心分页
+
+`/price-watch.html` 现由 16 个分页组成，同一批落盘数据同时喂给弹窗和页面：
+
+| 分页 | 口径要点 |
+| --- | --- |
+| News Trade | 快讯 / X / 官方动态 / 链上热门聚合成主题卡，规则层与 AI 层分开显示 |
+| 前高突破 | 因果枢轴确认压力位，价格从下方首次穿越母区间最高外沿才算正式 B 点 |
+| 超跌反弹 | 回撤到主升浪斐波那契位、或接近低位阶段高点时预警 |
+| 多周期结构 | 1m / 5m / 15m / 1h / 4h / 日线结构，链上币按「链 ID + 合约」定位 |
+| 新币低位结构 | 只对近一年上市的新币做低位结构跟踪，且只跑 1 小时 / 4 小时周期，不强制补分钟线 |
+| 补涨映射 | 先判当前真实龙头，再给同叙事里尚未启动的补涨标的 |
+| Aster 上新公告 | Aster 官方上新公告时间线 |
+| 群聊机会 | 微信 / QQ 线索里抽出的标的，可一键送入结构监控 |
+| 个人 X | 你自己登记的 X 账号发帖（含合约地址）抽出的标的，进前高与结构监控 |
+| 聪明钱买入 | 见下节，按链分口径的 KOL / 聪明钱买入流 |
+| 链上投研 | L0-L3 市场树、今日新币全量扫盘、GMGN 战壕 |
+| 被夹检测 | 把 GMGN 成交逐笔回链上取证，只有 `confirmed` 才弹 |
+| Dev 发币 | 盯指定 Dev 地址，直接部署与发射台代发两条路都覆盖 |
+| 做市商监控 | 只扫 BSC / SOL / Robinhood / Base / Elysium 五个链上地址群 |
+| 价格异动 | 现价 ÷ 最近 6 小时最低价 − 1 ≥ 20% 当场弹，同币 6 小时只弹一次，只覆盖币安 U 本位 |
+| 地址集群 | Arkham 实体归因，同一集群在 ≥2 个标的各占流通 ≥5% 才提醒 |
+
+另有两个不在页面上但会独立弹窗的监控：**大幅异动**（3 日跌 ≥50% 或 2 日涨 ≥100%，只取上过 AIcoin 热门榜的币）与**战壕新币关键词**（BSC / SOL / Robinhood 新创建且命中关键词，数据由油猴脚本从 GMGN 战壕页回传，每轮只吃筛选后的少量新币）。
+
+### 聪明钱与 KOL 同车
+
+- **聪明钱买入**：按链配置要弹窗的钱包清单，每笔买入过阈值即记账。同一 (链, 钱包, 代币) 的买入按 **5 分钟墙钟**合并成一条，后续笔只更新「近 5 分钟另 N 笔 +$X」；同一个标的**当天只弹第一条**，避免一个人反复加仓刷屏。
+- **KOL 同车**：两个阶段分开提醒 —— `kol-sync`（同一标的上凑够人数，弹一次，`queuePriority` 130）和 `kol-join`（同一剧集里又有新人上车，每个新人弹一次）。EVM 要求「含核心 KOL ≥2 人」，**Solana 不设核心**，只数人数（≥3 人）并加钱闸（其中至少 2 人各 ≥ $10）。剧集状态（24 小时窗口、12 小时冷静期、已算过谁）**全部落盘**在 `sync_episodes`，所以「同车增加」不会因为服务重启而永远不弹，也不会重启后把「三人同时上车」重复推一遍。
+- **Solana 签名洪水**：失败交易密集的钱包（实测单个钱包可达 200 笔/秒）会让 `getSignaturesForAddress` 翻页在数学上追不平，这类钱包自动改问 GMGN 成交表 `/v1/user/wallet_activity`（只回真实成交），翻页降级为按时间与页数双封顶的兜底，并在健康状态里明说「N 个钱包被失败交易灌满，已改用 GMGN 成交表兜底」。
 
 ## 返佣注册链接
 
@@ -153,22 +192,25 @@ http://127.0.0.1:8765/
 server.py                  # HTTP 入口（唯一的巨型单体）
 service_guard.py           # 守护进程入口
 worker_runner.py           # 独立 worker 入口
-*.cmd / *.ps1              # 双击启动、自启安装等脚本
+*.cmd / *.ps1              # 双击启动、自启安装、事件流窗口等脚本
 src/app/
   api/                     # 已抽出的路由（seo、dragon_wave、gigax、health、smart_money、login_rate）
   core/                    # 基础设施：paths、state、config、网络代理、守护、微信/QQ/钉钉通道
   sources/                 # 上游数据源客户端（GMGN、Arkham、币安 Web3、RootData、空投、快讯…）
-  monitors/                # 各类监控器（聪明钱、做市商、结构、前高、夹子、战壕…）
-  alerts/                  # 弹窗与事件流（桌面 alert、悬浮窗、事件流窗口）
+  monitors/                # 各类监控器（聪明钱、做市商、结构、前高、夹子、战壕、Dev 发币、新币关键词…）
+  alerts/                  # 弹窗与事件流（desktop_alert、alert_delivery、alert_stream_overlay、event_flow…）
   research/                # 链上投研与快速决策
 web/                       # 全部前端 html / css / js / assets（HTTP 对外的本站根）
 scripts/                   # 离线脚本（回测、报告生成、榜单构建），不属于运行期
 tools/                     # 开发工具与 Node 策略桥接
+go/prior-high-monitor/     # 前高监控的 Go 原生实现
+docs/                      # 部署、架构与重构文档
 tests/                     # Python unittest + Node test runner
 ```
 
 `app.core.paths` 是路径唯一真源：`ROOT` / `WEB_DIR` / `APP_DIR` / `runtime_dir()`。
-新增模块一律放进对应的 `src/app/<pkg>/`，**不要**再用 `Path(__file__).parent` 推导项目根。
+新增模块一律放进对应的 `src/app/<pkg>/`，**不要**再用 `Path(__file__).parent` 推导项目根——`src/app/<pkg>/` 下它不再等于项目根，缓存和 SQLite 会被静默写进子目录。
+`desktop_alert.py`、`alert_stream_overlay.py`、`quiet_http_server.py`、`dingtalk_price_watch_bot.py`、`qq_onebot_bridge.py` 等 8 个可独立运行的入口自带 `sys.path` 兜底块，删掉它们双击 `.cmd` 会直接 ImportError。
 
 ## Docker 本地部署
 
@@ -227,7 +269,7 @@ docker compose down
 
 ## 结构监控与起爆台策略
 
-“监控 → 多周期结构”和起爆台共用仓库中的当前策略实现，不维护第二套监控专用规则。服务端通过 `tools/dragon_wave_monitor_bridge.js` 调用 `dragon-wave-engine.js`、`dragon-wave-cases.js`、`dragon-wave-data.js`、`dragon-wave-feedback.js` 和 `dragon-wave-vision.js`，因此后续策略优化会自动同步到结构监控。
+“监控 → 多周期结构”和起爆台共用仓库中的当前策略实现，不维护第二套监控专用规则。服务端通过 `tools/dragon_wave_monitor_bridge.js` 调用起爆台页面正在使用的同一批 `web/dragon-wave-engine.js`、`dragon-wave-cases.js`、`dragon-wave-data.js`、`dragon-wave-feedback.js` 和 `dragon-wave-vision.js`，因此后续策略优化会自动同步到结构监控。
 
 链上标的使用“链 ID + 合约地址”作为第一身份，行情按 Binance Wallet K 线、可选的 OKX OnchainOS DEX K 线、GeckoTerminal OHLCV 轮换；DexScreener 用于解析主池并聚合同一合约的流动性与 24 小时成交额。Robinhood Chain 的 `4663`、BSC、Ethereum、Base、Solana 等常用链均有显式映射。点击链上标的弹窗“查看”会使用合约地址直接打开对应的币安钱包 Token 页面。极新代币尚未形成日线时会保留已经可用的分钟、小时和 4 小时数据，不再因为单个周期历史不足让整张卡片失败。
 
@@ -301,6 +343,13 @@ X 官方 API 当前按费用政策默认硬停用，日常追踪使用 RSS、FxT
 - `ONCHAIN_RESEARCH_ENRICH_LIMIT`：每条链每轮交给 DEX Screener 补全的数据量，默认 90。
 - `ONCHAIN_BSC_RPC_URLS`：BSC 只读 RPC 备用节点列表；每 5 秒增量读取 Flap / Four.meme 的创建事件，保存区块游标，失败后从原位置继续补读。
 - `XINGYUN_DISABLE_CHAIN_ECOSYSTEM_MONITOR`：设为 `1` 可暂停链上投研后台扫描。
+- `XINGYUN_DESKTOP_ALERT_STREAM_ONLY`：默认 `1`，弹窗全部改走左下角事件流浮窗、关掉系统通知；设 `0` 恢复逐条系统通知。`XINGYUN_ALERT_STREAM_OVERLAY` 控制是否常驻浮窗（默认 `1`），`XINGYUN_DESKTOP_ALERT_AUTO_CLOSE_SECONDS` 是卡片停留时间（默认 120 秒，鼠标悬停暂停）。
+- `SMART_MONEY_POLL_INTERVAL_SECONDS`：聪明钱轮询间隔，默认 6 秒；`SMART_MONEY_EVM_MAX_BLOCKS_PER_POLL` 与 `SMART_MONEY_EVM_FALLBACK_BLOCKS` 控制 EVM 每轮与兜底扫块上限；`SMART_MONEY_BUY_ONCE_PER_TOKEN_PER_DAY=0` 可关掉「同一标的当天只弹第一条」。
+- `XINGYUN_SOLANA_SIGNATURE_PAGES` / `XINGYUN_SOLANA_SIGNATURE_PAGE_SECONDS`：仅当 GMGN 成交表不可用时，Solana 签名翻页的页数（默认 8）与时间上限（默认 15 秒）。失败交易灌满钱包时以 GMGN 为准，这两个值只影响兜底深度。
+- `XINGYUN_KOL_SYNC_WALLETS` / `XINGYUN_KOL_SYNC_TRACK_WALLETS`：参与「KOL 同车」判定的钱包清单；`XINGYUN_KOL_SYNC_MIN` 是 EVM 同车所需总人数、`XINGYUN_KOL_SYNC_MIN_CORE` 是其中必须包含的核心 KOL 数（Solana 不设核心，只按人数与钱闸判）。
+- `NEW_TOKEN_SOURCE` / `NEW_TOKEN_MAX_PER_HOUR` / `NEW_TOKEN_SYMBOL_DEDUP_SECONDS` / `NEW_TOKEN_MAX_AGE_SECONDS`：战壕新币关键词弹窗的来源（默认 `feed`，即油猴回传）、每小时上限、同名冷却与最大年龄。
+- `PRICE_MOVE_SECONDS`：价格异动的回看窗口，默认 21600 秒（6 小时）。
+- `XINGYUN_GOPLUS_API_KEY`：合约安全与控盘检测（GoPlus）。未配置时控盘结论只会标「未核验」，不会写成 0%。
 - `GITHUB_TOKEN`：可选，仅用于提高手动添加项目仓库的 GitHub 公共接口额度。
 
 ## 链上投研
@@ -388,10 +437,10 @@ npm run desktop:build:mac
 项目会聚合多个公开页面、公开接口或用户本地授权后的数据源，包括但不限于：
 
 - **中心化与衍生品市场**：Binance、OKX、Bitget、Gate、HTX、AIcoin、Aster、Hyperliquid、trade.xyz。
-- **链上市场与行情**：币安钱包、币安 Web3、GMGN Hot Search / Trenches、OKX DEX / OnchainOS、DEX Screener、GeckoTerminal，以及各链可用的交易对和 K 线接口。
+- **链上市场与行情**：币安钱包、币安 Web3、GMGN Hot Search / Trenches / wallet activity、OKX DEX / OnchainOS、DEX Screener、GeckoTerminal，以及各链可用的交易对和 K 线接口。
 - **股票市场**：富途、同花顺、东方财富，以及公开的港股、美股和 A 股榜单。
-- **新闻与社区**：BlockBeats、RSS、微信公众号、X / Twitter，以及用户本地授权的微信或 QQ 群聊。
-- **链上投研**：DefiLlama、Blockscout、GitHub、GeckoTerminal 和 DEX Screener。
+- **新闻与社区**：BlockBeats、Foresight 空投线报、RSS、微信公众号、X / Twitter，以及用户本地授权的微信或 QQ 群聊。
+- **投研与实体归因**：DefiLlama、Blockscout、GitHub、GeckoTerminal、DEX Screener、RootData、ICODrops、Arkham、CoinMarketCap、GoPlus。
 
 不同数据源稳定性和可访问性会受网络环境、接口变动、地区限制、登录状态和限流策略影响。项目会在可用数据源之间轮换并保留最近有效缓存，但不会把估算值伪装成官方数据，也不保证任何第三方数据源持续可用。
 

@@ -60490,7 +60490,7 @@ def main():
     threading.Thread(target=ensure_local_translation_service, kwargs={"wait_seconds": 180}, daemon=True).start()
     print(f"Market hot dashboard: http://{args.host}:{args.port}/")
     print(f"Aggregated newsflash: http://{args.host}:{args.port}/newsflash.html")
-    print(f"Automation briefs: http://{args.host}:{args.port}/briefs.html")
+    print(f"Event flow inbox: http://{args.host}:{args.port}/event-flow.html")
     print(f"Listings and IPO: http://{args.host}:{args.port}/listings.html")
     print(f"RSS subscriptions: http://{args.host}:{args.port}/rss.html")
     print(f"X KOL watch: http://{args.host}:{args.port}/xwatch.html")

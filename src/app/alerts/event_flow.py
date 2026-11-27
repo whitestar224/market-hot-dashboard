@@ -20,6 +20,22 @@ MERGE_IDENTITY_CARRY_MAX = 16
 
 log = logging.getLogger("app.alerts.event_flow")
 
+#: 弹窗卡片**用户看得见**的字段。只有这些变了才算「真的又发生了一次」；
+#: `stage`、`explanationStatus`、`reason` 这类内部字段变化不该惊动事件流窗口。
+POPUP_CARD_FIELDS = (
+    "title", "thesis", "source", "kind", "url", "symbol", "priority",
+    "chain", "chainLabel", "eventAt", "alertTone", "board",
+)
+
+
+def _same_popup_card(before: dict, after: dict) -> bool:
+    """两张卡片在用户眼里是否一模一样。"""
+    return all(
+        str(before.get(key) or "") == str(after.get(key) or "")
+        for key in POPUP_CARD_FIELDS
+    )
+
+
 
 def article_alias(value: str) -> str:
     """Only identifiable articles/posts, never shared dashboards or coin charts."""
@@ -182,8 +198,25 @@ class EventFlowStore:
                 conn.execute("INSERT OR IGNORE INTO flow_identities VALUES(?,?)", (key, event_id))
             row = conn.execute("SELECT * FROM flow_events WHERE id=?", (event_id,)).fetchone()
             payload = json.loads(row["payload"])
+            previous = payload.get(kind) or {}
             next_part = {**data, "stage": stage}
-            if payload.get(kind) == next_part and len(matches) <= 1:
+            if previous == next_part and len(matches) <= 1:
+                return event_id
+            # 卡片上一个字都没变 → 这是同一条消息被来源重发 / 重复入库，不是新进展。
+            #
+            # 为什么必须在这里挡住（2026-11-27 用户「这个事件明明出现过了，现在居然还
+            # 出现了一次」）：同一条快讯 08:48 入库、15:58 又被喂了一次，命中的是**同一
+            # 行**事件。只要 payload 有一点内部字段差异就会 bump `revision`，而
+            # `revision` 是事件流窗口的推送游标 —— 一涨，窗口就把这条 9 小时前的卡片
+            # 当新事件重新弹到最上面（时间戳还是 08:48）。
+            # 这里只刷新 payload（叙事、原文这类后续字段可能补上了），不动 revision、
+            # 不记 step：卡片既然一模一样，就不该让任何人以为「又发生了一次」。
+            if kind == "popup" and len(matches) <= 1 and _same_popup_card(previous, next_part):
+                if previous != next_part:
+                    conn.execute(
+                        "UPDATE flow_events SET payload=? WHERE id=?",
+                        (json.dumps({**payload, kind: next_part}, ensure_ascii=False, separators=(",", ":")), event_id),
+                    )
                 return event_id
             payload[kind] = next_part
             conn.execute("UPDATE flow_meta SET revision=revision+1 WHERE id=1")

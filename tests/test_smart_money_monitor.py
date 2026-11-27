@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -401,24 +402,40 @@ class SolanaSignatureWindowTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.monitor = SmartMoneyMonitor(Path(self.tmp.name) / "window.sqlite")
+        # 这一组测的是「翻页」这条路；GMGN 兜底关掉（返回 None = 不可用），
+        # 否则洪水用例会真去连网，而且会走另一条分支。
+        self.monitor.solana_activity_fetcher = lambda address: None
 
     def tearDown(self):
         self.monitor.close()
         self.tmp.cleanup()
 
     def _run(self, first_page_rows, second_page_rows=None):
+        """模拟一条**真实**的签名序列：最新在前，`before=` 往更旧翻，`limit` 截断。
+
+        必须认 `before`：夹具只要按 `limit` 回同一页，翻页就会被当成「又满了一页」
+        无限重复请求，测试也就测不出「翻到接上为止」这个行为。
+        """
         key = f"solana:{LIMFORK_WALLET}:signature"
         self.monitor.store.set_cursor(key, "cursor-1")
         asked = []
+        rows = [{"signature": f"a{i}", "err": {"InstructionError": [0, 7]}}
+                for i in range(first_page_rows)]
+        rows += [{"signature": f"b{i}", "err": {"InstructionError": [0, 7]}}
+                 for i in range(second_page_rows or 0)]
 
         def fake_rpc(chain, method, params):
-            limit = params[1].get("limit")
+            options = params[1] or {}
+            limit = int(options.get("limit") or SOLANA_SIGNATURE_LIMIT_DEFAULT)
             asked.append(limit)
-            if limit == SOLANA_SIGNATURE_LIMIT_DEFAULT:
-                return [{"signature": f"a{i}", "err": {"InstructionError": [0, 7]}}
-                        for i in range(first_page_rows)]
-            return [{"signature": f"b{i}", "err": {"InstructionError": [0, 7]}}
-                    for i in range(second_page_rows or 0)]
+            window = list(rows)
+            before = options.get("before")
+            if before:
+                older = [i for i, row in enumerate(window) if row["signature"] == before]
+                if not older:
+                    return []
+                window = window[older[0] + 1:]
+            return window[:limit]
 
         self.monitor.rpc = fake_rpc
         self.monitor._poll_solana([{"address": LIMFORK_WALLET, "chain": "solana",
@@ -426,8 +443,13 @@ class SolanaSignatureWindowTests(unittest.TestCase):
         return asked
 
     def test_window_widens_to_the_ceiling_when_the_first_page_fills_up(self):
+        """一页 200 打满 → 放大到 1000；1000 还打满 → 再用 `before=` 翻一页翻到底。"""
         asked = self._run(SOLANA_SIGNATURE_LIMIT_DEFAULT, SOLANA_SIGNATURE_LIMIT_CEILING)
-        self.assertEqual(asked, [SOLANA_SIGNATURE_LIMIT_DEFAULT, SOLANA_SIGNATURE_LIMIT_CEILING])
+        self.assertEqual(
+            asked,
+            [SOLANA_SIGNATURE_LIMIT_DEFAULT, SOLANA_SIGNATURE_LIMIT_CEILING,
+             SOLANA_SIGNATURE_LIMIT_CEILING],
+        )
 
     def test_quiet_wallet_only_costs_one_call(self):
         asked = self._run(3)
@@ -457,6 +479,8 @@ class SolanaPollBudgetTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.monitor = SmartMoneyMonitor(Path(self.tmp.name) / "budget.sqlite")
         self.monitor.native_price_usd = lambda chain: 0.0
+        # 这一组测的是「翻页 + getTransaction 预算」，GMGN 兜底按不可用处理。
+        self.monitor.solana_activity_fetcher = lambda address: None
         self.key = f"solana:{LIMFORK_WALLET}:signature"
         self.monitor.store.set_cursor(self.key, "cursor-1")
 
@@ -472,7 +496,23 @@ class SolanaPollBudgetTests(unittest.TestCase):
 
         def fake_rpc(chain, method, params):
             if method == "getSignaturesForAddress":
-                return page[: params[1].get("limit") or len(page)]
+                opts = params[1] or {}
+                # 真实 RPC 是「最新在前 + until 截止 + before 往更旧翻」，
+                # 假对象必须照这个语义走，否则翻页逻辑测不出来。
+                snapshot = list(page)
+                until = opts.get("until")
+                if until:
+                    hits = [i for i, row in enumerate(snapshot) if row.get("signature") == until]
+                    if hits:
+                        snapshot = snapshot[: hits[0]]
+                before = opts.get("before")
+                if before:
+                    hits = [i for i, row in enumerate(snapshot) if row.get("signature") == before]
+                    if not hits:
+                        return []
+                    snapshot = snapshot[hits[0] + 1:]
+                limit = int(opts.get("limit") or len(snapshot))
+                return snapshot[:limit]
             fetched.append(params[0])
             return {}
 
@@ -511,6 +551,8 @@ class SolanaPollBudgetTests(unittest.TestCase):
 
     def test_flood_jumps_the_cursor_to_the_newest_and_says_so(self):
         # 放大到上限仍然打满 = 窗口被灌满，中间那段回不来了：取最新、跳过空洞。
+        # 这里的 `page` 只有一页（到 flood999 就没了），翻页也翻不出更早的，
+        # 所以仍然属于「回不来」的那一档。
         rows = [{"signature": f"flood{i}", "err": {"InstructionError": [0, 7]}}
                 for i in range(SOLANA_SIGNATURE_LIMIT_CEILING)]
         fetched: list[str] = []
@@ -522,6 +564,129 @@ class SolanaPollBudgetTests(unittest.TestCase):
         self.assertEqual(self.monitor.store.cursor(self.key), "flood0")
         message = [row for row in self.monitor.store.health() if row["chain"] == "solana"][0]["message"]
         self.assertIn("被灌满", message)
+
+    def test_flood_is_walked_back_past_one_page_to_recover_the_blocked_buy(self):
+        """2026-11-27 decu 事故回归：真实买入藏在 1000 条洪水之后，必须被翻页找回。
+
+        decu（4vw54Bm…x4rw9Ud9）被机器人刷到 200 笔/秒，一页 1000 条只够 2 秒。
+        旧逻辑「放大到上限仍打满就跳游标认亏」把他 23:20 那笔 $209 的 sheeb 买入
+        整笔丢了 —— 事件流里一条都没有。
+        """
+        rows = [{"signature": f"flood{i}", "err": {"InstructionError": [0, 7]}}
+                for i in range(1500)]
+        rows.append({"signature": "real-buy", "err": None})
+        rows.append({"signature": "cursor-1", "err": None})
+        fetched: list[str] = []
+        self.monitor.rpc = self._fake_rpc(rows, fetched)
+
+        self.monitor._poll_solana(self._wallet())
+
+        # 藏在一页 1000 条之后的真实买入被翻出来了（只有它会烧 getTransaction）
+        self.assertEqual(fetched, ["real-buy"])
+        message = [row for row in self.monitor.store.health() if row["chain"] == "solana"][0]["message"]
+        self.assertNotIn("被灌满", message)
+        self.assertIn("跳过 1500 笔失败交易", message)
+
+
+class SolanaGmgnFallbackTests(unittest.TestCase):
+    """被 200 笔/秒的失败交易灌满时，真实成交必须改由 GMGN 成交表补上。
+
+    用户 2026-11-27：「SOL链KOL DECU的买入记录怎么没有出现在事件流里」，随后纠正：
+    「我截图里的就是200U以上的啊」「209.12U啊」—— 那笔 $209 的买入远高于阈值，
+    丢的原因不是阈值，是签名窗口被洪水挤到 5 秒之外。公共 RPC 一页 1000 行要
+    1.4~9 秒，翻页追不平 1200 笔/秒的洪水，所以洪水钱包改问 GMGN 的成交表。
+    """
+
+    MINT = "SheebMint1111111111111111111111111111111111"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.monitor = SmartMoneyMonitor(Path(self.tmp.name) / "gmgn.sqlite")
+        self.monitor.native_price_usd = lambda chain: 0.0
+        self.monitor.store.upsert_wallet("solana", LIMFORK_WALLET,
+                                         nickname="decu", alert_threshold_usd=200.0)
+        self.key = f"solana:{LIMFORK_WALLET}:signature"
+        self.monitor.store.set_cursor(self.key, "cursor-1")
+        self.asked: list[int] = []
+        self.methods: list[str] = []
+        self.rows = [{"signature": f"flood{i}", "err": {"InstructionError": [0, 7]}}
+                     for i in range(SOLANA_SIGNATURE_LIMIT_CEILING)]
+        self.monitor.rpc = self._fake_rpc()
+
+    def tearDown(self):
+        self.monitor.close()
+        self.tmp.cleanup()
+
+    def _fake_rpc(self):
+        def fake_rpc(chain, method, params):
+            self.methods.append(method)
+            if method != "getSignaturesForAddress":
+                return {}
+            options = params[1] or {}
+            self.asked.append(int(options.get("limit") or 0))
+            # 只有一页：翻页翻不出更早的东西，正好模拟「洞补不回来」。
+            return [] if options.get("before") else self.rows
+        return fake_rpc
+
+    def _activity(self, **overrides):
+        row = {
+            "wallet": LIMFORK_WALLET, "chain": "sol", "tx_hash": "tx-sheeb-209",
+            "timestamp": int(time.time()), "event_type": "buy",
+            "token": {"address": self.MINT, "symbol": "sheeb"},
+            "token_amount": "1000", "quote_amount": "1.2", "cost_usd": "209.12",
+            "price_usd": "0.20912", "quote_token": {"symbol": "SOL"},
+        }
+        row.update(overrides)
+        return row
+
+    def _wallet(self):
+        return [{"address": LIMFORK_WALLET, "chain": "solana", "alertThresholdUsd": 200.0}]
+
+    def test_flooded_wallet_takes_the_buy_from_gmgn_instead_of_paging(self):
+        self.monitor.solana_activity_fetcher = lambda address: [self._activity()]
+
+        events = self.monitor._poll_solana(self._wallet())
+
+        # 一次 200 一次 1000 就够了：不翻页（翻页在洪水面前追不平）。
+        self.assertEqual(self.asked, [SOLANA_SIGNATURE_LIMIT_DEFAULT, SOLANA_SIGNATURE_LIMIT_CEILING])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["symbol"], "sheeb")
+        self.assertEqual(events[0]["tokenAddress"], self.MINT)
+        self.assertAlmostEqual(events[0]["paymentUsd"], 209.12, places=2)
+        self.assertTrue(events[0]["popupEligible"])  # 阈值 200，$209 该弹
+        message = [row for row in self.monitor.store.health() if row["chain"] == "solana"][0]["message"]
+        self.assertIn("GMGN 成交表兜底", message)
+        self.assertNotIn("已取最新一段", message)
+        # 这个钱包的成交归 GMGN 管：签名路不再烧 getTransaction，否则同一笔 tx
+        # 会被两条路各记一行（页面上就是同一笔两个币名）。
+        self.assertNotIn("getTransaction", self.methods)
+
+    def test_gmgn_unavailable_falls_back_to_paging_and_says_it_lost_the_hole(self):
+        self.monitor.solana_activity_fetcher = lambda address: None
+
+        self.monitor._poll_solana(self._wallet())
+
+        self.assertGreater(len(self.asked), 2)  # 翻页兜底启动了
+        message = [row for row in self.monitor.store.health() if row["chain"] == "solana"][0]["message"]
+        self.assertIn("被灌满", message)
+        self.assertIn("已取最新一段", message)
+
+    def test_stale_activity_does_not_flood_the_event_stream(self):
+        old = int(time.time()) - 3600
+        self.monitor.solana_activity_fetcher = lambda address: [self._activity(timestamp=old)]
+
+        events = self.monitor._poll_solana(self._wallet())
+
+        self.assertEqual(events, [])
+        self.assertEqual(self.monitor.store.list_events(), [])
+
+    def test_sells_and_rows_without_usd_are_not_buys(self):
+        self.monitor.solana_activity_fetcher = lambda address: [
+            self._activity(event_type="sell"),
+            self._activity(tx_hash="tx-no-usd", cost_usd="0"),
+        ]
+
+        self.assertEqual(self.monitor._poll_solana(self._wallet()), [])
 
 
 class SmartMoneyMonitorTests(unittest.TestCase):
