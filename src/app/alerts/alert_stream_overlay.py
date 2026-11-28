@@ -431,6 +431,125 @@ def acquire_single_instance() -> bool:
         return True
 
 
+def overlay_processes(script: Path) -> list:
+    """所有「同目录同脚本」的浮窗进程（**不筛**启动时间）。
+
+    与 ``retire_stale_overlay`` 的区别：那边只掐「比本进程更老」的，用来换新版；
+    这里要的是全部，因为光靠互斥量只能知道「有人在跑」，不知道跑的是窗口还是僵尸。
+    """
+    try:
+        import psutil
+    except Exception:
+        return []
+    target = script.resolve().as_posix().lower()
+    script_dir = script.resolve().parent.as_posix().lower()
+    found = []
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            if proc.pid == os.getpid():
+                continue
+            cmdline = " ".join(proc.info.get("cmdline") or [])
+            if "alert_stream_overlay.py" not in cmdline.lower():
+                continue
+            normalized = cmdline.replace("\\", "/").lower()
+            if target not in normalized:
+                if script.name.lower() not in normalized:
+                    continue
+                try:
+                    cwd = proc.cwd().replace("\\", "/").lower()
+                except Exception:
+                    continue
+                if cwd.rstrip("/") != script_dir.rstrip("/"):
+                    continue
+            found.append(proc)
+        except Exception:
+            continue
+    return found
+
+
+#: 「有没有窗口」比「进程在不在」重要：点了叉叉之后 Tk 主循环退出、窗口已经没了，
+#: 但只要还有非 daemon 的收尾在跑，进程就还活着并继续占着单实例互斥量 ——
+#: 用户再双击 `启动事件流窗口.cmd` 只会被判「another instance is already running」，
+#: 而 pythonw 没有控制台，看起来就是「点了没反应」。
+OVERLAY_WINDOW_TITLE = "星云社 · 事件流"
+
+
+def _each_overlay_window(callback) -> None:
+    """遍历所有标题等于窗口标题的顶层窗口，回调拿到 hwnd。"""
+    api = _user32()
+    if api is None:
+        return
+    buf = ctypes.create_unicode_buffer(256)
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def _cb(hwnd, _lparam):
+        try:
+            if not api.IsWindowVisible(hwnd):
+                return True
+            if api.GetWindowTextLengthW(hwnd) <= 0:
+                return True
+            api.GetWindowTextW(hwnd, buf, 256)
+            if buf.value == OVERLAY_WINDOW_TITLE:
+                callback(api, hwnd)
+        except Exception:
+            pass
+        return True
+
+    try:
+        api.EnumWindows(_cb, 0)
+    except Exception:
+        pass
+
+
+def visible_overlay_window_pids() -> set[int]:
+    """确实有可见窗口的浮窗 pid。``overrideredirect`` 的窗口也在 EnumWindows 里。"""
+    pids: set[int] = set()
+
+    def _collect(api, hwnd) -> None:
+        pid = ctypes.c_ulong()
+        api.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value:
+            pids.add(int(pid.value))
+
+    _each_overlay_window(_collect)
+    return pids
+
+
+def activate_overlay_window() -> bool:
+    """把已经开着的浮窗拉到前面。
+
+    窗口是 ``-topmost`` 的，正常情况下不会被盖住；但被别的 topmost 窗口（比如战壕
+    悬浮窗）压住时，用户双击启动脚本会「什么都没发生」，于是以为启动失败。
+    """
+    hit = {"value": False}
+
+    def _bring(api, hwnd) -> None:
+        try:
+            api.ShowWindow(hwnd, 9)  # SW_RESTORE
+            api.SetForegroundWindow(hwnd)
+            hit["value"] = True
+        except Exception:
+            pass
+
+    _each_overlay_window(_bring)
+    return hit["value"]
+
+
+def terminate_overlay_processes(procs) -> list[int]:
+    """硬杀一批浮窗进程，并**等它们真的退出**（互斥量是进程退出时才释放的）。"""
+    pids = []
+    for proc in procs:
+        try:
+            proc.kill()
+            pids.append(proc.pid)
+        except Exception:
+            continue
+    deadline = time.time() + 3.0
+    while time.time() < deadline and any(p.is_running() for p in procs):
+        time.sleep(0.05)
+    return pids
+
+
 # --------------------------------------------------------------------------- #
 # 事件流读取
 # --------------------------------------------------------------------------- #
@@ -1385,10 +1504,20 @@ class AlertStreamWindow:
             save_position(*self._current_position())
         except Exception:
             pass
+        log_line("window closed by user")
+        try:
+            PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
         try:
             self.root.destroy()
         except Exception:
             pass
+        # **必须硬退**：Tk 收尾、语音线程、还没返回的收尾回调里只要有一样卡住，
+        # 这个进程就会留着单实例互斥量变僵尸 —— 窗口已经消失，用户再双击
+        # `启动事件流窗口.cmd` 却什么也看不到（2026-11-28「点叉叉后无法手动重启」）。
+        # 该写的都写完了（位置、pid 文件、日志），不需要再跑 atexit。
+        os._exit(0)
 
     def _selfshot(self, path) -> None:
         """预览用：按窗口句柄自身截图。
@@ -1584,6 +1713,11 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=service_port())
     parser.add_argument("--hotkey", default=os.getenv("XYS_ALERT_STREAM_HOTKEY") or DEFAULT_HOTKEY)
     parser.add_argument("--reset-position", action="store_true")
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="先让已在跑的旧窗口退休再启动（手动双击启动脚本走这条；一个界面只有一个，重开即重启）",
+    )
     parser.add_argument("--selfcheck", action="store_true")
     parser.add_argument("--dump", action="store_true")
     parser.add_argument(
@@ -1615,9 +1749,31 @@ def main() -> int:
         window.root.after(max(1, args.preview) * 1000, window.quit)
         return window.run()
 
+    script = Path(__file__).resolve()
+    if args.replace:
+        retired = retire_stale_overlay(script)
+        if retired:
+            log_line(f"--replace retired old overlay(s): {retired}")
     if not acquire_single_instance():
-        log_line("another instance is already running")
-        return 0
+        # 抢不到互斥量有两种完全不同的情况：
+        #   * 真有一个窗口在跑 —— 把它拉到前面，别让用户以为「双击没反应」；
+        #   * **僵尸**：窗口已经点了叉叉、进程却还活着占着互斥量 ——
+        #     这就是「点叉叉后无法手动重启」的真身，直接掐掉再抢一次。
+        visible = visible_overlay_window_pids()
+        procs = overlay_processes(script)
+        zombies = [proc for proc in procs if proc.pid not in visible]
+        if zombies:
+            killed = terminate_overlay_processes(zombies)
+            log_line(f"zombie overlay without window killed: {killed}")
+            if acquire_single_instance():
+                log_line("recovered from zombie overlay")
+        if _MUTEX_HANDLE is None:
+            log_line(
+                "another instance is already running "
+                f"(pids={[proc.pid for proc in procs]}, visible={sorted(visible)})"
+            )
+            activate_overlay_window()
+            return 0
     try:
         window = AlertStreamWindow(port=args.port, hotkey=args.hotkey, position=load_position())
     except HotkeyError as exc:
