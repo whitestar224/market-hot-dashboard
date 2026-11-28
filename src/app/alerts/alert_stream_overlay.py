@@ -88,6 +88,9 @@ PANEL_WIDTH = 372
 PANEL_HEIGHT = 224
 HEADER_H = 38
 COLLAPSED_HEIGHT = HEADER_H + 2
+#: 空态高度 = 标题条 + 「等待新提醒…」那一行（含它自己的 pady）。窗口没内容时
+#: 收成这么高，避免一整块空白被当成「卡死」。
+EMPTY_HEIGHT = HEADER_H + 62
 # 内容区四周的留白：卡片要「整体居中」，所以上、下、左、右一起给，
 # 而不是像第一版那样顶死在标题条下沿。
 BODY_PAD_TOP = 9
@@ -701,13 +704,29 @@ class AlertStreamWindow:
 
     # -- 位置 ------------------------------------------------------------- #
     def _panel_height(self) -> int:
-        return COLLAPSED_HEIGHT if self.collapsed else PANEL_HEIGHT
+        if self.collapsed:
+            return COLLAPSED_HEIGHT
+        # 空态不要占满一张卡片的高度。一整块纯白看起来就像窗口卡死了
+        # （2026-11-28 用户对着空窗口说「现在也卡着了」）—— 没卡片时收成
+        # 「标题条 + 一行提示」这么高，来第一张卡片再长回 PANEL_HEIGHT。
+        return PANEL_HEIGHT if self.cards else EMPTY_HEIGHT
+
+    def _fit_height(self) -> None:
+        """卡片数从 0 变 1（或清空回 0）时按需要重设高度，位置不动。"""
+        if self.collapsed:
+            return
+        try:
+            if int(self.root.winfo_height()) == self._panel_height():
+                return
+            self._place(self.root, self._current_position())
+        except Exception:
+            pass
 
     def _default_position(self) -> tuple[int, int]:
         area = work_area()
         if area:
             left, top, _right, bottom = area
-            return left + 24, max(top, bottom - PANEL_HEIGHT - 24)
+            return left + 24, max(top, bottom - self._panel_height() - 24)
         return 24, 200
 
     def _place(self, root, position: tuple[int, int]) -> None:
@@ -827,7 +846,9 @@ class AlertStreamWindow:
             return
         self.empty_label = self.tk.Label(
             self.list_frame, text="等待新提醒…", bg=BG_PANEL, fg=FG_MUTED,
-            font=("Microsoft YaHei UI", 9), pady=28,
+            # pady 要小：空态窗口高度只有 EMPTY_HEIGHT，留 28 会把提示文字挤出可见区
+            # （实测空态窗口里只剩一片空白，正好又变成「看起来卡死」）。
+            font=("Microsoft YaHei UI", 9), pady=12,
         )
         self.empty_label.pack(fill="x", before=self.bottom_spacer)
         # 空态提示是后建的，窗口初始化的那次 _bind_wheel_tree(self.body) 还没它；
@@ -1358,6 +1379,8 @@ class AlertStreamWindow:
         if not self.visible:
             self.unread += 1
         self._refresh_count()
+        # 第一张卡片进来时窗口还只有「标题条 + 一行提示」那么高，这里长回一张卡片。
+        self._fit_height()
         if self.auto_speak:
             self._speak(voice_text)
 
@@ -1494,6 +1517,8 @@ class AlertStreamWindow:
         self.unread = 0
         self._show_empty_hint()
         self._refresh_count()
+        # 清空之后收回空态高度，别留一整块空白。
+        self._fit_height()
 
     # -- 收尾 ------------------------------------------------------------- #
     def quit(self) -> None:
@@ -1642,6 +1667,25 @@ def retire_stale_overlay(script: Path) -> list[int]:
     return pids
 
 
+def ensure_hotkey_host() -> dict:
+    """确保常驻热键宿主（``alert_stream_hotkey.py``）在跑。
+
+    热键是轮询在**窗口进程**里的，窗口一关热键就废了 —— 用户点完叉叉再按 Alt+Q
+    什么都不会发生（2026-11-28「我要的是快捷键启动」）。所以另起一个没有界面的
+    常驻进程专门盯这个组合键：窗口在跑就交给窗口，没有窗口就把它拉起来。
+    """
+    if os.name != "nt":
+        return {"started": False, "reason": "only supported on Windows", "pid": None}
+    try:
+        from app.alerts import alert_stream_hotkey
+    except Exception as exc:
+        return {"started": False, "reason": f"import failed: {exc}", "pid": None}
+    try:
+        return alert_stream_hotkey.ensure_running()
+    except Exception as exc:
+        return {"started": False, "reason": f"{type(exc).__name__}: {exc}", "pid": None}
+
+
 def spawn_detached(*, root: Path | None = None, source: str = "server", port: int | None = None) -> dict:
     """由 server.py 启动时拉起浮窗（独立进程，`server.py` 退出它也能活）。
 
@@ -1686,6 +1730,12 @@ def spawn_detached(*, root: Path | None = None, source: str = "server", port: in
     except Exception:
         pass
     log_line(f"spawned by {source} pid={child.pid}")
+    # 顺手把常驻热键宿主拉起来：窗口被叉掉之后，Alt+Q 还得能把窗口叫回来。
+    host = ensure_hotkey_host()
+    if host.get("started"):
+        log_line(f"hotkey host spawned pid={host.get('pid')}")
+    elif host.get("reason") not in (None, "", "already running"):
+        log_line(f"hotkey host not started: {host.get('reason')}")
     return {"started": True, "reason": "", "pid": child.pid}
 
 
@@ -1785,6 +1835,7 @@ def main() -> int:
         print(f"window init failed: {exc}", file=sys.stderr)
         return 2
     atexit.register(lambda: PID_FILE.unlink(missing_ok=True))
+    ensure_hotkey_host()
     return window.run()
 
 
